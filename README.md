@@ -8,7 +8,7 @@ the feedback payload be the raw top-layer state (A1) or a routed combination
 of the column's deltas (A2, "delta feedback") — the injection-form question
 the FBT paper leaves open.
 
-**Status:** design phase. Ledger settled (2026-08-27); no training code, no
+**Status:** design phase. Design settled (2026-08-27); no training code, no
 results yet. See [`docs/findings.md`](docs/findings.md).
 
 ## Plan shape
@@ -16,7 +16,7 @@ results yet. See [`docs/findings.md`](docs/findings.md).
 - Trials on jobe (1x4090): {vanilla, DAR, FBT, A1, A2} at DAR's 220M config,
   ~1B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
 - Flagship on rented pods: better of A1/A2 at ~1.08B params / 400B tokens,
-  gated on the trials (pre-registered gate in the ledger).
+  gated on the trials (pre-registered gate in the design doc).
 - Phase-2 extension (contingent): pause-token pretraining on the winner.
 
 ## Install
@@ -36,10 +36,12 @@ harness lands.
 
 ## Docs map
 
-- [`docs/design.md`](docs/design.md) — the design ledger (D1-D18):
-  architecture, arms, recipe, budgets, promotion gate, risks.
+- [`docs/design.md`](docs/design.md) — the authoritative current design:
+  architecture, training, arms, scale plan, evaluation, gates, risks.
 - [`docs/findings.md`](docs/findings.md) — claims and limitations (currently:
   none).
+- [`docs/journal.md`](docs/journal.md) — disposable working notes,
+  periodically cleared.
 - [`references/refs.yaml`](references/refs.yaml) — load-bearing papers;
   fetch markdown copies with `python -m transformer_experiments.references`.
 - [`figures/README.md`](figures/README.md) — figure map (currently empty).
