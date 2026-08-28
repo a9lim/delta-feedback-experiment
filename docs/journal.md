@@ -69,6 +69,27 @@ on DF would mean the gate was never necessary (headline surprise).
 Implementation note: route() must no-op with <2 sources (a singleton
 softmax would double u at layer 0).
 
+## 2026-08-28 — sources reversed: complete decomposition everywhere
+
+The srcs = [] trim below lasted one turn. Discussing *why* the paper's
+variants disagree (Block seeds with the embedding, per-sublayer doesn't)
+produced the telescoping read: Block's {embed, Δ_1..Δ_B} is the complete
+decomposition of the stream (sums to h_top); per-sublayer silently drops
+the seed term — the omission, not the seed, is the inconsistency. Also:
+embedding-prominence was only *observable* in the variant offering the
+option, so the paper's headline interp finding is partly an artifact of
+this asymmetry. a9 reversed the shape: **DF: srcs = [u]; DAR arm:
+srcs = [e]** — complete decomposition in every routed arm, closing the
+observability gap at trial granularity (seed weight = input-re-injection
+readout everywhere). Costs accepted: the DAR arm is now the untested cell
+(per-sublayer + seed) — its positive-control claim softened to
+harness-sensitivity (it already ran the shared recipe, so numeric
+replication was never on the table). Payload router deliberately exempt
+from completeness (deltas only): a payload re-amplifying its own carried
+input opens a persistence loop across steps; revisit flag. Singleton
+no-op guard restored (len < 2 — the seed would otherwise be doubled at
+layer 0), superseding the entry below's guard note.
+
 ## 2026-08-28 — spine sources trimmed to [] (a9's nit)
 
 a9 re-read the paper: per-sublayer Delta AttnRes routes deltas only — the

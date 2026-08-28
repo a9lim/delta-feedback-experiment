@@ -50,19 +50,19 @@ per-sublayer sources). `route(vs, q)` returns
 ```python
 e = embed(tok)
 u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G e)
-srcs = []                                # per-sublayer: deltas only (paper-verbatim)
+srcs = [u]                               # input seed + deltas: complete decomposition
 h = u
 for l in layers:
-    h = h + route(srcs, q_attn[l])       # depth routing (no-op only when srcs empty)
+    h = h + route(srcs, q_attn[l])       # depth routing (no-op while len(srcs) < 2)
     a = attn(norm(h)); h = h + a; srcs.append(a)
     h = h + route(srcs, q_mlp[l])        # depth routing
     m = mlp(norm(h));  h = h + m; srcs.append(m)
-p_prev = rmsnorm(h + route(srcs, q_p))   # additive delta payload (no null)
+p_prev = rmsnorm(h + route(srcs[1:], q_p))   # additive payload over deltas (no null)
 tok = sample(lm_head(h))
 
 # Parent arms delete from this model:
 #   vanilla: u = e; no route() calls; no payload
-#   DAR:     u = e; no payload           (depth routing identical to DF's)
+#   DAR:     u = e; srcs = [e] (its input seed); no payload
 #   FBT:     no route() calls; p_prev = rmsnorm(h)   (bare top state)
 #
 # DF-soft (screen-only fifth arm) replaces the hard choices with soft ones:
@@ -111,22 +111,30 @@ rmsnorm(h_top + (h_top − u)/N) ≈ the bare top state: the model starts as
 approximately FBT-with-depth-routing and diverges only as payload routing
 sharpens [synthesis].
 
-**Sources.** The spine carries no standing sources: the source list is
-whatever the paper's variant at the active granularity uses — per-sublayer
-Delta AttnRes routes deltas only [paper] (and beat Delta Block at every
-scale without an input source [paper]), while Block granularity (the
-flagship) seeds the list with the input, Block-verbatim [paper] — which
-for us is `u`, so input re-injection at depth returns at the flagship
-exactly where the paper licenses it. This also makes the depth-routing
-module identical between the DAR arm and DF: their contrast isolates
-{gate, payload} with no source-list confound. Raw `e` and raw `p_prev` are
-deliberately absent from the spine: token identity reaching the stack only
-through the gate's multiplicative pattern is FBT's own working regime
-[paper], and ungated payload access belongs to DF-soft, where it is the
-measurement. The spine/DF-soft source asymmetry is principled: the hard
-arm is minimal mandatory machinery, the soft arm a maximal optional menu —
-its options are its measurement surface. On single-pass batches (no
-payload yet) the input is plain `e`.
+**Sources.** Every routed arm carries the *complete decomposition* of its
+stream: the source list is the column's input seed plus the per-sublayer
+deltas, telescoping to the full hidden state (seed + Σv = h_top). The seed
+is whatever the column's input actually is — `u` in DF, `e` in the DAR
+arm (`srcs = [e]`), `e` in DF-soft (already present). This deliberately
+departs from the paper's per-sublayer variant, which routes deltas only:
+we read that omission as unprincipled — their Block variant seeds with the
+embedding, completing the decomposition, and their embedding-prominence
+finding was only *observable* in the variant that offered the option
+[synthesis]. The seed closes that observability gap at trial granularity:
+per-layer seed weight is the input-re-injection readout in every routed
+arm. The depth-routing module remains identical between the DAR arm and
+DF — only the seed's content differs, and that difference is entailed by
+the feedback apparatus itself. Raw `e` and raw `p_prev` remain absent from
+the spine's list (token identity passes only through the gate's
+multiplicative pattern, FBT's own working regime [paper]; ungated payload
+access is DF-soft's measurement), and the spine/DF-soft asymmetry stays
+principled: minimal mandatory machinery vs a maximal optional menu. The
+payload router is deliberately exempt from the completeness rule — it
+routes deltas only, since a payload that re-amplifies its own carried
+input would open a self-reinforcing persistence loop across steps, and
+"what changed this column" is the enrichment's semantics [synthesis]. On
+single-pass batches (no payload yet) the spine's input, and hence its
+seed, is plain `e`.
 
 **The hard/soft design space, and DF-soft.** Entry (gated vs plain input)
 and routing nulls (absent vs present) span a design plane whose coherent
@@ -269,9 +277,11 @@ unknowable data mixture makes them incomparable as controls.
 - **Decode modes:** Standard/Soft/Fused on every feedback-bearing arm.
 - **Interpretability (first-class):** routing weights are direct
   observables. Spine: the payload router's distribution over deltas (what
-  rides the recurrence); at the flagship's Block granularity, depth weight
-  on the `u` seed (does the paper's embedding-prominence pattern migrate
-  to the fused input?). DF-soft: per-layer weight on `p_prev` (does a
+  rides the recurrence) and per-layer depth weight on the `u` seed (does
+  the paper's Block-mode embedding-prominence appear at per-sublayer
+  granularity, and does it migrate to the fused input?) — with the DAR
+  arm's `e`-seed weight as the feedback-free baseline for the same
+  question. DF-soft: per-layer weight on `p_prev` (does a
   free model demand the previous column?), weight on `e`
   (embedding-prominence under recurrence), and null masses everywhere —
   the adoption readout, including the injection-form question. FBT's
@@ -283,9 +293,12 @@ unknowable data mixture makes them incomparable as controls.
 
 ## Gates
 
-**Ladder entry** (from the screen): DAR must reproduce its published
-ordering at the screen, or the harness is suspect and nothing else is
-interpretable. Finalists are vanilla, DF, and parents as budget allows.
+**Ladder entry** (from the screen): the DAR arm must clearly beat vanilla
+at the screen, or the harness is suspect and nothing else is
+interpretable. (It validates harness *sensitivity* to DAR-class effects
+rather than reproducing the paper numerically — it runs the shared
+FBT-binding recipe plus the input seed, neither of which the paper's
+per-sublayer runs used.) Finalists are vanilla, DF, and parents as budget allows.
 One deliberate asymmetry: a null-but-stable FBT side at the screen does
 **not** exclude DF from the ladder — the screen runs at 9 tok/param and
 formation-with-scale is precisely the hypothesis it cannot test; the
