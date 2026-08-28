@@ -3,6 +3,29 @@
 Disposable working space, periodically cleared. Keep only notes needed for
 active work; anything durable graduates to `design.md` or `findings.md`.
 
+## 2026-08-28 (night) — resume fix; runs.a9l.im tracking page live
+
+- First resume attempt under the spool FAILED in seconds: the spool folds
+  the log at the `resume` record and requires it to carry `path=` (the
+  source checkpoint) — df logged only the step. Fixed (0cf23c1): resume
+  records carry their snapshot path; pinned by an assertion in
+  `test_resume_is_exact`. Second attempt resumed cleanly from 825 and is
+  through the feedback boundary on the checkpointed multipass path.
+- **runs.a9l.im is now the multi-experiment tracker**:
+  `runs.a9l.im/EXPERIMENT#RUN` (e.g. `/delta-feedback#smoke-df1`,
+  `/recirculated-dot#TAG`), `/` a cross-experiment index. Shared
+  `monitor.serve` rewritten for path mounts (root repo 780a428):
+  repeatable `--exp NAME=REPO`, per-repo `monitor/serve.json`,
+  mount-relative chassis fetches. df's monitor page:
+  loss/pass1/val/val_fused, lr, gnorm, routing max/seed/null for payload
+  + deepest sites, contraction loss + update norm; overlays across arms
+  work (paired-comparison view). Trainer telemetry gained `schedule`
+  (phase bands), `elapsed` (pace/ETA), `kind=snapshot` on checkpoints,
+  and the `run` record now carries all EXACT fields (config card) — old
+  logs degrade gracefully. Deployed as `runs-monitor.service` on jobe
+  (unit lives in the monitor package; bootstrap step_monitor updated;
+  rd-monitor.service removed, rd repo carries only serve.json now).
+
 ## 2026-08-28 (evening) — smoke-v1 done; df1 OOM at feedback boundary; GPU fell off bus
 
 - **smoke-v1 complete**: final val **3.772** after clean cooldown to
