@@ -3,6 +3,33 @@
 Disposable working space, periodically cleared. Keep only notes needed for
 active work; anything durable graduates to `design.md` or `findings.md`.
 
+## 2026-08-28 (evening) — smoke-v1 done; df1 OOM at feedback boundary; GPU fell off bus
+
+- **smoke-v1 complete**: final val **3.772** after clean cooldown to
+  lr 0 (train 3.63), 22k tok/s solo, 7.9G peak. Sane vs DAR's 220M
+  anchor (~3.61 at their budget/recipe). Vanilla gate passes.
+- **Byte-prefix determinism check passes**: full 35B stream landed
+  (34.97B train + 30M val, 131 shards, revision 87f09149); val.bin
+  identical to smoke's, both smoke shards exact byte-prefixes of the
+  full stream. Smoke runs literally trained on a prefix of ladder data.
+- **smoke-df1 OOM'd at step 826 — the first two-pass step.** Single-pass
+  DF sits at 18.9G (router source-stacks are the hog); holding two full
+  activation graphs blew 24G. Honest allocator OOM; the protected
+  step-825 (heat_end) snapshot was written first, so resume loses
+  nothing. Fix (8e2c546): **multi-pass steps checkpoint blocks
+  unconditionally** — `--grad-checkpoint` still forces it for k=1 —
+  with a model-level parity test (loss + all grads, k=2). 32 invariants
+  green.
+- **Three minutes after the OOM exit, the idle GPU dropped off the PCIe
+  bus** (Xid 79 → Xid 154 "GPU Reset Required"; nvidia-smi saw no
+  devices). Likely load→idle power transient, a known 4090 mode.
+  Rebooted jobe to recover. Watch for recurrence — if it repeats under
+  the screen it's a hardware/PSU conversation, not a software one.
+- df1 telemetry before the crash, all as expected: attn/mlp routers
+  sharpening (L11.attn max 0.40 vs uniform 0.043, seed 0.037), payload
+  router exactly uniform (no gradient until feedback), val_fused ~8.8
+  and contraction absent (entry weights untrained pre-825).
+
 ## 2026-08-28 — harness complete; smoke live on jobe
 
 Second build block landed (commits through 80251df): data pipeline
