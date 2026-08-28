@@ -29,7 +29,7 @@
 </section>
 
 <div class="grid">
-  <div class="chart"><h2>NLL <small>nats · solid train loss · dashed pass-1 · ● val · ○ val fused · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
+  <div class="chart"><h2>NLL <small>nats · solid train loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
 </div>
 <div class="grid two">
   <div class="chart"><h2>learning rate <small>NorMuon group; Adam scales with it</small></h2><div class="plot" id="p-lr"></div></div>
@@ -42,6 +42,10 @@
 <div class="grid two">
   <div class="chart"><h2>contraction · fused loss <small>iterated fused prefill · solid iter 0 · dashed iter 8</small></h2><div class="plot" id="p-contract"></div></div>
   <div class="chart"><h2>contraction · update norm <small>‖h(8) − h(7)‖ · should decay once feedback trains</small></h2><div class="plot" id="p-upd"></div></div>
+</div>
+<h3>eval <small>held-out NLL at eval cadence</small></h3>
+<div class="grid">
+  <div class="chart"><h2>val <small>nats · solid pass-1 (plain LM) · dashed fused pass (feedback in use)</small></h2><div class="plot" id="p-val"></div></div>
 </div>
 <h3>log tail <small>non-step records</small></h3>
 <pre id="tail"></pre>
@@ -156,17 +160,26 @@ function renderConfig(run) {
 // ---------------------------------------------------------------- charts
 function rebuild() {
   const logY = document.getElementById('logy').checked;
-  const yLog = logY ? { distr: 3, log: 10 } : {};
+  // Tight log range: NLL sits just above a decade boundary all run, so
+  // decade-snapped ranging would waste half the axis.
+  const yLog = logY ? { distr: 3, log: 10, range: (u, lo, hi) => (lo == null || !(lo > 0) ? [null, null] : [lo / 1.15, hi * 1.15]) } : {};
   const ovs = overlayTags();
   const primary = () => runFor(state.selected);
   const marks = () => viewOf(state.selected)?.snapshots ?? [];
   const forks = () => viewOf(state.selected)?.forks ?? [];
   makeChart('p-nll', {
     series: [
-      line('loss', P.s1), dashed('pass1', P.s1), line('val', P.s1, PTS), dotted('val fused', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`loss · ${t}`, hue(i)), dashed(`pass1 · ${t}`, hue(i)), line(`val · ${t}`, hue(i), PTS), dotted(`val fused · ${t}`, hue(i), PTS)]),
+      line('loss', P.s1), dashed('pass1', P.s1),
+      ...ovs.flatMap((t, i) => [line(`loss · ${t}`, hue(i)), dashed(`pass1 · ${t}`, hue(i))]),
     ],
     yScale: yLog, bands: () => bandsOf(primary()), marks, forks,
+  });
+  makeChart('p-val', {
+    series: [
+      line('val', P.s1, PTS), dashed('val fused', P.s1, PTS),
+      ...ovs.flatMap((t, i) => [line(`val · ${t}`, hue(i), PTS), dashed(`val fused · ${t}`, hue(i), PTS)]),
+    ],
+    yScale: yLog, bands: () => bandsOf(primary()), forks,
   });
   makeChart('p-lr', {
     series: [line('lr', P.s1, { value: (u, v) => fmt(v, 3) }),
@@ -210,8 +223,8 @@ function seriesOf(view) {
   const vals = view.evals.get('val') || [];
   const contract = view.evals.get('contract') || [];
   return {
-    nll: [[xs, steps.map((s) => s.loss), steps.map((s) => s.pass1)],
-          [vals.map((e) => e.step), vals.map((e) => e.val), vals.map((e) => e.val_fused)]],
+    nll: [[xs, steps.map((s) => s.loss), steps.map((s) => s.pass1)]],
+    val: [[vals.map((e) => e.step), vals.map((e) => e.val), vals.map((e) => e.val_fused)]],
     lr: [[xs, steps.map((s) => s.lr)]],
     gnorm: [[xs, steps.map((s) => s.gnorm)]],
     route: [at(sites.payload, 'max'), at(sites.attn, 'max'), at(sites.mlp, 'max')],
@@ -228,7 +241,9 @@ function render(view) {
   const merged = {};
   for (const key of Object.keys(mine)) merged[key] = [...mine[key], ...others.flatMap((o) => o[key])];
   const lastX = view.steps.length ? view.steps[view.steps.length - 1].step : null;
+  const vals = view.evals.get('val') || [];
   setData('p-nll', join(merged.nll), lastX);
+  setData('p-val', join(merged.val), vals.length ? vals[vals.length - 1].step : null);
   setData('p-lr', join(merged.lr), lastX);
   setData('p-gnorm', join(merged.gnorm), lastX);
   setData('p-route', join(merged.route), lastX);
