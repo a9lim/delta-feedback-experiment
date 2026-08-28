@@ -275,8 +275,11 @@ class Block(nn.Module):
     """One layer: (routed read →) attention, (routed read →) MLP.
 
     The routed read enriches the sublayer's pre-norm input only; the
-    residual stream accumulates just the scaled branch outputs, which are
-    also the deltas appended to the source list.
+    residual stream accumulates just the scaled branch outputs, which
+    are also the deltas the caller appends to the source list.  The
+    forward is pure — sources in, deltas out, no list mutation — so it
+    can sit under activation checkpointing, whose backward recomputes
+    the forward.
     """
 
     def __init__(self, cfg: ModelConfig, layer: int):
@@ -294,45 +297,44 @@ class Block(nn.Module):
             self.attn_router = None
             self.mlp_router = None
 
-    def _read(self, h, router, sources, masks, want_weights, weights_out, site):
-        if router is None:
-            return h
-        routed, weights = router(sources, masks, want_weights)
-        if weights is not None:
-            weights_out[site] = weights
-        return h if routed is None else h + routed
+    def _read(self, h, router, sources, p_mask, want_weights):
+        """p_mask masks sources[0] and is passed only when that source is
+        the standing previous-column payload."""
+        if router is None or not sources:
+            return h, None
+        masks: list[Tensor | None] = [None] * len(sources)
+        if p_mask is not None:
+            masks[0] = p_mask
+        routed, weights = router(list(sources), masks, want_weights)
+        return (h if routed is None else h + routed), weights
 
     def forward(
         self,
         h: Tensor,
-        sources: list[Tensor] | None,
-        masks: list[Tensor | None] | None,
         cos: Tensor,
         sin: Tensor,
         cache: KVCache | None,
+        p_mask: Tensor | None,
         want_weights: bool,
-        weights_out: dict[str, Tensor],
-    ) -> Tensor:
-        x = self._read(
-            h, self.attn_router, sources, masks, want_weights, weights_out,
-            f"L{self.layer}.attn",
-        )
+        *sources: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
+        """Returns (h, attn delta, mlp delta, attn weights, mlp weights)."""
+        x, w_attn = self._read(h, self.attn_router, sources, p_mask, want_weights)
         a = self.branch_scale * self.attn(self.attn_norm(x), cos, sin, cache, self.layer)
         h = h + a
-        if sources is not None:
-            sources.append(a)
-            masks.append(None)
-
-        x = self._read(
-            h, self.mlp_router, sources, masks, want_weights, weights_out,
-            f"L{self.layer}.mlp",
+        x, w_mlp = self._read(
+            h, self.mlp_router, (*sources, a), p_mask, want_weights
         )
         m = self.branch_scale * self.mlp(self.mlp_norm(x))
         h = h + m
-        if sources is not None:
-            sources.append(m)
-            masks.append(None)
-        return h
+        return h, a, m, w_attn, w_mlp
+
+
+def _block_for_checkpoint(block, h, cos, sin, p_mask, *sources):
+    """Tensor-only wrapper for activation checkpointing (no cache, no
+    weights) — the recomputation must be free of side effects."""
+    h, a, m, _, _ = block(h, cos, sin, None, p_mask, False, *sources)
+    return h, a, m
 
 
 # -- the model -----------------------------------------------------------------
@@ -379,6 +381,8 @@ class DFModel(nn.Module):
             if cfg.routing_active:
                 self.payload_router = Router(cfg)
         self._rope: tuple[Tensor, Tensor] | None = None
+        self.grad_checkpoint = False
+        """Runtime switch: checkpoint each block during training forwards."""
         self.apply(self._init_weights)
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -431,20 +435,41 @@ class DFModel(nn.Module):
         cos, sin = self.rope(x.device, start, x.shape[1])
 
         sources: list[Tensor] | None = None
-        masks: list[Tensor | None] | None = None
+        p_mask = None
         if cfg.routing_active:
-            sources, masks = [], []
+            sources = []
             if p_source is not None:
                 sources.append(p_source)
-                masks.append(p_presence)
+                p_mask = p_presence
             sources.append(x)
-            masks.append(None)
         seeds = len(sources) if sources is not None else 0
 
         h = x
         weights_out: dict[str, Tensor] = {}
+        checkpointing = (
+            self.grad_checkpoint
+            and self.training
+            and torch.is_grad_enabled()
+            and cache is None
+            and not want_weights
+        )
         for block in self.blocks:
-            h = block(h, sources, masks, cos, sin, cache, want_weights, weights_out)
+            passed = tuple(sources) if sources is not None else ()
+            if checkpointing:
+                h, a, m = torch.utils.checkpoint.checkpoint(
+                    _block_for_checkpoint, block, h, cos, sin, p_mask, *passed,
+                    use_reentrant=False,
+                )
+            else:
+                h, a, m, w_attn, w_mlp = block(
+                    h, cos, sin, cache, p_mask, want_weights, *passed
+                )
+                if w_attn is not None:
+                    weights_out[f"L{block.layer}.attn"] = w_attn
+                if w_mlp is not None:
+                    weights_out[f"L{block.layer}.mlp"] = w_mlp
+            if sources is not None:
+                sources.extend((a, m))
         if cache is not None:
             cache.advance(x.shape[1])
 
@@ -550,24 +575,69 @@ def multipass(
     return outs
 
 
-def multipass_loss(
-    model: DFModel, tokens: Tensor, outs: list[ColumnOutput]
-) -> tuple[Tensor, list[Tensor]]:
-    """FBT Eq. 12 with λ=1: pass-1 NTP plus the mean over feedback passes.
+def _head_losses(model: DFModel, h_chunk: Tensor, target_chunk: Tensor, want_z: bool):
+    logits = model.logits(h_chunk).float()
+    ce = F.cross_entropy(
+        logits.flatten(0, 1), target_chunk.flatten(), reduction="sum"
+    )
+    if want_z:
+        return ce, logits.logsumexp(dim=-1).square().sum()
+    return ce, ce.new_zeros(())
 
-    Returns (total, per-pass losses); per-pass loss 0 is the Standard-mode
-    tracking metric.
+
+def sequence_ce(
+    model: DFModel, h_top: Tensor, targets: Tensor, *, want_z: bool = False,
+    chunk: int = 128,
+) -> tuple[Tensor, Tensor]:
+    """(mean CE, mean z²) over [B, T] targets, chunked along the sequence.
+
+    The vocab-sized logits (151936 wide at screen scale) dominate
+    activation memory, so the head runs under activation checkpointing
+    one sequence-chunk at a time — live logits are bounded to a single
+    chunk in both forward and backward.
+    """
+    count = targets.numel()
+    ce_sum = h_top.new_zeros((), dtype=torch.float32)
+    z_sum = h_top.new_zeros((), dtype=torch.float32)
+    recompute = torch.is_grad_enabled() and h_top.requires_grad
+    for start in range(0, targets.shape[1], chunk):
+        h_piece = h_top[:, start : start + chunk]
+        t_piece = targets[:, start : start + chunk]
+        if recompute:
+            ce, z = torch.utils.checkpoint.checkpoint(
+                _head_losses, model, h_piece, t_piece, want_z, use_reentrant=False
+            )
+        else:
+            ce, z = _head_losses(model, h_piece, t_piece, want_z)
+        ce_sum = ce_sum + ce
+        z_sum = z_sum + z
+    return ce_sum / count, z_sum / count
+
+
+def multipass_loss(
+    model: DFModel, tokens: Tensor, outs: list[ColumnOutput], *, z_coef: float = 0.0
+) -> tuple[Tensor, list[Tensor]]:
+    """FBT Eq. 12 with λ=1: pass-1 NTP plus the mean over feedback passes,
+    plus (in cooldown) the z-loss under the same per-pass weighting.
+
+    Returns (total, per-pass CE losses); per-pass loss 0 is the
+    Standard-mode tracking metric.
     """
     targets = tokens[:, 1:]
-    losses = []
+    losses, z_terms = [], []
     for out in outs:
-        logits = model.logits(out.h_top[:, :-1])
-        losses.append(
-            F.cross_entropy(logits.flatten(0, 1).float(), targets.flatten())
-        )
-    total = losses[0]
-    if len(losses) > 1:
-        total = total + torch.stack(losses[1:]).mean()
+        ce, z = sequence_ce(model, out.h_top[:, :-1], targets, want_z=z_coef > 0)
+        losses.append(ce)
+        z_terms.append(z)
+
+    def combine(values: list[Tensor]) -> Tensor:
+        if len(values) == 1:
+            return values[0]
+        return values[0] + torch.stack(values[1:]).mean()
+
+    total = combine(losses)
+    if z_coef:
+        total = total + z_coef * combine(z_terms)
     return total, losses
 
 
@@ -601,10 +671,7 @@ def iterate_fused(
         else:
             fused = model.fuse(p_shifted, e)
             out = model.forward_column(torch.where(plain[..., None], e, fused))
-        loss = F.cross_entropy(
-            model.logits(out.h_top[:, :-1]).flatten(0, 1).float(),
-            tokens[:, 1:].flatten(),
-        )
+        loss, _ = sequence_ce(model, out.h_top[:, :-1], tokens[:, 1:])
         delta = (out.h_top - previous).float().norm(dim=-1).mean()
         records.append({"loss": loss.item(), "update_norm": delta.item()})
     return records

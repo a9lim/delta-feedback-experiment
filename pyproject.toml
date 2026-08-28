@@ -15,6 +15,9 @@ dependencies = [
     "datasets",
 ]
 
+[project.scripts]
+df = "delta_feedback_experiment.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

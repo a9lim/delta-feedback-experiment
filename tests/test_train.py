@@ -1,0 +1,168 @@
+"""Offline checks for the data pipeline, optimizer stack, and trainer.
+
+The heavyweight claim here is resume exactness: a run interrupted and
+resumed must be bit-identical to an uninterrupted one — the property the
+whole paired-comparison design leans on for multi-day jobe runs.
+"""
+
+import numpy as np
+import pytest
+import torch
+
+from delta_feedback_experiment.data import TokenData, write_synthetic
+from delta_feedback_experiment.optim import NorMuon, orthogonalize
+from delta_feedback_experiment.train import (
+    build_parser,
+    build_schedule,
+    draw_passes,
+    mix,
+    train,
+)
+
+TINY_ARGS = [
+    "--vocab-size", "97", "--dim", "32", "--layers", "2", "--heads", "2",
+    "--kv-heads", "1", "--head-dim", "16", "--intermediate", "64",
+    "--seq-len", "16", "--batch-rows", "4", "--micro-rows", "2",
+    "--steps", "8", "--warmup-steps", "2", "--cooldown-frac", "0.25",
+    "--feedback-start", "0.5",
+    "--log-every", "4", "--eval-every", "4", "--snapshot-every", "100",
+    "--eval-rows", "4", "--device", "cpu",
+]
+
+
+def corpus(tmp_path):
+    directory = tmp_path / "tokens"
+    write_synthetic(directory, train_tokens=1200, val_tokens=120, vocab=97)
+    return directory
+
+
+# -- data ----------------------------------------------------------------------
+
+
+def test_token_data_stitches_shards(tmp_path):
+    directory = corpus(tmp_path)
+    data = TokenData.load(directory, "train", seq_len=16)
+    whole = np.concatenate([
+        np.fromfile(directory / "train.0000.bin", dtype=np.uint32),
+        np.fromfile(directory / "train.0001.bin", dtype=np.uint32),
+    ])
+    assert data.total_tokens == whole.size
+    batch = data.batch(0, data.rows)
+    assert torch.equal(
+        batch.flatten(), torch.from_numpy(whole[: data.rows * 17].astype(np.int64))
+    )
+    with pytest.raises(IndexError):
+        data.batch(data.rows, 1)
+
+
+# -- optimizer -----------------------------------------------------------------
+
+
+def test_orthogonalize_singular_values():
+    """NS5 with Muon's loose quintic: the bulk lands near 1 (median well
+    up, max bounded); a square Gaussian's smallest values lag — that's
+    the known worst case, not a bug."""
+    torch.manual_seed(0)
+    for shape in ((8, 24), (24, 8), (16, 16)):
+        matrix = torch.randn(shape)
+        singular = torch.linalg.svdvals(orthogonalize(matrix))
+        assert singular.max() < 1.4, shape
+        assert singular.median() > 0.65, shape
+        assert singular.min() > 0.2, shape
+
+
+def test_normuon_descends():
+    torch.manual_seed(0)
+    target = torch.randn(16, 8)
+    weight = torch.nn.Parameter(torch.zeros(16, 8))
+    optimizer = NorMuon([weight], lr=0.1, weight_decay=0.0)
+    first = None
+    for _ in range(300):
+        loss = (weight - target).square().mean()
+        first = loss.item() if first is None else first
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+    # Constant-RMS updates oscillate near the optimum at ~(0.2*lr) scale.
+    assert loss.item() < 0.02 * first
+
+
+def test_normuon_rejects_vectors():
+    with pytest.raises(ValueError):
+        NorMuon([torch.nn.Parameter(torch.zeros(8))])
+
+
+# -- schedule and derived randomness -------------------------------------------
+
+
+def test_build_schedule_screen_shape():
+    args = build_parser().parse_args(["x"])  # defaults: 6700 steps
+    schedule = build_schedule(args)
+    assert schedule.spans == (200, 0, 4825, 1675)
+    assert schedule.total == 6700
+    assert schedule.phase(200)[0] == "warmup"
+    assert schedule.phase(201)[0] == "heat"
+    assert schedule.phase(5026)[0] == "cooldown"
+    assert schedule.rate_at(5025, 1.0) == 1.0
+    assert schedule.rate_at(6700, 1.0) < 1e-6
+
+
+def test_mix_is_stable():
+    assert mix(0, 5, 1) == mix(0, 5, 1)
+    assert mix(0, 5, 1) != mix(0, 5, 2)
+    assert mix(1, 5, 1) != mix(0, 5, 1)
+
+
+def test_pass_mixture_fractions():
+    args = build_parser().parse_args(["x", "--steps", "4000"])
+    counts = {1: 0, 2: 0, 3: 0}
+    for step in range(1, 4001):
+        counts[draw_passes(args, step, 4000)] += 1
+    assert counts[1] == 3000  # feedback starts at 75% exactly
+    assert 0.06 < counts[3] / (counts[2] + counts[3]) < 0.20
+
+
+# -- end-to-end ----------------------------------------------------------------
+
+
+def run(tmp_path, tag, extra):
+    directory = corpus(tmp_path) if not (tmp_path / "tokens").exists() else tmp_path / "tokens"
+    return train([
+        tag, "--data-dir", str(directory), "--out-dir", str(tmp_path / "runs"),
+        *TINY_ARGS, *extra,
+    ])
+
+
+@pytest.mark.parametrize("arm", ["vanilla", "dar", "fbt", "df", "df_soft"])
+def test_tiny_run_completes(tmp_path, arm):
+    summary = run(tmp_path, f"t-{arm}", ["--arm", arm])
+    assert summary["step"] == 8
+    assert np.isfinite(summary["loss"])
+    assert np.isfinite(summary["val"])
+    if arm in ("fbt", "df", "df_soft"):
+        assert np.isfinite(summary["val_fused"])
+    snapshots = list((tmp_path / "runs").glob(f"t-{arm}.pt.*"))
+    assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {6, 8}
+
+
+def test_resume_is_exact(tmp_path):
+    full = run(tmp_path, "full", ["--arm", "df"])
+    half = run(tmp_path, "half", ["--arm", "df", "--max-steps", "5"])
+    assert half["step"] == 5
+    resumed = run(tmp_path, "half", ["--arm", "df", "--resume"])
+    assert resumed["step"] == 8
+    assert resumed["loss"] == full["loss"]
+    assert resumed["val"] == full["val"]
+
+
+def test_resume_rejects_conflicting_exact_field(tmp_path):
+    run(tmp_path, "conf", ["--arm", "df", "--max-steps", "2"])
+    with pytest.raises(ValueError, match="conflicts"):
+        run(tmp_path, "conf", ["--arm", "df", "--resume", "--dim", "64"])
+
+
+def test_grad_checkpoint_matches(tmp_path):
+    plain = run(tmp_path, "gc-off", ["--arm", "df", "--max-steps", "3"])
+    checked = run(tmp_path, "gc-on", ["--arm", "df", "--max-steps", "3",
+                                      "--grad-checkpoint"])
+    assert checked["loss"] == pytest.approx(plain["loss"], rel=1e-6)

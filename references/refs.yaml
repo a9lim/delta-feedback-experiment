@@ -30,6 +30,16 @@ references:
       pauses chain full-depth through the payload (a horizontally unrolled
       loop transformer), supplying the serial depth pauses lack alone.
       Loose conceptual parallel to recirculated-dot-experiment.
+  - arxiv: "2510.05491"
+    slug: li2025-normuon
+    note: >
+      Recipe reference — the matrix optimizer FBT binds us to. NorMuon =
+      Muon (EMA momentum beta1 0.95, 5-step Newton-Schulz) plus neuron-wise
+      second moments (beta2 0.95, per-row mean of the orthogonalized
+      update's squares) normalizing rows before a global rescale to
+      Frobenius norm 0.2*sqrt(m*n); decoupled weight decay. Applied to 2D
+      hidden matrices only; Adam handles embeddings/unembedding, vectors,
+      scalars. FBT's lr 1e-2 / wd 0.01 override the paper's own defaults.
   - arxiv: "2603.15031"
     slug: kimi2026-attention-residuals
     note: >
