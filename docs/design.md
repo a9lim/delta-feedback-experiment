@@ -138,10 +138,12 @@ before detaching — detaching changes the objective.
 
 ## Arms and comparisons
 
-Trial arms: **{vanilla, DAR, FBT, A1, A2}**, one recipe, matched tokens,
+Screen arms: **{vanilla, DAR, FBT, A1, A2}**, one recipe, matched tokens,
 paired data order (same batches, same order — loss curves difference
-cleanly), 2 seeds. Reported at matched tokens *and* matched token-
-equivalent compute (FBT accounting: an n-pass batch costs n).
+cleanly), 2 seeds. Finalists (~3–4 arms: vanilla, the better combined arm,
+parents as budget allows) then extend along the token ladder below.
+Reported at matched tokens *and* matched token-equivalent compute (FBT
+accounting: an n-pass batch costs n).
 
 Interaction := (combined − vanilla) − [(DAR − vanilla) + (FBT − vanilla)],
 evaluated per decode mode: **Standard** (no feedback), **Soft** (feedback
@@ -152,14 +154,29 @@ at scale.
 
 ## Configurations and scale plan
 
-| | Trials | Mid-rung (contingency) | Flagship |
-|---|---|---|---|
-| Params | ~220M (DAR's config: d=768, L=12) | ~300M | ~1.08B |
-| Trunk | Qwen3-style | scaled trial | FBT's: d=1536, L=24, GQA 16q/8kv headwise-gated, QK-norm, SiLU GLU 6656, RoPE, ctx 8192, 2048-SWA on 5/6 layers |
-| Tokens | ~1B / run | ~2B / finalist | 400B (FBT's largest; their decode-time behavior lives at 100–400B) |
-| Sources | per-sublayer | per-sublayer | block deltas |
-| Machine | jobe (1×4090) | jobe | Prime Intellect marketplace pods |
-| Rough cost | 4–6 h/run; ~2.5–3 days total | ~1 day/run | ~2,700 H100-h ≈ $6–7k at 2026-07 rates (~$3–4k H200 spot, checkpoint-tolerant); ~2 wk on 8×H100 |
+The flagship trains at ~370 tokens/param (400B on 1.08B) — far past
+compute-optimal, and the regime where FBT's decode-time behavior actually
+emerged [paper]. A short screen cannot reach that regime, and the feedback
+phase is a *late fraction* of training under the pass schedule, so a
+screen-scale FBT null is ambiguous rather than damning. The plan therefore
+measures the **trend** of the combined advantage along a token ladder,
+using WSD's extend-without-re-warming property (a cooldown branch at each
+rung gives a measurement point; the extension continues from the
+pre-cooldown checkpoint). De-risking spend totals ~$0.6–1k, ~10–15% of the
+flagship; program total ≈ $7–8k.
+
+| Stage | Model | Tokens | tok/param | Where | Rough cost |
+|---|---|---|---|---|---|
+| Smoke / dev | 220M (DAR's config: d=768, L=12, Qwen3-style) | ≤0.3B | — | jobe (1×4090) | free |
+| Screen | 220M, 5 arms × 2 seeds | 2B / run | 9 | jobe, ~1 wk background (or rented, ~$10/run, if wall-clock matters) | free–$100 |
+| Token ladder | 220M, finalists, 1 seed | 2B → 8B → 32B via WSD extension, cooldown branch per rung | 36 → 145 | rented single H100/H200 | ~$120–150/arm; $400–600 total |
+| Mid-rung (params axis, optional) | ~300M | ~30B | 100 | rented | ~$150/run |
+| Flagship | ~1.08B, FBT trunk: d=1536, L=24, GQA 16q/8kv headwise-gated, QK-norm, SiLU GLU 6656, RoPE, ctx 8192, 2048-SWA on 5/6 layers | 400B (FBT's largest) | 370 | Prime Intellect marketplace pods | ~2,700 H100-h ≈ $6–7k at 2026-07 rates (~$3–4k H200 spot, checkpoint-tolerant); ~2 wk on 8×H100 |
+
+Sources are per-sublayer at every stage except the flagship, which coarsens
+to block deltas. The ladder's top rung (145 tok/param) lands within ~2.5×
+of the flagship's ratio; ladder arms run 1 seed with paired data order,
+using the screen's seed spread as the noise estimate.
 
 Tokenizer: Qwen3's (~151k, tied) everywhere — one tokenizer across our runs
 beats matching FBT's phi-4 100k; DAR's "220M" is exactly the Qwen3-vocab
@@ -172,8 +189,8 @@ three-pass throughout.
 **Flagship controls.** No matched 1B vanilla (cost). Instead: decode-mode
 ablations on the same weights isolate the channel's inference contribution;
 pass-1 loss is tracked throughout training as the "as ordinary transformer"
-mode; one or two small matched-data vanilla rungs (≤300M) anchor a scaling
-extrapolation. Published 1B-class models (TinyLlama, Llama-3.2-1B,
+mode; the ladder's vanilla arm and the optional 300M mid-rung anchor the
+scaling extrapolation. Published 1B-class models (TinyLlama, Llama-3.2-1B,
 Qwen3-1.7B, SmolLM2) appear as context rows only — 2–36T tokens of
 unknowable data mixture makes them incomparable as controls.
 
@@ -196,17 +213,27 @@ unknowable data mixture makes them incomparable as controls.
 
 ## Gates
 
-**Promotion to flagship** (pre-registered): the better of A1/A2 beats
-**both** parents on val loss at matched token-equivalent compute with a
-consistent sign across seeds, **and** the contraction diagnostic is clean
-past 30 self-compositions. The flagship spend is not authorized by default;
-confirm with a9 at promotion time with trial evidence in hand.
+**Ladder entry** (from the screen): DAR must reproduce its published
+ordering at the screen, or the harness is suspect and nothing else is
+interpretable. Finalists are vanilla, the better combined arm, and parents
+as budget allows. One deliberate asymmetry: a null-but-stable FBT side at
+the screen does **not** exclude the best combined arm from the ladder — the
+screen runs at 9 tok/param and formation-with-scale is precisely the
+hypothesis it cannot test; the ladder is a ~$130 question.
+
+**Promotion to flagship** (pre-registered): the combined advantage over
+**both** parents at matched token-equivalent compute **holds or grows
+across the ladder** (2B → 32B) — a trend, not a point estimate — **and**
+the contraction diagnostic is clean past 30 self-compositions at the top
+rung. The flagship spend is not authorized by default; confirm with a9 at
+promotion time with ladder evidence in hand.
 
 **Null reading:** FBT is unproven below 1B params (their smallest run). A
-null FBT main effect at 220M with healthy DAR reads as a
-formation-conditions result (cf. acot at 135M), not harness noise — the
-DAR arm, proven at exactly trial scale [paper], is the positive control
-that the harness detects effects of this size.
+screen-level FBT null with healthy DAR reads as ambiguous (regime, not
+refutation); a null that *persists across the ladder* reads as a
+formation-conditions result (cf. acot at 135M). The DAR arm, proven at
+exactly screen scale [paper], is the positive control that the harness
+detects effects of this size.
 
 ## Extension (phase 2, contingent on the factorial)
 

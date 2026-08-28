@@ -45,3 +45,13 @@ Next: harness (`model.py` trunk + routing + gate + payload behind arm
 flags; multi-pass loop + stability kit), then jobe smoke of vanilla and DAR
 arms first — DAR is the positive control that must reproduce before any
 feedback arm means anything.
+
+## 2026-08-27 — scale-plan revision (ratified)
+
+a9 flagged the regime mismatch: flagship ~370 tok/param vs trials at ~4.5.
+Restructured into screen (2B on jobe) + WSD token ladder (finalists
+2B→8B→32B on rented single GPUs, cooldown branch per rung) + optional 300M
+mid-rung. Gate became trend-based (advantage holds or grows across the
+ladder); added the asymmetry that a screen-null FBT side doesn't exclude
+the best combined arm from the ladder (the screen can't test
+formation-with-scale). De-risking ≈ $0.6–1k; program total ≈ $7–8k.

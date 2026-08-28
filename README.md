@@ -13,10 +13,13 @@ results yet. See [`docs/findings.md`](docs/findings.md).
 
 ## Plan shape
 
-- Trials on jobe (1x4090): {vanilla, DAR, FBT, A1, A2} at DAR's 220M config,
-  ~1B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
+- Screen on jobe (1x4090): {vanilla, DAR, FBT, A1, A2} at DAR's 220M config,
+  ~2B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
+- Token ladder on rented single GPUs: finalists extended 2B -> 8B -> 32B via
+  WSD, testing whether the combined advantage holds with training scale
+  (the flagship regime is ~370 tok/param; the screen alone cannot reach it).
 - Flagship on rented pods: better of A1/A2 at ~1.08B params / 400B tokens,
-  gated on the trials (pre-registered gate in the design doc).
+  gated on the ladder trend (pre-registered gate in the design doc).
 - Phase-2 extension (contingent): pause-token pretraining on the winner.
 
 ## Install
