@@ -5,6 +5,14 @@ active work; anything durable graduates to `design.md` or `findings.md`.
 
 ## 2026-08-28 (night) — resume fix; runs.a9l.im tracking page live
 
+Plan settled with a9: once smoke-df1 lands, a9 runs the optimization
+pass with Codex directly (no gaslamp handoff needed from this side);
+the correctness contract for that pass is the invariant suite, the
+bit-exact-resume test, and the smoke logs/snapshots as parity
+references. Next session picks up at: read smoke-df1 against its gates
+(val_fused → val, contraction decay, pass-1 recovery), then screen prep
+on the optimized code.
+
 - First resume attempt under the spool FAILED in seconds: the spool folds
   the log at the `resume` record and requires it to carry `path=` (the
   source checkpoint) — df logged only the step. Fixed (0cf23c1): resume
