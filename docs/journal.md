@@ -46,6 +46,21 @@ flags; multi-pass loop + stability kit), then jobe smoke of vanilla and DAR
 arms first — DAR is the positive control that must reproduce before any
 feedback arm means anything.
 
+## 2026-08-27 — arms collapsed to one hybrid, renamed DF
+
+a9: A1 (bare-top-state payload) is the *less* parsimonious design once the
+payload is additive — drop A1 and A2r, focus on the single coherent
+hybrid. Ratified; combined arm renamed **DF** (delta feedback) since the
+A-numbering counted nothing anymore. Claude's addition (veto-able): a
+**null source** in the payload router only (from DAR's fine-tuning setup;
+within-column routing stays paper-verbatim without one), which makes "at
+worst the deltas are ignored" exact — bare-h_top is now a reachable point
+and the router's null mass is a continuous readout of the injection-form
+question, replacing the dropped A1 comparison with an observable.
+Accepted tradeoff: no deconfounded attribution between payload enrichment
+and mechanism coexistence (screen is 4 arms: vanilla, DAR, FBT, DF).
+Pseudocode now shows the full DF model inline with per-arm ablation flags.
+
 ## 2026-08-27 — A2 corrected to additive payload (a9's catch)
 
 The original A2 (payload = routed delta mixture alone) mis-transcribed

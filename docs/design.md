@@ -23,13 +23,14 @@ stack with a renewed depth budget [paper].
 
 - **Primary:** pretrained together from scratch, are the depth-axis and
   time-axis widenings complementary or redundant?
-- **Secondary:** should the feedback *payload* be the bare top-layer state,
-  or the top state *supplemented by* a routed combination of the column's
-  deltas — DAR's additive-routing principle applied at the cross-column
-  site? FBT hardcodes the bare top state and explicitly leaves the
-  injection-form question open [paper]; DAR's thesis is that deltas are the
-  routable decomposition of a column, routed additively onto a preserved
-  base.
+- **Secondary:** what does the feedback payload learn to carry? The
+  combined model's payload is the top state plus a null-sourced routed
+  combination of the column's deltas — DAR's additive-routing principle
+  applied at the cross-column site — so the bare-top-state payload (FBT
+  verbatim) is a reachable point of the router's parameter space, and the
+  learned routing weights (null mass included) are a *continuous readout*
+  of the injection-form question FBT explicitly leaves open [paper], rather
+  than a discrete arm comparison.
 
 Pre-registered predictions [speculation]: a9 expects superadditive gains;
 Claude hedges toward additive-to-mildly-sub (the channels may partially
@@ -40,22 +41,28 @@ early-layer information alive in the payload [synthesis].
 
 ## Architecture
 
-One decode step at position t (trial configuration: per-sublayer sources,
-A2 payload):
+One decode step of the full model at position t (trial configuration:
+per-sublayer sources). `route(vs, q)` returns
+`sum softmax_i(q . rmsnorm(vs_i)) vs_i` with `q` zero-init.
 
 ```python
 e = embed(tok)
-u = rmsnorm(glu(p_prev, e))          # FBT gate: W_U p_prev * sigmoid(W_G e)
-srcs = [u, p_prev, e]                # standing sources
+u = rmsnorm(glu(p_prev, e))                 # FBT gate: W_U p_prev * sigmoid(W_G e)
+srcs = [u, p_prev, e]                       # standing sources
 h = u
 for l in layers:
-    h = h + route(srcs, q_attn[l])   # DAR: + sum softmax(q . rmsnorm(v)) v
+    h = h + route(srcs, q_attn[l])          # depth routing
     a = attn(norm(h)); h = h + a; srcs.append(a)
-    h = h + route(srcs, q_mlp[l])
+    h = h + route(srcs, q_mlp[l])           # depth routing
     m = mlp(norm(h));  h = h + m; srcs.append(m)
-p_prev = payload(srcs)               # A1: rmsnorm(h_top)
-                                     # A2: rmsnorm(h_top + sum softmax(q_p . rmsnorm(v)) v)
+cands = srcs[3:] + [zero]                   # this column's deltas + null source
+p_prev = rmsnorm(h + route(cands, q_p))     # additive delta payload
 tok = sample(lm_head(h))
+
+# Ablation arms delete from this model:
+#   vanilla: u = e; no route() calls; no payload
+#   DAR:     u = e; srcs = [] (paper-verbatim per-sublayer); no payload
+#   FBT:     no route() calls; p_prev = rmsnorm(h)   (bare top state)
 ```
 
 **Depth routing (DAR side).** Before every attention and MLP sublayer, a
@@ -79,26 +86,33 @@ two ways:
    source at every sublayer, giving ungated access; its per-layer routing
    weight is a direct observable of cross-column demand [synthesis].
 
-**Payload variants.** A1: the RMS-normed top-layer state (FBT verbatim; the
-combination baseline). A2 "delta feedback": the top state *plus* a
-softmax-routed combination of the column's delta sources under a dedicated
-static learned query, RMS-normed — DAR's additive routing applied at the
-cross-column site exactly as within the column: base signal preserved by
-default, routing re-weights on top. A pure routed mixture without the base
-is structurally unable to transmit the full column state — softmax weights
-are convex, and h_top is the *sum* of the deltas, outside their convex
-hull — and repeats the replacement-routing pattern DAR shows fails within
-the column [synthesis]; it survives only as the optional screen-only
-control arm **A2r** (see Arms), a direct test of whether
-additive-beats-replacement transfers to the payload site. The payload
-router is *not* conditioned on the next token — the GLU already gates the
-payload elementwise by the token. With payload RMSNorm, A2 at zero-init is
-rmsnorm(h_top + mean delta) = A1 + O(1/N): the arms are near-identical at
-init and diverge only as routing sharpens, making A1 the routing-ablated
-nested baseline of A2 [synthesis]. The additive form also keeps every
-delta on a direct cross-column gradient path through h_top even under
-sharp routing, preserving the multi-pass auxiliary-supervision mechanism
-that sharp replacement routing would starve [synthesis].
+**Payload.** The payload is the top state *plus* a softmax-routed
+combination of the column's delta sources and a **null source** (a zero
+vector among the candidates), under a dedicated static learned query,
+RMS-normed — DAR's additive routing applied at the cross-column site
+exactly as within the column: base signal preserved by default, routing
+re-weights on top. The two halves are each load-bearing:
+
+- *Why keep the base:* a pure routed mixture is structurally unable to
+  transmit the full column state — softmax weights are convex, and h_top
+  is the *sum* of the deltas, outside their convex hull — and repeats the
+  replacement-routing pattern DAR shows fails within the column
+  [synthesis]. The base also keeps every delta on a direct cross-column
+  gradient path even under sharp routing, preserving the multi-pass
+  auxiliary-supervision mechanism [synthesis].
+- *Why the null source:* it makes "at worst, the deltas are ignored" exact
+  — routing all mass to null recovers the bare-top-state payload (FBT
+  verbatim) as a reachable point, and the learned null mass is the direct
+  observable answering the injection-form question (borrowed from DAR's
+  fine-tuning setup [paper]; the *within-column* routing carries no null
+  source, matching DAR's from-scratch configuration).
+
+The payload router is *not* conditioned on the next token — the GLU
+already gates the payload elementwise by the token. At zero-init the
+router is uniform over N deltas + null, so the payload is
+rmsnorm(h_top + (h_top − u)/(N+1)) ≈ the bare top state: the model starts
+as approximately FBT-with-depth-routing and diverges only as payload
+routing sharpens [synthesis].
 
 **Standing sources.** The source list opens with the fused input `u`, the
 raw payload `p_prev`, and the raw token embedding `e`. The `e` source
@@ -123,9 +137,9 @@ stack (depth routing active) in parallel over positions; k passes train a
 from later passes supervise earlier passes' states, which is part of FBT's
 data-efficiency mechanism [paper]. Prefix mixin (random plain-embedding
 prefix per pass) matches the prompt-then-generate structure of inference.
-Pass 1 of a combined arm is exactly the DAR-only model, so the combined
-model's Standard-decoding mode is a DAR transformer trained with an extra
-objective [synthesis].
+Pass 1 of DF is the depth-routing model with no feedback (u = e, payload
+unused), so DF's Standard-decoding mode is a DAR-style transformer trained
+with an extra objective [synthesis].
 
 **Schedule.** Depth routing from step 0. Feedback passes late, default
 mixture 75% one-pass / 22% two-pass / 3% three-pass — the small three-pass
@@ -152,22 +166,20 @@ before detaching — detaching changes the objective.
 
 ## Arms and comparisons
 
-Screen arms: **{vanilla, DAR, FBT, A1, A2}**, one recipe, matched tokens,
+Screen arms: **{vanilla, DAR, FBT, DF}**, one recipe, matched tokens,
 paired data order (same batches, same order — loss curves difference
-cleanly), 2 seeds. Optional sixth screen arm **A2r** (replacement-payload
-control: the routed delta mixture *without* the base state) — screen-only,
-cut freely under time pressure, never a ladder candidate unless it wins
-outright. Finalists (~3–4 arms: vanilla, the better combined arm,
-parents as budget allows) then extend along the token ladder below.
+cleanly), 2 seeds. **DF** ("delta feedback") is the full combined model of
+the Architecture section; the parents are its ablations per the pseudocode
+flags. Finalists (~3–4 arms: vanilla, DF, parents as budget allows) then
+extend along the token ladder below.
 Reported at matched tokens *and* matched token-equivalent compute (FBT
 accounting: an n-pass batch costs n).
 
-Interaction := (combined − vanilla) − [(DAR − vanilla) + (FBT − vanilla)],
+Interaction := (DF − vanilla) − [(DAR − vanilla) + (FBT − vanilla)],
 evaluated per decode mode: **Standard** (no feedback), **Soft** (feedback
 during generation), **Fused** (extra fused prefill pass + Soft).
 
-The flagship runs only the better of A1/A2 — one large run, not a factorial
-at scale.
+The flagship runs DF only — one large run, not a factorial at scale.
 
 ## Configurations and scale plan
 
@@ -185,7 +197,7 @@ flagship; program total ≈ $7–8k.
 | Stage | Model | Tokens | tok/param | Where | Rough cost |
 |---|---|---|---|---|---|
 | Smoke / dev | 220M (DAR's config: d=768, L=12, Qwen3-style) | ≤0.3B | — | jobe (1×4090) | free |
-| Screen | 220M, 5 arms × 2 seeds | 2B / run | 9 | jobe, ~1 wk background (or rented, ~$10/run, if wall-clock matters) | free–$100 |
+| Screen | 220M, 4 arms × 2 seeds | 2B / run | 9 | jobe, ~1 wk background (or rented, ~$10/run, if wall-clock matters) | free–$100 |
 | Token ladder | 220M, finalists, 1 seed | 2B → 8B → 32B via WSD extension, cooldown branch per rung | 36 → 145 | rented single H100/H200 | ~$120–150/arm; $400–600 total |
 | Mid-rung (params axis, optional) | ~300M | ~30B | 100 | rented | ~$150/run |
 | Flagship | ~1.08B, FBT trunk: d=1536, L=24, GQA 16q/8kv headwise-gated, QK-norm, SiLU GLU 6656, RoPE, ctx 8192, 2048-SWA on 5/6 layers | 400B (FBT's largest) | 370 | Prime Intellect marketplace pods | ~2,700 H100-h ≈ $6–7k at 2026-07 rates (~$3–4k H200 spot, checkpoint-tolerant); ~2 wk on 8×H100 |
@@ -225,20 +237,22 @@ unknowable data mixture makes them incomparable as controls.
   (deep layers reaching the previous column through layer 0). FBT's
   Appendix-F state-tracking synthetics (completion tracking, delayed
   memory, multi-register latest-write) reimplemented with linear probes
-  across depth: what rides the payload, and does A2's routed payload carry
-  different state than A1's top state?
+  across depth: what rides the payload, and does the routed delta
+  enrichment carry state the bare top state doesn't (probe the learned
+  payload against the null-routed payload on the same weights)? The
+  payload router's null mass is itself a headline observable.
 
 ## Gates
 
 **Ladder entry** (from the screen): DAR must reproduce its published
 ordering at the screen, or the harness is suspect and nothing else is
-interpretable. Finalists are vanilla, the better combined arm, and parents
-as budget allows. One deliberate asymmetry: a null-but-stable FBT side at
-the screen does **not** exclude the best combined arm from the ladder — the
-screen runs at 9 tok/param and formation-with-scale is precisely the
-hypothesis it cannot test; the ladder is a ~$130 question.
+interpretable. Finalists are vanilla, DF, and parents as budget allows.
+One deliberate asymmetry: a null-but-stable FBT side at the screen does
+**not** exclude DF from the ladder — the screen runs at 9 tok/param and
+formation-with-scale is precisely the hypothesis it cannot test; the
+ladder is a ~$130 question.
 
-**Promotion to flagship** (pre-registered): the combined advantage over
+**Promotion to flagship** (pre-registered): DF's advantage over
 **both** parents at matched token-equivalent compute **holds or grows
 across the ladder** (2B → 32B) — a trend, not a point estimate — **and**
 the contraction diagnostic is clean past 30 self-compositions at the top

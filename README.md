@@ -3,23 +3,24 @@
 Do the two axes of a transformer's compute lattice — depth-wise routing
 (**Delta Attention Residuals**, arXiv:2605.18855) and token-time latent
 feedback (**full-bandwidth transformers**, arXiv:2608.08888) — help
-complementarily or redundantly when pretrained together? Secondary: should
-the feedback payload be the bare top-layer state (A1) or the top state plus
-a routed combination of the column's deltas (A2, "delta feedback" — DAR's
-additive routing applied at the cross-column site) — the injection-form
-question the FBT paper leaves open.
+complementarily or redundantly when pretrained together? The combined model
+("delta feedback", DF) makes the payload the top state plus a null-sourced
+routed combination of the column's deltas — DAR's additive routing applied
+at the cross-column site — so the learned routing weights double as a
+continuous readout of the injection-form question the FBT paper leaves
+open.
 
 **Status:** design phase. Design settled (2026-08-27); no training code, no
 results yet. See [`docs/findings.md`](docs/findings.md).
 
 ## Plan shape
 
-- Screen on jobe (1x4090): {vanilla, DAR, FBT, A1, A2} at DAR's 220M config,
+- Screen on jobe (1x4090): {vanilla, DAR, FBT, DF} at DAR's 220M config,
   ~2B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
 - Token ladder on rented single GPUs: finalists extended 2B -> 8B -> 32B via
   WSD, testing whether the combined advantage holds with training scale
   (the flagship regime is ~370 tok/param; the screen alone cannot reach it).
-- Flagship on rented pods: better of A1/A2 at ~1.08B params / 400B tokens,
+- Flagship on rented pods: DF at ~1.08B params / 400B tokens,
   gated on the ladder trend (pre-registered gate in the design doc).
 - Phase-2 extension (contingent): pause-token pretraining on the winner.
 
