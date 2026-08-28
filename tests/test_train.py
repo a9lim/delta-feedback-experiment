@@ -145,7 +145,7 @@ def test_tiny_run_completes(tmp_path, arm):
     assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {6, 8}
 
 
-def test_resume_is_exact(tmp_path):
+def test_resume_is_exact(tmp_path, capsys):
     full = run(tmp_path, "full", ["--arm", "df"])
     half = run(tmp_path, "half", ["--arm", "df", "--max-steps", "5"])
     assert half["step"] == 5
@@ -153,6 +153,11 @@ def test_resume_is_exact(tmp_path):
     assert resumed["step"] == 8
     assert resumed["loss"] == full["loss"]
     assert resumed["val"] == full["val"]
+    # The spool folds the log at the resume record and requires its path.
+    assert any(
+        line.startswith("resume") and "path=" in line
+        for line in capsys.readouterr().out.splitlines()
+    )
 
 
 def test_resume_rejects_conflicting_exact_field(tmp_path):

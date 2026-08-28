@@ -208,7 +208,7 @@ def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dic
 def save_snapshot(args, model, pair, step: int, protected: set[int]) -> Path:
     path = runs.snapshot_path(args.tag, step, args.out_dir)
     checkpoints.save(path, CONTRACT, model, pair, args, step)
-    telemetry.log("checkpoint", step=step, path=str(path))
+    telemetry.log("checkpoint", step=step, path=str(path), kind="snapshot")
     existing = runs.snapshots(args.tag, args.out_dir)
     keep = {s for s, _ in existing[-2:]} | protected
     for snapshot_step, snapshot_path in existing:
@@ -315,13 +315,15 @@ def train(argv: list[str] | None = None) -> dict:
         start_step = checkpoints.restore(
             payload, CONTRACT, model, pair, current_optimizer_groups=False
         )
-        telemetry.log("resume", step=telemetry.step_address(start_step, total))
+        # The spool folds the log at this boundary; it needs the source path.
+        telemetry.log("resume", step=telemetry.step_address(start_step, total),
+                      path=str(path))
     else:
         telemetry.log(
-            "run", tag=args.tag, arm=args.arm, seed=args.seed, steps=total,
-            feedback_start=feedback_start, batch_rows=args.batch_rows,
+            "run", tag=args.tag,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
+            **{name: getattr(args, name) for name in EXACT_FIELDS},
         )
 
     autocast = (
@@ -333,8 +335,15 @@ def train(argv: list[str] | None = None) -> dict:
     end_step = total
     if args.max_steps is not None:
         end_step = min(total, start_step + args.max_steps)
+    telemetry.log(
+        "schedule",
+        warmup_steps=schedule.warmup_steps, preheat_steps=schedule.preheat_steps,
+        heat_steps=schedule.heat_steps, cooldown_steps=schedule.cooldown_steps,
+        start_step=start_step, end_step=end_step, total_steps=total,
+    )
     model.train()
-    window_start, window_tokens = time.monotonic(), 0
+    process_start = time.monotonic()
+    window_start, window_tokens = process_start, 0
     summary: dict = {}
     interrupted = False
 
@@ -391,6 +400,7 @@ def train(argv: list[str] | None = None) -> dict:
                     "lr": telemetry.format_metric(lr),
                     "gnorm": telemetry.format_metric(grad_norm),
                     "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
+                    "elapsed": f"{time.monotonic() - process_start:.1f}",
                 }
                 if device.type == "cuda":
                     fields["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
