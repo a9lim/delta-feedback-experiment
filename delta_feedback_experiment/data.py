@@ -60,6 +60,13 @@ def tokenize(
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
     eos = tokenizer.eos_token_id
     assert eos is not None
+    if revision is None:
+        # Pin the dataset commit so the stream is reproducible: the full
+        # 35B tokenization and any smoke-sized one must be byte-prefixes
+        # of the same stream.
+        from huggingface_hub import HfApi
+
+        revision = HfApi().dataset_info(dataset).sha
     stream = load_dataset(
         dataset, name=config, split="train", streaming=True, revision=revision
     )
