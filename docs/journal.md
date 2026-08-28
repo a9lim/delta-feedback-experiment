@@ -46,6 +46,22 @@ flags; multi-pass loop + stability kit), then jobe smoke of vanilla and DAR
 arms first — DAR is the positive control that must reproduce before any
 feedback arm means anything.
 
+## 2026-08-27 — A2 corrected to additive payload (a9's catch)
+
+The original A2 (payload = routed delta mixture alone) mis-transcribed
+DAR's principle: DAR routes deltas *additively onto a preserved base*, and
+the pure mixture is the replacement pattern DAR argues against. Structural
+proof it mattered: softmax weights are convex, h_top is the *sum* of the
+deltas — outside the convex hull — so old-A2 could not transmit the full
+column state except by flattening routing (the very contrast collapse DAR
+diagnosed). A2 is now h_top + sum softmax(q_p . rmsnorm(v)) v, RMS-normed.
+Bonuses: A1 becomes A2's routing-ablated nested baseline (zero-init A2 =
+A1 + O(1/N)), and every delta keeps a cross-column gradient path through
+h_top under sharp routing. Caveat kept honest: DAR's
+additive-beats-replacement evidence is within-column; the payload-site
+version is suspect-by-analogy, not refuted — hence the optional
+screen-only control arm A2r (pure mixture), a direct transfer test.
+
 ## 2026-08-27 — scale-plan revision (ratified)
 
 a9 flagged the regime mismatch: flagship ~370 tok/param vs trials at ~4.5.

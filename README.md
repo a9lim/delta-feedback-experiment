@@ -4,9 +4,10 @@ Do the two axes of a transformer's compute lattice — depth-wise routing
 (**Delta Attention Residuals**, arXiv:2605.18855) and token-time latent
 feedback (**full-bandwidth transformers**, arXiv:2608.08888) — help
 complementarily or redundantly when pretrained together? Secondary: should
-the feedback payload be the raw top-layer state (A1) or a routed combination
-of the column's deltas (A2, "delta feedback") — the injection-form question
-the FBT paper leaves open.
+the feedback payload be the bare top-layer state (A1) or the top state plus
+a routed combination of the column's deltas (A2, "delta feedback" — DAR's
+additive routing applied at the cross-column site) — the injection-form
+question the FBT paper leaves open.
 
 **Status:** design phase. Design settled (2026-08-27); no training code, no
 results yet. See [`docs/findings.md`](docs/findings.md).

@@ -23,10 +23,13 @@ stack with a renewed depth budget [paper].
 
 - **Primary:** pretrained together from scratch, are the depth-axis and
   time-axis widenings complementary or redundant?
-- **Secondary:** should the feedback *payload* be the raw top-layer state or
-  a routed combination of the column's deltas? FBT hardcodes the top state
-  and explicitly leaves the injection-form question open [paper]; DAR's
-  thesis is that deltas are the routable decomposition of a column.
+- **Secondary:** should the feedback *payload* be the bare top-layer state,
+  or the top state *supplemented by* a routed combination of the column's
+  deltas — DAR's additive-routing principle applied at the cross-column
+  site? FBT hardcodes the bare top state and explicitly leaves the
+  injection-form question open [paper]; DAR's thesis is that deltas are the
+  routable decomposition of a column, routed additively onto a preserved
+  base.
 
 Pre-registered predictions [speculation]: a9 expects superadditive gains;
 Claude hedges toward additive-to-mildly-sub (the channels may partially
@@ -51,7 +54,7 @@ for l in layers:
     h = h + route(srcs, q_mlp[l])
     m = mlp(norm(h));  h = h + m; srcs.append(m)
 p_prev = payload(srcs)               # A1: rmsnorm(h_top)
-                                     # A2: rmsnorm(sum softmax(q_p . rmsnorm(v)) v)
+                                     # A2: rmsnorm(h_top + sum softmax(q_p . rmsnorm(v)) v)
 tok = sample(lm_head(h))
 ```
 
@@ -77,14 +80,25 @@ two ways:
    weight is a direct observable of cross-column demand [synthesis].
 
 **Payload variants.** A1: the RMS-normed top-layer state (FBT verbatim; the
-combination baseline). A2 "delta feedback": a softmax-routed combination of
-the column's delta sources under a dedicated static learned query, RMS-
-normed. The payload router is *not* conditioned on the next token — the GLU
-already gates the payload elementwise by the token. With payload RMSNorm,
-A2's zero-init router yields the uniform delta average, which telescopes to
-approximately A1-minus-input: the arms are near-identical at init and
-diverge only as routing sharpens, so differences are attributable to
-learned selection [synthesis].
+combination baseline). A2 "delta feedback": the top state *plus* a
+softmax-routed combination of the column's delta sources under a dedicated
+static learned query, RMS-normed — DAR's additive routing applied at the
+cross-column site exactly as within the column: base signal preserved by
+default, routing re-weights on top. A pure routed mixture without the base
+is structurally unable to transmit the full column state — softmax weights
+are convex, and h_top is the *sum* of the deltas, outside their convex
+hull — and repeats the replacement-routing pattern DAR shows fails within
+the column [synthesis]; it survives only as the optional screen-only
+control arm **A2r** (see Arms), a direct test of whether
+additive-beats-replacement transfers to the payload site. The payload
+router is *not* conditioned on the next token — the GLU already gates the
+payload elementwise by the token. With payload RMSNorm, A2 at zero-init is
+rmsnorm(h_top + mean delta) = A1 + O(1/N): the arms are near-identical at
+init and diverge only as routing sharpens, making A1 the routing-ablated
+nested baseline of A2 [synthesis]. The additive form also keeps every
+delta on a direct cross-column gradient path through h_top even under
+sharp routing, preserving the multi-pass auxiliary-supervision mechanism
+that sharp replacement routing would starve [synthesis].
 
 **Standing sources.** The source list opens with the fused input `u`, the
 raw payload `p_prev`, and the raw token embedding `e`. The `e` source
@@ -140,7 +154,10 @@ before detaching — detaching changes the objective.
 
 Screen arms: **{vanilla, DAR, FBT, A1, A2}**, one recipe, matched tokens,
 paired data order (same batches, same order — loss curves difference
-cleanly), 2 seeds. Finalists (~3–4 arms: vanilla, the better combined arm,
+cleanly), 2 seeds. Optional sixth screen arm **A2r** (replacement-payload
+control: the routed delta mixture *without* the base state) — screen-only,
+cut freely under time pressure, never a ladder candidate unless it wins
+outright. Finalists (~3–4 arms: vanilla, the better combined arm,
 parents as budget allows) then extend along the token ladder below.
 Reported at matched tokens *and* matched token-equivalent compute (FBT
 accounting: an n-pass batch costs n).
