@@ -3,6 +3,80 @@
 Disposable working space, periodically cleared. Keep only notes needed for
 active work; anything durable graduates to `design.md` or `findings.md`.
 
+## 2026-08-28 — build forks resolved; DAR code archaeology
+
+Pre-build fork review with a9; all four resolved and recorded in design/
+AGENTS: (1) sub-flagship geometry ctx 1024 + FBT 300K-token batches
+(divergence recorded; smoke validates NorMuon at this geometry); (2)
+greenfield plain-PyTorch harness, DAR repo cloned to references/ as parity
+reference; (3) screen on jobe (~3 days/run accepted), triage order
+vanilla → DF → DAR/FBT → DF-soft with results gating each next spend; (4)
+operational layer from the root package (telemetry/runs/checkpoints/spool/
+Schedule/monitor). Claude writes first iteration, Codex optimizes
+(recirculated-dot convention; flash-attn on jobe, SDPA fallback for Mac).
+
+Cloning DAR's code paid off immediately:
+
+- **The per-sublayer `delta` mode seeds sources with the embedding**
+  (`if not blocks: blocks = [partial_block]` before the first delta
+  append). The paper's Fig. 3 pseudocode omits the seed, but the code that
+  produced the published numbers has it. Yesterday's complete-decomposition
+  reversal is therefore code-verbatim, not a departure — and the DAR arm is
+  *not* an untested cell: per-sublayer + seed is exactly what they ran.
+  Design's Sources and Gates sections updated accordingly.
+- **Queries are not zero-initialized in the released code** (HF default
+  normal 0.02, no override), despite the paper's "zero-initialized
+  queries" claim everywhere. Near-uniform routing at init either way at
+  from-scratch scale; we keep exact zero-init as designed (the
+  identity-at-init invariant is load-bearing for DF's init-matching
+  argument). Recorded as a paper/code discrepancy, not adopted.
+- **Null source implementation** (their fine-tuning setup): a *learnable*
+  per-site d-vector, zero-init, prepended to the source list; key
+  rmsnorm(0)=0 → logit exactly 0 at init. DF-soft adopts this exact
+  mechanism.
+- Their `final_res_proj` routing site exists only for replacement-routing
+  modes (block/full) where the stream doesn't carry full state; delta
+  modes end at norm(h) directly — no analogue to our payload site in their
+  code.
+- 220M run names confirm effective batch 32 sequences (bs2 × ga2 × 8
+  GPUs); exact head split for d=768 is unrecoverable (script defaults are
+  d=512-shaped) — pinned ours as 8H/4KV/head_dim 96/SwiGLU 3072 ≈ 223M.
+- Their data pipeline (streaming shuffle, val from a different shuffle
+  seed of the *same* split) is neither deterministic nor properly held
+  out — our memmap-prefix design replaces it, one more reason numeric
+  replication was never on the table.
+
+Feedback-phase placement pinned provisionally in design (a knob):
+single-pass first 75% of steps, 88/12 two-/three-pass mixture in the final
+25%, coinciding with WSD cooldown — reproduces FBT's overall 75/22/3 and
+keeps ladder rungs structurally comparable (every pre-cooldown checkpoint
+is single-pass-trained). Cost flagged: feedback never sees stable LR;
+feedback_start moves earlier if contraction/screen look unhealthy. FBT's
+Appendix-C pseudocode details captured for the implementation: jitter
+*before* shift, rmsnorm on the gate's embedding input and on the fused
+input, prefix mixin reverts prefix positions to plain e.
+
+**Design pseudocode bug found and fixed while implementing:** design.md
+had `h = h + route(...)` — routing accumulated into the residual stream.
+Paper Fig. 3 *and* code agree the routed sum feeds only the sublayer's
+pre-norm input read (`attn(norm(h + routed))`); the stream accumulates
+sublayer outputs only. The stream-accumulate version would have broken
+the telescoping identity (seed + Σv = h_top) that the Sources section's
+complete-decomposition argument rests on — the two sections were mutually
+inconsistent until now. Corrected to transient-read semantics
+(code-verbatim); Architecture pseudocode and Depth-routing prose updated.
+Corollary: the len<2 no-op guard is belt-and-suspenders — a singleton
+seed's weight-1 route gives norm(2u) = norm(u) under RMSNorm scale
+invariance, so it was never able to do damage at the only site where a
+singleton occurs. Guard kept (explicit, and keeps telemetry clean).
+Also pinned: depth scaling = 1/√(2L) branch-output multipliers (FBT names
+the property, not the formula); the entry gate reads rmsnorm(e) per
+Appendix C; prefix mixin reverts prefix positions to *plain* e (bypassing
+the entry norm) so prompt positions match pass-1 distribution exactly.
+
+Next: harness first iteration (model.py + invariant tests → check-in),
+then data pipeline, optimizer stack, multi-pass trainer.
+
 ## 2026-08-27 — scoping session (a9 + Claude)
 
 Both parent papers read in full; design settled into `design.md` the same

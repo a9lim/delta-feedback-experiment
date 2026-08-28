@@ -22,6 +22,17 @@ alternate schemas or stale guidance around.
 
 ## Operating notes
 
+- **Harness:** greenfield plain-PyTorch trainer in
+  `delta_feedback_experiment/` (no HF modeling code); flash-attn on jobe
+  with an SDPA fallback so tests and analysis run on the Mac (MPS/CPU).
+  Operational layer comes from the root package — `telemetry` log grammar,
+  `runs`/`checkpoints` snapshot addressing, `spool` job queue, `Schedule`,
+  and the `monitor` server — imported, never re-implemented. DAR's released
+  code is cloned (gitignored) at `references/delta-attention-residuals-code/`
+  as a parity reference for the routing module; Claude writes the first
+  correct iteration, Codex does the aggressive optimization pass
+  (recirculated-dot convention).
+
 - **Greenfield contract:** predecessors (stateful-thought-experiment,
   chain-of-dots-experiment) were deliberately cleared by a9. Do not dig up
   or inherit their design decisions.

@@ -49,14 +49,14 @@ per-sublayer sources). `route(vs, q)` returns
 
 ```python
 e = embed(tok)
-u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G e)
+u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G rmsnorm(e))
 srcs = [u]                               # input seed + deltas: complete decomposition
 h = u
 for l in layers:
-    h = h + route(srcs, q_attn[l])       # depth routing (no-op while len(srcs) < 2)
-    a = attn(norm(h)); h = h + a; srcs.append(a)
-    h = h + route(srcs, q_mlp[l])        # depth routing
-    m = mlp(norm(h));  h = h + m; srcs.append(m)
+    a = attn(norm(h + route(srcs, q_attn[l])))   # routed read (no-op while len(srcs) < 2)
+    h = h + a; srcs.append(a)
+    m = mlp(norm(h + route(srcs, q_mlp[l])))     # routed read
+    h = h + m; srcs.append(m)
 p_prev = rmsnorm(h + route(srcs[1:], q_p))   # additive payload over deltas (no null)
 tok = sample(lm_head(h))
 
@@ -72,8 +72,12 @@ tok = sample(lm_head(h))
 
 **Depth routing (DAR side).** Before every attention and MLP sublayer, a
 zero-init learned query per site routes softmax attention over the source
-list and adds the convex combination to the residual stream. Keys are
-RMS-normed; values are raw. Zero-init makes routing exactly the identity at
+list and adds the convex combination to *that sublayer's input read* — a
+transient enrichment of the pre-norm input. The residual stream itself
+accumulates only sublayer outputs (paper Fig. 3 and released code both
+keep the stream clean [paper]); this is exactly what makes the
+decomposition telescope (seed + Σv = h_top). Keys are RMS-normed; values
+are raw. Zero-init makes routing exactly the identity at
 step 0, so it is active from the start of training [paper]. Sources are
 per-sublayer deltas (2L per column) wherever affordable; the flagship
 coarsens to Delta-Block-style block deltas, supported by DAR's 533M
@@ -115,12 +119,16 @@ sharpens [synthesis].
 stream: the source list is the column's input seed plus the per-sublayer
 deltas, telescoping to the full hidden state (seed + Σv = h_top). The seed
 is whatever the column's input actually is — `u` in DF, `e` in the DAR
-arm (`srcs = [e]`), `e` in DF-soft (already present). This deliberately
-departs from the paper's per-sublayer variant, which routes deltas only:
-we read that omission as unprincipled — their Block variant seeds with the
-embedding, completing the decomposition, and their embedding-prominence
-finding was only *observable* in the variant that offered the option
-[synthesis]. The seed closes that observability gap at trial granularity:
+arm (`srcs = [e]`), `e` in DF-soft (already present). The paper's Figure-3
+pseudocode routes deltas only in the per-sublayer variant, an omission we
+read as unprincipled (their Block variant seeds with the embedding,
+completing the decomposition) — and their *released code* agrees: the
+per-sublayer `delta` mode seeds the source list with the layer-0 input
+before the first delta
+(`references/delta-attention-residuals-code/Attention-Residuals/modeling_qwen3_attnres.py`),
+so the published per-sublayer numbers were produced *with* the seed
+[paper]. Complete decomposition is therefore code-verbatim, not a
+departure. The seed also closes an observability gap at trial granularity:
 per-layer seed weight is the input-re-injection readout in every routed
 arm. The depth-routing module remains identical between the DAR arm and
 DF — only the seed's content differs, and that difference is entailed by
@@ -187,17 +195,28 @@ with an extra objective [synthesis].
 **Schedule.** Depth routing from step 0. Feedback passes late, default
 mixture 75% one-pass / 22% two-pass / 3% three-pass — the small three-pass
 fraction is what makes the learned feedback map a contraction rather than a
-divergence under self-composition [paper]. The contraction diagnostic
-(iterate fused prefill passes; watch ||h(k) − h(k−1)|| and val loss) is a
-standing monitor during and after training. Adaptive pass-mixing triggered
-by that monitor is in scope if cheap.
+divergence under self-composition [paper]. FBT does not publish *where*
+the feedback phase sits beyond "introduced progressively mid-training";
+our pin (provisional, a schedule knob): single-pass for the first 75% of
+each run's steps, then a stochastic 88/12 two-/three-pass mixture for the
+final 25% — reproducing the overall 75/22/3 fractions and coinciding with
+the WSD cooldown, so every ladder rung's pre-cooldown checkpoint is
+single-pass-trained and each cooldown branch learns feedback under its own
+decay, keeping rungs structurally comparable [synthesis]. Cost: feedback
+never trains at stable LR; if the contraction diagnostic or screen looks
+unhealthy, shifting feedback_start earlier is the first knob to turn. The
+contraction diagnostic (iterate fused prefill passes; watch
+||h(k) − h(k−1)|| and val loss) is a standing monitor during and after
+training. Adaptive pass-mixing triggered by that monitor is in scope if
+cheap.
 
 **One recipe everywhere; FBT's is binding.** Every arm, including vanilla,
 trains under FBT's published recipe: NorMuon for matrices (lr 1e-2, wd
 0.01) + Adam for vectors (lr 5e-4), WSD schedule (200 warmup, 25% cooldown),
 z-loss 1e-5 and AdamC-style weight-decay decay in cooldown, jitter
-sigma=0.02 on the carried state, depth scaling for O(1) top-state norm,
-tied embed/unembed. DAR module conventions (zero-init queries, RMS-normed
+sigma=0.02 on the carried state, depth scaling for O(1) top-state norm
+(pinned: sublayer branch outputs scaled 1/√(2L) — FBT names the property,
+not the formula), tied embed/unembed. DAR module conventions (zero-init queries, RMS-normed
 keys, raw values) nest inside. Divergences from the parent papers are
 recorded here when made. WSD permits extending token budgets for matched-
 compute baselines without re-warming.
@@ -252,10 +271,39 @@ to block deltas. The ladder's top rung (145 tok/param) lands within ~2.5×
 of the flagship's ratio; ladder arms run 1 seed with paired data order,
 using the screen's seed spread as the noise estimate.
 
+**Sub-flagship geometry.** Context length is a per-scale architecture
+parameter, not part of the binding recipe: screen and ladder run ctx 1024
+(DAR's 220M geometry), the flagship returns to FBT's 8192. Global batch is
+FBT's 300K tokens everywhere (grad accumulation on jobe) — a recorded
+divergence from DAR's 32K-token screen batches; NorMuon lr 1e-2 was tuned
+at 1B/8192/300K, so the smoke run validates the recipe at screen geometry
+before anything else trains. Screen trunk, pinned identically across all
+arms: d=768, L=12, 8 heads / 4 KV heads (head_dim 96, DAR's script
+defaults), SwiGLU intermediate 3072, RoPE θ 1e6, RMSNorm eps 1e-6, tied
+Qwen3 embeddings (vocab 151936) — ~223M params, matching the paper's
+"220M" total; the exact head split is unrecorded in paper and code
+defaults, so this pin is ours.
+
+**Screen sequencing (triage order).** Screen runs launch serially on jobe
+(~3 days/run accepted): **vanilla → DF → DAR/FBT → DF-soft**. Vanilla
+failing to learn stops everything (debug the harness); DF failing to beat
+vanilla is a clean small-scale negative and may stop the screen; DF
+beating vanilla buys the two parent cells to decompose the effect; DF
+surviving the factorial buys DF-soft's adoption readout. Both seeds of an
+arm run before the next arm.
+
 Tokenizer: Qwen3's (~151k, tied) everywhere — one tokenizer across our runs
 beats matching FBT's phi-4 100k; DAR's "220M" is exactly the Qwen3-vocab
 d=768/L=12 model [paper]. Data: FineWeb-Edu throughout, shared held-out val
-split (FBT's Phi-4 mixture is unavailable). Optional flagship
+split (FBT's Phi-4 mixture is unavailable). One fixed token stream,
+pre-tokenized once to uint32 memmap shards and sized for the ladder's top
+rung (~35B tokens on jobe `/data`), serves every run: the screen reads its
+prefix, and WSD extension continues the same stream in the same order —
+load-bearing for both paired comparisons and ladder continuity. The val
+slice is a fixed held-out cut of the same corpus, tokenized once.
+Feedback-arm randomness (pass-count draws, prefix-mixin lengths, jitter) is
+pre-seeded per step and shared across arms, so arm differences are purely
+architectural. Optional flagship
 follow-through, FBT-style, if the base result justifies it: long-context
 extension (12B tokens, 8K→32K) then instruction tune (6B tokens),
 three-pass throughout.
@@ -297,8 +345,9 @@ unknowable data mixture makes them incomparable as controls.
 at the screen, or the harness is suspect and nothing else is
 interpretable. (It validates harness *sensitivity* to DAR-class effects
 rather than reproducing the paper numerically — it runs the shared
-FBT-binding recipe plus the input seed, neither of which the paper's
-per-sublayer runs used.) Finalists are vanilla, DF, and parents as budget allows.
+FBT-binding recipe, which the paper's runs did not; the per-sublayer +
+input-seed shape itself matches their released code exactly.) Finalists
+are vanilla, DF, and parents as budget allows.
 One deliberate asymmetry: a null-but-stable FBT side at the screen does
 **not** exclude DF from the ladder — the screen runs at 9 tok/param and
 formation-with-scale is precisely the hypothesis it cannot test; the
