@@ -1,0 +1,32 @@
+# Data + figures are regenerated artifacts; keep them out of git.
+data/**
+!data/.gitkeep
+!data/summary/
+!data/summary/**
+figures/**
+!figures/README.md
+
+# References: refs.yaml is committed; fetched copies are regenerable.
+references/*.md
+references/*.pdf
+references/*.html
+
+# Run logs and checkpoints stay local.
+logs/**
+!logs/.gitkeep
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.env
+.DS_Store
+.idea/
+.vscode/
+.claude/

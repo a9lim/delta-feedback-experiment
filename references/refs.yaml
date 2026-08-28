@@ -1,0 +1,40 @@
+# Load-bearing papers for this experiment. Markdown copies live beside this
+# file, gitignored — (re)fetch them with:
+#   python -m transformer_experiments.references
+references:
+  - arxiv: "2605.18855"
+    slug: luo2026-delta-attention-residuals
+    note: >
+      Parent 1 — the depth axis. Route RMS-normed sublayer deltas (not
+      redundant cumulative states) with additive zero-init softmax routing;
+      cumulative/replacement routing collapses (max weight ~0.2) and degrades
+      past ~1B. Gains 1.7-8.2% val PPL, 220M-7.6B. Our trial config is their
+      220M (Qwen3 tokenizer, d=768, L=12); Delta Block is the flagship
+      coarsening (533M ablation shows block-size robustness).
+  - arxiv: "2608.08888"
+    slug: wang2026-full-bandwidth-transformer
+    note: >
+      Parent 2 — the token-time axis. Feed the previous top-layer state back
+      to layer 0 through an asymmetric GLU (state on value path, token as
+      gate — mandatory read). Jacobi multi-pass training, 75/22/3 pass
+      mixture (3% three-pass turns the feedback map into a contraction),
+      prefix mixin, jitter, depth scaling, tied embeddings. Binding recipe
+      for all our arms; flagship matches their 1B/400B-token scale and
+      1536x24 trunk. Their open question — which injection form is best —
+      is our A1-vs-A2 comparison.
+  - arxiv: "2310.02226"
+    slug: goyal2023-pause-tokens
+    note: >
+      Phase-2 extension arm. Pause tokens must be pretrained in to work —
+      matching our from-scratch setting. Under latent feedback, consecutive
+      pauses chain full-depth through the payload (a horizontally unrolled
+      loop transformer), supplying the serial depth pauses lack alone.
+      Loose conceptual parallel to recirculated-dot-experiment.
+  - arxiv: "2603.15031"
+    slug: kimi2026-attention-residuals
+    note: >
+      Context — DAR's substrate. Original Attention Residuals (cumulative
+      sources, replacement routing, reset); needed when implementing the
+      routing module and understanding what DAR fixed. NB: arXiv has no full
+      HTML rendering (fetched copy is a metadata stub) — use the PDF, or
+      DAR's Appendix B, which reproduces the pseudocode and differences.
