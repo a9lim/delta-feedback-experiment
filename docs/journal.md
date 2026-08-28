@@ -46,6 +46,29 @@ flags; multi-pass loop + stability kit), then jobe smoke of vanilla and DAR
 arms first — DAR is the positive control that must reproduce before any
 feedback arm means anything.
 
+## 2026-08-28 — hard/soft diagonals; DF goes hard-everywhere, DF-soft added
+
+a9 generalized the entry/payload choices into a hard/soft design plane and
+leaned diagonal: soft-everywhere (h = e, no GLU, srcs = [p_prev, e], nulls
+in every router, vanilla-reachable) or hard-everywhere (h = u, srcs = [u],
+no nulls, forced adoption of both). Claude updated — the prior mixed
+corner (hard entry, soft payload) is dominated by the pair. Settling
+argument: the late-feedback schedule means a soft feedback channel arrives
+at a well-trained checkpoint — the committed-valley regime where both
+parents' evidence predicts non-adoption — so the spine must be hard; but
+that prediction is testable at screen scale, so both diagonals run:
+**DF = hard-everywhere** (spine: screen → ladder → flagship candidate),
+**DF-soft = soft-everywhere** (screen-only fifth arm, carrying all the
+soft observables: p_prev demand, e-prominence, null masses). Casualties of
+the hard spine: the e standing source (D5-era; FBT's multiplicative-only
+token access suffices) and the payload null (the injection-form readout
+moves to DF-soft). Registered prediction (Claude): DF-soft ≈ DAR arm,
+within-column routing sharpens (step-0 start) while p_prev stays flat
+(late arrival) — same mechanism, opposite fates, one run; DF-soft closing
+on DF would mean the gate was never necessary (headline surprise).
+Implementation note: route() must no-op with <2 sources (a singleton
+softmax would double u at layer 0).
+
 ## 2026-08-27 — arms collapsed to one hybrid, renamed DF
 
 a9: A1 (bare-top-state payload) is the *less* parsimonious design once the

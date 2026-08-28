@@ -23,21 +23,23 @@ stack with a renewed depth budget [paper].
 
 - **Primary:** pretrained together from scratch, are the depth-axis and
   time-axis widenings complementary or redundant?
-- **Secondary:** what does the feedback payload learn to carry? The
-  combined model's payload is the top state plus a null-sourced routed
-  combination of the column's deltas — DAR's additive-routing principle
-  applied at the cross-column site — so the bare-top-state payload (FBT
-  verbatim) is a reachable point of the router's parameter space, and the
-  learned routing weights (null mass included) are a *continuous readout*
-  of the injection-form question FBT explicitly leaves open [paper], rather
-  than a discrete arm comparison.
+- **Secondary:** what happens when adoption is *free*? The screen-only
+  DF-soft arm makes both channels optional (null sources everywhere,
+  vanilla-reachable); its routing weights are a continuous readout of
+  channel demand — including the injection-form question FBT explicitly
+  leaves open [paper] — while the spine forces adoption and measures only
+  benefit.
 
 Pre-registered predictions [speculation]: a9 expects superadditive gains;
 Claude hedges toward additive-to-mildly-sub (the channels may partially
 substitute for the same limited per-column capacity). Either sign is a
 finding. If superadditivity is real it should concentrate in the
 Standard→Soft decoding gap on the same weights, since depth routing keeps
-early-layer information alive in the payload [synthesis].
+early-layer information alive in the payload [synthesis]. For DF-soft,
+Claude predicts within-column adoption but payload-source non-adoption
+(performance ≈ the DAR arm) — the same-arm split being the
+committed-valley signature; DF-soft closing on DF instead would be the
+surprising result (the gate was never necessary).
 
 ## Architecture
 
@@ -47,22 +49,25 @@ per-sublayer sources). `route(vs, q)` returns
 
 ```python
 e = embed(tok)
-u = rmsnorm(glu(p_prev, e))                 # FBT gate: W_U p_prev * sigmoid(W_G e)
-srcs = [u, p_prev, e]                       # standing sources
+u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G e)
+srcs = [u]                               # standing source: the column's input
 h = u
 for l in layers:
-    h = h + route(srcs, q_attn[l])          # depth routing
+    h = h + route(srcs, q_attn[l])       # depth routing (no-op while len(srcs) < 2)
     a = attn(norm(h)); h = h + a; srcs.append(a)
-    h = h + route(srcs, q_mlp[l])           # depth routing
+    h = h + route(srcs, q_mlp[l])        # depth routing
     m = mlp(norm(h));  h = h + m; srcs.append(m)
-cands = srcs[3:] + [zero]                   # this column's deltas + null source
-p_prev = rmsnorm(h + route(cands, q_p))     # additive delta payload
+p_prev = rmsnorm(h + route(srcs[1:], q_p))   # additive delta payload (no null)
 tok = sample(lm_head(h))
 
-# Ablation arms delete from this model:
+# Parent arms delete from this model:
 #   vanilla: u = e; no route() calls; no payload
 #   DAR:     u = e; srcs = [] (paper-verbatim per-sublayer); no payload
 #   FBT:     no route() calls; p_prev = rmsnorm(h)   (bare top state)
+#
+# DF-soft (screen-only fifth arm) replaces the hard choices with soft ones:
+#   h = e (no GLU anywhere); srcs = [p_prev, e]; every route() — depth and
+#   payload — carries a null source, so it can regress to vanilla.
 ```
 
 **Depth routing (DAR side).** Before every attention and MLP sublayer, a
@@ -75,52 +80,75 @@ coarsens to Delta-Block-style block deltas, supported by DAR's 533M
 ablation showing block-size insensitivity (PPL 31.18–31.27 across B=2–24)
 [paper].
 
-**Feedback channel (FBT side).** The payload from column t−1 enters column t
-two ways:
-
-1. *Mandatory* — fused into the layer-0 input through FBT's asymmetric GLU
-   (payload on the value path, token embedding as the gate). This closes the
-   shortcut in which multi-pass losses are minimized by imitating the
-   no-feedback pass and ignoring state [paper].
-2. *Optional* — the raw payload rides as one standing zero-init routed
-   source at every sublayer, giving ungated access; its per-layer routing
-   weight is a direct observable of cross-column demand [synthesis].
+**Feedback channel (FBT side).** The payload from column t−1 enters column
+t one way: fused into the layer-0 input through FBT's asymmetric GLU
+(payload on the value path, token embedding as the gate). This closes the
+shortcut in which multi-pass losses are minimized by imitating the
+no-feedback pass and ignoring state [paper] — load-bearing under our
+schedule, where feedback passes arrive late, i.e. at an effectively
+well-trained checkpoint, exactly the regime where optional paths go
+unadopted (DenseFormer's committed valley; FBT's own rationale for the
+gate) [paper]. Ungated access and adoption-by-choice are DF-soft's job,
+not the spine's.
 
 **Payload.** The payload is the top state *plus* a softmax-routed
-combination of the column's delta sources and a **null source** (a zero
-vector among the candidates), under a dedicated static learned query,
-RMS-normed — DAR's additive routing applied at the cross-column site
-exactly as within the column: base signal preserved by default, routing
-re-weights on top. The two halves are each load-bearing:
+combination of the column's delta sources under a dedicated static learned
+query, RMS-normed — DAR's additive routing applied at the cross-column
+site exactly as within the column: base signal preserved by default,
+routing re-weights on top. No null source: the routed enrichment carries
+fixed unit mass, forcing delta content into the recurrence (the hard
+philosophy; the gain dial and the regress-to-bare-FBT option live in
+DF-soft). Why keep the base: a pure routed mixture is structurally unable
+to transmit the full column state — softmax weights are convex, and h_top
+is the *sum* of the deltas, outside their convex hull — and repeats the
+replacement-routing pattern DAR shows fails within the column [synthesis];
+the base also keeps every delta on a direct cross-column gradient path
+even under sharp routing, preserving the multi-pass auxiliary-supervision
+mechanism [synthesis]. The payload router is *not* conditioned on the next
+token — the GLU already gates the payload elementwise. At zero-init the
+router is uniform over the N deltas, so the payload is
+rmsnorm(h_top + (h_top − u)/N) ≈ the bare top state: the model starts as
+approximately FBT-with-depth-routing and diverges only as payload routing
+sharpens [synthesis].
 
-- *Why keep the base:* a pure routed mixture is structurally unable to
-  transmit the full column state — softmax weights are convex, and h_top
-  is the *sum* of the deltas, outside their convex hull — and repeats the
-  replacement-routing pattern DAR shows fails within the column
-  [synthesis]. The base also keeps every delta on a direct cross-column
-  gradient path even under sharp routing, preserving the multi-pass
-  auxiliary-supervision mechanism [synthesis].
-- *Why the null source:* it makes "at worst, the deltas are ignored" exact
-  — routing all mass to null recovers the bare-top-state payload (FBT
-  verbatim) as a reachable point, and the learned null mass is the direct
-  observable answering the injection-form question (borrowed from DAR's
-  fine-tuning setup [paper]; the *within-column* routing carries no null
-  source, matching DAR's from-scratch configuration).
+**Standing source.** The fused input `u` is the sole standing source — the
+paper-faithful transplant of DAR's input-as-first-source pattern (their
+routers re-inject the diluted input at depth [paper]), applied to what is
+actually this column's input. Raw `e` and raw `p_prev` are deliberately
+absent from the spine: token identity reaching the stack only through the
+gate's multiplicative pattern is FBT's own working regime [paper], and
+ungated payload access belongs to DF-soft, where it is the measurement. On
+single-pass batches (no payload yet) the input, and hence the standing
+source, is plain `e`.
 
-The payload router is *not* conditioned on the next token — the GLU
-already gates the payload elementwise by the token. At zero-init the
-router is uniform over N deltas + null, so the payload is
-rmsnorm(h_top + (h_top − u)/(N+1)) ≈ the bare top state: the model starts
-as approximately FBT-with-depth-routing and diverges only as payload
-routing sharpens [synthesis].
+**The hard/soft design space, and DF-soft.** Entry (gated vs plain input)
+and routing nulls (absent vs present) span a design plane whose coherent
+points are the diagonals: **hard-everywhere** — the spine above — forces
+maximal adoption of both mechanisms and cannot give either up;
+**soft-everywhere** makes both free choices and can regress all the way to
+a vanilla transformer. Mixed corners (e.g. gated entry with a null-sourced
+payload) trade coherence for site-local optimizations and are dominated by
+the pair [synthesis]. The spine must be hard: under the late-feedback
+schedule a soft feedback channel arrives at a well-trained checkpoint —
+the committed-valley regime where the parents' evidence predicts
+non-adoption. That prediction is itself worth testing, so **DF-soft** runs
+as a screen-only fifth arm:
 
-**Standing sources.** The source list opens with the fused input `u`, the
-raw payload `p_prev`, and the raw token embedding `e`. The `e` source
-exists because DAR's strongest learned pattern is deep layers re-injecting
-the token embedding [paper], while the FBT gate destroys additive access to
-it (the token survives only as a multiplicative pattern) [paper]; the
-optional source restores that shortcut without weakening the mandatory gate
-[synthesis].
+- `h = e`, no GLU anywhere — feedback is just one more routed source; one
+  primitive everywhere, no W_U/W_G.
+- Standing sources `[p_prev, e]` — ungated payload access and raw token
+  re-injection, the two observables the spine gives up.
+- A null source in *every* router, within-column and payload — the model
+  can regress to vanilla, and every routing weight (null mass included) is
+  a continuous readout of channel demand.
+
+DF-soft contains its own control: within-column routing starts at step 0
+(the regime where DAR's optional routing is known to adopt [paper]), while
+the `p_prev` source structurally cannot appear before the late multi-pass
+batches — the same mechanism predicts opposite fates for the two channels
+in a single run. DF-soft is never a ladder candidate unless it matches DF
+outright, which would itself be a headline result (the gate was never
+necessary).
 
 **Scope boundaries.** Feeding multiple prev-column deltas as separate
 per-layer sources (the full-lattice variant), token-conditioned payload
@@ -166,12 +194,14 @@ before detaching — detaching changes the objective.
 
 ## Arms and comparisons
 
-Screen arms: **{vanilla, DAR, FBT, DF}**, one recipe, matched tokens,
-paired data order (same batches, same order — loss curves difference
-cleanly), 2 seeds. **DF** ("delta feedback") is the full combined model of
-the Architecture section; the parents are its ablations per the pseudocode
-flags. Finalists (~3–4 arms: vanilla, DF, parents as budget allows) then
-extend along the token ladder below.
+Screen arms: **{vanilla, DAR, FBT, DF, DF-soft}**, one recipe, matched
+tokens, paired data order (same batches, same order — loss curves
+difference cleanly), 2 seeds. **DF** ("delta feedback") is the
+hard-everywhere model of the Architecture section; the parents are its
+ablations per the pseudocode flags; **DF-soft** is the soft-everywhere
+companion, screen-only — its adoption question resolves in the routing
+weights at screen scale. Finalists (~3–4 arms: vanilla, DF, parents as
+budget allows) then extend along the token ladder below.
 Reported at matched tokens *and* matched token-equivalent compute (FBT
 accounting: an n-pass batch costs n).
 
@@ -197,7 +227,7 @@ flagship; program total ≈ $7–8k.
 | Stage | Model | Tokens | tok/param | Where | Rough cost |
 |---|---|---|---|---|---|
 | Smoke / dev | 220M (DAR's config: d=768, L=12, Qwen3-style) | ≤0.3B | — | jobe (1×4090) | free |
-| Screen | 220M, 4 arms × 2 seeds | 2B / run | 9 | jobe, ~1 wk background (or rented, ~$10/run, if wall-clock matters) | free–$100 |
+| Screen | 220M, 5 arms × 2 seeds | 2B / run | 9 | jobe, ~1 wk background (or rented, ~$10/run, if wall-clock matters) | free–$100 |
 | Token ladder | 220M, finalists, 1 seed | 2B → 8B → 32B via WSD extension, cooldown branch per rung | 36 → 145 | rented single H100/H200 | ~$120–150/arm; $400–600 total |
 | Mid-rung (params axis, optional) | ~300M | ~30B | 100 | rented | ~$150/run |
 | Flagship | ~1.08B, FBT trunk: d=1536, L=24, GQA 16q/8kv headwise-gated, QK-norm, SiLU GLU 6656, RoPE, ctx 8192, 2048-SWA on 5/6 layers | 400B (FBT's largest) | 370 | Prime Intellect marketplace pods | ~2,700 H100-h ≈ $6–7k at 2026-07 rates (~$3–4k H200 spot, checkpoint-tolerant); ~2 wk on 8×H100 |
@@ -231,16 +261,17 @@ unknowable data mixture makes them incomparable as controls.
   before any flagship spend.
 - **Decode modes:** Standard/Soft/Fused on every feedback-bearing arm.
 - **Interpretability (first-class):** routing weights are direct
-  observables — per-layer weight on the raw-payload source measures
-  cross-column demand; per-layer weight on `e` tracks whether DAR's
-  embedding-prominence pattern survives, or migrates to the fused input
-  (deep layers reaching the previous column through layer 0). FBT's
+  observables. Spine: the payload router's distribution over deltas (what
+  rides the recurrence) and depth-routing weight on `u` (input
+  re-injection at depth). DF-soft: per-layer weight on `p_prev` (does a
+  free model demand the previous column?), weight on `e`
+  (embedding-prominence under recurrence), and null masses everywhere —
+  the adoption readout, including the injection-form question. FBT's
   Appendix-F state-tracking synthetics (completion tracking, delayed
   memory, multi-register latest-write) reimplemented with linear probes
   across depth: what rides the payload, and does the routed delta
-  enrichment carry state the bare top state doesn't (probe the learned
-  payload against the null-routed payload on the same weights)? The
-  payload router's null mass is itself a headline observable.
+  enrichment carry state the bare top state doesn't (probe with the
+  enrichment term ablated vs as learned, same weights)?
 
 ## Gates
 

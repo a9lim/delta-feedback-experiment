@@ -4,19 +4,19 @@ Do the two axes of a transformer's compute lattice — depth-wise routing
 (**Delta Attention Residuals**, arXiv:2605.18855) and token-time latent
 feedback (**full-bandwidth transformers**, arXiv:2608.08888) — help
 complementarily or redundantly when pretrained together? The combined model
-("delta feedback", DF) makes the payload the top state plus a null-sourced
-routed combination of the column's deltas — DAR's additive routing applied
-at the cross-column site — so the learned routing weights double as a
-continuous readout of the injection-form question the FBT paper leaves
-open.
+("delta feedback", DF) commits hard to both: gated latent feedback whose
+payload is the top state plus routed deltas — DAR's additive routing
+applied at the cross-column site. A soft screen-only companion arm makes
+every channel optional and null-sourced, its routing weights reading out
+what a free model actually adopts.
 
 **Status:** design phase. Design settled (2026-08-27); no training code, no
 results yet. See [`docs/findings.md`](docs/findings.md).
 
 ## Plan shape
 
-- Screen on jobe (1x4090): {vanilla, DAR, FBT, DF} at DAR's 220M config,
-  ~2B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
+- Screen on jobe (1x4090): {vanilla, DAR, FBT, DF, DF-soft} at DAR's 220M
+  config, ~2B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
 - Token ladder on rented single GPUs: finalists extended 2B -> 8B -> 32B via
   WSD, testing whether the combined advantage holds with training scale
   (the flagship regime is ~370 tok/param; the screen alone cannot reach it).
