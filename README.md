@@ -23,10 +23,10 @@ results yet. See [`docs/findings.md`](docs/findings.md).
 
 ```bash
 # from the workspace root, once:
-python -m pip install -e .
+uv pip install -e .
 # then:
 cd delta-feedback-experiment
-python -m pip install -e .
+uv pip install -e .
 ```
 
 ## Run
