@@ -69,6 +69,21 @@ on DF would mean the gate was never necessary (headline surprise).
 Implementation note: route() must no-op with <2 sources (a singleton
 softmax would double u at layer 0).
 
+## 2026-08-28 — spine sources trimmed to [] (a9's nit)
+
+a9 re-read the paper: per-sublayer Delta AttnRes routes deltas only — the
+input-as-first-source pattern is Delta Block's. srcs = [u] was a Block
+feature transplanted into a per-sublayer configuration; dropped. Rule now:
+sources are whatever the paper's variant at the active granularity uses
+(per-sublayer: none; Block: the input seed — which at the flagship is u,
+so the input-re-injection mechanism and its migrate-to-fused-input
+observable return there, paper-licensed). Bonus: DAR arm and DF now share
+an identical depth-routing module — DF−DAR isolates {gate, payload}
+exactly. Spine/DF-soft source asymmetry declared principled: minimal
+mandatory vs maximal optional menu. Supersedes the earlier <2-sources
+no-op note: paper's depth_route softmaxes over a singleton (weight 1), so
+only the empty list needs a guard.
+
 ## 2026-08-27 — arms collapsed to one hybrid, renamed DF
 
 a9: A1 (bare-top-state payload) is the *less* parsimonious design once the

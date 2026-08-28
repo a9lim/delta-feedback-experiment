@@ -50,19 +50,19 @@ per-sublayer sources). `route(vs, q)` returns
 ```python
 e = embed(tok)
 u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G e)
-srcs = [u]                               # standing source: the column's input
+srcs = []                                # per-sublayer: deltas only (paper-verbatim)
 h = u
 for l in layers:
-    h = h + route(srcs, q_attn[l])       # depth routing (no-op while len(srcs) < 2)
+    h = h + route(srcs, q_attn[l])       # depth routing (no-op only when srcs empty)
     a = attn(norm(h)); h = h + a; srcs.append(a)
     h = h + route(srcs, q_mlp[l])        # depth routing
     m = mlp(norm(h));  h = h + m; srcs.append(m)
-p_prev = rmsnorm(h + route(srcs[1:], q_p))   # additive delta payload (no null)
+p_prev = rmsnorm(h + route(srcs, q_p))   # additive delta payload (no null)
 tok = sample(lm_head(h))
 
 # Parent arms delete from this model:
 #   vanilla: u = e; no route() calls; no payload
-#   DAR:     u = e; srcs = [] (paper-verbatim per-sublayer); no payload
+#   DAR:     u = e; no payload           (depth routing identical to DF's)
 #   FBT:     no route() calls; p_prev = rmsnorm(h)   (bare top state)
 #
 # DF-soft (screen-only fifth arm) replaces the hard choices with soft ones:
@@ -111,15 +111,22 @@ rmsnorm(h_top + (h_top − u)/N) ≈ the bare top state: the model starts as
 approximately FBT-with-depth-routing and diverges only as payload routing
 sharpens [synthesis].
 
-**Standing source.** The fused input `u` is the sole standing source — the
-paper-faithful transplant of DAR's input-as-first-source pattern (their
-routers re-inject the diluted input at depth [paper]), applied to what is
-actually this column's input. Raw `e` and raw `p_prev` are deliberately
-absent from the spine: token identity reaching the stack only through the
-gate's multiplicative pattern is FBT's own working regime [paper], and
-ungated payload access belongs to DF-soft, where it is the measurement. On
-single-pass batches (no payload yet) the input, and hence the standing
-source, is plain `e`.
+**Sources.** The spine carries no standing sources: the source list is
+whatever the paper's variant at the active granularity uses — per-sublayer
+Delta AttnRes routes deltas only [paper] (and beat Delta Block at every
+scale without an input source [paper]), while Block granularity (the
+flagship) seeds the list with the input, Block-verbatim [paper] — which
+for us is `u`, so input re-injection at depth returns at the flagship
+exactly where the paper licenses it. This also makes the depth-routing
+module identical between the DAR arm and DF: their contrast isolates
+{gate, payload} with no source-list confound. Raw `e` and raw `p_prev` are
+deliberately absent from the spine: token identity reaching the stack only
+through the gate's multiplicative pattern is FBT's own working regime
+[paper], and ungated payload access belongs to DF-soft, where it is the
+measurement. The spine/DF-soft source asymmetry is principled: the hard
+arm is minimal mandatory machinery, the soft arm a maximal optional menu —
+its options are its measurement surface. On single-pass batches (no
+payload yet) the input is plain `e`.
 
 **The hard/soft design space, and DF-soft.** Entry (gated vs plain input)
 and routing nulls (absent vs present) span a design plane whose coherent
@@ -262,8 +269,9 @@ unknowable data mixture makes them incomparable as controls.
 - **Decode modes:** Standard/Soft/Fused on every feedback-bearing arm.
 - **Interpretability (first-class):** routing weights are direct
   observables. Spine: the payload router's distribution over deltas (what
-  rides the recurrence) and depth-routing weight on `u` (input
-  re-injection at depth). DF-soft: per-layer weight on `p_prev` (does a
+  rides the recurrence); at the flagship's Block granularity, depth weight
+  on the `u` seed (does the paper's embedding-prominence pattern migrate
+  to the fused input?). DF-soft: per-layer weight on `p_prev` (does a
   free model demand the previous column?), weight on `e`
   (embedding-prominence under recurrence), and null masses everywhere —
   the adoption readout, including the injection-form question. FBT's
