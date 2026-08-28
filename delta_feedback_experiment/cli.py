@@ -1,21 +1,83 @@
 """``df`` — the operator entry point.
 
 Model-lazy: subcommands import what they need, so ``df --help`` costs
-nothing and the spool can drive phases as separate processes.
+nothing and the spool worker drives phases as separate processes.
+Durable orchestration (queue, worker, status/watch/stop/clear) is the
+shared ``transformer_experiments.spool``; this module owns only the
+pipeline: a commit-cached offline probe, then the training run.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
+
+from transformer_experiments import spool
+
+ROOT = Path(__file__).resolve().parents[1]
 
 USAGE = """\
 df — delta-feedback experiment operator
 
-  df train TAG [FLAGS]     train one arm (see df train --help)
-  df tokenize [FLAGS]      build the fixed token stream (once)
-  df probe                 run the offline invariant suite
+  df train TAG [FLAGS]      train one arm directly (see df train --help)
+  df tokenize [FLAGS]       build the fixed token stream (once)
+  df probe                  run the offline invariant suite
+  df queue TAG [FLAGS]      append a training job to the detached spool
+  df queue FILE             append jobs from a file (TAG FLAGS per line)
+  df status                 print queue and recent-run state
+  df watch                  follow milestones until the queue is idle
+  df stop TAG|live|all [--at STEP]
+  df clear TAG|all          move an idle tag's artifacts to recovery
 """
+
+
+def _train_args(job: spool.Job) -> tuple[str, ...]:
+    return job.argv[0]
+
+
+def _resumes(job: spool.Job) -> bool:
+    return "--resume" in _train_args(job)
+
+
+def _validate_job(job: spool.Job) -> None:
+    from .train import build_parser
+
+    build_parser().parse_args([job.tag, *_train_args(job)])
+
+
+PIPELINE = spool.Pipeline(
+    slots=("train",),
+    validate=_validate_job,
+    phases=(
+        spool.Phase(
+            name="probe",
+            module="pytest",
+            argv=lambda job: ["tests", "-q"],
+            log="{tag}.probe.log",
+            cache=lambda job: job.commit,
+        ),
+        spool.Phase(
+            name="train run",
+            module="delta_feedback_experiment.train",
+            argv=lambda job: [job.tag, *_train_args(job)],
+            log="{tag}.log",
+            resume=_resumes,
+            telemetry=True,
+            report_exit=True,
+        ),
+    ),
+)
+
+LAYOUT = spool.Layout(
+    root=ROOT,
+    worker_module="delta_feedback_experiment.cli",
+    snapshot_dir=Path("runs"),
+)
+
+SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="df")
+
+STOP_PHASE = "train run"
 
 
 def tokenize_command(argv: list[str]) -> None:
@@ -43,7 +105,8 @@ def probe_command(argv: list[str]) -> None:
     import subprocess
 
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests", "-q", *argv], check=False
+        [sys.executable, "-m", "pytest", str(ROOT / "tests"), "-q", *argv],
+        check=False,
     )
     raise SystemExit(result.returncode)
 
@@ -54,7 +117,9 @@ def main() -> None:
         print(USAGE, end="")
         return
     command, rest = argv[0], argv[1:]
-    if command == "train":
+    if command == "_worker":
+        SPOOL.worker()
+    elif command == "train":
         from .train import train
 
         train(rest)
@@ -62,6 +127,19 @@ def main() -> None:
         tokenize_command(rest)
     elif command == "probe":
         probe_command(rest)
+    elif command == "queue":
+        SPOOL.queue_command(rest, resumes=_resumes)
+    elif command == "status":
+        SPOOL.status()
+    elif command == "watch":
+        SPOOL.watch()
+    elif command == "stop":
+        target, at = SPOOL.parse_stop(rest)
+        SPOOL.stop(target, at=at, phase=STOP_PHASE)
+    elif command == "clear":
+        if len(rest) != 1:
+            raise SystemExit("usage: df clear TAG|all")
+        SPOOL.clear(rest[0])
     else:
         print(USAGE, end="", file=sys.stderr)
         raise SystemExit(f"unknown command {command!r}")
