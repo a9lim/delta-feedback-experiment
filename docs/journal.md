@@ -3,6 +3,48 @@
 Disposable working space, periodically cleared. Keep only notes needed for
 active work; anything durable graduates to `design.md` or `findings.md`.
 
+## 2026-08-28 — harness complete; smoke live on jobe
+
+Second build block landed (commits through 80251df): data pipeline
+(uint32 memmap shards, val-first layout, revision-pinned FineWeb-Edu
+stream, row-addressed reader), NorMuon implemented from arXiv:2510.05491
+(added to refs.yaml) + Adam split, WSD via the shared Schedule with
+AdamC wd-decay and cooldown z-loss, trainer with keyed derived
+randomness (pass counts per step, prefix/jitter per microbatch — arms
+must share data_seed/batch_rows/micro_rows), chunked+checkpointed head
+loss (vocab 151936 logits were the memory hog), telemetry/checkpoints/
+runs integration with **bit-exact resume** (tested), block-level
+activation checkpointing (parity-tested), and `df` CLI with the shared
+spool queue. 31 offline invariants green on Mac and jobe.
+
+Operational state on jobe (all under `df status` / logs/):
+
+- `/data/df/tokens-smoke`: 420M train + 30M val, Qwen3 tokenizer,
+  fineweb-edu sample-100BT @ 87f09149, eos 151645. Tokenizer throughput
+  ~3M tok/s single-process.
+- `/data/df/tokens`: full 35B stream tokenizing in background (~3.5h).
+  Same revision → must be a byte-prefix superset of the smoke stream
+  (check with cmp when done — standing determinism check).
+- Queue: `smoke-v1` (vanilla, 1100 steps = DAR's 0.33B-token budget at
+  our geometry) running — init loss 11.96 ≈ ln(151936) sane, 14–18k
+  tok/s, 7.3G peak; `smoke-df1` (df, same budget; feedback phase covers
+  final 275 steps) queued behind it.
+- GPU is shared with an active recirculated-dot run (~8.5G). Its 9.5h
+  direct invocation ended (DONE 08:24:17, *before* our first GPU
+  allocation ~08:25:30) and was immediately re-queued `--resume` under
+  its own spool at 08:25:24 — looks like concurrent operator action on
+  that experiment, not our interference; no OOM/traceback in its logs.
+  Contention costs us ~20% (17.8k → 14.2k tok/s).
+
+Screen projection from measured smoke throughput: 2B tokens ≈ 39h/run
+vanilla-solo at 14k tok/s, likely ~2× for DF pre-optimization — the
+Codex optimization pass (compile, flash-attn, fused draws) matters
+before the screen. No torch.compile yet by design: correctness first.
+
+Pending: smoke gates (loss sanity vs DAR's 220M numbers, routing
+sharpness rising, DF contraction telemetry), Codex handoff, monitor
+page, root-repo submodule pointer bump.
+
 ## 2026-08-28 — build forks resolved; DAR code archaeology
 
 Pre-build fork review with a9; all four resolved and recorded in design/
