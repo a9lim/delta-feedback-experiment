@@ -346,6 +346,9 @@ def train(argv: list[str] | None = None) -> dict:
             n_passes = 1
             if model.cfg.feedback_active:
                 n_passes = draw_passes(args, step, total)
+            # A k-pass step holds all k activation graphs at once; checkpoint
+            # those unconditionally (--grad-checkpoint forces it for k=1 too).
+            model.grad_checkpoint = args.grad_checkpoint or n_passes > 1
 
             step_loss = 0.0
             pass1_loss = 0.0

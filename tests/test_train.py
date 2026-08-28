@@ -161,6 +161,38 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
         run(tmp_path, "conf", ["--arm", "df", "--resume", "--dim", "64"])
 
 
+def test_multipass_checkpoint_parity():
+    """Multi-pass steps checkpoint unconditionally (the k>=2 graphs OOM'd
+    the 4090 otherwise); loss and grads must match the plain path."""
+    from delta_feedback_experiment.model import (
+        DFModel, arm_config, multipass, multipass_loss,
+    )
+    cfg = arm_config(
+        "df", vocab_size=97, dim=32, layers=2, heads=2, kv_heads=1,
+        head_dim=16, intermediate=64, max_seq_len=17,
+    )
+    torch.manual_seed(0)
+    tokens = torch.randint(0, 97, (2, 17))
+    prefix = torch.ones((1, 2), dtype=torch.long)
+
+    def run(flag):
+        torch.manual_seed(1)
+        model = DFModel(cfg)
+        model.grad_checkpoint = flag
+        outs = multipass(model, tokens, 2, prefix_lens=prefix)
+        loss, _ = multipass_loss(model, tokens, outs)
+        loss.backward()
+        grads = torch.cat([
+            p.grad.flatten() for p in model.parameters() if p.grad is not None
+        ])
+        return loss.item(), grads
+
+    plain_loss, plain_grads = run(False)
+    checked_loss, checked_grads = run(True)
+    assert checked_loss == pytest.approx(plain_loss, rel=1e-6)
+    assert torch.allclose(plain_grads, checked_grads, rtol=1e-5, atol=1e-7)
+
+
 def test_grad_checkpoint_matches(tmp_path):
     plain = run(tmp_path, "gc-off", ["--arm", "df", "--max-steps", "3"])
     checked = run(tmp_path, "gc-on", ["--arm", "df", "--max-steps", "3",
