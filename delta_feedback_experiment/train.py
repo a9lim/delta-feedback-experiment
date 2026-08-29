@@ -518,6 +518,10 @@ def train(argv: list[str] | None = None) -> dict:
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(argv)
     device = pick_device(args.device)
+    if device.type == "cuda":
+        # Ada's TF32 tensor cores materially accelerate NorMuon's FP32 batched
+        # Newton-Schulz products; the trunk itself runs BF16 under autocast.
+        torch.set_float32_matmul_precision("high")
 
     start_step = 0
     payload = None
