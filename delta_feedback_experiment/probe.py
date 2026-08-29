@@ -19,6 +19,7 @@ def cuda_gate() -> None:
 
     from .model import (
         DFModel,
+        KVCache,
         arm_config,
         flash_attn_func,
         linear_cross_entropy_apply,
@@ -28,6 +29,49 @@ def cuda_gate() -> None:
 
     if flash_attn_func is None or linear_cross_entropy_apply is None:
         raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
+
+    # Exercise both FlashAttention entry points: full causal attention and the
+    # in-place native GQA KV cache. BF16 changes with block partitioning, so the
+    # invariant is close recurrence rather than bit identity.
+    decode_cfg = arm_config(
+        "vanilla",
+        vocab_size=1000,
+        dim=128,
+        layers=3,
+        heads=4,
+        kv_heads=2,
+        head_dim=32,
+        intermediate=256,
+        max_seq_len=16,
+    )
+    torch.manual_seed(0)
+    decode_model = DFModel(decode_cfg).cuda().eval()
+    decode_tokens = torch.randint(0, 1000, (2, 12), device="cuda")
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        full = decode_model.forward_column(
+            decode_model.embed_tokens(decode_tokens)
+        ).h_top
+        cache = KVCache(decode_cfg, 2, "cuda", torch.bfloat16)
+        prefill = decode_model.forward_column(
+            decode_model.embed_tokens(decode_tokens[:, :5]), cache=cache
+        )
+        pieces = [prefill.h_top]
+        for column in range(5, decode_tokens.shape[1]):
+            pieces.append(
+                decode_model.step(
+                    decode_tokens[:, column : column + 1], None, cache
+                ).h_top
+            )
+        incremental = torch.cat(pieces, dim=1)
+    decode_rel = (
+        torch.linalg.vector_norm((full - incremental).float())
+        / torch.linalg.vector_norm(full.float())
+    ).item()
+    if decode_rel >= 0.02:
+        raise AssertionError(f"FlashAttention cache parity drift: {decode_rel:.4f}")
+    del decode_model, decode_tokens, full, cache, prefill, pieces, incremental
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
 
     args = build_parser().parse_args(["cuda-probe", "--arm", "df"])
     schedule = build_schedule(args)
@@ -111,7 +155,8 @@ def cuda_gate() -> None:
     print(
         "cuda gate | "
         f"prepare={prepared:.1f}s | peak={capture_peak:.2f}GiB | "
-        f"graphs={len(runner.states)} | " + " | ".join(records)
+        f"decode_rel={decode_rel:.4f} | graphs={len(runner.states)} | "
+        + " | ".join(records)
     )
 
 

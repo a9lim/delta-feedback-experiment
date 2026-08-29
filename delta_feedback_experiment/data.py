@@ -72,8 +72,12 @@ def tokenize(
     )
 
     telemetry.log(
-        "tokenize", dataset=dataset, config=config, tokenizer=tokenizer_name,
-        target=target_tokens, val=val_tokens,
+        "tokenize",
+        dataset=dataset,
+        config=config,
+        tokenizer=tokenizer_name,
+        target=target_tokens,
+        val=val_tokens,
     )
 
     written = 0  # total tokens emitted (val + train)
@@ -201,8 +205,15 @@ class TokenData:
         return tensor.to(device) if device is not None else tensor
 
 
-def write_synthetic(directory: str | Path, *, train_tokens: int, val_tokens: int,
-                    vocab: int = 97, seed: int = 0, shards: int = 2) -> None:
+def write_synthetic(
+    directory: str | Path,
+    *,
+    train_tokens: int,
+    val_tokens: int,
+    vocab: int = 97,
+    seed: int = 0,
+    shards: int = 2,
+) -> None:
     """A tiny fake corpus for offline tests and smoke runs."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -210,15 +221,27 @@ def write_synthetic(directory: str | Path, *, train_tokens: int, val_tokens: int
     rng.integers(0, vocab, val_tokens, dtype=np.uint32).tofile(directory / "val.bin")
     per_shard = train_tokens // shards
     for index in range(shards):
-        count = per_shard if index < shards - 1 else train_tokens - per_shard * (shards - 1)
+        count = (
+            per_shard if index < shards - 1 else train_tokens - per_shard * (shards - 1)
+        )
         rng.integers(0, vocab, count, dtype=np.uint32).tofile(
             directory / f"train.{index:04d}.bin"
         )
-    (directory / META).write_text(json.dumps({
-        "tokenizer": "synthetic", "eos_id": 0, "dataset": "synthetic",
-        "config": None, "revision": None, "val_tokens": val_tokens,
-        "train_tokens": train_tokens, "vocab_size": vocab,
-    }, indent=2))
+    (directory / META).write_text(
+        json.dumps(
+            {
+                "tokenizer": "synthetic",
+                "eos_id": 0,
+                "dataset": "synthetic",
+                "config": None,
+                "revision": None,
+                "val_tokens": val_tokens,
+                "train_tokens": train_tokens,
+                "vocab_size": vocab,
+            },
+            indent=2,
+        )
+    )
 
 
 def read_meta(directory: str | Path) -> dict:
