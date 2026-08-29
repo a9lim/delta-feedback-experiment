@@ -551,123 +551,206 @@ def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
     return sources + (sources[-1],) * (MAX_ROUTE_SOURCES - len(sources))
 
 
-class _BespokeRoute(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
+def _route_forward_impl(
+    projected: Tensor,
+    present: Tensor,
+    sources: list[Tensor],
+    null_first: bool,
+    eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    n_sources = len(sources)
+    batch, length, dim = sources[0].shape
+    bt = batch * length
+    padded = _padded_sources(tuple(sources))
+    logits = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
+    inv_rms = torch.empty_like(logits)
+    weights = torch.empty_like(logits)
+    routed = torch.empty_like(sources[0], memory_format=torch.contiguous_format)
+    block_d = triton.next_power_of_2(dim)
+    has_present = present.numel() > 0
+    present_arg = present if has_present else sources[0]
+    _route_logits_kernel[(bt,)](
+        *padded,
+        projected,
+        present_arg,
+        logits,
+        inv_rms,
+        bt=bt,
+        dim=dim,
+        eps=eps,
+        n_sources=n_sources,
+        has_present=has_present,
+        null_first=null_first,
+        block_d=block_d,
+        num_warps=8,
+    )
+    _route_softmax_kernel[(bt,)](
+        logits,
+        weights,
+        bt=bt,
+        n_sources=n_sources,
+        block_n=triton.next_power_of_2(n_sources),
+        num_warps=1,
+    )
+    mix_block = 256
+    _route_mix_kernel[(bt, triton.cdiv(dim, mix_block))](
+        *padded,
+        weights,
+        routed,
+        bt=bt,
+        dim=dim,
+        n_sources=n_sources,
+        null_first=null_first,
+        block_d=mix_block,
+        num_warps=4,
+    )
+    return routed, weights.view(n_sources, batch, length), inv_rms
+
+
+def _route_backward_impl(
+    projected: Tensor,
+    grad_routed: Tensor,
+    weights: Tensor,
+    inv_rms: Tensor,
+    sources: list[Tensor],
+    null_first: bool,
+) -> tuple[Tensor, list[Tensor]]:
+    grad_routed = grad_routed.contiguous()
+    batch, length, dim = sources[0].shape
+    bt = batch * length
+    n_sources = len(sources)
+    flat_weights = weights.view(n_sources, bt)
+    padded = _padded_sources(tuple(sources))
+    beta = torch.empty_like(flat_weights)
+    block_d = triton.next_power_of_2(dim)
+    _route_beta_kernel[(bt,)](
+        *padded,
+        grad_routed,
+        flat_weights,
+        beta,
+        bt=bt,
+        dim=dim,
+        n_sources=n_sources,
+        null_first=null_first,
+        block_d=block_d,
+        block_n=triton.next_power_of_2(n_sources),
+        num_warps=8,
+    )
+    source_grads = [
+        torch.empty(source.shape, device=source.device, dtype=source.dtype)
+        for source in sources
+    ]
+    padded_grads = tuple(source_grads) + (source_grads[-1],) * (
+        MAX_ROUTE_SOURCES - n_sources
+    )
+    grad_projected_tokens = torch.empty_like(
+        sources[0], memory_format=torch.contiguous_format
+    )
+    grad_block = 256
+    _route_backward_kernel[(bt, triton.cdiv(dim, grad_block))](
+        *padded,
+        *padded_grads,
+        projected,
+        grad_routed,
+        flat_weights,
+        inv_rms,
+        beta,
+        grad_projected_tokens,
+        bt=bt,
+        dim=dim,
+        n_sources=n_sources,
+        null_first=null_first,
+        block_d=grad_block,
+        num_warps=4,
+    )
+    grad_projected = grad_projected_tokens.sum(dim=(0, 1)).to(projected.dtype)
+    return grad_projected, source_grads
+
+
+if triton is not None:
+
+    @torch.library.custom_op(
+        "delta_feedback::route_forward", mutates_args=(), device_types="cuda"
+    )
+    def _route_forward_op(
         projected: Tensor,
-        present: Tensor | None,
+        present: Tensor,
+        sources: list[Tensor],
         null_first: bool,
         eps: float,
-        *sources: Tensor,
-    ):
-        if triton is None:  # pragma: no cover - guarded by the public wrapper
-            raise RuntimeError("Triton is unavailable")
-        n_sources = len(sources)
-        batch, length, dim = sources[0].shape
-        bt = batch * length
-        padded = _padded_sources(tuple(sources))
-        logits = torch.empty(
-            (n_sources, bt), device=projected.device, dtype=torch.float32
-        )
-        inv_rms = torch.empty_like(logits)
-        weights = torch.empty_like(logits)
-        routed = torch.empty_like(sources[0], memory_format=torch.contiguous_format)
-        block_d = triton.next_power_of_2(dim)
-        present_arg = present if present is not None else sources[0]
-        _route_logits_kernel[(bt,)](
-            *padded,
-            projected,
-            present_arg,
-            logits,
-            inv_rms,
-            bt=bt,
-            dim=dim,
-            eps=eps,
-            n_sources=n_sources,
-            has_present=present is not None,
-            null_first=null_first,
-            block_d=block_d,
-            num_warps=8,
-        )
-        _route_softmax_kernel[(bt,)](
-            logits,
-            weights,
-            bt=bt,
-            n_sources=n_sources,
-            block_n=triton.next_power_of_2(n_sources),
-            num_warps=1,
-        )
-        mix_block = 256
-        _route_mix_kernel[(bt, triton.cdiv(dim, mix_block))](
-            *padded,
-            weights,
-            routed,
-            bt=bt,
-            dim=dim,
-            n_sources=n_sources,
-            null_first=null_first,
-            block_d=mix_block,
-            num_warps=4,
-        )
-        ctx.save_for_backward(projected, weights, inv_rms, *sources)
-        ctx.null_first = null_first
-        ctx.shape = (bt, dim)
-        return routed, weights.view(n_sources, batch, length)
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return _route_forward_impl(projected, present, sources, null_first, eps)
 
-    @staticmethod
-    def backward(ctx, grad_routed: Tensor, _grad_weights: Tensor | None):
+    @_route_forward_op.register_fake
+    def _route_forward_fake(
+        projected: Tensor,
+        present: Tensor,
+        sources: list[Tensor],
+        null_first: bool,
+        eps: float,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        del present, null_first, eps
+        batch, length, _ = sources[0].shape
+        aux_shape = (len(sources), batch, length)
+        routed = torch.empty_like(sources[0])
+        weights = torch.empty(aux_shape, device=projected.device, dtype=torch.float32)
+        inv_rms = torch.empty(aux_shape, device=projected.device, dtype=torch.float32)
+        return routed, weights, inv_rms
+
+    @torch.library.custom_op(
+        "delta_feedback::route_backward", mutates_args=(), device_types="cuda"
+    )
+    def _route_backward_op(
+        projected: Tensor,
+        grad_routed: Tensor,
+        weights: Tensor,
+        inv_rms: Tensor,
+        sources: list[Tensor],
+        null_first: bool,
+    ) -> tuple[Tensor, list[Tensor]]:
+        return _route_backward_impl(
+            projected, grad_routed, weights, inv_rms, sources, null_first
+        )
+
+    @_route_backward_op.register_fake
+    def _route_backward_fake(
+        projected: Tensor,
+        grad_routed: Tensor,
+        weights: Tensor,
+        inv_rms: Tensor,
+        sources: list[Tensor],
+        null_first: bool,
+    ) -> tuple[Tensor, list[Tensor]]:
+        del grad_routed, weights, inv_rms, null_first
+        return torch.empty_like(projected), [
+            torch.empty_like(source) for source in sources
+        ]
+
+    def _route_setup_context(ctx, inputs, output) -> None:
+        projected, _present, sources, null_first, _eps = inputs
+        _routed, weights, inv_rms = output
+        ctx.save_for_backward(projected, weights, inv_rms, *sources)
+        ctx.n_sources = len(sources)
+        ctx.null_first = null_first
+        ctx.mark_non_differentiable(weights, inv_rms)
+
+    def _route_autograd_backward(ctx, grad_routed, _grad_weights, _grad_inv_rms):
         projected, weights, inv_rms, *sources = ctx.saved_tensors
-        # Addition and reduction consumers may return a strided view. Triton
-        # receives raw pointers, so normalize the upstream layout explicitly.
-        grad_routed = grad_routed.contiguous()
-        bt, dim = ctx.shape
-        n_sources = len(sources)
-        padded = _padded_sources(tuple(sources))
-        beta = torch.empty_like(weights)
-        block_d = triton.next_power_of_2(dim)
-        _route_beta_kernel[(bt,)](
-            *padded,
-            grad_routed,
-            weights,
-            beta,
-            bt=bt,
-            dim=dim,
-            n_sources=n_sources,
-            null_first=ctx.null_first,
-            block_d=block_d,
-            block_n=triton.next_power_of_2(n_sources),
-            num_warps=8,
-        )
-        source_grads = tuple(
-            torch.empty(source.shape, device=source.device, dtype=source.dtype)
-            for source in sources
-        )
-        padded_grads = source_grads + (source_grads[-1],) * (
-            MAX_ROUTE_SOURCES - n_sources
-        )
-        grad_projected_tokens = torch.empty_like(
-            sources[0], memory_format=torch.contiguous_format
-        )
-        grad_block = 256
-        _route_backward_kernel[(bt, triton.cdiv(dim, grad_block))](
-            *padded,
-            *padded_grads,
+        grad_projected, source_grads = _route_backward_op(
             projected,
             grad_routed,
             weights,
             inv_rms,
-            beta,
-            grad_projected_tokens,
-            bt=bt,
-            dim=dim,
-            n_sources=n_sources,
-            null_first=ctx.null_first,
-            block_d=grad_block,
-            num_warps=4,
+            list(sources),
+            ctx.null_first,
         )
-        grad_projected = grad_projected_tokens.sum(dim=(0, 1)).to(projected.dtype)
-        return grad_projected, None, None, None, *source_grads
+        return grad_projected, None, source_grads, None, None
+
+    _route_forward_op.register_autograd(
+        _route_autograd_backward, setup_context=_route_setup_context
+    )
+else:  # pragma: no cover - the Mac never enters the CUDA route.
+    _route_forward_op = None
 
 
 def bespoke_route(
@@ -680,7 +763,15 @@ def bespoke_route(
     """RMS-key softmax route with fixed-capacity Triton forward/backward."""
     if triton is None or not projected.is_cuda:
         raise RuntimeError("bespoke_route requires Triton CUDA")
-    return _BespokeRoute.apply(projected, present, null_first, eps, *sources)
+    present_arg = (
+        present
+        if present is not None
+        else torch.empty(0, device=projected.device, dtype=torch.bool)
+    )
+    routed, weights, _inv_rms = _route_forward_op(
+        projected, present_arg, list(sources), null_first, eps
+    )
+    return routed, weights
 
 
 __all__ = ["MAX_ROUTE_SOURCES", "bespoke_route", "triton"]
