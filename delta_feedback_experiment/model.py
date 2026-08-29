@@ -470,7 +470,11 @@ _compiled_block = torch.compile(
     _block_for_checkpoint,
     fullgraph=True,
     dynamic=True,
-    mode="max-autotune-no-cudagraphs",
+    # The complete block has many lifted GEMMs and source-count variants.
+    # Default Inductor still fuses every surrounding pointwise epilogue while
+    # avoiding a >10 minute exhaustive GEMM search already covered well by
+    # cuBLAS/FlashAttention on Ada. The outer trainer owns CUDA capture.
+    mode="default",
 )
 
 
