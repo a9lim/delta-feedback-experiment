@@ -36,6 +36,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+try:  # Triton is deliberately a CUDA-only optimization dependency.
+    from .cuda_kernels import bespoke_route
+    from .cuda_kernels import triton as route_triton
+except (ImportError, OSError):  # pragma: no cover - portable fallback
+    bespoke_route = None
+    route_triton = None
+
 try:  # CUDA-only wheels; CPU/MPS retain the exact portable fallbacks.
     from flash_attn import flash_attn_func, flash_attn_with_kvcache
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
@@ -381,7 +388,18 @@ class Router(nn.Module):
                     for mask in masks
                 ]
             )
-        if sources[0].is_cuda:
+        if sources[0].is_cuda and route_triton is not None:
+            projected = (self.query.float() * self.key_norm.weight.float()).to(
+                sources[0].dtype
+            )
+            routed, weights = bespoke_route(
+                projected,
+                present,
+                self.null is not None,
+                self.key_norm.eps,
+                tuple(sources),
+            )
+        elif sources[0].is_cuda:
             routed, weights = _compiled_route_sources(
                 self.query,
                 self.key_norm.weight,

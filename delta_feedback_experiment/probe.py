@@ -17,10 +17,13 @@ def cuda_gate() -> None:
     """Capture and replay every default DF mode at full screen geometry."""
     from torch._dynamo.utils import counters
 
+    from .cuda_kernels import bespoke_route
+    from .cuda_kernels import triton as route_triton
     from .model import (
         DFModel,
         KVCache,
         _fixed_cce_z,
+        _route_sources,
         arm_config,
         flash_attn_func,
         linear_cross_entropy_apply,
@@ -30,6 +33,56 @@ def cuda_gate() -> None:
 
     if flash_attn_func is None or linear_cross_entropy_apply is None:
         raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
+    if route_triton is None:
+        raise RuntimeError("Jobe gate requires the bespoke Triton router")
+
+    # The fixed-capacity router must match the semantic implementation in both
+    # values and its source/query gradient.  Use a masked source to cover the
+    # DF-soft prefix mixin instead of benchmarking only the dense DAR case.
+    torch.manual_seed(7)
+    route_query = torch.randn(48, device="cuda", dtype=torch.float32).requires_grad_()
+    route_key = torch.randn(48, device="cuda", dtype=torch.float32).requires_grad_()
+    route_sources = tuple(
+        torch.randn(3, 11, 48, device="cuda", dtype=torch.bfloat16).requires_grad_()
+        for _ in range(6)
+    )
+    route_present = torch.rand(6, 3, 11, device="cuda") > 0.2
+    route_present[0] = True
+    projected = (route_query * route_key).to(torch.bfloat16)
+    routed, route_weights = bespoke_route(
+        projected, route_present, False, 1e-6, route_sources
+    )
+    route_loss = routed.float().square().mean()
+    route_loss.backward()
+    route_grads = (
+        route_query.grad.clone(),
+        route_key.grad.clone(),
+        *(source.grad.clone() for source in route_sources),
+    )
+    ref_query = route_query.detach().clone().requires_grad_()
+    ref_key = route_key.detach().clone().requires_grad_()
+    ref_sources = tuple(
+        source.detach().clone().requires_grad_() for source in route_sources
+    )
+    ref_routed, ref_weights = _route_sources(
+        ref_query, ref_key, 1e-6, route_present, *ref_sources
+    )
+    ref_routed.float().square().mean().backward()
+    ref_grads = (
+        ref_query.grad,
+        ref_key.grad,
+        *(source.grad for source in ref_sources),
+    )
+    if not torch.allclose(routed, ref_routed, rtol=3e-2, atol=3e-3):
+        raise AssertionError("bespoke router value drift")
+    if not torch.allclose(route_weights, ref_weights, rtol=3e-2, atol=3e-3):
+        raise AssertionError("bespoke router weight drift")
+    for actual, expected in zip(route_grads, ref_grads, strict=True):
+        if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
+            raise AssertionError("bespoke router gradient drift")
+    del route_query, route_key, route_sources, route_present, projected
+    del routed, route_weights, route_loss, route_grads
+    del ref_query, ref_key, ref_sources, ref_routed, ref_weights, ref_grads
 
     # CCE-native z-loss must retain the full-logit scalar and gradient semantics
     # while never constructing the classifier-wide activation in the real path.
