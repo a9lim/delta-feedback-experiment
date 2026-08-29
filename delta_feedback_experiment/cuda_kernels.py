@@ -97,19 +97,18 @@ if triton is not None:
             s25,
             s26,
         )
-        for index, source in enumerate(sources):
-            if index < n_sources:
-                base = 0 if null_first and index == 0 else token * dim
-                value = tl.load(source + base + offsets, mask=mask, other=0.0).to(
-                    tl.float32
-                )
-                inverse = tl.rsqrt(tl.sum(value * value, axis=0) / dim + eps)
-                score = tl.sum(value * p, axis=0) * inverse
-                if has_present:
-                    exists = tl.load(present + index * bt + token)
-                    score = tl.where(exists, score, -float("inf"))
-                tl.store(logits + index * bt + token, score)
-                tl.store(inv_rms + index * bt + token, inverse)
+        for index in range(n_sources):
+            base = 0 if null_first and index == 0 else token * dim
+            value = tl.load(sources[index] + base + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            inverse = tl.rsqrt(tl.sum(value * value, axis=0) / dim + eps)
+            score = tl.sum(value * p, axis=0) * inverse
+            if has_present:
+                exists = tl.load(present + index * bt + token)
+                score = tl.where(exists, score, -float("inf"))
+            tl.store(logits + index * bt + token, score)
+            tl.store(inv_rms + index * bt + token, inverse)
 
     @triton.jit
     def _route_softmax_kernel(
@@ -199,12 +198,11 @@ if triton is not None:
             s25,
             s26,
         )
-        for index, source in enumerate(sources):
-            if index < n_sources:
-                base = 0 if null_first and index == 0 else token * dim
-                value = tl.load(source + base + offsets, mask=mask, other=0.0)
-                weight = tl.load(weights + index * bt + token)
-                total += value * weight
+        for index in range(n_sources):
+            base = 0 if null_first and index == 0 else token * dim
+            value = tl.load(sources[index] + base + offsets, mask=mask, other=0.0)
+            weight = tl.load(weights + index * bt + token)
+            total += value * weight
         tl.store(routed + token * dim + offsets, total, mask=mask)
 
     @triton.jit
@@ -284,14 +282,13 @@ if triton is not None:
             s25,
             s26,
         )
-        for index, source in enumerate(sources):
-            if index < n_sources:
-                base = 0 if null_first and index == 0 else token * dim
-                value = tl.load(source + base + d_offsets, mask=d_mask, other=0.0).to(
-                    tl.float32
-                )
-                dot = tl.sum(grad * value, axis=0)
-                products = tl.where(n_offsets == index, dot, products)
+        for index in range(n_sources):
+            base = 0 if null_first and index == 0 else token * dim
+            value = tl.load(
+                sources[index] + base + d_offsets, mask=d_mask, other=0.0
+            ).to(tl.float32)
+            dot = tl.sum(grad * value, axis=0)
+            products = tl.where(n_offsets == index, dot, products)
         route_weights = tl.load(
             weights + n_offsets * bt + token, mask=n_mask, other=0.0
         )
@@ -438,21 +435,20 @@ if triton is not None:
             g25,
             g26,
         )
-        for index, (source, grad_source) in enumerate(zip(sources, gradients)):
-            if index < n_sources:
-                source_base = 0 if null_first and index == 0 else token * dim
-                value = tl.load(
-                    source + source_base + offsets, mask=mask, other=0.0
-                ).to(tl.float32)
-                weight = tl.load(weights + index * bt + token)
-                route_beta = tl.load(beta + index * bt + token)
-                inverse = tl.load(inv_rms + index * bt + token)
-                score = tl.load(logits + index * bt + token)
-                source_grad = weight * upstream + route_beta * (
-                    p * inverse - score * inverse * inverse * value / dim
-                )
-                tl.store(grad_source + token * dim + offsets, source_grad, mask=mask)
-                grad_p += route_beta * value * inverse
+        for index in range(n_sources):
+            source_base = 0 if null_first and index == 0 else token * dim
+            value = tl.load(
+                sources[index] + source_base + offsets, mask=mask, other=0.0
+            ).to(tl.float32)
+            weight = tl.load(weights + index * bt + token)
+            route_beta = tl.load(beta + index * bt + token)
+            inverse = tl.load(inv_rms + index * bt + token)
+            score = tl.load(logits + index * bt + token)
+            source_grad = weight * upstream + route_beta * (
+                p * inverse - score * inverse * inverse * value / dim
+            )
+            tl.store(gradients[index] + token * dim + offsets, source_grad, mask=mask)
+            grad_p += route_beta * value * inverse
         tl.store(grad_projected + token * dim + offsets, grad_p, mask=mask)
 
 
