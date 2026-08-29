@@ -1,14 +1,12 @@
-"""The FBT-binding optimizer stack: NorMuon for hidden matrices, Adam
-for everything else, under a WSD schedule with AdamC-style weight-decay
-decay in cooldown.
+"""The experiment optimizer stack: NorMuon for hidden matrices and Adam
+for everything else under WSD with cooldown weight-decay scaling.
 
 NorMuon (arXiv:2510.05491): EMA momentum, Newton-Schulz
 orthogonalization, then neuron-wise (row) second-moment normalization
 and a global rescale to Frobenius norm 0.2·sqrt(m·n) — the row moments
-shape *relative* row magnitudes while the rescale fixes the overall
-update RMS at 0.2, so no bias correction is needed.  FBT's published
-hyperparameters (lr 1e-2, wd 0.01) are the binding defaults here, not
-the NorMuon paper's own.
+shape *relative* row magnitudes while the rescale fixes the overall update
+RMS at 0.2, so no bias correction is needed. The registered defaults are
+learning rate 1e-2 and weight decay 0.01.
 """
 
 from __future__ import annotations
@@ -277,9 +275,8 @@ def apply_schedule(
 ) -> float:
     """Set per-group lr (and AdamC-decayed wd in cooldown) at one step.
 
-    Returns the NorMuon lr for telemetry.  Weight decay follows the
-    learning rate down during cooldown only (Defazio's AdamC, as FBT
-    applies it); warmup keeps the full stable decay.
+    Returns the NorMuon lr for telemetry. Weight decay follows the learning
+    rate down during cooldown only; warmup keeps the full stable decay.
     """
     in_cooldown = schedule.phase(step)[0] == "cooldown"
     lead = None

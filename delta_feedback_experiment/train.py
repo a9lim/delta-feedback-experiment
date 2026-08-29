@@ -376,8 +376,8 @@ class CudaGraphTrainer:
             gradient.zero_()
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
-        # Capturing on a blocking stream cannot inherit unfinished legacy-
-        # stream writes from optimizer/kernel preparation.
+        # Capturing on a blocking stream cannot inherit unfinished
+        # default-stream writes from optimizer/kernel preparation.
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=pool):

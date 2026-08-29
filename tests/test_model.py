@@ -162,7 +162,7 @@ def test_routing_heads_can_select_different_sources():
     assert routed[..., 16:].mean() > 0.99
 
 
-def test_single_head_routing_and_old_arm_name_are_rejected():
+def test_single_head_routing_and_unknown_arm_are_rejected():
     with pytest.raises(ValueError, match="unknown arm"):
         arm_config("dar", **TINY)
     cfg = arm_config("mhdar", **(TINY | {"kv_heads": 1}))

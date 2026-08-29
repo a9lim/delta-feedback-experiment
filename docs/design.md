@@ -1,540 +1,598 @@
 # Design
 
-This file is the authoritative architecture and operating contract, and
-defines the current experiment only. Evidence lives in
-[findings.md](findings.md); disposable working notes in
-[journal.md](journal.md); source roles in
-[../references/refs.yaml](../references/refs.yaml). Confidence marks:
-[paper] = claim from a parent paper, [synthesis] = our reasoning on top,
-[speculation] = pre-registered bet.
+This document is the authoritative contract for the current experiment. It
+defines the model family, training recipe, comparisons, diagnostics, scale
+plan, and promotion gates. Accepted scientific evidence belongs in
+[findings.md](findings.md); active scratch work belongs in
+[journal.md](journal.md); primary source roles are indexed in
+[../references/refs.yaml](../references/refs.yaml).
 
-## Research question
+## Objective
 
-Autoregressive transformers under-route information along two axes of the
-(position t, layer l) compute lattice. **Multi-Head Delta Attention
-Residuals** (MHDAR, combining arXiv:2607.27230's headwise routing with
-arXiv:2605.18855's additive delta stream) widens the *vertical* axis: each
-sublayer routes additively over its own column's RMS-normed *deltas*, with an
-independent source softmax for each contiguous channel group. The query is
-still one zero-init D-vector reshaped into heads, so this adds no parameters
-over DAR [paper]. **Full-bandwidth transformers** (FBT,
-arXiv:2608.08888) widen the *horizontal* axis: the previous column's
-top-layer state is fed back to layer 0, fused with the sampled token
-embedding through an asymmetric GLU, so non-verbalized state re-enters the
-stack with a renewed depth budget [paper].
+The experiment tests two axes of information flow in an autoregressive
+transformer:
 
-- **Primary:** pretrained together from scratch, are the depth-axis and
-  time-axis widenings complementary or redundant?
-- **Secondary:** what happens when adoption is *free*? The screen-only
-  DF-soft arm makes both channels optional (null sources everywhere,
-  vanilla-reachable); its routing weights are a continuous readout of
-  channel demand — including the injection-form question FBT explicitly
-  leaves open [paper] — while the spine forces adoption and measures only
-  benefit.
+1. **Within-column depth routing.** Multi-Head Delta Attention Residuals
+   (MHDAR) let each sublayer read an additive mixture of the current column's
+   input seed and earlier residual deltas. Different contiguous feature groups
+   select depth sources independently.
+2. **Between-column latent feedback.** Full-Bandwidth Transformer (FBT)
+   feedback returns the previous column's top state to layer 0 of the next
+   column through a token-gated fusion, giving latent state another full pass
+   through depth.
 
-Pre-registered predictions [speculation]: a9 expects superadditive gains;
-Claude hedges toward additive-to-mildly-sub (the channels may partially
-substitute for the same limited per-column capacity). Either sign is a
-finding. If superadditivity is real it should concentrate in the
-Standard→Soft decoding gap on the same weights, since depth routing keeps
-early-layer information alive in the payload [synthesis]. For DF-soft,
-Claude predicts within-column adoption but payload-source non-adoption
-(performance ≈ the MHDAR arm) — the same-arm split being the
-committed-valley signature; DF-soft closing on DF instead would be the
-surprising result (the gate was never necessary).
+The primary question is whether these mechanisms are complementary,
+independent, or redundant when pretrained together. The primary four-cell
+factorial is:
 
-## Architecture
+| Arm | Within-column MHDAR | Latent feedback | Entry on feedback passes | Recurrent payload |
+|---|---:|---:|---|---|
+| `vanilla` | no | no | token embedding | none |
+| `mhdar` | yes | no | token embedding | none |
+| `fbt` | no | yes | mandatory FBT fusion | normalized top state |
+| `df` | yes | yes | mandatory FBT fusion | normalized top state plus routed deltas |
 
-One decode step of the full model at position t (trial configuration:
-per-sublayer sources). For source vectors `v_i in R^D`, `route(vs, q)` first
-computes a full-width `k_i = rmsnorm(v_i)`, then reshapes `q`, `k_i`, and
-`v_i` into `H x (D/H)`. Each head has its own source softmax,
-`w_i,h = softmax_i(q_h . k_i,h)`, and the returned D-vector concatenates
-`sum_i w_i,h v_i,h` over heads. Queries are zero-init. Every `rmsnorm` below
-is a per-site learnable full-width RMSNorm (weight-1 init). The authoritative
-rule is **H = number of KV heads**: H=4 for the 220M screen/ladder and H=8
-for the flagship. Routing groups are ordinary contiguous feature slices,
-not attention-projection groups, and H is not an experiment knob.
+`df_soft` is a separate screen diagnostic. It keeps a plain token entry and
+puts a zero-initialized learnable null source in every router so that
+within-column routing, previous-payload access, and payload enrichment can each
+be declined by routing mass. It tests adoption; it does not replace the hard
+hybrid in the factorial.
 
-```python
-# DF
-# <payload>─────┐  ┌────→(       sources      )→[route]→[+]────────→<payload>
-#               │  │ {   ↓        ↑   ↓       ↑  }       ↑
-#               │  │ {[route]     │[route]    │  }       │
-#               │  │ {   ↓        │   ↓       │  }       │
-#               │  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
-#               ↓  │ {   ↑        ↓   ↑       ↓  }       │
-# <embedding>→[GLU]┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
-e = embed(tok)
-u = rmsnorm(glu(p, e))  # FBT gate: W_U p * sigmoid(W_G rmsnorm(e))
-srcs = [u]  # input seed + deltas
-h = u
-for l in layers:
-    a = attn(rmsnorm(h + route(srcs, q_attn[l])))  # routed read
-    h = h + a
-    srcs.append(a)
-    m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))  # routed read
-    h = h + m
-    srcs.append(m)
-p = rmsnorm(h + route(srcs[1:], q_p))  # additive payload over deltas
-tok = sample(lm_head(rmsnorm(h)))
+The claim boundary is pretraining behavior under the registered recipe and
+data. No result is a general claim about recurrent transformers, depth routing,
+reasoning, or adaptive computation without a dedicated evaluation that supports
+that claim.
 
-# DF-soft
-# <payload>────────┬────→(       sources      )→[route]→[+]────────→<payload>
-#                  │ {   ↓        ↑   ↓       ↑  }       ↑
-#                  │ {[route]     │[route]    │  }       │
-#                  │ {   ↓        │   ↓       │  }       │
-#                  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
-#                  │ {   ↑        ↓   ↑       ↓  }       │
-# <embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
-e = embed(tok)
-srcs = [p, e]  # optional inputs + input seed + deltas
-h = e
-for l in layers:
-    a = attn(rmsnorm(h + route([null] + srcs, q_attn[l])))  # routed read
-    h = h + a
-    srcs.append(a)
-    m = mlp(rmsnorm(h + route([null] + srcs, q_mlp[l])))  # routed read
-    h = h + m
-    srcs.append(m)
-p = rmsnorm(h + route([null] + srcs[2:], q_p))  # optional delta enrichment
-tok = sample(lm_head(rmsnorm(h)))
+## Common transformer trunk
 
-# MHDAR
-#                  ┌────→(       sources      )
-#                  │ {   ↓        ↑   ↓       ↑  }
-#                  │ {[route]     │[route]    │  }
-#                  │ {   ↓        │   ↓       │  }
-#                  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }
-#                  │ {   ↑        ↓   ↑       ↓  }
-# <embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
-e = embed(tok)
-srcs = [e]  # input seed + deltas
-h = e
-for l in layers:
-    a = attn(rmsnorm(h + route(srcs, q_attn[l])))  # routed read
-    h = h + a
-    srcs.append(a)
-    m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))  # routed read
-    h = h + m
-    srcs.append(m)
-tok = sample(lm_head(rmsnorm(h)))
+Every arm uses one `DFModel` implementation and differs only through
+`ModelConfig` flags. The screen trunk is:
 
-# FBT
-# <payload>─────┐    {   ┌─→[Attn]┐   ┌─→[MLP]┐  }       ┌─────────→<payload>
-#               ↓    {   ↑        ↓   ↑       ↓  }       │
-# <embedding>→[GLU]─→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
-e = embed(tok)
-u = rmsnorm(glu(p, e))  # FBT gate: W_U p * sigmoid(W_G rmsnorm(e))
-h = u
-for l in layers:
-    a = attn(rmsnorm(h))
-    h = h + a
-    m = mlp(rmsnorm(h))
-    h = h + m
-p = rmsnorm(h)
-tok = sample(lm_head(rmsnorm(h)))
+| Field | Value |
+|---|---:|
+| Vocabulary | 151,936, Qwen3 tokenizer |
+| Width | 768 |
+| Layers | 12 |
+| Query heads | 8 |
+| KV heads | 4 |
+| Attention head width | 96 |
+| SwiGLU intermediate width | 3,072 |
+| Context / predicted tokens per row | 1,024 |
+| RoPE theta | 1,000,000 |
+| RMSNorm epsilon | 1e-6 |
+| Routing heads | 4, exactly the KV-head count |
 
-# Vanilla
-#                    {   ┌─→[Attn]┐   ┌─→[MLP]┐  }
-#                    {   ↑        ↓   ↑       ↓  }
-# <embedding>───────→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
-e = embed(tok)
-h = e
-for l in layers:
-    a = attn(rmsnorm(h))
-    h = h + a
-    m = mlp(rmsnorm(h))
-    h = h + m
-tok = sample(lm_head(rmsnorm(h)))
+The trunk is a bias-free pre-norm decoder with packed QKV projection, grouped
+query attention, per-head Q/K RMSNorm, rotary positions, packed SwiGLU
+gate/up projection, tied embedding/unembedding, and a final RMSNorm. Each
+attention and MLP branch output is scaled by `1/sqrt(2L)` before it is added to
+the residual stream. There is no dropout.
+
+Embedding weights and optimizer state remain FP32. Under CUDA autocast, the
+embedding output, residual stream, recurrent payload, and routed values are
+BF16. CPU and MPS use the same semantics through portable PyTorch operations.
+
+## MHDAR depth routing
+
+### Router
+
+For source vectors `v_i in R^D`, one routing site owns:
+
+- a learned query `q in R^D`, initialized to zero;
+- a learned RMS key scale `g in R^D`, initialized to one;
+- `H = kv_heads` contiguous feature groups of width `D/H`.
+
+The source key is normalized across the full width before the grouped score is
+formed:
+
+```text
+k_i = g * v_i / sqrt(mean(v_i^2) + eps)
+s_i,h = dot(q_h, k_i,h)
+a_i,h = softmax_i(s_i,h)
+route(v_1..v_N)_h = sum_i a_i,h * v_i,h
 ```
 
-**Depth routing (MHDAR side).** Before every attention and MLP sublayer, a
-zero-init learned D-vector per site supplies H routing queries. Each head
-routes its own source softmax and the concatenated convex mixtures are added
-to *that sublayer's input read* — a transient enrichment of the pre-norm
-input. Full-width RMS statistics are shared across heads; only the depth
-softmax and value mixture are headwise. The residual stream itself
-accumulates only sublayer outputs (paper Fig. 3 and released code both
-keep the stream clean [paper]); this is exactly what makes the
-decomposition telescope (seed + Σv = h_top). Keys are RMS-normed; values
-are raw. Zero-init makes every head uniform over sources at step 0, so routing
-is active from the start of training [paper]. Sources are
-per-sublayer deltas (2L per column) wherever affordable; the flagship
-coarsens to Delta-Block-style block deltas, supported by DAR's 533M
-ablation showing block-size insensitivity (PPL 31.18–31.27 across B=2–24)
-[paper].
+Keys are normalized; values are raw. There is no output projection and no
+`1/sqrt(head_dim)` score factor. Full-width RMS statistics couple the groups,
+while the source softmax and value mixture are independent per group. Splitting
+one width-`D` query into groups adds no query parameters relative to a
+single-head delta router.
 
-**Feedback channel (FBT side).** The payload from column t−1 enters column
-t one way: fused into the layer-0 input through FBT's asymmetric GLU
-(payload on the value path, token embedding as the gate). This closes the
-shortcut in which multi-pass losses are minimized by imitating the
-no-feedback pass and ignoring state [paper] — load-bearing under our
-schedule, where feedback passes arrive late, i.e. at an effectively
-well-trained checkpoint, exactly the regime where optional paths go
-unadopted (DenseFormer's committed valley; FBT's own rationale for the
-gate) [paper]. Ungated access and adoption-by-choice are DF-soft's job,
-not the spine's.
+Zero query initialization makes every active head uniform over its available
+sources. A hard router with fewer than two sources is a no-op. In `df_soft`, a
+learnable width-`D` null vector is prepended at every site; it is initialized to
+zero, so even the first attention site has two choices.
 
-**Payload.** The payload is the top state *plus* a multi-head softmax-routed
-combination of the column's delta sources under a dedicated learned query and
-full-width RMSNorm — MHDAR's additive routing applied at the cross-column site
-exactly as within the column: base signal preserved by default, routing
-re-weights on top. No null source: the routed enrichment carries
-fixed unit mass, forcing delta content into the recurrence (the hard
-philosophy; the gain dial and the regress-to-bare-FBT option live in
-DF-soft). Why keep the base: a pure routed mixture is structurally unable
-to transmit the full column state — softmax weights are convex, and h_top
-is the *sum* of the deltas, outside their convex hull — and repeats the
-replacement-routing pattern DAR shows fails within the column [synthesis];
-the base also keeps every delta on a direct cross-column gradient path
-even under sharp routing, preserving the multi-pass auxiliary-supervision
-mechanism [synthesis]. The payload router is *not* conditioned on the next
-token — the GLU already gates the payload elementwise. At zero-init the
-router is uniform over the N deltas, so the payload is
-rmsnorm(h_top + (h_top − u)/N) ≈ the bare top state: the model starts as
-approximately FBT-with-depth-routing and diverges only as payload routing
-sharpens [synthesis].
+### Sources and residual identity
 
-**Sources.** Every routed arm carries the *complete decomposition* of its
-stream: the source list is the column's input seed plus the per-sublayer
-deltas, telescoping to the full hidden state (seed + Σv = h_top). The seed
-is whatever the column's input actually is — `u` in DF, `e` in the MHDAR
-arm (`srcs = [e]`), `e` in DF-soft (already present). The paper's Figure-3
-pseudocode routes deltas only in the per-sublayer variant, an omission we
-read as unprincipled (their Block variant seeds with the embedding,
-completing the decomposition) — and their *released code* agrees: the
-per-sublayer `delta` mode seeds the source list with the layer-0 input
-before the first delta
-(`references/delta-attention-residuals-code/Attention-Residuals/modeling_qwen3_attnres.py`),
-so the published per-sublayer numbers were produced *with* the seed
-[paper]. Complete decomposition is therefore code-verbatim, not a
-departure. The seed also closes an observability gap at trial granularity:
-per-layer seed weight is the input-re-injection readout in every routed
-arm. The depth-routing module remains identical between the MHDAR arm and
-DF — only the seed's content differs, and that difference is entailed by
-the feedback apparatus itself. Raw `e` and raw `p` remain absent from
-the spine's list (token identity passes only through the gate's
-multiplicative pattern, FBT's own working regime [paper]; ungated payload
-access is DF-soft's measurement), and the spine/DF-soft asymmetry stays
-principled: minimal mandatory machinery vs a maximal optional menu. The
-payload router is deliberately exempt from the completeness rule — it
-routes deltas only, since a payload that re-amplifies its own carried
-input would open a self-reinforcing persistence loop across steps, and
-"what changed this column" is the enrichment's semantics [synthesis]. On
-single-pass batches (no payload yet) the spine's input, and hence its
-seed, is plain `e`.
+For a column input seed `s`, layer `l` produces scaled attention and MLP deltas
+`a_l` and `m_l`. The residual stream is always:
 
-**The hard/soft design space, and DF-soft.** Entry (gated vs plain input)
-and routing nulls (absent vs present) span a design plane whose coherent
-points are the diagonals: **hard-everywhere** — the spine above — forces
-maximal adoption of both mechanisms and cannot give either up;
-**soft-everywhere** makes both free choices and can regress all the way to
-a vanilla transformer. Mixed corners (e.g. gated entry with a null-sourced
-payload) trade coherence for site-local optimizations and are dominated by
-the pair [synthesis]. The spine must be hard: under the late-feedback
-schedule a soft feedback channel arrives at a well-trained checkpoint —
-the committed-valley regime where the parents' evidence predicts
-non-adoption. That prediction is itself worth testing, so **DF-soft** runs
-as a screen-only fifth arm:
+```text
+h_top = s + sum_l (a_l + m_l)
+```
 
-- `h = e`, no GLU anywhere — feedback is just one more routed source; one
-  primitive everywhere, no W_U/W_G.
-- Standing sources `[p, e]` — ungated payload access and raw token
-  re-injection, the two observables the spine gives up.
-- A null source in *every* router, within-column and payload — the model
-  can regress to vanilla, and every routing weight (null mass included) is
-  a continuous readout of channel demand.
+At the attention read in layer `l`, the available sources are the seed and all
+completed earlier deltas. At the MLP read, `a_l` is also available. A routed
+mixture is added only to that sublayer's pre-norm read:
 
-DF-soft contains its own control: within-column routing starts at step 0,
-while
-the `p` source structurally cannot appear before the late multi-pass
-batches — the same mechanism predicts opposite fates for the two channels
-in a single run. DF-soft is never a ladder candidate unless it matches DF
-outright, which would itself be a headline result (the gate was never
-necessary).
+```text
+x_attn = h + route(s, a_0, m_0, ..., m_(l-1))
+a_l = scale * attention(rmsnorm(x_attn))
+h = h + a_l
 
-**Scope boundaries.** Feeding multiple prev-column deltas as separate
-per-layer sources (the full-lattice variant), token-conditioned payload
-routing, and any cross-column access deeper than one step are *not* part of
-this design; each defines a different experiment. Revisit only with routing-
-weight evidence of unmet cross-column demand.
+x_mlp = h + route(s, a_0, m_0, ..., m_(l-1), a_l)
+m_l = scale * mlp(rmsnorm(x_mlp))
+h = h + m_l
+```
 
-## Training
+The routed value is not accumulated directly into `h`. This transient-read
+rule preserves the exact telescoping identity and makes every stored source a
+real component of the column state rather than another cumulative state.
 
-**Multi-pass regime.** FBT's Jacobi-style parallel training, unchanged:
-pass k shifts pass k−1's payloads one position right, fuses, and re-runs the
-stack (depth routing active) in parallel over positions; k passes train a
-(k−1)-step feedback horizon. NTP loss on every pass, no detach — gradients
-from later passes supervise earlier passes' states, which is part of FBT's
-data-efficiency mechanism [paper]. Prefix mixin (random plain-embedding
-prefix per pass) matches the prompt-then-generate structure of inference.
-Pass 1 of DF is the depth-routing model with no feedback (u = e, payload
-unused), so DF's Standard-decoding mode is an MHDAR transformer trained
-with an extra objective [synthesis].
+For `mhdar`, the seed is the token embedding `e`. For hard `df`, the seed is
+`e` on pass 1 and the fused input `u` on feedback passes. For `df_soft`, the
+stream seed is always `e`; the previous payload is an additional standing
+source only where the prefix mask marks it present.
 
-**Schedule.** Depth routing from step 0. Feedback passes late, default
-mixture 75% one-pass / 22% two-pass / 3% three-pass — the small three-pass
-fraction is what makes the learned feedback map a contraction rather than a
-divergence under self-composition [paper]. FBT does not publish *where*
-the feedback phase sits beyond "introduced progressively mid-training";
-our pin (provisional, a schedule knob): single-pass for the first 75% of
-each run's steps, then a stochastic 88/12 two-/three-pass mixture for the
-final 25% — reproducing the overall 75/22/3 fractions and coinciding with
-the WSD cooldown, so every ladder rung's pre-cooldown checkpoint is
-single-pass-trained and each cooldown branch learns feedback under its own
-decay, keeping rungs structurally comparable [synthesis]. Cost: feedback
-never trains at stable LR; if the contraction diagnostic or screen looks
-unhealthy, shifting feedback_start earlier is the first knob to turn. The
-contraction diagnostic (iterate fused prefill passes; watch
-||h(k) − h(k−1)|| and val loss) is a standing monitor during and after
-training. Adaptive pass-mixing triggered by that monitor is in scope if
-cheap.
+## FBT latent feedback
 
-**One recipe everywhere; FBT's is binding.** Every arm, including vanilla,
-trains under FBT's published recipe: NorMuon for matrices (lr 1e-2, wd
-0.01) + Adam for vectors (lr 5e-4), WSD schedule (200 warmup, 25% cooldown),
-z-loss 1e-5 and AdamC-style weight-decay decay in cooldown, jitter
-sigma=0.02 on the carried state, depth scaling for O(1) top-state norm
-(pinned: sublayer branch outputs scaled 1/√(2L) — FBT names the property,
-not the formula), tied embed/unembed. MHDAR module conventions (zero-init
-queries, full-width RMS-normed keys, headwise source softmaxes, raw values)
-nest inside. Divergences from the parent papers are
-recorded here when made. WSD permits extending token budgets for matched-
-compute baselines without re-warming.
+Let `e_t` be the sampled token embedding for column `t`, and let `p_(t-1)` be
+the payload produced by the previous column. Hard feedback arms construct the
+next column input as:
 
-**Authoritative CUDA numerics and execution.** Jobe training retains FP32
-master weights and optimizer state but makes the embedding output, residual
-stream, feedback payload, and route values explicitly BF16. QKV and SwiGLU
-gate/up weights are persistent packed matrices; this also makes each packed
-matrix one NorMuon object rather than several independently orthogonalized
-objects. FlashAttention handles training, prefill, GQA, and cached decoding.
-Each complete transformer block is a full-graph compiled unit around its
-FlashAttention calls. Routing is one fixed-capacity, zero-copy Triton custom
-operator over the source pointer list: full-width fused RMS-key scores,
-per-head masked source softmaxes, FP32 headwise value mixes, and an analytic
-backward with the correct cross-head RMS coupling, without a normalized or
-stacked source bank. CCE supplies CE and exact z-loss without materialized logits; the
-z-loss backward is folded into the same vocabulary sweep with an exact target-
-column correction. CUDA BF16 jitter is keyed by data seed, step, and row. TF32
-is enabled for NorMuon's batched FP32 Newton-Schulz products. These are
-intentional numerical divergences from the parent implementations; paired arms
-share the same optimized recipe and keyed streams.
+```text
+u_t = entry_norm(
+    W_U p_(t-1) * sigmoid(W_G gate_norm(e_t))
+)
+```
 
-Training captures a fixed-address forward/backward CUDA graph for every mode
-reachable under the exact schedule, after compilation and persistent optimizer
-state initialization. Fixed no-grad evaluation graphs share the training
-graph's private pool, so validation does not re-enter Python model execution.
-No compilation occurs in timed steps. The 4090 hard-DF screen runs k=1, k=2,
-and k=3 without activation checkpointing; DF-soft checkpoints from k=2 onward,
-and larger geometries cross the same internal work threshold automatically.
-The policy is not a public experiment knob. The final pass does not construct
-an unused payload. Snapshots first freeze model, optimizer, settings, and RNG
-state into pinned host buffers, then serialize and atomically rename on a
-single background writer; the CUDA stream dependency prevents a later update
-from racing the copy while disk I/O overlaps training.
+The payload occupies the value path and the token embedding controls the gate.
+There is no additive token-embedding bypass on a feedback position. Prompt
+positions and all pass-1 positions use `e_t` directly because no recurrent
+payload is present.
 
-**Memory.** No-detach multi-pass times per-sublayer sources compounds
-activation memory. The automatic policy above is authoritative at trial scale;
-block deltas remain the flagship plan. If a larger run exceeds memory with
-checkpointing, coarsen sources before detaching — detaching changes the
-objective.
+The cache stores attention keys and values for the actual column inputs. During
+sequential feedback decoding, only the immediately previous payload is carried
+outside the cache; each generated column consumes it once and emits the next
+payload.
 
-## Arms and comparisons
+The `fbt` payload is:
 
-Screen arms: **{vanilla, MHDAR, FBT, DF, DF-soft}**, one recipe, matched
-tokens, paired data order (same batches, same order — loss curves
-difference cleanly), 2 seeds. **DF** ("delta feedback") is the
-hard-everywhere model of the Architecture section; the parents are its
-ablations per the pseudocode flags; **DF-soft** is the soft-everywhere
-companion, screen-only — its adoption question resolves in the routing
-weights at screen scale. Finalists (~3–4 arms: vanilla, DF, parents as
-budget allows) then extend along the token ladder below.
-Reported at matched tokens *and* matched token-equivalent compute (FBT
-accounting: an n-pass batch costs n).
+```text
+p_t = payload_norm(h_top,t)
+```
 
-Interaction := (DF − vanilla) − [(MHDAR − vanilla) + (FBT − vanilla)],
-evaluated per decode mode: **Standard** (no feedback), **Soft** (feedback
-during generation), **Fused** (extra fused prefill pass + Soft).
+## Hard Delta Feedback
 
-The flagship runs DF only — one large run, not a factorial at scale.
+Hard `df` combines the two axes without adding an alternate route around either
+one:
 
-## Configurations and scale plan
+1. On a feedback position, fuse the shifted previous payload with the token
+   embedding to obtain `u`.
+2. Use `u` as both the residual seed and the first source for every
+   within-column MHDAR site.
+3. Preserve the clean residual identity while attention and MLP sites read
+   routed mixtures of the seed and completed deltas.
+4. Route over this column's deltas with a dedicated multi-head payload router.
+5. Add the routed enrichment to the full top state and normalize the result.
 
-The flagship trains at ~370 tokens/param (400B on 1.08B) — far past
-compute-optimal, and the regime where FBT's decode-time behavior actually
-emerged [paper]. A short screen cannot reach that regime, and the feedback
-phase is a *late fraction* of training under the pass schedule, so a
-screen-scale FBT null is ambiguous rather than damning. The plan therefore
-measures the **trend** of the combined advantage along a token ladder,
-using WSD's extend-without-re-warming property (a cooldown branch at each
-rung gives a measurement point; the extension continues from the
-pre-cooldown checkpoint). De-risking spend totals ~$0.6–1k, ~10–15% of the
-flagship; program total ≈ $7–8k.
+Formally, with `Delta = [a_0, m_0, ..., a_(L-1), m_(L-1)]`:
 
-| Stage | Model | Tokens | tok/param | Where | Rough cost |
-|---|---|---|---|---|---|
-| Smoke / dev | 220M (d=768, L=12, Qwen3-style, H_route=4) | ≤0.3B | — | jobe (1×4090) | free |
-| Screen | 220M, 5 arms × 2 seeds | 2B / run | 9 | jobe, ~1 wk background (or rented, ~$10/run, if wall-clock matters) | free–$100 |
-| Token ladder | 220M, finalists, 1 seed | 2B → 8B → 32B via WSD extension, cooldown branch per rung | 36 → 145 | rented single H100/H200 | ~$120–150/arm; $400–600 total |
-| Mid-rung (params axis, optional) | ~300M | ~30B | 100 | rented | ~$150/run |
-| Flagship | ~1.08B, FBT trunk: d=1536, L=24, GQA 16q/8kv, H_route=8, headwise-gated, QK-norm, SiLU GLU 6656, RoPE, ctx 8192, 2048-SWA on 5/6 layers | 400B (FBT's largest) | 370 | Prime Intellect marketplace pods | ~2,700 H100-h ≈ $6–7k at 2026-07 rates (~$3–4k H200 spot, checkpoint-tolerant); ~2 wk on 8×H100 |
+```text
+r_payload = route(Delta; q_payload)
+p = payload_norm(h_top + r_payload)
+```
 
-Sources are per-sublayer at every stage except the flagship, which coarsens
-to block deltas. The ladder's top rung (145 tok/param) lands within ~2.5×
-of the flagship's ratio; ladder arms run 1 seed with paired data order,
-using the screen's seed spread as the noise estimate.
+The payload router excludes the seed. The base `h_top` guarantees that the full
+column state is retained; the routed term selects which changes made in this
+column receive an additional cross-column path. The router has no null source,
+so delta enrichment carries unit softmax mass in every head. At initialization
+it is the mean of the scaled deltas.
 
-**Sub-flagship geometry.** Context length is a per-scale architecture
-parameter, not part of the binding recipe: screen and ladder run ctx 1024
-(DAR's 220M geometry), the flagship returns to FBT's 8192. Global batch is
-FBT's 300K tokens everywhere (grad accumulation on jobe) — a recorded
-divergence from DAR's 32K-token screen batches; NorMuon lr 1e-2 was tuned
-at 1B/8192/300K, so the smoke run validates the recipe at screen geometry
-before anything else trains. Screen trunk, pinned identically across all
-arms: d=768, L=12, 8 attention heads / 4 KV and routing heads (head_dim 96),
-SwiGLU intermediate 3072, RoPE θ 1e6, RMSNorm eps 1e-6, tied
-Qwen3 embeddings (vocab 151936) — ~223M params, matching the paper's
-"220M" total; the exact head split is unrecorded in paper and code
-defaults, so this pin is ours.
+The payload query is not conditioned on the next token. Token-dependent control
+occurs in the FBT entry gate after the payload shifts to the next position.
 
-**Screen sequencing (triage order).** Screen runs launch serially on jobe
-(~3 days/run accepted): **vanilla → DF → MHDAR/FBT → DF-soft**. Vanilla
-failing to learn stops everything (debug the harness); DF failing to beat
-vanilla is a clean small-scale negative and may stop the screen; DF
-beating vanilla buys the two parent cells to decompose the effect; DF
-surviving the factorial buys DF-soft's adoption readout. Both seeds of an
-arm run before the next arm.
+An equivalent high-level pass is:
 
-Tokenizer: Qwen3's (~151k, tied) everywhere — one tokenizer across our runs
-beats matching FBT's phi-4 100k; DAR's "220M" is exactly the Qwen3-vocab
-d=768/L=12 model [paper]. Data: FineWeb-Edu throughout, shared held-out val
-split (FBT's Phi-4 mixture is unavailable). One fixed token stream,
-pre-tokenized once to uint32 memmap shards and sized for the ladder's top
-rung (~35B tokens on jobe `/data`), serves every run: the screen reads its
-prefix, and WSD extension continues the same stream in the same order —
-load-bearing for both paired comparisons and ladder continuity. The val
-slice is a fixed held-out cut of the same corpus, tokenized once.
-Feedback-arm randomness (pass-count draws, prefix-mixin lengths, jitter) is
-pre-seeded per step and shared across arms, so arm differences are purely
-architectural. Optional flagship
-follow-through, FBT-style, if the base result justifies it: long-context
-extension (12B tokens, 8K→32K) then instruction tune (6B tokens),
-three-pass throughout.
+```python
+e = embed(tokens)
+s = e if payload is None else fuse(payload, e)
+sources = [s]
+h = s
+for block in blocks:
+    a = scaled_attention(rmsnorm(h + route(sources)))
+    h = h + a
+    sources.append(a)
+    m = scaled_mlp(rmsnorm(h + route(sources)))
+    h = h + m
+    sources.append(m)
+payload = payload_norm(h + route(sources[1:], q_payload))
+logits = tied_head(final_norm(h))
+```
 
-**Flagship controls.** No matched 1B vanilla (cost). Instead: decode-mode
-ablations on the same weights isolate the channel's inference contribution;
-pass-1 loss is tracked throughout training as the "as ordinary transformer"
-mode; the ladder's vanilla arm and the optional 300M mid-rung anchor the
-scaling extrapolation. Published 1B-class models (TinyLlama, Llama-3.2-1B,
-Qwen3-1.7B, SmolLM2) appear as context rows only — 2–36T tokens of
-unknowable data mixture makes them incomparable as controls.
+The first attention router sees only the seed and therefore acts as a no-op in
+hard MHDAR/DF. All later sites have at least two sources.
 
-## Evaluation and diagnostics
+## Soft adoption diagnostic
 
-- **Language modeling:** paired val-loss curves per arm; token-equivalent
-  compute isoclines.
-- **Contraction:** the standing monitor above; also the stability gate
-  before any flagship spend.
-- **Decode modes:** Standard/Soft/Fused on every feedback-bearing arm.
-- **Interpretability (first-class):** routing weights are direct
-  observables. Spine: the payload router's distribution over deltas (what
-  rides the recurrence) and per-layer depth weight on the `u` seed (does
-  the paper's Block-mode embedding-prominence appear at per-sublayer
-  granularity, and does it migrate to the fused input?) — with the MHDAR
-  arm's `e`-seed weight as the feedback-free baseline for the same
-  question. Every routed site reports each head separately plus normalized
-  cross-head Jensen-Shannon divergence; specialization, not just average
-  sharpness, is a first-class observable. DF-soft: per-layer weight on `p` (does a
-  free model demand the previous column?), weight on `e`
-  (embedding-prominence under recurrence), and null masses everywhere —
-  the adoption readout, including the injection-form question. FBT's
-  Appendix-F state-tracking synthetics (completion tracking, delayed
-  memory, multi-register latest-write) reimplemented with linear probes
-  across depth: what rides the payload, and does the routed delta
-  enrichment carry state the bare top state doesn't (probe with the
-  enrichment term ablated vs as learned, same weights)?
+`df_soft` uses the same trunk, multi-pass loop, and routing primitive but removes
+the mandatory FBT entry:
+
+```text
+stream seed: e
+standing sources on a fused suffix: [p_previous, e]
+router sources at every site: [learnable_null, standing_sources, deltas_so_far]
+payload: payload_norm(h_top + route([learnable_null, deltas]))
+```
+
+The previous-payload source is masked out on the plain prefix. The null and
+token seed remain available everywhere. On pass 1 there is no previous-payload
+source, but null-sourced within-column routing is already active. This creates a
+within-run adoption contrast: depth routing trains from step 1, whereas the
+feedback source appears only in the feedback phase.
+
+The learned null is a trainable source, not a hard zero clamp. Its mass, the
+previous-payload mass, the token-seed mass, and the payload-router null mass are
+observables. A high null mass shows non-adoption at that site; it does not by
+itself establish that the corresponding mechanism is useless under a mandatory
+entry or a different formation schedule.
+
+## Multi-pass training
+
+### Jacobi passes
+
+Feedback arms use parallel Jacobi passes over a full token sequence. Pass 1 is
+ordinary teacher forcing with plain embeddings. For each later pass:
+
+1. take the preceding pass's payload tensor;
+2. add keyed uniform jitter;
+3. shift it one position right, inserting zero at position 0;
+4. sample a per-row plain-prefix length;
+5. use plain embeddings on the prefix and feedback inputs on the suffix;
+6. run the complete stack again without detaching the payload graph.
+
+`k` passes train a feedback horizon of `k-1` token transitions and cost `k`
+transformer evaluations. The shift and prefix mask preserve token causality.
+Gradients from later-pass losses reach the earlier states, payload router, and
+entry gate.
+
+For hard feedback arms, suffix inputs are FBT-fused. For `df_soft`, suffix
+inputs remain plain embeddings and the shifted payload becomes a masked routing
+source. Non-feedback arms always use one pass.
+
+### Prefix mixin and jitter
+
+For every feedback pass and row, the plain-prefix length is drawn uniformly
+from `1..seq_len`. Position 0 is therefore always plain, and every row retains
+at least one feedback position. Payload jitter is drawn uniformly from
+`[-0.02, 0.02]` by default and is added before shifting.
+
+Pass count is keyed by `data_seed` and step. Prefix lengths and jitter are keyed
+by `data_seed`, step, and the microbatch's first global row. They do not depend
+on ambient RNG state and are shared across paired feedback arms.
+
+### Objective
+
+Let `ell_k` be mean next-token cross-entropy on pass `k`. The loss is:
+
+```text
+K = 1:  L = ell_1
+K > 1:  L = ell_1 + mean(ell_2, ..., ell_K)
+```
+
+The pass-1 term always has unit weight; all feedback passes together have unit
+weight. No pass is detached. During cooldown, the same combination is applied
+to the squared log-partition penalty
+`mean(logsumexp(logits)^2)` with coefficient `1e-5`.
+
+Pass-1 loss is logged separately because it is the shared Standard-mode metric
+across all arms.
+
+## Data and pairing
+
+The corpus is FineWeb-Edu in canonical streaming order, tokenized with
+`Qwen/Qwen3-0.6B`. If no dataset revision is supplied, tokenization resolves and
+records the current dataset commit before writing data. Each non-empty document
+is followed by EOS.
+
+The held-out validation slice is taken from the head of the stream. Training
+tokens follow it in contiguous uint32 shards. A training row is a non-overlapping
+`seq_len + 1` window: 1,025 stored tokens yield 1,024 predictions. Rows may
+cross document boundaries, and each step directly addresses its global row
+range:
+
+```text
+first_row(step) = (step - 1) * batch_rows
+```
+
+Paired arms and seeds use the same data directory, `data_seed`, batch geometry,
+and step addresses. Initialization seeds differ only when registering a new
+paired seed. Resumption returns to the same row and the same keyed feedback
+draws.
+
+## Optimizer and schedule
+
+Every arm uses the same recipe.
+
+### Parameter groups
+
+- **NorMuon:** every trainable two-dimensional weight except the tied
+  embedding/unembedding. Defaults: learning rate `1e-2`, momentum `0.95`, row
+  second-moment beta `0.95`, five Newton-Schulz steps, epsilon `1e-8`, decoupled
+  weight decay `0.01`.
+- **Adam:** tied embeddings, RMSNorm weights, routing queries, null vectors, and
+  all other non-matrix parameters. Defaults: learning rate `5e-4`, betas
+  `(0.9, 0.95)`, epsilon `1e-8`, no weight decay.
+
+NorMuon orthogonalizes the momentum, normalizes rows by their second moments,
+and globally rescales the update to Frobenius norm `0.2 * sqrt(m*n)` before
+applying learning rate and decoupled decay.
+
+### Default screen schedule
+
+The default 6,700-step WSD schedule is:
+
+| Phase | Steps | Pass behavior |
+|---|---:|---|
+| Warmup | 1–200 | one pass |
+| Stable heat | 201–5,025 | one pass |
+| Cooldown | 5,026–6,700 | feedback arms draw 2 or 3 passes |
+
+Within cooldown, `P(k=3) = 0.12`; otherwise `k=2`. Across the full run this
+targets the 75%/22%/3% one-/two-/three-pass mixture. The exact draws are
+deterministic for the registered data seed. The expected compute multiplier for
+a feedback arm is 1.28 transformer passes per predicted token, while
+non-feedback arms remain at 1.0.
+
+Learning rates follow the shared WSD multiplier. NorMuon weight decay stays at
+its stable value through warmup and heat, then is multiplied by the normalized
+learning-rate factor during cooldown. The z-loss is active only during
+cooldown.
+
+`--max-steps` caps the number of additional steps in one process. It does not
+change the schedule, feedback boundary, protected checkpoints, or any
+state-defining field.
+
+## Execution and checkpoints
+
+### Portable path
+
+CPU and MPS use PyTorch scaled-dot-product attention, the algebraic MHDAR
+router, chunked tied-head cross-entropy, eager execution, and the same model,
+loss, optimizer, data, and checkpoint semantics. This path owns fast invariant
+tests and analysis.
+
+### CUDA path
+
+The authoritative Jobe screen path uses:
+
+- BF16 trunk activations with FP32 weights and optimizer state;
+- FlashAttention for full-sequence, prefill, GQA, and cached decoding;
+- a fixed-capacity Triton MHDAR router over source pointers, with full-width RMS
+  scores, per-head masked softmaxes, FP32 value accumulation, and an analytic
+  backward that retains cross-head RMS coupling;
+- cut cross-entropy for the tied head, including the exact squared
+  log-partition gradient without materializing vocabulary-wide logits;
+- full-block compilation around attention kernels;
+- fixed-address forward/backward CUDA graphs for every schedule-reachable train
+  mode and shared-pool no-grad validation graphs;
+- BF16 keyed jitter drawn directly into graph input buffers;
+- internal activation checkpointing for `df_soft` feedback modes and geometries
+  above the measured screen work threshold;
+- asynchronous snapshot staging to pinned host memory followed by atomic
+  background serialization.
+
+The public experiment surface does not expose kernel, graph, or activation
+checkpoint policy switches. Those are execution choices, not factorial axes.
+
+### Checkpoint contract
+
+Snapshots use checkpoint contract v4 and resume only v4. They contain model,
+both optimizer states, exact state-defining arguments, step, and Python/Torch/
+CUDA RNG state. A resume inherits all state-defining fields and rejects an
+explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
+and evaluation-row count may change per invocation.
+
+The run retains the latest two snapshots plus the protected end-of-heat and
+end-of-run snapshots. `df queue` runs the commit-cached probe before training;
+queue entries and logs are commit-addressed through the shared spool.
+
+## Evaluation
+
+### Language-model metrics
+
+At each evaluation point:
+
+- every arm reports `val`, the pass-1 held-out cross-entropy;
+- every feedback arm also reports `val_fused`, a second pass whose plain prefix
+  has length 1.
+
+The inference modes are:
+
+- **Standard:** one prompt prefill and no latent feedback during generation;
+- **Soft:** one plain prompt prefill, then one latent-feedback transition per
+  generated token;
+- **Fused:** an additional fused prompt pass, then the same latent-feedback
+  decode loop.
+
+Here “Soft” names the FBT decoding mode and is unrelated to the `df_soft` arm.
+No-feedback arms use their Standard metric when a factorial table is shown for
+Soft or Fused mode.
+
+### Effect and interaction
+
+For validation loss `L` (lower is better), define the gain of arm `A` over
+vanilla as:
+
+```text
+G_A = L_vanilla - L_A
+```
+
+The factorial interaction is:
+
+```text
+I = G_df - G_mhdar - G_fbt
+  = L_mhdar + L_fbt - L_df - L_vanilla
+```
+
+`I > 0` is superadditive loss reduction, `I = 0` is additive, and `I < 0` is
+subadditive. Compute the statistic on paired checkpoints and per decode mode,
+then aggregate paired seed differences. Do not mix Standard, Soft, and Fused
+losses inside one interaction estimate.
+
+Equal step counts are matched-data comparisons, not matched-compute
+comparisons. Report predicted tokens and pass-tokens for every point. A
+matched-compute view must compare curves or checkpoints at equal cumulative
+pass-tokens; feedback batches count once per pass.
+
+### Contraction
+
+For every feedback-bearing checkpoint, repeatedly apply fully fused prefill
+passes with prefix length 1. At iteration `k`, record held-out loss and:
+
+```text
+mean_token ||h_top^(k) - h_top^(k-1)||_2
+```
+
+The standing training monitor runs eight iterations. Promotion uses at least 30
+self-compositions. Stable loss and a decaying update norm support safe
+composition; oscillating updates or rising loss make feedback comparisons
+untrustworthy even if a one-step metric improves.
+
+### Routing observables and causal probes
+
+For each routing site and head, record source weights separately rather than
+only their mean. Current summaries include mean source mass, per-token maximum,
+normalized entropy, normalized cross-head Jensen-Shannon divergence, source RMS
+scale, query norm, and query cosine similarity.
+
+The important source labels are:
+
+- within-column seed mass (`e` for `mhdar`, `u` for hard `df` feedback passes);
+- previous-payload, token-seed, and null mass in `df_soft`;
+- per-delta mass at attention, MLP, and payload sites.
+
+`scripts/route_report.py` produces held-out route maps and query geometry from
+a hard-DF checkpoint. `scripts/payload_swap.py` replaces the learned payload
+mixture with top-only, uniform, or single-delta alternatives on the same
+weights. The sweep is a co-adapted same-checkpoint intervention: its landscape
+identifies sensitive payload content but does not estimate the effect of
+training an alternative payload rule from scratch.
+
+## Screen and scale plan
+
+### 220M screen
+
+The active screen uses the geometry above, 6,700 steps, 2.003B predicted tokens
+per run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
+primary four factorial arms run before the conditional `df_soft` diagnostic.
+
+The screen is designed to establish:
+
+1. that the shared recipe learns a healthy vanilla baseline;
+2. that the harness can resolve the MHDAR factor under this recipe;
+3. the signs and paired magnitudes of the MHDAR, FBT, and DF effects;
+4. whether hard DF is stable under recurrent self-composition;
+5. whether optional within-column and cross-column routes are adopted in
+   `df_soft`, if that diagnostic is reached.
+
+The screen runs at about nine predicted tokens per parameter. It is a
+sensitivity and interaction screen, not a decisive test of FBT formation at the
+high token-per-parameter regime.
+
+### Token ladder
+
+The registered ladder keeps the 220M trunk and extends selected arms through
+2B, 8B, and 32B predicted tokens, taking a WSD cooldown branch at each rung and
+continuing the next rung from that rung's protected pre-cooldown checkpoint.
+Finalist arms share the stream prefix and use one paired seed, with the screen's
+two-seed spread retained as the noise estimate.
+
+This ladder is not currently runnable through exact resume: `steps` is a v4
+state-defining field, and no tested branch-from-heat-end continuation command
+exists. Before ladder launch, code and tests must define a new run address,
+preserve model/optimizer/RNG and row continuity, extend the stable phase without
+re-warming, and create a new cooldown branch without weakening exact resume.
+
+### Flagship
+
+The registered flagship target is hard DF at approximately 1.08B parameters
+and 400B predicted tokens, with width 1,536, 24 layers, 16 query heads, 8 KV and
+routing heads, SwiGLU width 6,656, and context 8,192. Five of every six layers
+use a 2,048-token sliding window; every sixth layer uses full attention. It runs
+only after ladder promotion.
+
+The current model stores per-sublayer sources and the CUDA router supports at
+most 27 sources, so the 24-layer flagship cannot use the screen representation.
+Before launch, the repository must specify and test a block-delta partition,
+its payload-source semantics, the sliding-window layout, distributed training,
+checkpoint portability, and restart behavior on the selected hardware. A
+width-1,536/H=8 router parity check is necessary but is not flagship readiness.
 
 ## Gates
 
-**Ladder entry** (from the screen): the MHDAR arm must clearly beat vanilla
-at the screen, or the harness is suspect and nothing else is
-interpretable. (It validates harness *sensitivity* to MHDAR-class effects
-rather than reproducing the paper numerically — it runs the shared
-FBT-binding recipe, which the paper's runs did not; the per-sublayer +
-input-seed shape itself matches their released code exactly.) Finalists
-are vanilla, DF, and parents as budget allows.
-One deliberate asymmetry: a null-but-stable FBT side at the screen does
-**not** exclude DF from the ladder — the screen runs at 9 tok/param and
-formation-with-scale is precisely the hypothesis it cannot test; the
-ladder is a ~$130 question.
+### Engineering gate
 
-**Promotion to flagship** (pre-registered): DF's advantage over
-**both** parents at matched token-equivalent compute **holds or grows
-across the ladder** (2B → 32B) — a trend, not a point estimate — **and**
-the contraction diagnostic is clean past 30 self-compositions at the top
-rung. The flagship spend is not authorized by default; confirm with a9 at
-promotion time with ladder evidence in hand.
+`df probe` must pass at the queued commit. On Jobe this includes portable tests,
+Triton router value/weight/gradient parity for H=4 and H=8, cut-cross-entropy
+z-loss parity, cached FlashAttention recurrence, captured/eager evaluation
+parity, every schedule-reachable CUDA graph, finite optimizer updates,
+contraction-monitor execution, and production-scale checkpoint staging.
 
-**Null reading:** FBT is unproven below 1B params (their smallest run). A
-screen-level FBT null with healthy MHDAR reads as ambiguous (regime, not
-refutation); a null that *persists across the ladder* reads as a
-formation-conditions result (cf. acot at 135M). The MHDAR arm is the positive
-control that the harness detects a depth-routing effect under the shared
-recipe; this is a sensitivity gate, not a numerical paper reproduction.
+Engineering qualification establishes implementation sensitivity and numerical
+coherence. It is not an experiment finding.
 
-## Extension (phase 2, contingent on the factorial)
+### Screen admissibility and ladder entry
 
-Add adaptive pause-slot pretraining under the CYB loss (Catch Your Breath,
-arXiv:2510.13879) to the winning model. During the feedback phase, insert
-W_max−1 pause slots after each real token (W_max−1 = 1–2; CYB's one-pause
-models beat fixed three-pause TBYS baselines [paper]). A pause slot repeats
-its real token's position index and embedding, so FBT's slot-to-slot
-payload shift implements both recurrences with one rule: real→real
-boundaries carry ordinary cross-column feedback, real→pause and
-pause→pause are self-loops on the column — same token gating the GLU, own
-payload on the value path [synthesis]. The model emits a reserved
-`<don't-know>` output token to request another iteration; the CYB loss
-marginalizes the NTP likelihood over the halting slot
-(−log E_{i~Pr(S|d,ω)}[γ_i·t_i], discount γ, world-stop prior ω), trained
-fully in parallel over the W_max prediction sites per real token [paper].
+A screen comparison is admissible only when the registered paired runs finish
+with the same token stream, batch order, recipe, seeds, and schedule, and all
+feedback arms have healthy contraction traces.
 
-**Default mask: pause slots are hidden from future attention — they write
-no KV.** Decode-time iteration then costs FLOPs only: no cache growth, no
-context clutter (CYB's own pauses write KV and inflate context W_max×
-[paper]), long-context behavior untouched. The mask is also the
-attribution instrument: KV-free pauses in a vanilla transformer cannot
-chain at all — each is an independent one-shot re-read — so any
-serial-depth gain here is payload-mediated by construction [synthesis].
-Pre-registered internal ablation: flip the single mask bit to
-CYB-verbatim visible pauses, measuring what pause-KV visibility buys
-beyond the payload carry. Decode: Soft decoding iterates a column while
-`<don't-know>` mass exceeds threshold, up to W_max — per-token adaptive
-serial depth, with the halting distribution as a per-token compute-demand
-readout in the routing-weights-as-observables spirit. Fused prefill still
-scales prompt-side compute; pauses scale decode-side.
+MHDAR must clearly improve on vanilla in Standard mode for the screen to serve
+as a sensitivity gate for few-percent routing effects. A stable FBT null at
+screen scale does not by itself exclude DF from the ladder because the screen
+is far below the registered token-per-parameter regime. DF enters the ladder
+only if its paired effect is credible enough that additional tokens can resolve
+its interaction with both parent factors.
 
-Constraints and knobs. Pauses must be pretrained in (Goyal et al.,
-arXiv:2310.02226 [paper]), matching this from-scratch setting; pause
-slots carry non-trivial payloads only in passes ≥ 2, so they activate
-with the feedback phase [synthesis]. The pause loop literally iterates
-the per-position map at decode, so the contraction gate is load-bearing
-for this extension, not merely diagnostic. New knobs: γ and ω (start from
-CYB's exponential-discount defaults); distinct learned `<pause_i>`
-embeddings (CYB's own form) are the fallback if the self-loop needs an
-explicit iteration signal. CYB stays out of phase 1: every
-feedback-phase batch would pay W_max passes (vs the mixture's expected
-2.12) and a third mechanism in DF alone would confound the interaction
-term [synthesis]. The parallel to recirculated-dot-experiment is loose
-and conceptual; no shared protocol obligation.
+### Flagship promotion
 
-## Risks
+Promote only if:
 
-- Both parents are recent arXiv results; MHDAR's additive delta variant is
-  implemented in its released code but is not the paper's main controlled
-  comparison. Effect sizes are a few percent PPL — seeds, paired
-  data order, and matched-compute accounting are load-bearing, not hygiene.
-- DAR and MHDAR have public parity code under `references/`; FBT has none —
-  the multi-pass loop is small but the stability kit
-  has several interacting pieces. Reproduce the contraction signature
-  before trusting any arm comparison.
+1. DF's advantage over both parent arms at matched token-equivalent compute
+   holds or grows from 2B through 32B rather than appearing at one rung;
+2. the top-rung feedback map remains stable for at least 30 fused
+   self-compositions;
+3. routing and same-checkpoint ablations do not reveal a trivial unused or
+   bypassed mechanism;
+4. the flagship implementation gate passes on its exact distributed geometry;
+5. a9 explicitly approves the flagship spend with the ladder evidence in hand.
+
+## Scope exclusions
+
+The current experiment does not include adaptive pause or halting tokens,
+token-conditioned payload queries, more than one explicit previous-column
+payload, per-layer cross-column source banks, alternative optimizer arms,
+long-context continuation, instruction tuning, or downstream reasoning claims.
+Any of those changes requires a separately specified experiment and cannot be
+introduced into the registered factorial.
+
+## Risks and interpretation
+
+- Expected effects are small relative to run noise. Paired data order, paired
+  seeds, complete runs, and pass-token accounting are part of the causal
+  design.
+- The shared FBT recipe may not reproduce the best standalone MHDAR setting.
+  The MHDAR cell therefore acts as a sensitivity control for this exact recipe,
+  not as a numerical reproduction target.
+- A low-token FBT null is compatible with missing formation conditions. A null
+  that persists across the registered ladder is stronger evidence against the
+  current feedback recipe at this model scale.
+- `df_soft` non-adoption can reflect optimization path dependence. Compare it
+  with hard DF before interpreting null mass as lack of utility.
+- Parameter counts differ slightly because feedback fusion and routers add
+  parameters. Always report exact arm parameter counts alongside token and
+  pass-token budgets.
+- Contraction is a stability condition, not evidence that latent feedback
+  improves language modeling or performs serial reasoning.

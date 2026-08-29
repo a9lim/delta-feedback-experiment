@@ -1,69 +1,101 @@
 # delta-feedback-experiment
 
-Do the two axes of a transformer's compute lattice — depth-wise routing
-(**Multi-Head Delta Attention Residuals**, arXiv:2607.27230 plus the additive
-delta stream of arXiv:2605.18855) and token-time latent
-feedback (**full-bandwidth transformers**, arXiv:2608.08888) — help
-complementarily or redundantly when pretrained together? The combined model
-("delta feedback", DF) commits hard to both: gated latent feedback whose
-payload is the top state plus headwise-routed deltas — MHDAR's additive routing
-applied at the cross-column site. A soft screen-only companion arm makes
-every channel optional and null-sourced, its routing weights reading out
-what a free model actually adopts.
+This repository tests whether two routing mechanisms improve a transformer
+independently or interact when pretrained together:
 
-**Status:** the plain-PyTorch harness and optimized Jobe CUDA path are ready;
-no scientific training result exists yet. See
-[`docs/findings.md`](docs/findings.md).
+- **Multi-Head Delta Attention Residuals (MHDAR)** route each sublayer read over
+  the current column's input seed and earlier attention/MLP deltas, with an
+  independent depth softmax for each feature group.
+- **Full-Bandwidth Transformer (FBT) feedback** carries the previous column's
+  top state into the next column through a mandatory token-gated fusion.
+- **Delta Feedback (DF)** uses MHDAR inside each column and applies the same
+  multi-head delta router to enrich the recurrent payload between columns.
 
-## Plan shape
+The primary experiment is the four-cell factorial `{vanilla, mhdar, fbt, df}`.
+`df_soft` is a gated diagnostic arm in which null sources make both routing
+channels optional.
 
-- Screen on jobe (1x4090): {vanilla, MHDAR, FBT, DF, DF-soft} at the 220M
-  config, ~2B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
-- Token ladder on rented single GPUs: finalists extended 2B -> 8B -> 32B via
-  WSD, testing whether the combined advantage holds with training scale
-  (the flagship regime is ~370 tok/param; the screen alone cannot reach it).
-- Flagship on rented pods: DF at ~1.08B params / 400B tokens,
-  gated on the ladder trend (pre-registered gate in the design doc).
-- Phase-2 extension (contingent): pause-token pretraining on the winner.
+## Status
+
+The 220M screen campaign is active on Jobe. No matched arm comparison is
+complete, so there are no accepted experiment findings. The screen-scale
+plain-PyTorch model, deterministic trainer, portable fallbacks, and optimized
+single-GPU CUDA path are implemented. The token-ladder continuation and the
+distributed block-delta flagship path are specified but not yet implemented.
+
+See [docs/findings.md](docs/findings.md) for the scientific result surface and
+[docs/design.md](docs/design.md) for the complete experiment contract.
 
 ## Install
 
+Python 3.12 is required. The shared operational package is installed from the
+workspace root; this project owns the model and trainer.
+
 ```bash
-# from the workspace root, once:
+cd /path/to/transformer-experiments
 uv pip install -e .
-# then:
 cd delta-feedback-experiment
 uv pip install -e .
+```
 
-# Jobe CUDA kernels (the shared environment already carries the pinned wheels):
+On Jobe, install the CUDA extras into its shared environment without changing
+the pinned Torch/FlashAttention pair:
+
+```bash
 uv pip install -e '.[cuda]'
 ```
 
-## Run
+## Operate
 
 ```bash
+# Portable invariant suite; adds the full CUDA execution gate on a CUDA host.
 df probe
-df train TAG --arm df --data-dir /data/df/tokens
-df queue TAG --arm df --data-dir /data/df/tokens
+
+# Build the fixed FineWeb-Edu/Qwen3 token stream once.
+df tokenize --out /data/df/tokens
+
+# Run or queue one arm.
+df train example-df-s1 --arm df --seed 1 --data-seed 0 \
+  --data-dir /data/df/tokens
+df queue example-df-s1 --arm df --seed 1 --data-seed 0 \
+  --data-dir /data/df/tokens
+
+# Inspect or control the detached queue.
 df status
 df watch
+df stop TAG|live|all [--at STEP]
+df clear TAG|all
 ```
 
-`df probe` runs the invariant suite everywhere and, when CUDA is present, the
-full 220M/B4/T1025 graph-capture gate. Training uses fixed CUDA graphs,
-whole-block compilation, FlashAttention, exact CCE-native z-loss, a bespoke
-Triton MHDAR router, BF16 residuals, captured evaluation, and asynchronous atomic
-snapshots. The activation plan is internally measured; there are no public
-kernel or checkpoint-policy switches.
+The default screen run is 6,700 steps, 292 rows per step, and sequence length
+1,024: 2.003B predicted training tokens. Feedback arms use one pass through
+step 5,025, then draw two or three passes during cooldown. Every step is
+addressed directly into one fixed token stream. Pass counts are keyed by data
+seed and step; prefix lengths and jitter additionally use the global row, so
+paired arms see identical examples and feedback draws.
 
-## Docs map
+Snapshots are immutable, exact-resume checkpoint-contract v4 files under
+`runs/`. `--max-steps` limits only the current invocation; it never rescales the
+state-defining schedule.
 
-- [`docs/design.md`](docs/design.md) — the authoritative current design:
-  architecture, training, arms, scale plan, evaluation, gates, risks.
-- [`docs/findings.md`](docs/findings.md) — scientific and systems evidence,
-  with limitations.
-- [`docs/journal.md`](docs/journal.md) — disposable working notes,
-  periodically cleared.
-- [`references/refs.yaml`](references/refs.yaml) — load-bearing papers;
-  fetch markdown copies with `python -m transformer_experiments.references`.
-- [`figures/README.md`](figures/README.md) — figure map (currently empty).
+## Analysis
+
+```bash
+python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+```
+
+The route report summarizes a hard-DF snapshot's per-head source weights,
+entropy, head divergence, source scale, and query geometry. The payload sweep
+is a same-checkpoint counterfactual for routed feedback content; it is not an
+independently trained arm comparison.
+
+## Documentation
+
+- [docs/design.md](docs/design.md): authoritative architecture, training,
+  comparison, evaluation, scale, and gate contract.
+- [docs/findings.md](docs/findings.md): accepted experiment findings only.
+- [docs/journal.md](docs/journal.md): disposable active notes.
+- [references/refs.yaml](references/refs.yaml): primary references and their
+  current roles.
+- [figures/README.md](figures/README.md): committed experiment-result figures.

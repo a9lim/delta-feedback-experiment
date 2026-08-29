@@ -1,15 +1,11 @@
-"""The DF model family: one trunk, arms as deletions.
+"""The DF model family: one trunk with five exact arm configurations.
 
-The architecture contract is docs/design.md (Architecture); parity
-references are DAR's and MHAR's released code
-(references/delta-attention-residuals-code/ and
-references/multi-head-attention-residuals-code/) for routing semantics and
-FBT arXiv:2608.08888 Appendices A/C for the trunk conventions and the
-multi-pass entry.  Everything here is arm-agnostic model semantics: the
-five arms are one class under :class:`ModelConfig` flags, and the parents
-are exact deletions of DF.  Randomness (jitter draws, prefix lengths,
-pass counts) enters as *data* — the trainer owns the shared streams that
-keep paired arms architecturally identical in everything but the flags.
+The architecture contract is ``docs/design.md``. Everything here is
+arm-agnostic model semantics: the five arms are one class under
+:class:`ModelConfig` flags, and the factorial cells are deletions of DF.
+Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
+the trainer owns the shared streams that keep paired arms architecturally
+identical in everything but the flags.
 
 Semantics worth naming because they are easy to get subtly wrong:
 
@@ -17,17 +13,16 @@ Semantics worth naming because they are easy to get subtly wrong:
   group has its own softmax over sources; the concatenated convex mixtures
   enriches one sublayer's pre-norm input and is never accumulated into
   the residual stream, so the stream stays the clean telescoping sum
-  seed + Σdeltas = h_top (paper Fig. 3 and released code agree).
+  ``seed + sum(deltas) = h_top``.
 - The source list seeds with the column's actual input (complete
   decomposition), and a routing site is a no-op until it can see two
   sources — the singleton seed would route weight 1 onto itself.
 - The payload router uses the same multi-head primitive over deltas only
   (never the seed), additively on
   top of the top state; DF-soft's routers all carry a learnable
-  zero-init null source (DAR's fine-tuning mechanism, verbatim).
-- Sublayer branch outputs are scaled 1/sqrt(2L) (FBT depth scaling, our
-  pinned formula), so deltas — and hence routing sources — are the
-  scaled outputs.
+  zero-initialized null source.
+- Sublayer branch outputs are scaled ``1/sqrt(2L)``, so deltas — and hence
+  routing sources — are the scaled outputs.
 """
 
 from __future__ import annotations
@@ -81,12 +76,10 @@ ARMS = ("vanilla", "mhdar", "fbt", "df", "df_soft")
 class ModelConfig:
     """Trunk geometry plus the two-axis arm flags.
 
-    Screen defaults are the pinned 220M trunk (design: Sub-flagship
-    geometry): DAR's d=768/L=12 with our pinned attention-head split.
-    Routing heads are not an independent knob: every routed arm uses one
-    contiguous channel group per KV head (H=4 at screen scale, H=8 at the
-    flagship).  This is MHAR's zero-parameter reshape, not alignment to the
-    attention projections.
+    Defaults are the registered 220M screen trunk. Routing heads are not an
+    independent knob: every routed arm uses one contiguous feature group per
+    KV head (H=4 at screen scale, H=8 at the flagship target). The groups do
+    not align to attention projections.
     """
 
     vocab_size: int = 151936
@@ -756,7 +749,7 @@ def multipass(
     jitter: Tensor | None = None,
     want_weights: bool = False,
 ) -> list[ColumnOutput]:
-    """FBT's Jacobi multi-pass forward (Appendix C), arm-agnostic.
+    """The arm-agnostic Jacobi multi-pass forward.
 
     tokens [B, T]; prefix_lens [n_passes-1, B] with values in 1..T (the
     plain-embedding prefix per feedback pass; position 0 is always

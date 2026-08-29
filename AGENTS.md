@@ -1,63 +1,94 @@
 # AGENTS.md
 
-Research repo: pretraining factorial combining Multi-Head Delta Attention
-Residuals (per-head depth-axis routing over sublayer deltas) with full-bandwidth latent feedback
-(previous column's top state fed back to layer 0). Independent of every
-sibling experiment. The design and harness are implemented; scientific runs
-have not started.
+This repository owns a from-scratch pretraining factorial over two mechanisms:
+multi-head routing over within-column residual deltas and full-bandwidth latent
+feedback between adjacent token columns. The hard hybrid is `df`; `mhdar` and
+`fbt` are its parent-factor deletions; `vanilla` is the shared baseline;
+`df_soft` is an optional-channel diagnostic.
 
-## Documents
+The 220M screen campaign is active. No matched scientific comparison is
+complete, and [docs/findings.md](docs/findings.md) must remain empty of
+architecture claims until one is admissible.
 
-- [`docs/design.md`](docs/design.md) is the authoritative current
-  architecture, training, evaluation, scale plan, and gates. It defines the
-  current experiment only — keep it current-only, no decision history.
-- [`docs/findings.md`](docs/findings.md) contains only evidence valid for
-  the current design.
-- [`docs/journal.md`](docs/journal.md) is disposable working space,
-  periodically cleared; durable content graduates to design or findings.
-- [`references/refs.yaml`](references/refs.yaml) carries source roles.
+## Documentation contract
 
-Update code, docs, and tests together when the design changes; do not keep
-alternate schemas or stale guidance around.
+- [README.md](README.md) is the concise operator entry point and live status.
+- [docs/design.md](docs/design.md) is the sole architecture, training,
+  evaluation, scale-plan, and promotion contract.
+- [docs/findings.md](docs/findings.md) contains accepted experiment findings
+  only. Do not put unit tests, kernel parity, smoke behavior, throughput,
+  isolated checkpoints, plans, or predictions there.
+- [docs/journal.md](docs/journal.md) is disposable working space. Clear it when
+  notes graduate or become inactive; Git history is the archive.
+- [references/refs.yaml](references/refs.yaml) records the primary sources and
+  only the roles needed by the current design.
+- [figures/README.md](figures/README.md) indexes committed figures that support
+  accepted findings. Generated diagnostics remain ignored until promoted.
 
-## Operating notes
+Keep every active document current-only. State the present contract directly;
+do not retain chronology, provenance narrative, superseded configurations,
+legacy aliases, decision journals, or future extensions outside the defined
+experiment. Update code, tests, CLI help, and documentation together when the
+contract changes.
 
-- **Harness:** greenfield plain-PyTorch trainer in
-  `delta_feedback_experiment/` (no HF modeling code); flash-attn on jobe
-  with an SDPA fallback so tests and analysis run on the Mac (MPS/CPU).
-  Operational layer comes from the root package — `telemetry` log grammar,
-  `runs`/`checkpoints` snapshot addressing, `spool` job queue, `Schedule`,
-  and the `monitor` server — imported, never re-implemented. DAR's and MHDAR's
-  released code are cloned (gitignored) at
-  `references/delta-attention-residuals-code/` and
-  `references/multi-head-attention-residuals-code/` as parity references for
-  routing semantics and the fused backward.
+## Architecture invariants
 
-- **Greenfield contract:** predecessors (stateful-thought-experiment,
-  chain-of-dots-experiment) were deliberately cleared by a9. Do not dig up
-  or inherit their design decisions.
-- **One recipe everywhere** (design: Training): FBT's training recipe is
-  binding for every arm including vanilla; MHDAR module conventions nest
-  inside it. Record any divergence from the parent papers in design.md when
-  it is made.
-- **Paired comparisons are load-bearing** (design: Arms): arms share data,
-  batch order, and seeds; effect sizes (~few % PPL) are near noise
-  otherwise. Report matched tokens and matched token-equivalent compute (an
-  n-pass batch costs n).
-- **Contraction diagnostic** (design: Training / Evaluation): iterated
-  fused prefill passes with ||h(k) − h(k−1)|| decay is a standing monitor —
-  run it before trusting any feedback-arm result, and as the stability gate
-  before the flagship.
-- **Machines:** smoke/screen and debug on jobe (`ssh jobe`, 1×4090, torch
-  pinned 2.8.0+cu128 — respect the flash-attn wheel constraint); the token
-  ladder on rented single H100/H200s; analysis and probing on the Mac
-  (MPS). Flagship on Prime Intellect marketplace pods —
-  checkpoint-tolerant discipline if on spot instances.
-- **Promotion gate** (design: Gates) is pre-registered — the combined
-  advantage must hold or grow across the token ladder, not just exist at
-  the screen. The flagship spend (~$6–7k H100-rate; ~$7–8k program total)
-  is not authorized by default — confirm with a9 at promotion time with
-  ladder evidence in hand.
-- Smoke, then pilot, then scale. A null on the FBT side at trial scale is a
-  formation-conditions finding, not a failure (the MHDAR arm is the positive
-  control).
+- The model family is one plain-PyTorch `DFModel` configured by the five exact
+  arm names in `ARMS`; do not add parallel model implementations or aliases.
+- MHDAR sources are the column's actual input seed followed by scaled attention
+  and MLP deltas. Routing is a transient pre-norm read; routed values never
+  enter the residual stream directly, so `seed + sum(deltas) == h_top` remains
+  exact.
+- Each routing site uses a zero-initialized width-`D` query, a learnable
+  full-width RMS key normalization, raw values, and one source softmax per
+  contiguous feature group. The number of routing groups equals `kv_heads`.
+- Hard DF fuses the shifted payload with the token embedding through the FBT
+  asymmetric GLU, then uses the fused input as the MHDAR seed. Its payload is
+  the normalized top state plus a routed mixture over this column's deltas.
+- `df_soft` keeps the plain token embedding as the stream seed, exposes the
+  shifted payload as a masked standing source, and prepends a learnable null to
+  every router, including the payload router.
+- Multi-pass feedback is causal, differentiable across passes, and uses the
+  shared prefix-mixin and jitter streams. Do not detach the payload to solve a
+  memory problem; checkpoint blocks or coarsen the source representation.
+
+## Experimental discipline
+
+- Every arm uses the same tokenizer, token stream, row order, initialization
+  seed pairing, feedback random stream, trunk geometry, optimizer recipe, and
+  schedule. Treat any divergence as a different experiment.
+- Report both predicted tokens and token-equivalent compute. A `k`-pass batch
+  costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
+  comparisons.
+- The primary factorial is `{vanilla, mhdar, fbt, df}`. `df_soft` is run only
+  as the adoption diagnostic defined in the design and is not substituted for
+  hard DF.
+- Pass-1 validation is the common Standard-mode metric. Feedback arms also
+  report the fully fused second-pass metric. Routing observables and
+  contraction traces are diagnostics, not architecture wins by themselves.
+- A feedback result is not interpretable without the contraction trace. Run
+  the repeated fused-prefill diagnostic throughout training and require stable
+  long-horizon self-composition before scale promotion.
+- Accept a scientific claim only from completed, matched comparisons at the
+  registered seeds/tokens or from a clearly labeled same-checkpoint causal
+  ablation. Keep engineering qualification separate.
+
+## Runtime and scale boundary
+
+- The project imports telemetry, run/snapshot addressing, checkpoint staging,
+  spool orchestration, `Schedule`, and monitor serving from the workspace root
+  package. Do not reimplement those facilities here.
+- CPU/MPS runs use the semantic PyTorch fallbacks. Jobe is the authoritative
+  single-GPU CUDA surface: BF16 activations, FlashAttention, cut cross-entropy,
+  the Triton MHDAR router, compiled blocks, CUDA graphs, and asynchronous atomic
+  snapshots. Respect Jobe's pinned Torch/FlashAttention environment.
+- Inspect `df status`, the active log, and GPU ownership before operating Jobe.
+  Queue entries are commit-addressed; do not disturb an active run to update
+  documentation or code.
+- The screen and same-geometry continuation surfaces are implemented. The
+  2B→8B→32B WSD ladder still requires an explicit tested branch-from-heat-end
+  continuation path. The 24-layer flagship additionally requires a defined
+  block-delta source partition and distributed execution. Do not describe
+  either path as runnable until those contracts land in code and tests.
+- Flagship promotion requires the registered ladder trend, a clean contraction
+  gate, and explicit spend confirmation from a9.
