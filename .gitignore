@@ -5,6 +5,8 @@ data/**
 !data/summary/**
 figures/**
 !figures/README.md
+!figures/architectures/
+!figures/architectures/**
 
 # References: refs.yaml is committed; fetched copies are regenerable.
 references/*.md

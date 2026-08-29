@@ -43,6 +43,12 @@ surprising result (the gate was never necessary).
 
 ## Architecture
 
+Companion arm diagrams: [vanilla](../figures/architectures/vanilla.svg),
+[DAR](../figures/architectures/dar.svg),
+[FBT](../figures/architectures/fbt.svg),
+[DF](../figures/architectures/df.svg), and
+[DF-soft](../figures/architectures/df-soft.svg).
+
 One decode step of the full model at position t (trial configuration:
 per-sublayer sources). `route(vs, q)` returns
 `sum softmax_i(q . rmsnorm(vs_i)) vs_i` with `q` zero-init. Every
