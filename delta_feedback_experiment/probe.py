@@ -45,61 +45,72 @@ def cuda_gate() -> None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
 
     # The fixed-capacity router must match the semantic implementation in both
-    # values and its source/query gradient. Use four routing heads and a masked
-    # source to cover both MHDAR specialization and DF-soft prefix masking.
-    torch.manual_seed(7)
-    route_query = torch.randn(48, device="cuda", dtype=torch.float32).requires_grad_()
-    route_key = torch.randn(48, device="cuda", dtype=torch.float32).requires_grad_()
-    route_sources = tuple(
-        torch.randn(3, 11, 48, device="cuda", dtype=torch.bfloat16).requires_grad_()
-        for _ in range(6)
-    )
-    route_present = torch.rand(6, 3, 11, device="cuda") > 0.2
-    route_present[0] = True
-    projected = (route_query * route_key).to(torch.bfloat16)
-    routed, route_weights = bespoke_route(
-        projected, route_present, False, 1e-6, 4, route_sources
-    )
-    route_loss = routed.float().square().mean()
-    route_loss.backward()
-    route_grads = (
-        route_query.grad.clone(),
-        route_key.grad.clone(),
-        *(source.grad.clone() for source in route_sources),
-    )
-    ref_query = route_query.detach().clone().requires_grad_()
-    ref_key = route_key.detach().clone().requires_grad_()
-    ref_sources = tuple(
-        source.detach().clone().requires_grad_() for source in route_sources
-    )
-    ref_routed, ref_weights = _route_sources(
-        ref_query, ref_key, 1e-6, route_present, 4, *ref_sources
-    )
-    ref_routed.float().square().mean().backward()
-    ref_grads = (
-        ref_query.grad,
-        ref_key.grad,
-        *(source.grad for source in ref_sources),
-    )
-    # The fused kernel accumulates the value mix in FP32 instead of reproducing
-    # the reference's source-by-source BF16 rounding. Bound that intentional
-    # numerical change by both relative norm and a loose elementwise ceiling.
-    route_rel = torch.linalg.vector_norm(
-        (routed - ref_routed).float()
-    ) / torch.linalg.vector_norm(ref_routed.float())
-    weight_rel = torch.linalg.vector_norm(
-        route_weights - ref_weights
-    ) / torch.linalg.vector_norm(ref_weights)
-    if route_rel >= 0.01 or (routed - ref_routed).abs().max() >= 0.03:
-        raise AssertionError("bespoke router value drift")
-    if weight_rel >= 0.01 or (route_weights - ref_weights).abs().max() >= 0.015:
-        raise AssertionError("bespoke router weight drift")
-    for actual, expected in zip(route_grads, ref_grads, strict=True):
-        if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
-            raise AssertionError("bespoke router gradient drift")
-    del route_query, route_key, route_sources, route_present, projected
-    del routed, route_weights, route_loss, route_grads
-    del ref_query, ref_key, ref_sources, ref_routed, ref_weights, ref_grads
+    # values and gradients. H=4 covers the screen; H=8 with a shared null row
+    # covers flagship width and DF-soft's specialized pointer branch.
+    def route_parity(dim, heads, batch, length, n_sources, null_first, seed):
+        torch.manual_seed(seed)
+        query = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
+        key = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
+        sources = [
+            torch.randn(
+                batch, length, dim, device="cuda", dtype=torch.bfloat16
+            ).requires_grad_()
+            for _ in range(n_sources)
+        ]
+        if null_first:
+            sources[0] = (
+                torch.randn(1, 1, dim, device="cuda", dtype=torch.bfloat16)
+                .expand(batch, length, dim)
+                .clone()
+                .requires_grad_()
+            )
+        sources = tuple(sources)
+        present = torch.rand(n_sources, batch, length, device="cuda") > 0.2
+        present[0] = True
+        projected = (query * key).to(torch.bfloat16)
+        routed, weights = bespoke_route(
+            projected, present, null_first, 1e-6, heads, sources
+        )
+        routed.float().square().mean().backward()
+        grads = (
+            query.grad.clone(),
+            key.grad.clone(),
+            *(source.grad.clone() for source in sources),
+        )
+
+        ref_query = query.detach().clone().requires_grad_()
+        ref_key = key.detach().clone().requires_grad_()
+        ref_sources = tuple(
+            source.detach().clone().requires_grad_() for source in sources
+        )
+        ref_routed, ref_weights = _route_sources(
+            ref_query, ref_key, 1e-6, present, heads, *ref_sources
+        )
+        ref_routed.float().square().mean().backward()
+        ref_grads = (
+            ref_query.grad,
+            ref_key.grad,
+            *(source.grad for source in ref_sources),
+        )
+
+        # The bespoke value mix accumulates in FP32 rather than reproducing
+        # source-by-source BF16 rounding. Bound that intentional difference.
+        route_rel = torch.linalg.vector_norm(
+            (routed - ref_routed).float()
+        ) / torch.linalg.vector_norm(ref_routed.float())
+        weight_rel = torch.linalg.vector_norm(
+            weights - ref_weights
+        ) / torch.linalg.vector_norm(ref_weights)
+        if route_rel >= 0.01 or (routed - ref_routed).abs().max() >= 0.03:
+            raise AssertionError(f"H={heads} bespoke router value drift")
+        if weight_rel >= 0.01 or (weights - ref_weights).abs().max() >= 0.015:
+            raise AssertionError(f"H={heads} bespoke router weight drift")
+        for actual, expected in zip(grads, ref_grads, strict=True):
+            if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
+                raise AssertionError(f"H={heads} bespoke router gradient drift")
+
+    route_parity(48, 4, 3, 11, 6, False, 7)
+    route_parity(1536, 8, 2, 3, 4, True, 8)
 
     # CCE-native z-loss must retain the full-logit scalar and gradient semantics
     # while never constructing the classifier-wide activation in the real path.
