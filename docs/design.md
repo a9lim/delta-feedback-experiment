@@ -43,45 +43,6 @@ surprising result (the gate was never necessary).
 
 ## Architecture
 
-```text
-# DF
-<payload>─────┐  ┌────→(       sources      )→[route]→[+]────────→<payload>
-              │  │ {   ↓        ↑   ↓       ↑  }       ↑
-              │  │ {[route]     │[route]    │  }       │
-              │  │ {   ↓        │   ↓       │  }       │
-              │  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
-              ↓  │ {   ↑        ↓   ↑       ↓  }       │
-<embedding>→[GLU]┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
-
-# DF-soft
-<payload>────────┬────→(       sources      )→[route]→[+]────────→<payload>
-                 │ {   ↓        ↑   ↓       ↑  }       ↑
-                 │ {[route]     │[route]    │  }       │
-                 │ {   ↓        │   ↓       │  }       │
-                 │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
-                 │ {   ↑        ↓   ↑       ↓  }       │
-<embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
-
-# DAR
-                 ┌────→(       sources      )
-                 │ {   ↓        ↑   ↓       ↑  }
-                 │ {[route]     │[route]    │  }
-                 │ {   ↓        │   ↓       │  }
-                 │ {  [+]→[Attn]┤  [+]→[MLP]┤  }
-                 │ {   ↑        ↓   ↑       ↓  }
-<embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
-
-# FBT
-<payload>─────┐    {  [+]→[Attn]┐  [+]→[MLP]┐  }       ┌─────────→<payload>
-              ↓    {   ↑        ↓   ↑       ↓  }       │
-<embedding>→[GLU]─→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
-
-# Vanilla
-                   {  [+]→[Attn]┐  [+]→[MLP]┐  }
-                   {   ↑        ↓   ↑       ↓  }
-<embedding>───────→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
-```
-
 One decode step of the full model at position t (trial configuration:
 per-sublayer sources). `route(vs, q)` returns
 `sum softmax_i(q . rmsnorm(vs_i)) vs_i` with `q` zero-init. Every
@@ -89,26 +50,90 @@ per-sublayer sources). `route(vs, q)` returns
 router's key norm included, code-verbatim with DAR.
 
 ```python
+# DF
+# <payload>─────┐  ┌────→(       sources      )→[route]→[+]────────→<payload>
+#               │  │ {   ↓        ↑   ↓       ↑  }       ↑
+#               │  │ {[route]     │[route]    │  }       │
+#               │  │ {   ↓        │   ↓       │  }       │
+#               │  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
+#               ↓  │ {   ↑        ↓   ↑       ↓  }       │
+# <embedding>→[GLU]┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
 e = embed(tok)
-u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G rmsnorm(e))
-srcs = [u]                               # input seed + deltas: complete decomposition
+u = rmsnorm(glu(p, e))              # FBT gate: W_U p * sigmoid(W_G rmsnorm(e))
+srcs = [u]                               # input seed + deltas
 h = u
 for l in layers:
-    a = attn(rmsnorm(h + route(srcs, q_attn[l])))   # routed read (no-op while len(srcs) < 2)
+    a = attn(rmsnorm(h + route(srcs, q_attn[l])))   # routed read
     h = h + a; srcs.append(a)
     m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))     # routed read
     h = h + m; srcs.append(m)
-p_prev = rmsnorm(h + route(srcs[1:], q_p))   # additive payload over deltas (no null)
+p = rmsnorm(h + route(srcs[1:], q_p))   # additive payload over deltas
 tok = sample(lm_head(rmsnorm(h)))
 
-# Parent arms delete from this model:
-#   vanilla: u = e; no route() calls; no payload
-#   DAR:     u = e; srcs = [e] (its input seed); no payload
-#   FBT:     no route() calls; p_prev = rmsnorm(h)   (bare top state)
-#
-# DF-soft (screen-only fifth arm) replaces the hard choices with soft ones:
-#   h = e (no GLU anywhere); srcs = [p_prev, e]; every route() — depth and
-#   payload — carries a null source, so it can regress to vanilla.
+# DF-soft
+# <payload>────────┬────→(       sources      )→[route]→[+]────────→<payload>
+#                  │ {   ↓        ↑   ↓       ↑  }       ↑
+#                  │ {[route]     │[route]    │  }       │
+#                  │ {   ↓        │   ↓       │  }       │
+#                  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
+#                  │ {   ↑        ↓   ↑       ↓  }       │
+# <embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
+e = embed(tok)
+srcs = [p, e, null]                 # input seed + deltas
+h = e
+for l in layers:
+    a = attn(rmsnorm(h + route(srcs, q_attn[l])))   # routed read
+    h = h + a; srcs.append(a)
+    m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))     # routed read
+    h = h + m; srcs.append(m)
+p = rmsnorm(h + route(srcs[2:], q_p))   # additive payload over deltas
+tok = sample(lm_head(rmsnorm(h)))
+
+# DAR
+#                  ┌────→(       sources      )
+#                  │ {   ↓        ↑   ↓       ↑  }
+#                  │ {[route]     │[route]    │  }
+#                  │ {   ↓        │   ↓       │  }
+#                  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }
+#                  │ {   ↑        ↓   ↑       ↓  }
+# <embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
+e = embed(tok)
+srcs = [e]                               # input seed + deltas
+h = e
+for l in layers:
+    a = attn(rmsnorm(h + route(srcs, q_attn[l])))   # routed read
+    h = h + a; srcs.append(a)
+    m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))     # routed read
+    h = h + m; srcs.append(m)
+tok = sample(lm_head(rmsnorm(h)))
+
+# FBT
+# <payload>─────┐    {   ┌─→[Attn]┐   ┌─→[MLP]┐  }       ┌─────────→<payload>
+#               ↓    {   ↑        ↓   ↑       ↓  }       │
+# <embedding>→[GLU]─→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
+e = embed(tok)
+u = rmsnorm(glu(p, e))              # FBT gate: W_U p * sigmoid(W_G rmsnorm(e))
+h = u
+for l in layers:
+    a = attn(rmsnorm(h))
+    h = h + a
+    m = mlp(rmsnorm(h)) 
+    h = h + m
+p = rmsnorm(h)
+tok = sample(lm_head(rmsnorm(h)))
+
+# Vanilla
+#                    {   ┌─→[Attn]┐   ┌─→[MLP]┐  }
+#                    {   ↑        ↓   ↑       ↓  }
+# <embedding>───────→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
+e = embed(tok)
+h = e
+for l in layers:
+    a = attn(rmsnorm(h))
+    h = h + a
+    m = mlp(rmsnorm(h))
+    h = h + m
+tok = sample(lm_head(rmsnorm(h)))
 ```
 
 **Depth routing (DAR side).** Before every attention and MLP sublayer, a
@@ -173,7 +198,7 @@ departure. The seed also closes an observability gap at trial granularity:
 per-layer seed weight is the input-re-injection readout in every routed
 arm. The depth-routing module remains identical between the DAR arm and
 DF — only the seed's content differs, and that difference is entailed by
-the feedback apparatus itself. Raw `e` and raw `p_prev` remain absent from
+the feedback apparatus itself. Raw `e` and raw `p` remain absent from
 the spine's list (token identity passes only through the gate's
 multiplicative pattern, FBT's own working regime [paper]; ungated payload
 access is DF-soft's measurement), and the spine/DF-soft asymmetry stays
@@ -200,7 +225,7 @@ as a screen-only fifth arm:
 
 - `h = e`, no GLU anywhere — feedback is just one more routed source; one
   primitive everywhere, no W_U/W_G.
-- Standing sources `[p_prev, e]` — ungated payload access and raw token
+- Standing sources `[p, e]` — ungated payload access and raw token
   re-injection, the two observables the spine gives up.
 - A null source in *every* router, within-column and payload — the model
   can regress to vanilla, and every routing weight (null mass included) is
@@ -208,7 +233,7 @@ as a screen-only fifth arm:
 
 DF-soft contains its own control: within-column routing starts at step 0
 (the regime where DAR's optional routing is known to adopt [paper]), while
-the `p_prev` source structurally cannot appear before the late multi-pass
+the `p` source structurally cannot appear before the late multi-pass
 batches — the same mechanism predicts opposite fates for the two channels
 in a single run. DF-soft is never a ladder candidate unless it matches DF
 outright, which would itself be a headline result (the gate was never
@@ -370,7 +395,7 @@ unknowable data mixture makes them incomparable as controls.
   the paper's Block-mode embedding-prominence appear at per-sublayer
   granularity, and does it migrate to the fused input?) — with the DAR
   arm's `e`-seed weight as the feedback-free baseline for the same
-  question. DF-soft: per-layer weight on `p_prev` (does a
+  question. DF-soft: per-layer weight on `p` (does a
   free model demand the previous column?), weight on `e`
   (embedding-prominence under recurrence), and null masses everywhere —
   the adoption readout, including the injection-form question. FBT's
