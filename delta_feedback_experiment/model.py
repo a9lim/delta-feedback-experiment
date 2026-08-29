@@ -32,6 +32,7 @@ Semantics worth naming because they are easy to get subtly wrong:
 
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass, replace
 
@@ -1035,22 +1036,33 @@ def iterate_fused(
     cfg = model.cfg
     if not cfg.feedback_active:
         raise ValueError("the contraction diagnostic needs a feedback-bearing arm")
-    batch, length = tokens.shape
-    e = model.embed_tokens(tokens)
-    positions = torch.arange(length, device=tokens.device)
-    plain = (positions[None, :] < 1).expand(batch, -1)
+    # This is part of the standing training monitor, so CUDA must follow the
+    # same BF16 activation path as captured training and evaluation.  Besides
+    # preserving the numerical contract, keeping autocast state identical
+    # avoids an unprepared whole-block Dynamo specialization at every routed
+    # source count after the capture-time recompile limit has been restored.
+    autocast = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if tokens.is_cuda
+        else contextlib.nullcontext()
+    )
+    with autocast:
+        batch, length = tokens.shape
+        e = model.embed_tokens(tokens)
+        positions = torch.arange(length, device=tokens.device)
+        plain = (positions[None, :] < 1).expand(batch, -1)
 
-    out = model.forward_column(e)
-    records = []
-    for _ in range(n_iters):
-        previous = out.h_top
-        p_shifted = shift_right(out.payload)
-        if cfg.soft:
-            out = model.forward_column(e, p_source=p_shifted, p_presence=~plain)
-        else:
-            fused = model.fuse(p_shifted, e)
-            out = model.forward_column(torch.where(plain[..., None], e, fused))
-        loss, _ = sequence_ce(model, out.h_top[:, :-1], tokens[:, 1:])
-        delta = (out.h_top - previous).float().norm(dim=-1).mean()
-        records.append({"loss": loss.item(), "update_norm": delta.item()})
+        out = model.forward_column(e)
+        records = []
+        for _ in range(n_iters):
+            previous = out.h_top
+            p_shifted = shift_right(out.payload)
+            if cfg.soft:
+                out = model.forward_column(e, p_source=p_shifted, p_presence=~plain)
+            else:
+                fused = model.fuse(p_shifted, e)
+                out = model.forward_column(torch.where(plain[..., None], e, fused))
+            loss, _ = sequence_ce(model, out.h_top[:, :-1], tokens[:, 1:])
+            delta = (out.h_top - previous).float().norm(dim=-1).mean()
+            records.append({"loss": loss.item(), "update_norm": delta.item()})
     return records

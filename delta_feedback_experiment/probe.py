@@ -27,6 +27,7 @@ def cuda_gate() -> None:
         _route_sources,
         arm_config,
         flash_attn_func,
+        iterate_fused,
         linear_cross_entropy_apply,
     )
     from .optim import OptimizerPair, build_optimizers
@@ -37,6 +38,7 @@ def cuda_gate() -> None:
         build_parser,
         build_schedule,
         evaluate,
+        route_summary,
     )
 
     if flash_attn_func is None or linear_cross_entropy_apply is None:
@@ -262,6 +264,21 @@ def cuda_gate() -> None:
                 f"captured evaluation drift in {key}: {value} versus "
                 f"{eager_scores[key]}"
             )
+
+    # Exercise the exact first-report sequence used by training after all
+    # capture-time whole-block specializations have been prepared.  This
+    # catches global-state/compiler-cache mismatches in monitors that the
+    # captured train/eval bodies cannot expose by themselves.
+    summary = route_summary(model, probe_validation, args, torch.device("cuda"))
+    if not summary:
+        raise AssertionError("CUDA route summary is empty for the DF arm")
+    trace = iterate_fused(model, probe_validation.batch(0, 2, "cuda"), n_iters=2)
+    if any(
+        not math.isfinite(record[key])
+        for record in trace
+        for key in ("loss", "update_norm")
+    ):
+        raise AssertionError(f"nonfinite CUDA contraction trace: {trace}")
 
     compiled = counters["stats"]["unique_graphs"]
     generator = torch.Generator().manual_seed(0)
