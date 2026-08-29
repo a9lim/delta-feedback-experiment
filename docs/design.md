@@ -45,7 +45,9 @@ surprising result (the gate was never necessary).
 
 One decode step of the full model at position t (trial configuration:
 per-sublayer sources). `route(vs, q)` returns
-`sum softmax_i(q . rmsnorm(vs_i)) vs_i` with `q` zero-init.
+`sum softmax_i(q . rmsnorm(vs_i)) vs_i` with `q` zero-init. Every
+`rmsnorm` below is a per-site learnable RMSNorm (weight-1 init) — the
+router's key norm included, code-verbatim with DAR.
 
 ```python
 e = embed(tok)
@@ -53,12 +55,12 @@ u = rmsnorm(glu(p_prev, e))              # FBT gate: W_U p_prev * sigmoid(W_G rm
 srcs = [u]                               # input seed + deltas: complete decomposition
 h = u
 for l in layers:
-    a = attn(norm(h + route(srcs, q_attn[l])))   # routed read (no-op while len(srcs) < 2)
+    a = attn(rmsnorm(h + route(srcs, q_attn[l])))   # routed read (no-op while len(srcs) < 2)
     h = h + a; srcs.append(a)
-    m = mlp(norm(h + route(srcs, q_mlp[l])))     # routed read
+    m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))     # routed read
     h = h + m; srcs.append(m)
 p_prev = rmsnorm(h + route(srcs[1:], q_p))   # additive payload over deltas (no null)
-tok = sample(lm_head(h))
+tok = sample(lm_head(rmsnorm(h)))
 
 # Parent arms delete from this model:
 #   vanilla: u = e; no route() calls; no payload
