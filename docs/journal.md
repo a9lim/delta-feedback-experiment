@@ -3,6 +3,57 @@
 Disposable working space, periodically cleared. Keep only notes needed for
 active work; anything durable graduates to `design.md` or `findings.md`.
 
+## 2026-08-29 — phase 2 repinned: CYB loss + recurrent pause slots
+
+a9 raised CYB (Catch Your Breath, arXiv:2510.13879 — marginal-likelihood
+loss over a learned per-token halting distribution, `<don't-know>` output
+buys a pause slot) with two questions: CYB-style loss over FBT's passes,
+and a recurrent pause token that triggers an extra pass *without touching
+the KV cache*. Resolution, now pinned in design.md's Extension section:
+
+- **Not phase 1.** A CYB loss over passes needs every feedback-phase
+  batch to run W_max passes so the mixture components exist (~3 vs the
+  schedule's expected 2.12 → ~17% more program compute before any
+  sequence inflation; CYB's "no extra cost" is relative to fixed pauses,
+  not none), and a third mechanism in DF alone turns the factorial into
+  DAR × FBT × CYB with the third factor unpartnered — the interaction
+  term stops being interpretable. Matched-compute accounting also gets
+  ugly under adaptive halting. The binding-recipe contract stands.
+- **Core phase 2, replacing the Goyal fixed-pause pin.** CYB's own
+  evidence dominates the old pin (CYB@1 pause beats TBYS@3, 2.7–3.6%
+  PPL, ~33% data-to-match at Gemma 2B/4B on C4), keeps the pretrained-in
+  requirement Goyal established, and ships the halting distribution as a
+  per-token compute-demand readout — routing-weights-as-observables,
+  extended to the time axis.
+- **Slot-shift unification** (the tidy part): lay out
+  `[…, t, t.p1, t.p2, t+1, …]` with pause slots repeating position index
+  *and* token embedding, and FBT's "shift payload one slot right"
+  implements both recurrences uniformly — real→real is cross-column
+  feedback, real→pause and pause→pause are self-loops (same token gates
+  the GLU, own payload on the value path). No new mechanism in the
+  Jacobi trainer; the CYB loss sits over the W_max prediction sites.
+- **a9's no-KV variant is the strongest form and the default.** Pause
+  slots masked from future attention: decode iteration costs FLOPs only
+  (CYB's own pauses inflate context W_max×), and attribution sharpens —
+  KV-free pauses in a vanilla transformer *cannot chain at all* (each an
+  independent one-shot re-read), so serial-depth gains are
+  payload-mediated by construction. CYB-verbatim visible pauses are one
+  mask bit away: pre-registered internal ablation for what pause-KV
+  visibility buys beyond the payload carry.
+- **Costs kept honest:** self-loops are never trained by the current
+  schedule (payloads always consumed one column right) — pauses must be
+  trained in, and only activate in passes ≥ 2, i.e. with the feedback
+  phase; the decode pause loop literally iterates the per-position map,
+  promoting the contraction gate from diagnostic to load-bearing; the
+  payload is a d-dim bottleneck vs a KV entry per layer per pause (the
+  mask-bit ablation measures exactly this); γ/ω are new knobs; evidence
+  class is one group, fine-tune/short-pretrain scale — same trust tier
+  as the parents.
+
+refs.yaml: galashov2025-catch-your-breath added as phase-2 core; Goyal
+entry demoted to lineage/TBYS-baseline. Phase-1 arms, recipe, and gates
+untouched.
+
 ## 2026-08-29 — smoke-df1 landed; all three smoke gates read clean
 
 Exit 0 at 00:29, queue DONE; snapshots at 825/1000/1100 (2.2G each);

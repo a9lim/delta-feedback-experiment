@@ -22,14 +22,29 @@ references:
       for all our arms; flagship matches their 1B/400B-token scale and
       1536x24 trunk. Their open question — which injection form is best —
       is our A1-vs-A2 comparison.
+  - arxiv: "2510.13879"
+    slug: galashov2025-catch-your-breath
+    note: >
+      Phase-2 extension core. CYB: per-token adaptive pauses via a
+      marginal-likelihood loss — the model emits <don't-know> to take
+      another pause slot; loss −log E_{i~Pr(S|d,ω)}[γ_i·t_i] over the
+      W_max prediction sites, fully parallel at train and inference
+      (pauses share the real token's position index). 2.7–3.6% PPL over
+      fixed-pause TBYS (Gemma 2B/4B, C4; CYB@1 pause beats TBYS@3), ~33%
+      of baseline data to match it; pause use stays judicious even
+      undiscounted. Their pauses write KV and inflate context W_max× —
+      our recurrent-pause variant masks them from future attention and
+      chains through the payload instead.
   - arxiv: "2310.02226"
     slug: goyal2023-pause-tokens
     note: >
-      Phase-2 extension arm. Pause tokens must be pretrained in to work —
-      matching our from-scratch setting. Under latent feedback, consecutive
-      pauses chain full-depth through the payload (a horizontally unrolled
-      loop transformer), supplying the serial depth pauses lack alone.
-      Loose conceptual parallel to recirculated-dot-experiment.
+      Phase-2 lineage — fixed pause tokens (the TBYS recipe CYB
+      supersedes). Core carry-over: pauses must be pretrained in,
+      matching our from-scratch setting. Under latent feedback,
+      consecutive pauses chain full-depth through the payload (a
+      horizontally unrolled loop transformer), supplying the serial
+      depth pauses lack alone. Loose conceptual parallel to
+      recirculated-dot-experiment.
   - arxiv: "2510.05491"
     slug: li2025-normuon
     note: >

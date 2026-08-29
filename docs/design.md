@@ -371,18 +371,48 @@ detects effects of this size.
 
 ## Extension (phase 2, contingent on the factorial)
 
-Add pause-token pretraining (Goyal et al., arXiv:2310.02226) to the winning
-model. Mechanism bet [synthesis]: in a vanilla transformer pauses add
-parallel width only (constant input embedding; pause columns chain only via
-attention); under latent feedback, consecutive pauses chain through the
-payload at full depth — k pauses approximate a k-step loop transformer
-unrolled horizontally, paid in KV entries. Pause supplies decode-time
-serial depth; the feedback channel supplies the carry pauses lack.
-Complementary dials: fused prefill scales prompt-side compute, pauses scale
-decode-side. Goyal et al.'s core finding — pauses must be pretrained in —
-matches this from-scratch setting [paper]. The parallel to
-recirculated-dot-experiment is loose and conceptual; no shared protocol
-obligation.
+Add adaptive pause-slot pretraining under the CYB loss (Catch Your Breath,
+arXiv:2510.13879) to the winning model. During the feedback phase, insert
+W_max−1 pause slots after each real token (W_max−1 = 1–2; CYB's one-pause
+models beat fixed three-pause TBYS baselines [paper]). A pause slot repeats
+its real token's position index and embedding, so FBT's slot-to-slot
+payload shift implements both recurrences with one rule: real→real
+boundaries carry ordinary cross-column feedback, real→pause and
+pause→pause are self-loops on the column — same token gating the GLU, own
+payload on the value path [synthesis]. The model emits a reserved
+`<don't-know>` output token to request another iteration; the CYB loss
+marginalizes the NTP likelihood over the halting slot
+(−log E_{i~Pr(S|d,ω)}[γ_i·t_i], discount γ, world-stop prior ω), trained
+fully in parallel over the W_max prediction sites per real token [paper].
+
+**Default mask: pause slots are hidden from future attention — they write
+no KV.** Decode-time iteration then costs FLOPs only: no cache growth, no
+context clutter (CYB's own pauses write KV and inflate context W_max×
+[paper]), long-context behavior untouched. The mask is also the
+attribution instrument: KV-free pauses in a vanilla transformer cannot
+chain at all — each is an independent one-shot re-read — so any
+serial-depth gain here is payload-mediated by construction [synthesis].
+Pre-registered internal ablation: flip the single mask bit to
+CYB-verbatim visible pauses, measuring what pause-KV visibility buys
+beyond the payload carry. Decode: Soft decoding iterates a column while
+`<don't-know>` mass exceeds threshold, up to W_max — per-token adaptive
+serial depth, with the halting distribution as a per-token compute-demand
+readout in the routing-weights-as-observables spirit. Fused prefill still
+scales prompt-side compute; pauses scale decode-side.
+
+Constraints and knobs. Pauses must be pretrained in (Goyal et al.,
+arXiv:2310.02226 [paper]), matching this from-scratch setting; pause
+slots carry non-trivial payloads only in passes ≥ 2, so they activate
+with the feedback phase [synthesis]. The pause loop literally iterates
+the per-position map at decode, so the contraction gate is load-bearing
+for this extension, not merely diagnostic. New knobs: γ and ω (start from
+CYB's exponential-discount defaults); distinct learned `<pause_i>`
+embeddings (CYB's own form) are the fallback if the self-loop needs an
+explicit iteration signal. CYB stays out of phase 1: every
+feedback-phase batch would pay W_max passes (vs the mixture's expected
+2.12) and a third mechanism in DF alone would confound the interaction
+term [synthesis]. The parallel to recirculated-dot-experiment is loose
+and conceptual; no shared protocol obligation.
 
 ## Risks
 
