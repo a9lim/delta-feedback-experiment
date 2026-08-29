@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -325,16 +324,12 @@ def _route_sources(
     return routed, weights
 
 
-@lru_cache(maxsize=None)
-def _compiled_route(source_count: int):
-    """One intentional static graph per source count, without guard churn."""
-    del source_count  # The cache key owns specialization; the call shape verifies it.
-    return torch.compile(
-        _route_sources,
-        fullgraph=True,
-        dynamic=False,
-        mode="max-autotune-no-cudagraphs",
-    )
+_compiled_route_sources = torch.compile(
+    _route_sources,
+    fullgraph=True,
+    dynamic=True,
+    mode="max-autotune-no-cudagraphs",
+)
 
 
 class Router(nn.Module):
@@ -376,7 +371,7 @@ class Router(nn.Module):
                 ]
             )
         if sources[0].is_cuda:
-            routed, weights = _compiled_route(len(sources))(
+            routed, weights = _compiled_route_sources(
                 self.query,
                 self.key_norm.weight,
                 self.key_norm.eps,

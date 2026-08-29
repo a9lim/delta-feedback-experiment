@@ -261,9 +261,18 @@ class CudaGraphTrainer:
         for spec in specs:
             self.states[spec] = self._allocate(spec)
 
-        active_by_spec = {
-            spec: self._warm(state) for spec, state in self.states.items()
-        }
+        # The pointer-list router intentionally specializes on source count
+        # (up to 27), while retaining dynamic B/T. Raise Dynamo's frame-local
+        # guard only during exhaustive preparation, then restore the process
+        # default before timed execution.
+        prior_recompile_limit = torch._dynamo.config.recompile_limit
+        torch._dynamo.config.recompile_limit = max(prior_recompile_limit, 64)
+        try:
+            active_by_spec = {
+                spec: self._warm(state) for spec, state in self.states.items()
+            }
+        finally:
+            torch._dynamo.config.recompile_limit = prior_recompile_limit
         model.zero_grad(set_to_none=True)
         union = set().union(*active_by_spec.values())
         self.grad_buffers = {p: torch.zeros_like(p) for p in union}
