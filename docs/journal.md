@@ -67,6 +67,28 @@ against step-1100 route telemetry (payload maxT 0.981 vs logged 0.9805).
   Pass-1 vs fused routing differs little; largest shift is L1.attn giving
   the fused entry u 10% (vs 1% to plain e).
 
+**Why a8** — counterfactual sweep (`scripts/payload_swap.py`, forcing
+the payload enrichment to each single delta; caveat: entry weights
+co-adapted to a8, so alternatives are handicapped — read shape, not
+gaps). Trained/forced-a8 fused 3.7948; **h_top-only and uniform both
+3.8001** — the uniform init is a structural no-op (Σdeltas ≈ h_top up to
+the tiny seed, and payload_norm scales it away), so the router had to
+break symmetry to contribute anything, and its whole contribution is
+~5 mn of the 21 mn fused-vs-plain gap. The landscape is family-
+structured: every attn delta ties or beats no-enrichment (a8 3.7948 <
+a6 3.7968 < a9 3.7976), every MLP delta *hurts*, monotonically worse
+with depth (m8 3.8037 → m10 3.8102) — worse than sending nothing.
+Read (synthesis): position t's fused entry already knows token t, so
+late-MLP content — next-token-prediction features of position t−1 —
+is redundant and is also the amplifying direction the contraction
+fight is about; contextual attention summaries are the non-redundant
+family. Within the attn family the preference for a8 over a6/a9 is
+~2–3 mn under co-adapted weights — plausibly semi-contingent
+(rich-get-richer during the short feedback phase; a different seed
+might crown a6 or a9). Screen-scale question: does the family
+structure persist and the specific choice stay stable across arms and
+seeds?
+
 ## 2026-08-28 (night) — resume fix; runs.a9l.im tracking page live
 
 Plan settled with a9: once smoke-df1 lands, a9 runs the optimization
