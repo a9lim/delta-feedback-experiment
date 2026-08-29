@@ -44,12 +44,23 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 
 try:
     from cut_cross_entropy import linear_cross_entropy
-    from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
+    from cut_cross_entropy.cce import (
+        CCEParams,
+        linear_cross_entropy_apply,
+        sort_logit_avg,
+    )
+    from cut_cross_entropy.cce_backward import cce_backward_kernel
+    from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
+    from cut_cross_entropy.indexed_dot import indexed_neg_dot_forward_kernel
     from cut_cross_entropy.utils import _handle_eps
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     linear_cross_entropy = None
     CCEParams = None
     linear_cross_entropy_apply = None
+    sort_logit_avg = None
+    cce_backward_kernel = None
+    cce_lse_forward_kernel = None
+    indexed_neg_dot_forward_kernel = None
     _handle_eps = None
 
 ARMS = ("vanilla", "dar", "fbt", "df", "df_soft")
@@ -757,6 +768,92 @@ def _fixed_cce(embeddings: Tensor, classifier: Tensor, targets: Tensor) -> Tenso
     return linear_cross_entropy_apply(embeddings, classifier, params)
 
 
+class _LinearCrossEntropyZFunction(torch.autograd.Function):
+    """CCE's tiled linear CE plus exact mean-square log-partition loss.
+
+    The pinned CCE forward already computes one FP32 log-sum-exp per token.
+    Preserve it for the scalar z-loss and reuse CCE's probability-tile backward
+    for ``2 * z * lse * softmax(logits)``.  The classifier-sized logits are
+    never materialized.  CE retains the authoritative high-threshold gradient
+    filter; the z term is deliberately unfiltered so its derivative is exact.
+    """
+
+    @staticmethod
+    def forward(ctx, embeddings: Tensor, classifier: Tensor, targets: Tensor):
+        filter_eps = _handle_eps("high", embeddings.dtype)
+        return_logit_avg = (
+            embeddings.requires_grad or classifier.requires_grad
+        ) and filter_eps is not None
+        result = cce_lse_forward_kernel(
+            embeddings,
+            classifier,
+            None,
+            softcap=None,
+            return_logit_avg=return_logit_avg,
+        )
+        if return_logit_avg:
+            lse, logit_avg = result
+        else:
+            lse, logit_avg = result, None
+        neg_dot = indexed_neg_dot_forward_kernel(
+            embeddings,
+            classifier,
+            targets,
+            False,
+            None,
+            None,
+            lse.dtype,
+        )
+        ce = neg_dot.add_(lse).mean()
+        z = lse.square().mean()
+        ctx.save_for_backward(embeddings, classifier, lse, targets, logit_avg)
+        ctx.filter_eps = filter_eps
+        return ce, z
+
+    @staticmethod
+    def backward(ctx, grad_ce: Tensor, grad_z: Tensor):
+        embeddings, classifier, lse, targets, logit_avg = ctx.saved_tensors
+        ordering = sort_logit_avg(logit_avg) if logit_avg is not None else None
+        scale = 1.0 / lse.numel()
+        de_ce, dc_ce = cce_backward_kernel(
+            grad_ce,
+            embeddings,
+            classifier,
+            lse,
+            None,
+            None,
+            ctx.filter_eps,
+            targets=targets,
+            shift=False,
+            vocab_ordering=ordering,
+            grad_scale=scale,
+        )
+        # With no targets CCE's tile derivative is exactly softmax(logits).
+        de_z, dc_z = cce_backward_kernel(
+            grad_z * (2.0 * lse),
+            embeddings,
+            classifier,
+            lse,
+            None,
+            None,
+            None,
+            targets=None,
+            shift=False,
+            vocab_ordering=None,
+            grad_scale=scale,
+        )
+        return de_ce + de_z, dc_ce + dc_z, None
+
+
+def _fixed_cce_z(
+    embeddings: Tensor, classifier: Tensor, targets: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Dense capture-safe CCE and z-loss for the packed training stream."""
+    embeddings = embeddings.contiguous().flatten(0, -2)
+    targets = targets.contiguous().flatten()
+    return _LinearCrossEntropyZFunction.apply(embeddings, classifier, targets)
+
+
 def sequence_ce(
     model: DFModel,
     h_top: Tensor,
@@ -773,11 +870,13 @@ def sequence_ce(
     chunk in both forward and backward.
     """
     count = targets.numel()
-    if h_top.is_cuda and not want_z and linear_cross_entropy is not None:
+    if h_top.is_cuda and linear_cross_entropy is not None:
         # CCE fuses tied unembedding and CE, never materializing [B,T,V].
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
         normalized = model.final_norm(h_top)
+        if want_z:
+            return _fixed_cce_z(normalized, model.embed_tokens.weight, targets)
         ce = _fixed_cce(normalized, model.embed_tokens.weight, targets)
         return ce, ce.new_zeros((), dtype=torch.float32)
 

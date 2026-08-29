@@ -20,6 +20,7 @@ def cuda_gate() -> None:
     from .model import (
         DFModel,
         KVCache,
+        _fixed_cce_z,
         arm_config,
         flash_attn_func,
         linear_cross_entropy_apply,
@@ -29,6 +30,32 @@ def cuda_gate() -> None:
 
     if flash_attn_func is None or linear_cross_entropy_apply is None:
         raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
+
+    # CCE-native z-loss must retain the full-logit scalar and gradient semantics
+    # while never constructing the classifier-wide activation in the real path.
+    torch.manual_seed(11)
+    cce_e = torch.randn(41, 32, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    cce_c = torch.randn(127, 32, device="cuda", dtype=torch.float32).requires_grad_()
+    cce_t = torch.randint(0, 127, (41,), device="cuda")
+    cce_ce, cce_z = _fixed_cce_z(cce_e, cce_c, cce_t)
+    (cce_ce + 1e-2 * cce_z).backward()
+    cce_de, cce_dc = cce_e.grad.float().clone(), cce_c.grad.clone()
+    ref_e = cce_e.detach().clone().requires_grad_()
+    ref_c = cce_c.detach().clone().requires_grad_()
+    ref_logits = (ref_e @ ref_c.mT).float()
+    ref_ce = torch.nn.functional.cross_entropy(ref_logits, cce_t)
+    ref_z = ref_logits.logsumexp(-1).square().mean()
+    (ref_ce + 1e-2 * ref_z).backward()
+    if not torch.allclose(cce_ce, ref_ce, rtol=2e-3, atol=2e-3):
+        raise AssertionError(f"CCE CE drift: {cce_ce.item()} versus {ref_ce.item()}")
+    if not torch.allclose(cce_z, ref_z, rtol=2e-3, atol=2e-3):
+        raise AssertionError(f"CCE z drift: {cce_z.item()} versus {ref_z.item()}")
+    if not torch.allclose(cce_de, ref_e.grad.float(), rtol=3e-2, atol=3e-3):
+        raise AssertionError("CCE-native z embedding gradient drift")
+    if not torch.allclose(cce_dc, ref_c.grad, rtol=3e-2, atol=3e-3):
+        raise AssertionError("CCE-native z classifier gradient drift")
+    del cce_e, cce_c, cce_t, cce_de, cce_dc, ref_e, ref_c, ref_logits
+    del cce_ce, cce_z, ref_ce, ref_z
 
     # Exercise both FlashAttention entry points: full causal attention and the
     # in-place native GQA KV cache. BF16 changes with block partitioning, so the
