@@ -45,8 +45,8 @@ def cuda_gate() -> None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
 
     # The fixed-capacity router must match the semantic implementation in both
-    # values and its source/query gradient.  Use a masked source to cover the
-    # DF-soft prefix mixin instead of benchmarking only the dense DAR case.
+    # values and its source/query gradient. Use four routing heads and a masked
+    # source to cover both MHDAR specialization and DF-soft prefix masking.
     torch.manual_seed(7)
     route_query = torch.randn(48, device="cuda", dtype=torch.float32).requires_grad_()
     route_key = torch.randn(48, device="cuda", dtype=torch.float32).requires_grad_()
@@ -58,7 +58,7 @@ def cuda_gate() -> None:
     route_present[0] = True
     projected = (route_query * route_key).to(torch.bfloat16)
     routed, route_weights = bespoke_route(
-        projected, route_present, False, 1e-6, route_sources
+        projected, route_present, False, 1e-6, 4, route_sources
     )
     route_loss = routed.float().square().mean()
     route_loss.backward()
@@ -73,7 +73,7 @@ def cuda_gate() -> None:
         source.detach().clone().requires_grad_() for source in route_sources
     )
     ref_routed, ref_weights = _route_sources(
-        ref_query, ref_key, 1e-6, route_present, *ref_sources
+        ref_query, ref_key, 1e-6, route_present, 4, *ref_sources
     )
     ref_routed.float().square().mean().backward()
     ref_grads = (

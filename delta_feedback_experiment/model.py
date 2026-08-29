@@ -1,8 +1,9 @@
 """The DF model family: one trunk, arms as deletions.
 
 The architecture contract is docs/design.md (Architecture); parity
-references are DAR's released code
-(references/delta-attention-residuals-code/) for routing semantics and
+references are DAR's and MHAR's released code
+(references/delta-attention-residuals-code/ and
+references/multi-head-attention-residuals-code/) for routing semantics and
 FBT arXiv:2608.08888 Appendices A/C for the trunk conventions and the
 multi-pass entry.  Everything here is arm-agnostic model semantics: the
 five arms are one class under :class:`ModelConfig` flags, and the parents
@@ -12,14 +13,16 @@ keep paired arms architecturally identical in everything but the flags.
 
 Semantics worth naming because they are easy to get subtly wrong:
 
-- Depth routing is a *transient read*: the routed convex combination
+- Multi-head depth routing is a *transient read*: each KV-sized channel
+  group has its own softmax over sources; the concatenated convex mixtures
   enriches one sublayer's pre-norm input and is never accumulated into
   the residual stream, so the stream stays the clean telescoping sum
   seed + Σdeltas = h_top (paper Fig. 3 and released code agree).
 - The source list seeds with the column's actual input (complete
   decomposition), and a routing site is a no-op until it can see two
   sources — the singleton seed would route weight 1 onto itself.
-- The payload router reads deltas only (never the seed), additively on
+- The payload router uses the same multi-head primitive over deltas only
+  (never the seed), additively on
   top of the top state; DF-soft's routers all carry a learnable
   zero-init null source (DAR's fine-tuning mechanism, verbatim).
 - Sublayer branch outputs are scaled 1/sqrt(2L) (FBT depth scaling, our
@@ -70,7 +73,7 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     indexed_neg_dot_forward_kernel = None
     _handle_eps = None
 
-ARMS = ("vanilla", "dar", "fbt", "df", "df_soft")
+ARMS = ("vanilla", "mhdar", "fbt", "df", "df_soft")
 
 
 @dataclass(frozen=True)
@@ -78,7 +81,11 @@ class ModelConfig:
     """Trunk geometry plus the two-axis arm flags.
 
     Screen defaults are the pinned 220M trunk (design: Sub-flagship
-    geometry): DAR's d=768/L=12 with their script-default head split.
+    geometry): DAR's d=768/L=12 with our pinned attention-head split.
+    Routing heads are not an independent knob: every routed arm uses one
+    contiguous channel group per KV head (H=4 at screen scale, H=8 at the
+    flagship).  This is MHAR's zero-parameter reshape, not alignment to the
+    attention projections.
     """
 
     vocab_size: int = 151936
@@ -93,7 +100,7 @@ class ModelConfig:
     norm_eps: float = 1e-6
 
     depth_routing: bool = False
-    """DAR axis: routing sites before every sublayer."""
+    """MHDAR axis: multi-head delta routing before every sublayer."""
 
     feedback: bool = False
     """FBT axis: gated entry plus a payload for the next column."""
@@ -105,6 +112,11 @@ class ModelConfig:
     @property
     def routing_active(self) -> bool:
         return self.depth_routing or self.soft
+
+    @property
+    def routing_heads(self) -> int:
+        """The authoritative MHDAR scaling rule: H equals KV-head count."""
+        return self.kv_heads
 
     @property
     def feedback_active(self) -> bool:
@@ -120,7 +132,7 @@ def arm_config(arm: str, **overrides) -> ModelConfig:
     """The named arm's configuration; overrides adjust trunk geometry only."""
     flags = {
         "vanilla": {},
-        "dar": {"depth_routing": True},
+        "mhdar": {"depth_routing": True},
         "fbt": {"feedback": True},
         "df": {"depth_routing": True, "feedback": True},
         "df_soft": {"soft": True},
@@ -296,22 +308,46 @@ class SwiGLU(nn.Module):
         return self.down_proj(F.silu(gate) * up)
 
 
+def _check_route_geometry(dim: int, num_heads: int) -> int:
+    if num_heads < 2:
+        raise ValueError("MHDAR requires at least two routing heads")
+    if dim % num_heads:
+        raise ValueError(
+            f"model dimension {dim} must be divisible by {num_heads} routing heads"
+        )
+    return dim // num_heads
+
+
 def _route_algebra(
     values: Tensor,
     query: Tensor,
     key_weight: Tensor,
     eps: float,
     present: Tensor | None,
+    num_heads: int,
 ) -> tuple[Tensor, Tensor]:
-    """RMS-key routing without materializing the normalized source bank."""
+    """MHDAR algebra over a pre-stacked source bank.
+
+    RMS statistics remain full-width, while each contiguous channel group has
+    its own source-axis softmax.  Values are mixed only inside their group;
+    there is no output projection and no parameter increase over one query.
+    """
+    n_sources, batch, length, dim = values.shape
+    head_dim = _check_route_geometry(dim, num_heads)
     projected = (query.float() * key_weight.float()).to(values.dtype)
-    dots = (values * projected).float().sum(dim=-1)
+    value_heads = values.reshape(n_sources, batch, length, num_heads, head_dim)
+    query_heads = projected.reshape(num_heads, head_dim)
+    dots = (value_heads * query_heads).float().sum(dim=-1)
     inv_rms = torch.rsqrt(values.float().square().mean(dim=-1) + eps)
-    logits = dots * inv_rms
+    logits = dots * inv_rms.unsqueeze(-1)
     if present is not None:
-        logits = logits.masked_fill(~present, float("-inf"))
+        logits = logits.masked_fill(~present.unsqueeze(-1), float("-inf"))
     weights = logits.softmax(dim=0)
-    routed = (weights.to(values.dtype).unsqueeze(-1) * values).sum(dim=0)
+    routed = (
+        (weights.to(values.dtype).unsqueeze(-1) * value_heads)
+        .sum(dim=0)
+        .reshape(batch, length, dim)
+    )
     return routed, weights
 
 
@@ -320,26 +356,35 @@ def _route_sources(
     key_weight: Tensor,
     eps: float,
     present: Tensor | None,
+    num_heads: int,
     *sources: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Static pointer-list router: never copies sources into a value bank."""
+    """Static MHDAR pointer-list router: never copies a value bank."""
+    batch, length, dim = sources[0].shape
+    head_dim = _check_route_geometry(dim, num_heads)
     projected = (query.float() * key_weight.float()).to(sources[0].dtype)
+    query_heads = projected.reshape(num_heads, head_dim)
     logits = torch.stack(
         [
-            (source * projected).float().sum(dim=-1)
-            * torch.rsqrt(source.float().square().mean(dim=-1) + eps)
+            (source.reshape(batch, length, num_heads, head_dim) * query_heads)
+            .float()
+            .sum(dim=-1)
+            * torch.rsqrt(source.float().square().mean(dim=-1) + eps).unsqueeze(-1)
             for source in sources
         ]
     )
     if present is not None:
-        logits = logits.masked_fill(~present, float("-inf"))
+        logits = logits.masked_fill(~present.unsqueeze(-1), float("-inf"))
     weights = logits.softmax(dim=0)
-    routed = weights[0].to(sources[0].dtype).unsqueeze(-1) * sources[0]
+    routed = weights[0].to(sources[0].dtype).unsqueeze(-1) * sources[0].reshape(
+        batch, length, num_heads, head_dim
+    )
     for index in range(1, len(sources)):
         routed = routed + (
-            weights[index].to(sources[index].dtype).unsqueeze(-1) * sources[index]
+            weights[index].to(sources[index].dtype).unsqueeze(-1)
+            * sources[index].reshape(batch, length, num_heads, head_dim)
         )
-    return routed, weights
+    return routed.reshape(batch, length, dim), weights
 
 
 _compiled_route_sources = torch.compile(
@@ -351,7 +396,7 @@ _compiled_route_sources = torch.compile(
 
 
 class Router(nn.Module):
-    """One DAR routing site: zero-init query, RMS-normed keys, raw values.
+    """One MHDAR site: per-group softmaxes, RMS-normed keys, raw values.
 
     With a null source (DF-soft), a learnable zero-init vector is
     prepended — its key is rmsnorm(0)=0, so its logit is exactly zero at
@@ -362,6 +407,8 @@ class Router(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        _check_route_geometry(cfg.dim, cfg.routing_heads)
+        self.num_heads = cfg.routing_heads
         self.query = nn.Parameter(torch.zeros(cfg.dim))
         self.key_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.null = nn.Parameter(torch.zeros(cfg.dim)) if cfg.soft else None
@@ -372,7 +419,7 @@ class Router(nn.Module):
         masks: list[Tensor | None],
         want_weights: bool,
     ) -> tuple[Tensor | None, Tensor | None]:
-        """(routed addition [B,T,D] or None if inactive, weights [N,B,T] or None)."""
+        """Return a routed addition and weights shaped ``[N,B,T,H]``."""
         if self.null is not None:
             sources = [self.null.expand_as(sources[0])] + sources
             masks = [None] + masks
@@ -397,6 +444,7 @@ class Router(nn.Module):
                 present,
                 self.null is not None,
                 self.key_norm.eps,
+                self.num_heads,
                 tuple(sources),
             )
         elif sources[0].is_cuda:
@@ -405,6 +453,7 @@ class Router(nn.Module):
                 self.key_norm.weight,
                 self.key_norm.eps,
                 present,
+                self.num_heads,
                 *sources,
             )
         else:
@@ -414,6 +463,7 @@ class Router(nn.Module):
                 self.key_norm.weight,
                 self.key_norm.eps,
                 present,
+                self.num_heads,
             )
         return routed, (weights.detach() if want_weights else None)
 
@@ -510,7 +560,7 @@ class ColumnOutput:
     """What rides to the next column (feedback arms), [B, T, D]."""
 
     route_weights: dict[str, Tensor]
-    """Site → softmax weights [N, B, T]; populated when requested."""
+    """Site → per-head softmax weights [N, B, T, H], when requested."""
 
     sources: list[Tensor] | None
     """The routed source list (seeds then deltas); None off the routing

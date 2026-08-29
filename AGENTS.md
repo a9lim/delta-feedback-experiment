@@ -1,10 +1,10 @@
 # AGENTS.md
 
-Research repo: pretraining factorial combining Delta Attention Residuals
-(depth-axis routing over sublayer deltas) with full-bandwidth latent feedback
+Research repo: pretraining factorial combining Multi-Head Delta Attention
+Residuals (per-head depth-axis routing over sublayer deltas) with full-bandwidth latent feedback
 (previous column's top state fed back to layer 0). Independent of every
-sibling experiment. Currently in design phase — the design is settled, the
-harness is not yet written.
+sibling experiment. The design and harness are implemented; scientific runs
+have not started.
 
 ## Documents
 
@@ -27,17 +27,17 @@ alternate schemas or stale guidance around.
   with an SDPA fallback so tests and analysis run on the Mac (MPS/CPU).
   Operational layer comes from the root package — `telemetry` log grammar,
   `runs`/`checkpoints` snapshot addressing, `spool` job queue, `Schedule`,
-  and the `monitor` server — imported, never re-implemented. DAR's released
-  code is cloned (gitignored) at `references/delta-attention-residuals-code/`
-  as a parity reference for the routing module; Claude writes the first
-  correct iteration, Codex does the aggressive optimization pass
-  (recirculated-dot convention).
+  and the `monitor` server — imported, never re-implemented. DAR's and MHDAR's
+  released code are cloned (gitignored) at
+  `references/delta-attention-residuals-code/` and
+  `references/multi-head-attention-residuals-code/` as parity references for
+  routing semantics and the fused backward.
 
 - **Greenfield contract:** predecessors (stateful-thought-experiment,
   chain-of-dots-experiment) were deliberately cleared by a9. Do not dig up
   or inherit their design decisions.
 - **One recipe everywhere** (design: Training): FBT's training recipe is
-  binding for every arm including vanilla; DAR module conventions nest
+  binding for every arm including vanilla; MHDAR module conventions nest
   inside it. Record any divergence from the parent papers in design.md when
   it is made.
 - **Paired comparisons are load-bearing** (design: Arms): arms share data,
@@ -59,5 +59,5 @@ alternate schemas or stale guidance around.
   is not authorized by default — confirm with a9 at promotion time with
   ladder evidence in hand.
 - Smoke, then pilot, then scale. A null on the FBT side at trial scale is a
-  formation-conditions finding, not a failure (the DAR arm is the positive
+  formation-conditions finding, not a failure (the MHDAR arm is the positive
   control).

@@ -1,11 +1,12 @@
 # delta-feedback-experiment
 
 Do the two axes of a transformer's compute lattice — depth-wise routing
-(**Delta Attention Residuals**, arXiv:2605.18855) and token-time latent
+(**Multi-Head Delta Attention Residuals**, arXiv:2607.27230 plus the additive
+delta stream of arXiv:2605.18855) and token-time latent
 feedback (**full-bandwidth transformers**, arXiv:2608.08888) — help
 complementarily or redundantly when pretrained together? The combined model
 ("delta feedback", DF) commits hard to both: gated latent feedback whose
-payload is the top state plus routed deltas — DAR's additive routing
+payload is the top state plus headwise-routed deltas — MHDAR's additive routing
 applied at the cross-column site. A soft screen-only companion arm makes
 every channel optional and null-sourced, its routing weights reading out
 what a free model actually adopts.
@@ -16,7 +17,7 @@ no scientific training result exists yet. See
 
 ## Plan shape
 
-- Screen on jobe (1x4090): {vanilla, DAR, FBT, DF, DF-soft} at DAR's 220M
+- Screen on jobe (1x4090): {vanilla, MHDAR, FBT, DF, DF-soft} at the 220M
   config, ~2B FineWeb-Edu tokens, 2 seeds, one recipe (FBT's, binding).
 - Token ladder on rented single GPUs: finalists extended 2B -> 8B -> 32B via
   WSD, testing whether the combined advantage holds with training scale
@@ -51,7 +52,7 @@ df watch
 `df probe` runs the invariant suite everywhere and, when CUDA is present, the
 full 220M/B4/T1025 graph-capture gate. Training uses fixed CUDA graphs,
 whole-block compilation, FlashAttention, exact CCE-native z-loss, a bespoke
-Triton router, BF16 residuals, captured evaluation, and asynchronous atomic
+Triton MHDAR router, BF16 residuals, captured evaluation, and asynchronous atomic
 snapshots. The activation plan is internally measured; there are no public
 kernel or checkpoint-policy switches.
 

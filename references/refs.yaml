@@ -2,10 +2,19 @@
 # file, gitignored — (re)fetch them with:
 #   python -m transformer_experiments.references
 references:
+  - arxiv: "2607.27230"
+    slug: luo2026-multi-head-attention-residuals
+    note: >
+      Parent 1 — the multi-head depth axis. Reshape one D-dimensional routing
+      query into H contiguous channel groups, each with an independent
+      softmax over depth sources; full-width RMSNorm is shared across heads
+      and there is no output projection or parameter increase. Its released
+      code includes the additive delta_mh variant used here. Our fixed scaling
+      rule is H = KV heads (4 at 220M, 8 at the flagship).
   - arxiv: "2605.18855"
     slug: luo2026-delta-attention-residuals
     note: >
-      Parent 1 — the depth axis. Route RMS-normed sublayer deltas (not
+      Depth-routing substrate for MHDAR. Route RMS-normed sublayer deltas (not
       redundant cumulative states) with additive zero-init softmax routing;
       cumulative/replacement routing collapses (max weight ~0.2) and degrades
       past ~1B. Gains 1.7-8.2% val PPL, 220M-7.6B. Our trial config is their
@@ -21,7 +30,7 @@ references:
       prefix mixin, jitter, depth scaling, tied embeddings. Binding recipe
       for all our arms; flagship matches their 1B/400B-token scale and
       1536x24 trunk. Their open question — which injection form is best —
-      is our A1-vs-A2 comparison.
+      is measured by the hard DF spine versus the optional DF-soft companion.
   - arxiv: "2510.13879"
     slug: galashov2025-catch-your-breath
     note: >

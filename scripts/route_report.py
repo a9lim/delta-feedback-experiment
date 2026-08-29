@@ -7,15 +7,14 @@ the payload router — two ways:
 - statically: query-vector geometry (norms set the effective softmax
   temperature since keys are RMS-normed; pairwise cosines say whether
   sites learned a shared reading direction);
-- empirically: mean routing distributions over held-out rows, on the
+- empirically: per-head mean routing distributions over held-out rows, on the
   plain pass and on a fused pass (prefix length 1, the training eval
-  convention), plus per-site entropy.
+  convention), plus entropy and cross-head Jensen-Shannon divergence.
 
 Writes figures under figures/route-TAG/ and prints a per-site table.
 
 Usage:
-    python scripts/route_report.py runs/smoke-df1.pt.1100 \
-        --data-dir data/tokens-smoke
+    python scripts/route_report.py runs/ladder-df.pt.6700
 """
 
 from __future__ import annotations
@@ -71,7 +70,8 @@ def site_names(layers: int) -> list[str]:
 def collect(model, data_val, device, rows: int, micro: int):
     """Routing statistics per (pass, site) over `rows` val rows.
 
-    Returns (mean weights [N], per-token stats {max, H_tok}) keyed by
+    Returns (mean weights [N,H], per-head token stats {max, H_tok},
+    normalized cross-head JS) keyed by
     (pass, site).  Mean weights say *which* sources a site reads; the
     per-token mean max and mean normalized entropy say whether that read
     is static wiring (sharp and identical everywhere) or token-dependent
@@ -79,6 +79,7 @@ def collect(model, data_val, device, rows: int, micro: int):
     """
     sums: dict[tuple[int, str], torch.Tensor] = {}
     stats: dict[tuple[int, str], torch.Tensor] = {}
+    divergences: dict[tuple[int, str], torch.Tensor] = {}
     norms: dict[int, torch.Tensor] = {}
     counted = 0
     for first in range(0, rows, micro):
@@ -93,22 +94,32 @@ def collect(model, data_val, device, rows: int, micro: int):
             for site, weights in out.route_weights.items():
                 w = weights.float()
                 per_token = -(w.clamp_min(1e-12).log() * w).sum(dim=0)
+                head_mean = w.mean(dim=-1, keepdim=True)
+                head_js = (
+                    (w * (w.clamp_min(1e-12).log() - head_mean.clamp_min(1e-12).log()))
+                    .sum(dim=0)
+                    .mean()
+                )
+                head_js /= math.log(min(w.shape[0], w.shape[-1]))
                 batch_stats = (
                     torch.stack(
                         [
-                            w.max(dim=0).values.mean(),
-                            per_token.mean() / math.log(w.shape[0]),
-                        ]
+                            w.max(dim=0).values.mean(dim=(0, 1)),
+                            per_token.mean(dim=(0, 1)) / math.log(w.shape[0]),
+                        ],
+                        dim=-1,
                     ).cpu()
                     * n
                 )
                 key = (p, site)
                 sums[key] = sums.get(key, 0.0) + w.mean(dim=(1, 2)).cpu() * n
                 stats[key] = stats.get(key, 0.0) + batch_stats
+                divergences[key] = divergences.get(key, 0.0) + head_js.cpu() * n
         counted += n
     return (
         {key: (value / counted).numpy() for key, value in sums.items()},
         {key: (value / counted).numpy() for key, value in stats.items()},
+        {key: float(value / counted) for key, value in divergences.items()},
         {key: (value / counted).numpy() for key, value in norms.items()},
     )
 
@@ -119,21 +130,22 @@ def entropy(weights: np.ndarray) -> float:
     return float(-(w * np.log(w)).sum() / math.log(len(weights)))
 
 
-def site_matrix(means, layers: int, passes=(0, 1)):
-    """[site, source] mean-weight matrices per pass; NaN = source absent.
+def site_matrix(means, layers: int, heads: int, passes=(0, 1)):
+    """[site, source] mean-weight matrices per pass and head; NaN = absent.
 
     Columns: seed (e on pass 0, fused u on pass 1) then a0,m0..a(L-1),m(L-1).
     """
     sites = site_names(layers)
     matrices = {}
     for p in passes:
-        matrix = np.full((len(sites), 1 + 2 * layers), np.nan)
-        for row, site in enumerate(sites):
-            if (p, site) not in means:
-                continue  # L0.attn routes over a singleton and stays off
-            w = means[(p, site)]
-            matrix[row, : len(w)] = w
-        matrices[p] = matrix
+        for head in range(heads):
+            matrix = np.full((len(sites), 1 + 2 * layers), np.nan)
+            for row, site in enumerate(sites):
+                if (p, site) not in means:
+                    continue  # L0.attn routes over a singleton and stays off
+                w = means[(p, site)][:, head]
+                matrix[row, : len(w)] = w
+            matrices[p, head] = matrix
     return sites, matrices
 
 
@@ -172,10 +184,10 @@ def main() -> None:
 
     # -- empirical: routing distributions --------------------------------------
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
-    means, stats, norms_by_pass = collect(
+    means, stats, divergences, norms_by_pass = collect(
         model, data_val, device, args.rows, args.micro_rows
     )
-    sites, matrices = site_matrix(means, layers)
+    sites, matrices = site_matrix(means, layers, cfg.routing_heads)
 
     # The routed values are raw (only keys are normed), so source scale
     # matters for what a read actually adds.
@@ -190,53 +202,87 @@ def main() -> None:
     # Console table: per site, per pass — mean-distribution entropy,
     # per-token mean max / entropy, and top-3 sources.
     names = ["seed"] + source_names(layers)
-    print(f"\n{'site':<10}{'|q|':>7}   pass  H_mean  maxT  H_tok  top sources")
+    print(
+        f"\n{'site':<10}{'|q|':>7}   pass head H_mean  maxT  H_tok head-JS  top sources"
+    )
     for label, norm in zip(labels, norms):
         for p in (0, 1):
             key = (p, label)
             if key not in means:
                 continue
-            w = means[key]
-            max_t, h_tok = stats[key]
-            local = names[: len(w)] if label != "payload" else source_names(layers)
-            top = sorted(zip(local, w), key=lambda t: -t[1])[:3]
-            shown = "  ".join(f"{n}={v:.3f}" for n, v in top)
-            first_row = (0, label) not in means or p == 0
-            head = f"{label:<10}{norm:>7.2f}" if first_row else " " * 17
-            print(
-                f"{head}   p{p + 1}    {entropy(w):5.3f}  {max_t:.3f}  {h_tok:.3f}  {shown}"
-            )
+            for route_head in range(cfg.routing_heads):
+                w = means[key][:, route_head]
+                max_t, h_tok = stats[key][route_head]
+                local = names[: len(w)] if label != "payload" else source_names(layers)
+                top = sorted(zip(local, w), key=lambda t: -t[1])[:3]
+                shown = "  ".join(f"{n}={v:.3f}" for n, v in top)
+                first_row = ((0, label) not in means or p == 0) and route_head == 0
+                site = f"{label:<10}{norm:>7.2f}" if first_row else " " * 17
+                js = f"{divergences[key]:.3f}" if route_head == 0 else "  ·  "
+                print(
+                    f"{site}   p{p + 1}   h{route_head:<2}  {entropy(w):5.3f}  "
+                    f"{max_t:.3f}  {h_tok:.3f}   {js}   {shown}"
+                )
 
     # -- figures ---------------------------------------------------------------
     norm_map = colors.PowerNorm(
-        0.5, vmin=0, vmax=np.nanmax([np.nanmax(matrices[p]) for p in matrices])
+        0.5,
+        vmin=0,
+        vmax=np.nanmax([np.nanmax(matrix) for matrix in matrices.values()]),
     )
     fig, axes = plt.subplots(
-        2, 1, figsize=(11, 9), sharex=True, constrained_layout=True
+        cfg.routing_heads,
+        2,
+        figsize=(15, 3.1 * cfg.routing_heads),
+        sharex=True,
+        sharey=True,
+        squeeze=False,
+        constrained_layout=True,
     )
-    for ax, p, title in zip(axes, (0, 1), ("pass 1 (plain)", "pass 2 (fused)")):
-        image = ax.imshow(matrices[p], aspect="auto", cmap="viridis", norm=norm_map)
-        ax.set_yticks(range(len(sites)), sites, fontsize=7)
-        ax.set_title(f"site routing, {title}", fontsize=10)
-        ax.set_ylabel("reading site")
-    axes[1].set_xticks(
-        range(1 + 2 * layers), ["e/u"] + source_names(layers), fontsize=7, rotation=90
-    )
-    axes[1].set_xlabel("source (seed, then sublayer deltas)")
+    for route_head in range(cfg.routing_heads):
+        for p, title in ((0, "pass 1 (plain)"), (1, "pass 2 (fused)")):
+            ax = axes[route_head, p]
+            image = ax.imshow(
+                matrices[p, route_head], aspect="auto", cmap="viridis", norm=norm_map
+            )
+            ax.set_yticks(range(len(sites)), sites, fontsize=7)
+            ax.set_title(f"head {route_head}, {title}", fontsize=10)
+            if p == 0:
+                ax.set_ylabel("reading site")
+            if route_head == cfg.routing_heads - 1:
+                ax.set_xticks(
+                    range(1 + 2 * layers),
+                    ["e/u"] + source_names(layers),
+                    fontsize=7,
+                    rotation=90,
+                )
+                ax.set_xlabel("source (seed, then sublayer deltas)")
     fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
-    fig.suptitle(f"{tag}: depth-routing read maps", fontsize=12)
+    fig.suptitle(f"{tag}: MHDAR read maps", fontsize=12)
     fig.savefig(out_dir / "site-routing.png", dpi=150)
 
     if (0, "payload") in means:
-        fig, ax = plt.subplots(figsize=(11, 3.2), constrained_layout=True)
-        x = np.arange(2 * layers)
-        ax.bar(x - 0.2, means[(0, "payload")], 0.4, label="pass 1")
-        ax.bar(x + 0.2, means[(1, "payload")], 0.4, label="pass 2 (fused)")
-        ax.axhline(1 / (2 * layers), color="grey", lw=0.8, ls="--", label="uniform")
-        ax.set_xticks(x, source_names(layers), fontsize=7, rotation=90)
-        ax.set_ylabel("mean weight")
-        ax.set_title(f"{tag}: payload router — what rides to the next column")
-        ax.legend(fontsize=8)
+        fig, axes = plt.subplots(
+            2, 1, figsize=(11, 5.5), sharex=True, constrained_layout=True
+        )
+        payload_max = max(means[(0, "payload")].max(), means[(1, "payload")].max())
+        for ax, p, title in zip(axes, (0, 1), ("pass 1 (plain)", "pass 2 (fused)")):
+            image = ax.imshow(
+                means[(p, "payload")].T,
+                aspect="auto",
+                cmap="viridis",
+                vmin=0,
+                vmax=payload_max,
+            )
+            ax.set_yticks(range(cfg.routing_heads), range(cfg.routing_heads))
+            ax.set_ylabel("routing head")
+            ax.set_title(title)
+        axes[-1].set_xticks(
+            range(2 * layers), source_names(layers), fontsize=7, rotation=90
+        )
+        axes[-1].set_xlabel("delta source")
+        fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
+        fig.suptitle(f"{tag}: MHDAR payload — what rides to the next column")
         fig.savefig(out_dir / "payload-routing.png", dpi=150)
 
     fig, (ax_norm, ax_cos) = plt.subplots(

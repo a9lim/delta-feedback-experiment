@@ -1,7 +1,7 @@
 """Counterfactual payload sweep: what should ride to the next column?
 
-Forces the payload router's routed enrichment to each single delta in
-turn (plus none / uniform), and measures fused val loss under the
+Forces the MHDAR payload enrichment to each single delta in turn (plus none /
+uniform), either across all heads or in one selected head, and measures fused val loss under the
 training eval convention (one fused pass, prefix length 1).  Answers
 whether the trained router's choice is a family preference, a specific
 peak, or a no-op.
@@ -11,8 +11,8 @@ alternatives are handicapped — read the landscape's shape (which family
 helps, which hurts, how peaked), not absolute gaps.
 
 Usage:
-    python scripts/payload_swap.py runs/smoke-df1.pt.1100 \
-        --data-dir data/tokens-smoke
+    python scripts/payload_swap.py runs/ladder-df.pt.6700
+    python scripts/payload_swap.py runs/ladder-df.pt.6700 --head 2
 """
 
 from __future__ import annotations
@@ -50,6 +50,12 @@ def main() -> None:
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--head",
+        type=int,
+        default=None,
+        help="replace only this routing head; default replaces every head",
+    )
     args = parser.parse_args()
 
     device = pick_device(args.device)
@@ -62,6 +68,10 @@ def main() -> None:
     )
     if not cfg.feedback_active or not cfg.routing_active:
         raise SystemExit("the payload sweep needs a payload router (df/df_soft)")
+    if args.head is not None and not 0 <= args.head < cfg.routing_heads:
+        raise SystemExit(
+            f"--head must be in [0, {cfg.routing_heads - 1}], got {args.head}"
+        )
     model = DFModel(cfg)
     model.load_state_dict(payload["state"])
     model = model.to(device).eval()
@@ -87,6 +97,7 @@ def main() -> None:
     val, fused = losses()
     print(f"trained router : val={val:.4f}  fused={fused:.4f}")
 
+    trained_forward = model.payload_router.forward
     model.payload_router.forward = lambda sources, masks, want: (None, None)
     print(f"h_top only     : fused={losses()[1]:.4f}")
     model.payload_router.forward = lambda sources, masks, want: (
@@ -97,10 +108,25 @@ def main() -> None:
 
     results = []
     for i, name in enumerate(names):
-        model.payload_router.forward = lambda sources, masks, want, i=i: (
-            sources[i],
-            None,
-        )
+        if args.head is None:
+            model.payload_router.forward = lambda sources, masks, want, i=i: (
+                sources[i],
+                None,
+            )
+        else:
+
+            def force_one_head(sources, masks, want, i=i):
+                routed, _ = trained_forward(sources, masks, want)
+                batch, length, dim = routed.shape
+                head_dim = dim // cfg.routing_heads
+                routed = routed.reshape(batch, length, cfg.routing_heads, head_dim)
+                routed = routed.clone()
+                routed[:, :, args.head] = sources[i].reshape(
+                    batch, length, cfg.routing_heads, head_dim
+                )[:, :, args.head]
+                return routed.reshape(batch, length, dim), None
+
+            model.payload_router.forward = force_one_head
         results.append((name, losses()[1]))
         print(f"force {name:<4}     : fused={results[-1][1]:.4f}", flush=True)
 

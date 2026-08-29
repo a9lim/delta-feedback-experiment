@@ -28,7 +28,7 @@ TINY = {
     "dim": 32,
     "layers": 3,
     "heads": 2,
-    "kv_heads": 1,
+    "kv_heads": 2,
     "head_dim": 16,
     "intermediate": 64,
     "max_seq_len": 32,
@@ -55,8 +55,9 @@ def forward(model, toks, **kwargs):
 def test_arm_flags():
     assert not arm_config("vanilla", **TINY).routing_active
     assert not arm_config("vanilla", **TINY).feedback_active
-    assert arm_config("dar", **TINY).routing_active
-    assert not arm_config("dar", **TINY).feedback_active
+    assert arm_config("mhdar", **TINY).routing_active
+    assert not arm_config("mhdar", **TINY).feedback_active
+    assert arm_config("mhdar", **TINY).routing_heads == TINY["kv_heads"]
     assert arm_config("fbt", **TINY).gated_entry
     assert not arm_config("fbt", **TINY).routing_active
     assert arm_config("df", **TINY).gated_entry
@@ -68,10 +69,10 @@ def test_arm_flags():
 def test_parents_are_deletions():
     """Every parent's parameter set is a strict subset of DF's."""
     names = {arm: {name for name, _ in tiny(arm).named_parameters()} for arm in ARMS}
-    assert names["vanilla"] < names["dar"] < names["df"]
+    assert names["vanilla"] < names["mhdar"] < names["df"]
     assert names["vanilla"] < names["fbt"] < names["df"]
     # The union misses exactly the payload router, which needs both axes.
-    assert names["df"] - (names["dar"] | names["fbt"]) == {
+    assert names["df"] - (names["mhdar"] | names["fbt"]) == {
         "payload_router.query",
         "payload_router.key_norm.weight",
     }
@@ -92,7 +93,7 @@ def test_large_projections_are_persistently_packed():
     model = tiny("df")
     attention = model.blocks[0].attn
     mlp = model.blocks[0].mlp
-    assert attention.qkv_proj.weight.shape == (64, 32)
+    assert attention.qkv_proj.weight.shape == (96, 32)
     assert not hasattr(attention, "q_proj")
     assert mlp.gate_up_proj.weight.shape == (128, 32)
     assert not hasattr(mlp, "gate_proj")
@@ -104,11 +105,12 @@ def test_large_projections_are_persistently_packed():
 def test_zero_init_routing_uniform():
     """Zero-init queries route uniformly wherever a site is active, and the
     singleton-seed sites are inactive on the seed-only arms."""
-    for arm in ("dar", "df"):
+    for arm in ("mhdar", "df"):
         out = forward(tiny(arm), tokens(), want_weights=True)
         assert "L0.attn" not in out.route_weights  # singleton guard
         for site, weights in out.route_weights.items():
             n = weights.shape[0]
+            assert weights.shape[-1] == TINY["kv_heads"]
             assert torch.allclose(weights, torch.full_like(weights, 1.0 / n)), (
                 f"{arm} {site}"
             )
@@ -121,7 +123,7 @@ def test_zero_init_routing_uniform():
 
 
 def test_algebraic_router_matches_normalized_reference_in_fp32():
-    model = tiny("dar")
+    model = tiny("mhdar")
     router = model.blocks[2].mlp_router
     with torch.no_grad():
         router.query.normal_()
@@ -129,17 +131,49 @@ def test_algebraic_router_matches_normalized_reference_in_fp32():
     sources = [torch.randn(2, 7, 32) for _ in range(5)]
     routed, weights = router(sources, [None] * len(sources), True)
     values = torch.stack(sources)
-    logits = torch.einsum("d,nbtd->nbt", router.query, router.key_norm(values))
+    h = model.cfg.routing_heads
+    k = model.cfg.dim // h
+    logits = torch.einsum(
+        "hk,nbthk->nbth",
+        router.query.view(h, k),
+        router.key_norm(values).view(5, 2, 7, h, k),
+    )
     reference_weights = logits.softmax(dim=0)
-    reference = torch.einsum("nbt,nbtd->btd", reference_weights, values)
+    reference = torch.einsum(
+        "nbth,nbthk->bthk", reference_weights, values.view(5, 2, 7, h, k)
+    ).reshape(2, 7, 32)
     assert torch.allclose(weights, reference_weights, rtol=2e-5, atol=2e-6)
     assert torch.allclose(routed, reference, rtol=2e-5, atol=2e-6)
+
+
+def test_routing_heads_can_select_different_sources():
+    model = tiny("mhdar")
+    router = model.blocks[2].mlp_router
+    source0 = torch.zeros(1, 1, TINY["dim"])
+    source1 = torch.zeros_like(source0)
+    source0[..., :16] = 1
+    source1[..., 16:] = 1
+    with torch.no_grad():
+        router.query.fill_(8)
+    routed, weights = router([source0, source1], [None, None], True)
+    assert weights[:, 0, 0, 0].argmax().item() == 0
+    assert weights[:, 0, 0, 1].argmax().item() == 1
+    assert routed[..., :16].mean() > 0.99
+    assert routed[..., 16:].mean() > 0.99
+
+
+def test_single_head_routing_and_old_arm_name_are_rejected():
+    with pytest.raises(ValueError, match="unknown arm"):
+        arm_config("dar", **TINY)
+    cfg = arm_config("mhdar", **(TINY | {"kv_heads": 1}))
+    with pytest.raises(ValueError, match="at least two"):
+        DFModel(cfg)
 
 
 def test_telescoping():
     """The stream is exactly seed + Σdeltas at the top — transient-read
     routing never leaks into the residual stream."""
-    for arm in ("dar", "df", "df_soft"):
+    for arm in ("mhdar", "df", "df_soft"):
         model = tiny(arm)
         # Sharpen every query so routing is far from uniform — the identity
         # must hold because of *semantics*, not because routing is ~0.

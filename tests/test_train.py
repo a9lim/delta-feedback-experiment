@@ -30,7 +30,7 @@ TINY_ARGS = [
     "--heads",
     "2",
     "--kv-heads",
-    "1",
+    "2",
     "--head-dim",
     "16",
     "--intermediate",
@@ -197,7 +197,7 @@ def run(tmp_path, tag, extra):
     )
 
 
-@pytest.mark.parametrize("arm", ["vanilla", "dar", "fbt", "df", "df_soft"])
+@pytest.mark.parametrize("arm", ["vanilla", "mhdar", "fbt", "df", "df_soft"])
 def test_tiny_run_completes(tmp_path, capsys, arm):
     summary = run(tmp_path, f"t-{arm}", ["--arm", arm])
     assert summary["step"] == 8
@@ -208,7 +208,9 @@ def test_tiny_run_completes(tmp_path, capsys, arm):
     snapshots = list((tmp_path / "runs").glob(f"t-{arm}.pt.*"))
     assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {6, 8}
     step_records = [
-        line for line in capsys.readouterr().out.splitlines() if line.startswith("step ")
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("step ")
     ]
     assert len(step_records) == 8
 
@@ -249,7 +251,7 @@ def test_multipass_checkpoint_parity():
         dim=32,
         layers=2,
         heads=2,
-        kv_heads=1,
+        kv_heads=2,
         head_dim=16,
         intermediate=64,
         max_seq_len=17,

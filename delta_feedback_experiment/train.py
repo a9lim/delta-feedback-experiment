@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import math
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -32,7 +33,7 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=3, resumable=frozenset({3}), surface_version=3
+    version=4, resumable=frozenset({4}), surface_version=4
 )
 
 EXACT_FIELDS = (
@@ -604,11 +605,21 @@ def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dic
     soft = model.cfg.soft
     records = []
     for site, weights in out.route_weights.items():
-        mean = weights.float().mean(dim=(1, 2))
+        w = weights.float()
+        mean = w.mean(dim=(1, 2, 3))
+        head_mean = w.mean(dim=-1, keepdim=True)
+        head_js = (
+            (w * (w.clamp_min(1e-12).log() - head_mean.clamp_min(1e-12).log()))
+            .sum(dim=0)
+            .mean()
+        )
+        head_js = head_js / math.log(min(w.shape[0], w.shape[-1]))
         record = {
             "site": site,
             "n": weights.shape[0],
-            "max": round(weights.float().max(dim=0).values.mean().item(), 4),
+            "heads": weights.shape[-1],
+            "max": round(w.max(dim=0).values.mean().item(), 4),
+            "head_js": round(head_js.item(), 4),
         }
         offset = 0
         if soft:

@@ -36,8 +36,11 @@
   <div class="chart"><h2>gradient norm <small>global L2 before update</small></h2><div class="plot" id="p-gnorm"></div></div>
 </div>
 <div class="grid two">
-  <div class="chart"><h2>routing · max weight <small>uniform is 1/n · solid payload · dashed deepest attn · dotted deepest mlp</small></h2><div class="plot" id="p-route"></div></div>
-  <div class="chart"><h2>routing · seed &amp; null <small>solid attn seed · dashed mlp seed · dotted payload null (soft)</small></h2><div class="plot" id="p-seed"></div></div>
+  <div class="chart"><h2>MHDAR · max weight <small>averaged over routing heads · uniform is 1/n</small></h2><div class="plot" id="p-route"></div></div>
+  <div class="chart"><h2>MHDAR · seed &amp; null <small>head-averaged · solid attn seed · dashed mlp seed · dotted payload null</small></h2><div class="plot" id="p-seed"></div></div>
+</div>
+<div class="grid">
+  <div class="chart"><h2>MHDAR · head specialization <small>normalized Jensen–Shannon divergence · 0 means identical head routes</small></h2><div class="plot" id="p-headjs"></div></div>
 </div>
 <div class="grid two">
   <div class="chart"><h2>contraction · fused loss <small>iterated fused prefill · solid iter 0 · dashed iter 8</small></h2><div class="plot" id="p-contract"></div></div>
@@ -88,7 +91,7 @@ function onEval(run, rec, step) {
 function onRecord(run, rec) {
   if (rec.event === 'route') {
     Object.assign(entryAt(run, `route|${rec.site}`, address(rec.step)[0]),
-      { n: num(rec.n), max: num(rec.max), seed: num(rec.seed), nul: num(rec.null), prev: num(rec.prev) });
+      { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), nul: num(rec.null), prev: num(rec.prev) });
   } else if (rec.event === 'contract') {
     Object.assign(entryAt(run, 'contract', address(rec.step)[0]),
       { loss0: num(rec.loss0), loss8: num(rec.loss8), upd8: num(rec.upd8) });
@@ -123,7 +126,7 @@ function renderTiles(view) {
     tile('pace', `${fmt(1 / rateRecent, 3)} <small>s/step</small>`, Number.isFinite(etaS) ? `ETA ${fmtDuration(etaS)} · ${fmtWhen(run.serverDate + etaS * 1000)}` : remaining > 0 ? `stopped · ${remaining.toLocaleString()} steps left` : 'complete'),
     tile('elapsed', fmtDuration(elapsed), began != null ? `began ${fmtWhen(began)}` : ''),
     tile('loss', fmt(last.loss), `pass1 ${fmt(last.pass1)} · k ${last.k ?? '–'}`),
-    tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `fused ${fmt(lastVal.val_fused)} · @ ${lastVal.step.toLocaleString()}` : arm === 'vanilla' || arm === 'dar' ? 'no feedback arm' : ''),
+    tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `fused ${fmt(lastVal.val_fused)} · @ ${lastVal.step.toLocaleString()}` : arm === 'vanilla' || arm === 'mhdar' ? 'no feedback arm' : ''),
     tile('lr', fmt(last.lr, 3), `gnorm ${fmt(last.gnorm, 3)}`),
     tile('memory', `${fmt(last.mem, 3)} <small>GiB</small>`, `${last.tok_s != null ? Math.round(last.tok_s).toLocaleString() : '–'} tok/s`),
     gpuTile(live),
@@ -201,6 +204,11 @@ function rebuild() {
       ...ovs.flatMap((t, i) => [line(`attn seed · ${t}`, hue(i), PTS), dashed(`mlp seed · ${t}`, hue(i), PTS), dotted(`payload null · ${t}`, hue(i), PTS)])],
     yScale: { range: [0, 1] }, bands: () => bandsOf(primary()), forks,
   });
+  makeChart('p-headjs', {
+    series: [line('payload', P.s1, PTS), dashed('attn', P.s1, PTS), dotted('mlp', P.s1, PTS),
+      ...ovs.flatMap((t, i) => [line(`payload · ${t}`, hue(i), PTS), dashed(`attn · ${t}`, hue(i), PTS), dotted(`mlp · ${t}`, hue(i), PTS)])],
+    yScale: { range: [0, 1] }, bands: () => bandsOf(primary()), forks,
+  });
   makeChart('p-contract', {
     series: [line('iter 0', P.s1, PTS), dashed('iter 8', P.s1, PTS),
       ...ovs.flatMap((t, i) => [line(`iter 0 · ${t}`, hue(i), PTS), dashed(`iter 8 · ${t}`, hue(i), PTS)])],
@@ -229,6 +237,7 @@ function seriesOf(view) {
     gnorm: [[xs, steps.map((s) => s.gnorm)]],
     route: [at(sites.payload, 'max'), at(sites.attn, 'max'), at(sites.mlp, 'max')],
     seed: [at(sites.attn, 'seed'), at(sites.mlp, 'seed'), at(sites.payload, 'nul')],
+    headjs: [at(sites.payload, 'headjs'), at(sites.attn, 'headjs'), at(sites.mlp, 'headjs')],
     contract: [[contract.map((e) => e.step), contract.map((e) => e.loss0), contract.map((e) => e.loss8)]],
     upd: [[contract.map((e) => e.step), contract.map((e) => e.upd8)]],
   };
@@ -248,6 +257,7 @@ function render(view) {
   setData('p-gnorm', join(merged.gnorm), lastX);
   setData('p-route', join(merged.route), lastX);
   setData('p-seed', join(merged.seed), lastX);
+  setData('p-headjs', join(merged.headjs), lastX);
   setData('p-contract', join(merged.contract), lastX);
   setData('p-upd', join(merged.upd), lastX);
 }

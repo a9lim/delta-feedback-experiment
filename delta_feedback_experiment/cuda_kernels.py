@@ -1,4 +1,4 @@
-"""Bespoke CUDA kernels for the DF hot path.
+"""Bespoke CUDA kernels for the MHDAR x FBT hot path.
 
 The portable semantic implementations remain in :mod:`model`.  This module is
 optional at import time and exposes only kernels whose fixed screen geometry
@@ -144,15 +144,21 @@ if triton is not None:
         inv_rms,
         bt: tl.constexpr,
         dim: tl.constexpr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
         eps: tl.constexpr,
         n_sources: tl.constexpr,
         has_present: tl.constexpr,
         null_first: tl.constexpr,
-        block_d: tl.constexpr,
+        block_h: tl.constexpr,
+        block_k: tl.constexpr,
     ):
         token = tl.program_id(0)
-        offsets = tl.arange(0, block_d)
-        mask = offsets < dim
+        h_offsets = tl.arange(0, block_h)
+        k_offsets = tl.arange(0, block_k)
+        head_mask = h_offsets < num_heads
+        mask = head_mask[:, None] & (k_offsets[None, :] < head_dim)
+        offsets = h_offsets[:, None] * head_dim + k_offsets[None, :]
         p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
         for index in range(n_sources):
             source = _route_pointer(
@@ -189,12 +195,18 @@ if triton is not None:
             value = tl.load(source + base + offsets, mask=mask, other=0.0).to(
                 tl.float32
             )
-            inverse = tl.rsqrt(tl.sum(value * value, axis=0) / dim + eps)
-            score = tl.sum(value * p, axis=0) * inverse
+            inverse = tl.rsqrt(
+                tl.sum(tl.sum(value * value, axis=1), axis=0) / dim + eps
+            )
+            score = tl.sum(value * p, axis=1) * inverse
             if has_present:
                 exists = tl.load(present + index * bt + token)
                 score = tl.where(exists, score, -float("inf"))
-            tl.store(logits + index * bt + token, score)
+            tl.store(
+                logits + index * bt * num_heads + token * num_heads + h_offsets,
+                score,
+                mask=head_mask,
+            )
             tl.store(inv_rms + index * bt + token, inverse)
 
     @triton.jit
@@ -202,17 +214,20 @@ if triton is not None:
         logits,
         weights,
         bt: tl.constexpr,
+        num_heads: tl.constexpr,
         n_sources: tl.constexpr,
         block_n: tl.constexpr,
     ):
         token = tl.program_id(0)
+        head = tl.program_id(1)
         offsets = tl.arange(0, block_n)
         mask = offsets < n_sources
-        values = tl.load(logits + offsets * bt + token, mask=mask, other=-float("inf"))
+        addresses = offsets * bt * num_heads + token * num_heads + head
+        values = tl.load(logits + addresses, mask=mask, other=-float("inf"))
         values = values - tl.max(values, axis=0)
         numerators = tl.exp(values)
         result = numerators / tl.sum(numerators, axis=0)
-        tl.store(weights + offsets * bt + token, result, mask=mask)
+        tl.store(weights + addresses, result, mask=mask)
 
     @triton.jit
     def _route_mix_kernel(
@@ -247,15 +262,18 @@ if triton is not None:
         routed,
         bt: tl.constexpr,
         dim: tl.constexpr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
         n_sources: tl.constexpr,
         null_first: tl.constexpr,
-        block_d: tl.constexpr,
+        block_k: tl.constexpr,
     ):
         token = tl.program_id(0)
-        block = tl.program_id(1)
-        offsets = block * block_d + tl.arange(0, block_d)
-        mask = offsets < dim
-        total = tl.zeros((block_d,), tl.float32)
+        head = tl.program_id(1)
+        k_offsets = tl.arange(0, block_k)
+        offsets = head * head_dim + k_offsets
+        mask = k_offsets < head_dim
+        total = tl.zeros((block_k,), tl.float32)
         for index in range(n_sources):
             source = _route_pointer(
                 index,
@@ -289,104 +307,11 @@ if triton is not None:
             )
             base = 0 if null_first and index == 0 else token * dim
             value = tl.load(source + base + offsets, mask=mask, other=0.0)
-            weight = tl.load(weights + index * bt + token)
+            weight = tl.load(
+                weights + index * bt * num_heads + token * num_heads + head
+            )
             total += value * weight
         tl.store(routed + token * dim + offsets, total, mask=mask)
-
-    @triton.jit
-    def _route_beta_kernel(
-        s0,
-        s1,
-        s2,
-        s3,
-        s4,
-        s5,
-        s6,
-        s7,
-        s8,
-        s9,
-        s10,
-        s11,
-        s12,
-        s13,
-        s14,
-        s15,
-        s16,
-        s17,
-        s18,
-        s19,
-        s20,
-        s21,
-        s22,
-        s23,
-        s24,
-        s25,
-        s26,
-        grad_routed,
-        weights,
-        beta,
-        bt: tl.constexpr,
-        dim: tl.constexpr,
-        n_sources: tl.constexpr,
-        null_first: tl.constexpr,
-        block_d: tl.constexpr,
-        block_n: tl.constexpr,
-    ):
-        token = tl.program_id(0)
-        d_offsets = tl.arange(0, block_d)
-        d_mask = d_offsets < dim
-        grad = tl.load(
-            grad_routed + token * dim + d_offsets, mask=d_mask, other=0.0
-        ).to(tl.float32)
-        n_offsets = tl.arange(0, block_n)
-        n_mask = n_offsets < n_sources
-        products = tl.zeros((block_n,), tl.float32)
-        for index in range(n_sources):
-            source = _route_pointer(
-                index,
-                s0,
-                s1,
-                s2,
-                s3,
-                s4,
-                s5,
-                s6,
-                s7,
-                s8,
-                s9,
-                s10,
-                s11,
-                s12,
-                s13,
-                s14,
-                s15,
-                s16,
-                s17,
-                s18,
-                s19,
-                s20,
-                s21,
-                s22,
-                s23,
-                s24,
-                s25,
-                s26,
-            )
-            base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(source + base + d_offsets, mask=d_mask, other=0.0).to(
-                tl.float32
-            )
-            dot = tl.sum(grad * value, axis=0)
-            products = tl.where(n_offsets == index, dot, products)
-        route_weights = tl.load(
-            weights + n_offsets * bt + token, mask=n_mask, other=0.0
-        )
-        centered = products - tl.sum(route_weights * products, axis=0)
-        tl.store(
-            beta + n_offsets * bt + token,
-            route_weights * centered,
-            mask=n_mask,
-        )
 
     @triton.jit
     def _route_backward_kernel(
@@ -448,23 +373,70 @@ if triton is not None:
         grad_routed,
         weights,
         inv_rms,
-        beta,
         grad_projected,
         bt: tl.constexpr,
         dim: tl.constexpr,
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
         n_sources: tl.constexpr,
         null_first: tl.constexpr,
-        block_d: tl.constexpr,
+        block_h: tl.constexpr,
+        block_k: tl.constexpr,
     ):
         token = tl.program_id(0)
-        block = tl.program_id(1)
-        offsets = block * block_d + tl.arange(0, block_d)
-        mask = offsets < dim
+        h_offsets = tl.arange(0, block_h)
+        k_offsets = tl.arange(0, block_k)
+        head_mask = h_offsets < num_heads
+        mask = head_mask[:, None] & (k_offsets[None, :] < head_dim)
+        offsets = h_offsets[:, None] * head_dim + k_offsets[None, :]
         p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
         upstream = tl.load(
             grad_routed + token * dim + offsets, mask=mask, other=0.0
         ).to(tl.float32)
-        grad_p = tl.zeros((block_d,), tl.float32)
+        centered = tl.zeros((block_h,), tl.float32)
+        for index in range(n_sources):
+            source = _route_pointer(
+                index,
+                s0,
+                s1,
+                s2,
+                s3,
+                s4,
+                s5,
+                s6,
+                s7,
+                s8,
+                s9,
+                s10,
+                s11,
+                s12,
+                s13,
+                s14,
+                s15,
+                s16,
+                s17,
+                s18,
+                s19,
+                s20,
+                s21,
+                s22,
+                s23,
+                s24,
+                s25,
+                s26,
+            )
+            source_base = 0 if null_first and index == 0 else token * dim
+            value = tl.load(source + source_base + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
+            weight = tl.load(
+                weights + index * bt * num_heads + token * num_heads + h_offsets,
+                mask=head_mask,
+                other=0.0,
+            )
+            centered += weight * tl.sum(upstream * value, axis=1)
+
+        grad_p = tl.zeros((block_h, block_k), tl.float32)
         for index in range(n_sources):
             source = _route_pointer(
                 index,
@@ -530,18 +502,24 @@ if triton is not None:
             value = tl.load(source + source_base + offsets, mask=mask, other=0.0).to(
                 tl.float32
             )
-            weight = tl.load(weights + index * bt + token)
-            route_beta = tl.load(beta + index * bt + token)
+            weight = tl.load(
+                weights + index * bt * num_heads + token * num_heads + h_offsets,
+                mask=head_mask,
+                other=0.0,
+            )
             inverse = tl.load(inv_rms + index * bt + token)
-            # ``logits`` carries -inf for absent sources into softmax. Rebuild
-            # the finite pre-mask score here so beta=0 produces an exact zero
-            # gradient rather than the indeterminate 0 * inf.
-            score = tl.sum(value * p, axis=0) * inverse
-            source_grad = weight * upstream + route_beta * (
-                p * inverse - score * inverse * inverse * value / dim
+            route_beta = weight * (tl.sum(upstream * value, axis=1) - centered)
+            dkp = route_beta[:, None] * p
+            # RMS statistics are shared across the full hidden width, so the
+            # norm-backward correction couples all routing heads.
+            norm_dot = tl.sum(tl.sum(dkp * value, axis=1), axis=0)
+            source_grad = (
+                weight[:, None] * upstream
+                + inverse * dkp
+                - (inverse * inverse * inverse / dim) * norm_dot * value
             )
             tl.store(grad_source + token * dim + offsets, source_grad, mask=mask)
-            grad_p += route_beta * value * inverse
+            grad_p += route_beta[:, None] * value * inverse
         tl.store(grad_projected + token * dim + offsets, grad_p, mask=mask)
 
 
@@ -551,22 +529,48 @@ def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
     return sources + (sources[-1],) * (MAX_ROUTE_SOURCES - len(sources))
 
 
+def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int]:
+    block_h = triton.next_power_of_2(num_heads)
+    block_k = triton.next_power_of_2(head_dim)
+    tile = block_h * block_k
+    if tile > 8192:
+        raise RuntimeError(
+            f"MHDAR routing tile {block_h}x{block_k} is too large "
+            f"(H={num_heads}, D/H={head_dim})"
+        )
+    num_warps = 8 if tile >= 4096 else (4 if tile >= 1024 else 2)
+    return block_h, block_k, num_warps
+
+
+def _check_route_dims(dim: int, num_heads: int) -> int:
+    if num_heads < 2 or dim % num_heads:
+        raise RuntimeError(
+            f"MHDAR requires at least two heads dividing hidden size; "
+            f"got D={dim}, H={num_heads}"
+        )
+    return dim // num_heads
+
+
 def _route_forward_impl(
     projected: Tensor,
     present: Tensor,
     sources: list[Tensor],
     null_first: bool,
     eps: float,
+    num_heads: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
     n_sources = len(sources)
     batch, length, dim = sources[0].shape
     bt = batch * length
+    head_dim = _check_route_dims(dim, num_heads)
+    block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
     padded = _padded_sources(tuple(sources))
-    logits = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
-    inv_rms = torch.empty_like(logits)
+    logits = torch.empty(
+        (n_sources, bt, num_heads), device=projected.device, dtype=torch.float32
+    )
+    inv_rms = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
     weights = torch.empty_like(logits)
     routed = torch.empty_like(sources[0], memory_format=torch.contiguous_format)
-    block_d = triton.next_power_of_2(dim)
     has_present = present.numel() > 0
     present_arg = present if has_present else sources[0]
     _route_logits_kernel[(bt,)](
@@ -577,36 +581,41 @@ def _route_forward_impl(
         inv_rms,
         bt=bt,
         dim=dim,
+        num_heads=num_heads,
+        head_dim=head_dim,
         eps=eps,
         n_sources=n_sources,
         has_present=has_present,
         null_first=null_first,
-        block_d=block_d,
-        num_warps=8,
+        block_h=block_h,
+        block_k=block_k,
+        num_warps=num_warps,
     )
-    _route_softmax_kernel[(bt,)](
+    _route_softmax_kernel[(bt, num_heads)](
         logits,
         weights,
         bt=bt,
+        num_heads=num_heads,
         n_sources=n_sources,
         block_n=triton.next_power_of_2(n_sources),
         num_warps=1,
     )
-    mix_block = 256
-    _route_mix_kernel[(bt, triton.cdiv(dim, mix_block))](
+    _route_mix_kernel[(bt, num_heads)](
         *padded,
         weights,
         routed,
         bt=bt,
         dim=dim,
+        num_heads=num_heads,
+        head_dim=head_dim,
         n_sources=n_sources,
         null_first=null_first,
-        block_d=mix_block,
-        num_warps=4,
+        block_k=block_k,
+        num_warps=max(1, num_warps // 2),
     )
     return (
         routed,
-        weights.view(n_sources, batch, length),
+        weights.view(n_sources, batch, length, num_heads),
         inv_rms.view(n_sources, batch, length),
     )
 
@@ -618,28 +627,16 @@ def _route_backward_impl(
     inv_rms: Tensor,
     sources: list[Tensor],
     null_first: bool,
+    num_heads: int,
 ) -> tuple[Tensor, list[Tensor]]:
     grad_routed = grad_routed.contiguous()
     batch, length, dim = sources[0].shape
     bt = batch * length
     n_sources = len(sources)
-    flat_weights = weights.view(n_sources, bt)
+    head_dim = _check_route_dims(dim, num_heads)
+    block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
+    flat_weights = weights.view(n_sources, bt, num_heads)
     padded = _padded_sources(tuple(sources))
-    beta = torch.empty_like(flat_weights)
-    block_d = triton.next_power_of_2(dim)
-    _route_beta_kernel[(bt,)](
-        *padded,
-        grad_routed,
-        flat_weights,
-        beta,
-        bt=bt,
-        dim=dim,
-        n_sources=n_sources,
-        null_first=null_first,
-        block_d=block_d,
-        block_n=triton.next_power_of_2(n_sources),
-        num_warps=8,
-    )
     source_grads = [
         torch.empty(source.shape, device=source.device, dtype=source.dtype)
         for source in sources
@@ -650,22 +647,23 @@ def _route_backward_impl(
     grad_projected_tokens = torch.empty_like(
         sources[0], memory_format=torch.contiguous_format
     )
-    grad_block = 256
-    _route_backward_kernel[(bt, triton.cdiv(dim, grad_block))](
+    _route_backward_kernel[(bt,)](
         *padded,
         *padded_grads,
         projected,
         grad_routed,
         flat_weights,
         inv_rms,
-        beta,
         grad_projected_tokens,
         bt=bt,
         dim=dim,
+        num_heads=num_heads,
+        head_dim=head_dim,
         n_sources=n_sources,
         null_first=null_first,
-        block_d=grad_block,
-        num_warps=4,
+        block_h=block_h,
+        block_k=block_k,
+        num_warps=num_warps,
     )
     grad_projected = grad_projected_tokens.sum(dim=(0, 1)).to(projected.dtype)
     return grad_projected, source_grads
@@ -682,8 +680,11 @@ if triton is not None:
         sources: list[Tensor],
         null_first: bool,
         eps: float,
+        num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        return _route_forward_impl(projected, present, sources, null_first, eps)
+        return _route_forward_impl(
+            projected, present, sources, null_first, eps, num_heads
+        )
 
     @_route_forward_op.register_fake
     def _route_forward_fake(
@@ -692,13 +693,21 @@ if triton is not None:
         sources: list[Tensor],
         null_first: bool,
         eps: float,
+        num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
         del present, null_first, eps
         batch, length, _ = sources[0].shape
-        aux_shape = (len(sources), batch, length)
         routed = torch.empty_like(sources[0])
-        weights = torch.empty(aux_shape, device=projected.device, dtype=torch.float32)
-        inv_rms = torch.empty(aux_shape, device=projected.device, dtype=torch.float32)
+        weights = torch.empty(
+            (len(sources), batch, length, num_heads),
+            device=projected.device,
+            dtype=torch.float32,
+        )
+        inv_rms = torch.empty(
+            (len(sources), batch, length),
+            device=projected.device,
+            dtype=torch.float32,
+        )
         return routed, weights, inv_rms
 
     @torch.library.custom_op(
@@ -711,9 +720,16 @@ if triton is not None:
         inv_rms: Tensor,
         sources: list[Tensor],
         null_first: bool,
+        num_heads: int,
     ) -> tuple[Tensor, list[Tensor]]:
         return _route_backward_impl(
-            projected, grad_routed, weights, inv_rms, sources, null_first
+            projected,
+            grad_routed,
+            weights,
+            inv_rms,
+            sources,
+            null_first,
+            num_heads,
         )
 
     @_route_backward_op.register_fake
@@ -724,18 +740,20 @@ if triton is not None:
         inv_rms: Tensor,
         sources: list[Tensor],
         null_first: bool,
+        num_heads: int,
     ) -> tuple[Tensor, list[Tensor]]:
-        del grad_routed, weights, inv_rms, null_first
+        del grad_routed, weights, inv_rms, null_first, num_heads
         return torch.empty_like(projected), [
             torch.empty_like(source) for source in sources
         ]
 
     def _route_setup_context(ctx, inputs, output) -> None:
-        projected, _present, sources, null_first, _eps = inputs
+        projected, _present, sources, null_first, _eps, num_heads = inputs
         _routed, weights, inv_rms = output
         ctx.save_for_backward(projected, weights, inv_rms, *sources)
         ctx.n_sources = len(sources)
         ctx.null_first = null_first
+        ctx.num_heads = num_heads
         ctx.mark_non_differentiable(weights, inv_rms)
 
     def _route_autograd_backward(ctx, grad_routed, _grad_weights, _grad_inv_rms):
@@ -747,8 +765,9 @@ if triton is not None:
             inv_rms,
             list(sources),
             ctx.null_first,
+            ctx.num_heads,
         )
-        return grad_projected, None, source_grads, None, None
+        return grad_projected, None, source_grads, None, None, None
 
     _route_forward_op.register_autograd(
         _route_autograd_backward, setup_context=_route_setup_context
@@ -762,9 +781,10 @@ def bespoke_route(
     present: Tensor | None,
     null_first: bool,
     eps: float,
+    num_heads: int,
     sources: tuple[Tensor, ...],
 ) -> tuple[Tensor, Tensor]:
-    """RMS-key softmax route with fixed-capacity Triton forward/backward."""
+    """Full-width RMS keys plus per-head depth softmaxes in fused Triton."""
     if triton is None or not projected.is_cuda:
         raise RuntimeError("bespoke_route requires Triton CUDA")
     present_arg = (
@@ -773,7 +793,7 @@ def bespoke_route(
         else torch.empty(0, device=projected.device, dtype=torch.bool)
     )
     routed, weights, _inv_rms = _route_forward_op(
-        projected, present_arg, list(sources), null_first, eps
+        projected, present_arg, list(sources), null_first, eps, num_heads
     )
     return routed, weights
 

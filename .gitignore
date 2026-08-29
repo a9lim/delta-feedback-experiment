@@ -13,6 +13,7 @@ references/*.md
 references/*.pdf
 references/*.html
 references/delta-attention-residuals-code/
+references/multi-head-attention-residuals-code/
 
 # Run logs and checkpoints stay local.
 logs/**
