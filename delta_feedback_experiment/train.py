@@ -476,7 +476,12 @@ class CudaEvalRunner:
         sizes = {min(args.eval_rows, args.micro_rows)}
         if remainder:
             sizes.add(remainder)
-        self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
+        prior_recompile_limit = torch._dynamo.config.recompile_limit
+        torch._dynamo.config.recompile_limit = max(prior_recompile_limit, 64)
+        try:
+            self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
+        finally:
+            torch._dynamo.config.recompile_limit = prior_recompile_limit
 
     def _body(self, state: CapturedEval) -> None:
         n_passes = 2 if self.model.cfg.feedback_active else 1
