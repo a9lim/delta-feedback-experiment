@@ -44,8 +44,13 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 
 try:
     from cut_cross_entropy import linear_cross_entropy
+    from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
+    from cut_cross_entropy.utils import _handle_eps
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     linear_cross_entropy = None
+    CCEParams = None
+    linear_cross_entropy_apply = None
+    _handle_eps = None
 
 ARMS = ("vanilla", "dar", "fbt", "df", "df_soft")
 
@@ -691,6 +696,28 @@ _compiled_head_losses = torch.compile(
 )
 
 
+def _fixed_cce(embeddings: Tensor, classifier: Tensor, targets: Tensor) -> Tensor:
+    """CCE for dense fixed training targets, without capture-unsafe ``nonzero``.
+
+    CCE's public wrapper constructs an ignore-index map even when every token is
+    valid.  Our packed stream has no ignored targets, so call its pinned core
+    with ``valids=None`` and retain its high-throughput gradient filter.
+    """
+    batch_shape = targets.shape
+    embeddings = embeddings.contiguous().flatten(0, -2)
+    targets = targets.contiguous().flatten()
+    params = CCEParams(
+        targets=targets,
+        valids=None,
+        softcap=None,
+        reduction="mean",
+        filter_eps=_handle_eps("high", embeddings.dtype),
+        shift=False,
+        batch_shape=batch_shape,
+    )
+    return linear_cross_entropy_apply(embeddings, classifier, params)
+
+
 def sequence_ce(
     model: DFModel,
     h_top: Tensor,
@@ -712,13 +739,7 @@ def sequence_ce(
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
         normalized = model.final_norm(h_top)
-        ce = linear_cross_entropy(
-            normalized,
-            model.embed_tokens.weight,
-            targets,
-            reduction="mean",
-            filter_eps="high",
-        )
+        ce = _fixed_cce(normalized, model.embed_tokens.weight, targets)
         return ce, ce.new_zeros((), dtype=torch.float32)
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
