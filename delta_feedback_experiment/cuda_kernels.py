@@ -604,7 +604,11 @@ def _route_forward_impl(
         block_d=mix_block,
         num_warps=4,
     )
-    return routed, weights.view(n_sources, batch, length), inv_rms
+    return (
+        routed,
+        weights.view(n_sources, batch, length),
+        inv_rms.view(n_sources, batch, length),
+    )
 
 
 def _route_backward_impl(
