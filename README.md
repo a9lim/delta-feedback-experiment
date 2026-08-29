@@ -50,8 +50,10 @@ df watch
 
 `df probe` runs the invariant suite everywhere and, when CUDA is present, the
 full 220M/B4/T1025 graph-capture gate. Training uses fixed CUDA graphs,
-FlashAttention, CCE, BF16 residuals, and an internal measured activation plan;
-there are no public kernel or checkpoint-policy switches.
+whole-block compilation, FlashAttention, exact CCE-native z-loss, a bespoke
+Triton router, BF16 residuals, captured evaluation, and asynchronous atomic
+snapshots. The activation plan is internally measured; there are no public
+kernel or checkpoint-policy switches.
 
 ## Docs map
 

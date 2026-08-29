@@ -36,6 +36,7 @@ def cuda_gate() -> None:
         CudaGraphTrainer,
         build_parser,
         build_schedule,
+        evaluate,
     )
 
     if flash_attn_func is None or linear_cross_entropy_apply is None:
@@ -230,9 +231,17 @@ def cuda_gate() -> None:
             rows = self.rows[first : first + count]
             return rows.to(device) if device is not None else rows
 
-    eval_scores = eval_runner.run(_ProbeValidation())
+    probe_validation = _ProbeValidation()
+    eval_scores = eval_runner.run(probe_validation)
     if any(not math.isfinite(value) for value in eval_scores.values()):
         raise AssertionError(f"nonfinite captured evaluation: {eval_scores}")
+    eager_scores = evaluate(model, probe_validation, args, torch.device("cuda"))
+    for key, value in eval_scores.items():
+        if not math.isclose(value, eager_scores[key], rel_tol=2e-3, abs_tol=2e-3):
+            raise AssertionError(
+                f"captured evaluation drift in {key}: {value} versus "
+                f"{eager_scores[key]}"
+            )
 
     compiled = counters["stats"]["unique_graphs"]
     generator = torch.Generator().manual_seed(0)

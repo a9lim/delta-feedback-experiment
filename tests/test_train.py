@@ -228,8 +228,7 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
 
 
 def test_multipass_checkpoint_parity():
-    """Multi-pass steps checkpoint unconditionally (the k>=2 graphs OOM'd
-    the 4090 otherwise); loss and grads must match the plain path."""
+    """The guarded larger/DF-soft modes preserve plain-path loss and grads."""
     from delta_feedback_experiment.model import (
         DFModel,
         arm_config,

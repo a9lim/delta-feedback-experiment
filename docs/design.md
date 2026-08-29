@@ -293,22 +293,29 @@ stream, feedback payload, and route values explicitly BF16. QKV and SwiGLU
 gate/up weights are persistent packed matrices; this also makes each packed
 matrix one NorMuon object rather than several independently orthogonalized
 objects. FlashAttention handles training, prefill, GQA, and cached decoding.
-The router evaluates its RMS-key dot product algebraically from raw values and
-inverse RMS scalars in a compiled Triton region, avoiding a normalized source
-bank. CCE supplies non-cooldown CE without materialized logits and uses its
-`high` gradient filter; the cooldown CE+z-loss head is separately compiled in
-1024-token chunks. CUDA BF16 jitter is keyed by data seed, step, and row. TF32
+Each complete transformer block is a full-graph compiled unit around its
+FlashAttention calls. Routing is one fixed-capacity, zero-copy Triton custom
+operator over the source pointer list: fused RMS-key scores, masked softmax,
+FP32 value mix, and an analytic backward, without a normalized or stacked
+source bank. CCE supplies CE and exact z-loss without materialized logits; the
+z-loss backward is folded into the same vocabulary sweep with an exact target-
+column correction. CUDA BF16 jitter is keyed by data seed, step, and row. TF32
 is enabled for NorMuon's batched FP32 Newton-Schulz products. These are
 intentional numerical divergences from the parent implementations; paired arms
 share the same optimized recipe and keyed streams.
 
 Training captures a fixed-address forward/backward CUDA graph for every mode
 reachable under the exact schedule, after compilation and persistent optimizer
-state initialization. No compilation occurs in timed steps. The 4090 screen
-plan runs k=1 and k=2 without activation checkpointing, checkpoints the rare
-k=3 graph, and checkpoints DF-soft from k=2 onward. Larger geometries cross the
-same internal work threshold automatically. The policy is not a public
-experiment knob. The final pass does not construct an unused payload.
+state initialization. Fixed no-grad evaluation graphs share the training
+graph's private pool, so validation does not re-enter Python model execution.
+No compilation occurs in timed steps. The 4090 hard-DF screen runs k=1, k=2,
+and k=3 without activation checkpointing; DF-soft checkpoints from k=2 onward,
+and larger geometries cross the same internal work threshold automatically.
+The policy is not a public experiment knob. The final pass does not construct
+an unused payload. Snapshots first freeze model, optimizer, settings, and RNG
+state into pinned host buffers, then serialize and atomically rename on a
+single background writer; the CUDA stream dependency prevents a later update
+from racing the copy while disk I/O overlaps training.
 
 **Memory.** No-detach multi-pass times per-sublayer sources compounds
 activation memory. The automatic policy above is authoritative at trial scale;
