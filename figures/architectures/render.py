@@ -151,247 +151,150 @@ def finish_svg(svg: list[str], footer: str) -> str:
     return "\n".join(svg)
 
 
-def stack(svg: list[str], *, routed: bool, source_label: list[str] | None = None) -> None:
-    """Draw the shared trunk on one fixed grid.
-
-    Routed arms reserve the upper half for one source bank and two vertical
-    read paths. The residual computation stays on a single horizontal lane;
-    no routing edge crosses it.
-    """
-    x, y, w, h = 500, 205, 680, 500
-    stream_y = 515
-    svg.append(
-        f'<rect class="stack" x="{x}" y="{y}" width="{w}" height="{h}" rx="24"/>'
-    )
-    svg.append(
-        text(
-            x + 28,
-            y + 38,
-            "Transformer block ℓ   × L",
-            css="section",
-            anchor="start",
-        )
-    )
-    svg.append(
-        text(
-            x + w - 28,
-            y + 38,
-            "pre-norm residual trunk",
-            css="small",
-            anchor="end",
-        )
-    )
-
-    svg.append(text(x + 36, stream_y - 27, "hℓ", css="formula"))
-    svg.append(line(x + 18, stream_y, x + 100, stream_y))
-    attn_lines = (
-        ["RMSNorm(h + rᵃℓ)", "Attention → Δaℓ"]
-        if routed
-        else ["RMSNorm", "Attention → Δaℓ"]
-    )
-    mlp_lines = (
-        ["RMSNorm(h + rᵐℓ)", "MLP → Δmℓ"]
-        if routed
-        else ["RMSNorm", "MLP → Δmℓ"]
-    )
-    svg.append(box(x + 100, 467, 200, 96, attn_lines, kind="blue-node"))
-    svg.append(line(x + 300, stream_y, x + 316, stream_y))
-    svg.append(circle(x + 336, stream_y))
-    svg.append(line(x + 355, stream_y, x + 370, stream_y))
-    svg.append(box(x + 370, 467, 200, 96, mlp_lines, kind="blue-node"))
-    svg.append(line(x + 570, stream_y, x + 586, stream_y))
-    svg.append(circle(x + 606, stream_y))
-    svg.append(line(x + 625, stream_y, x + 680, stream_y))
-    svg.append(text(x + 650, stream_y - 27, "hℓ₊₁", css="formula"))
-
-    if routed:
-        svg.append(
-            box(
-                x + 70,
-                275,
-                540,
-                80,
-                source_label or ["Sources Sℓ"],
-                kind="purple-node",
-                css="formula",
-            )
-        )
-        svg.append(
-            box(
-                x + 120,
-                380,
-                160,
-                66,
-                ["rᵃℓ = route", "(Sℓ, qᵃℓ)"],
-                kind="purple-node",
-                css="formula",
-            )
-        )
-        svg.append(
-            box(
-                x + 390,
-                380,
-                160,
-                66,
-                ["rᵐℓ = route", "(Sℓ, qᵐℓ)"],
-                kind="purple-node",
-                css="formula",
-            )
-        )
-        svg.append(line(x + 200, 355, x + 200, 378, kind="purple"))
-        svg.append(line(x + 470, 355, x + 470, 378, kind="purple"))
-        svg.append(line(x + 200, 446, x + 200, 465, kind="purple"))
-        svg.append(line(x + 470, 446, x + 470, 465, kind="purple"))
-        svg.append(
-            text(
-                x + w / 2,
-                635,
-                "Each branch delta joins Sℓ before the next routed read.",
-                css="small",
-            )
-        )
-    else:
-        svg.append(
-            box(
-                x + 140,
-                295,
-                400,
-                70,
-                ["No source bank  ·  no routing sites"],
-                kind="neutral",
-            )
-        )
-        svg.append(
-            text(
-                x + w / 2,
-                635,
-                "Each sublayer reads only the current residual stream.",
-                css="small",
-            )
-        )
-
-
-def common_head(svg: list[str]) -> None:
-    svg.append(
-        box(
-            1215,
-            468,
-            190,
-            94,
-            ["Top state", "hₜᵗᵒᵖ"],
-            kind="blue-node",
-            css="formula",
-        )
-    )
-    svg.append(line(1180, 515, 1213, 515))
-    svg.append(
-        box(
-            1460,
-            453,
-            195,
-            124,
-            ["Final RMSNorm", "+ tied LM head", "→ logitsₜ"],
-            kind="green-node",
-        )
-    )
-    svg.append(line(1405, 515, 1458, 515, kind="blue"))
-
-
-def token_input(svg: list[str], *, y: int = 479) -> None:
-    svg.append(box(45, y, 120, 72, ["Token", "xₜ"], kind="neutral", css="formula"))
-    svg.append(line(165, y + 36, 202, y + 36))
-    svg.append(box(205, y - 8, 210, 88, ["Token embedding", "eₜ"], kind="blue-node", css="formula"))
+def token_input(svg: list[str], *, gated: bool = False) -> None:
+    y = 690 if gated else 590
+    svg.append(box(45, y, 110, 70, ["Token", "xₜ"], kind="neutral", css="formula"))
+    svg.append(line(155, y + 35, 188, y + 35))
+    svg.append(box(190, y - 5, 190, 80, ["Embedding", "eₜ"], kind="blue-node", css="formula"))
 
 
 def feedback_input(svg: list[str]) -> None:
     svg.append(
         box(
             45,
-            255,
-            190,
-            88,
-            ["Previous payload", "pₜ₋₁"],
+            250,
+            170,
+            70,
+            ["Payload", "pₜ₋₁"],
             kind="orange-node",
             css="formula",
         )
     )
 
 
-def gated_entry(svg: list[str]) -> None:
+def gated_entry(svg: list[str], *, routed: bool) -> None:
     feedback_input(svg)
-    svg.append(box(45, 628, 120, 72, ["Token", "xₜ"], kind="neutral", css="formula"))
-    svg.append(line(165, 664, 198, 664))
-    svg.append(box(200, 620, 190, 88, ["Embedding", "eₜ"], kind="blue-node", css="formula"))
+    token_input(svg, gated=True)
     svg.append(
         box(
-            270,
-            440,
-            190,
+            330,
+            565,
             150,
-            [
-                "Asymmetric GLU",
-                "value: Wᵤpₜ₋₁",
-                "gate: σ(Wɢ·norm(eₜ))",
-                "RMSNorm → uₜ",
-            ],
+            120,
+            ["Asymmetric GLU", "Wᵤpₜ₋₁", "× σ(Wɢ·norm(eₜ))", "norm → uₜ"],
             kind="orange-node",
             css="small",
         )
     )
-    svg.append(path([(235, 299), (365, 299), (365, 438)], kind="orange"))
-    svg.append(path([(295, 620), (295, 605), (365, 605), (365, 592)], kind="blue"))
-    svg.append(line(460, 515, 498, 515, kind="orange"))
-    svg.append(text(479, 488, "uₜ", css="formula"))
+    svg.append(path([(215, 285), (405, 285), (405, 563)], kind="orange"))
+    svg.append(path([(285, 690), (285, 675), (405, 675), (405, 687)], kind="blue"))
+    svg.append(line(480, 625, 498, 625, kind="orange"))
+    if routed:
+        svg.append(path([(490, 625), (490, 290), (498, 290)], kind="purple"))
+        svg.append(text(465, 470, "seed uₜ", css="small", anchor="end"))
 
 
-def simple_payload(svg: list[str]) -> None:
-    svg.append(path([(1310, 562), (1310, 755)], kind="orange"))
-    svg.append(
-        box(
-            1235,
-            757,
-            150,
-            76,
-            ["RMSNorm", "pₜ"],
-            kind="orange-node",
-            css="formula",
-        )
+def plain_entry(svg: list[str], *, routed: bool, soft: bool = False) -> None:
+    if soft:
+        feedback_input(svg)
+    token_input(svg)
+    svg.append(line(380, 625, 498, 625))
+    if routed:
+        if soft:
+            svg.append(line(215, 285, 498, 285, kind="orange"))
+            svg.append(path([(430, 625), (430, 315), (498, 315)], kind="purple"))
+            svg.append(text(285, 705, "plain entry  ·  h₀ = eₜ  ·  no GLU", css="small"))
+        else:
+            svg.append(path([(430, 625), (430, 290), (498, 290)], kind="purple"))
+            svg.append(text(455, 470, "seed eₜ", css="small", anchor="end"))
+
+
+def wiring_stack(
+    svg: list[str], *, routed: bool, source_label: list[str] | None = None
+) -> None:
+    """Draw one block as an upper source rail and lower residual rail."""
+    svg.append(text(500, 195, "Transformer block ℓ   × L", css="section", anchor="start"))
+    rail_note = (
+        "branch deltas update both rails"
+        if routed
+        else "branch deltas update the residual rail"
     )
-    svg.append(line(1385, 795, 1458, 795, kind="orange"))
-    svg.append(box(1460, 757, 195, 76, ["Carry to", "step t+1"], kind="orange-node"))
+    svg.append(text(1190, 195, rail_note, css="small", anchor="end"))
+
+    if routed:
+        svg.append(
+            box(
+                500,
+                245,
+                690,
+                90,
+                source_label or ["Sources Sℓ"],
+                kind="purple-node",
+                css="formula",
+            )
+        )
+        svg.append(box(550, 365, 140, 65, ["route", "qᵃℓ"], kind="purple-node", css="formula"))
+        svg.append(box(910, 365, 140, 65, ["route", "qᵐℓ"], kind="purple-node", css="formula"))
+        svg.append(line(620, 335, 620, 363, kind="purple"))
+        svg.append(line(980, 335, 980, 363, kind="purple"))
+        svg.append(circle(620, 485))
+        svg.append(circle(980, 485))
+        svg.append(line(620, 430, 620, 464, kind="purple"))
+        svg.append(line(980, 430, 980, 464, kind="purple"))
+        svg.append(path([(620, 625), (620, 506)], kind="blue"))
+        svg.append(path([(980, 625), (980, 506)], kind="blue"))
+        svg.append(line(639, 485, 678, 485, kind="blue"))
+        svg.append(line(999, 485, 1038, 485, kind="blue"))
+        attn_x, mlp_x = 680, 1040
+    else:
+        svg.append(text(845, 290, "No source rail  ·  no routed reads", css="small"))
+        attn_x, mlp_x = 550, 910
+        svg.append(path([(620, 625), (620, 512)], kind="blue"))
+        svg.append(path([(980, 625), (980, 512)], kind="blue"))
+
+    svg.append(box(attn_x, 445, 140, 80, ["RMSNorm", "Attention"], kind="blue-node"))
+    svg.append(box(mlp_x, 445, 140, 80, ["RMSNorm", "MLP"], kind="blue-node"))
+
+    svg.append(line(500, 625, 799, 625))
+    svg.append(circle(820, 625))
+    svg.append(line(839, 625, 1149, 625))
+    svg.append(circle(1170, 625))
+
+    svg.append(path([(attn_x + 140, 485), (820, 485), (820, 604)], kind="blue"))
+    svg.append(path([(mlp_x + 140, 485), (1170, 485), (1170, 604)], kind="blue"))
+    svg.append(text(842, 460, "Δaℓ", css="formula", anchor="start"))
+    svg.append(text(1192, 460, "Δmℓ", css="formula", anchor="start"))
+
+    if routed:
+        svg.append(path([(820, 485), (820, 337)], kind="purple"))
+        svg.append(path([(1170, 485), (1170, 337)], kind="purple"))
+        svg.append(text(735, 352, "deltas return to Sℓ", css="small"))
+
+    svg.append(text(520, 650, "residual stream", css="small", anchor="start"))
 
 
-def routed_payload(svg: list[str]) -> None:
-    svg.append(
-        box(
-            650,
-            757,
-            260,
-            76,
-            ["Payload route", "qₚ"],
-            kind="purple-node",
-            css="formula",
-        )
-    )
-    svg.append(line(910, 795, 1288, 795, kind="purple"))
-    svg.append(text(1100, 773, "routed payload view of Sℓ", css="small"))
-    svg.append(circle(1310, 795))
-    svg.append(path([(1310, 562), (1310, 774)], kind="blue"))
-    svg.append(text(1328, 708, "base hₜᵗᵒᵖ", css="small", anchor="start"))
-    svg.append(line(1329, 795, 1360, 795, kind="orange"))
-    svg.append(
-        box(
-            1362,
-            757,
-            120,
-            76,
-            ["RMSNorm", "pₜ"],
-            kind="orange-node",
-            css="formula",
-        )
-    )
-    svg.append(line(1482, 795, 1508, 795, kind="orange"))
-    svg.append(box(1510, 757, 145, 76, ["Carry to", "step t+1"], kind="orange-node"))
+def lm_outputs(svg: list[str], *, payload: str) -> None:
+    svg.append(line(1189, 625, 1318, 625))
+    svg.append(text(1240, 650, "hₜᵗᵒᵖ", css="formula"))
+    svg.append(box(1320, 585, 160, 80, ["Final RMSNorm", "+ LM head"], kind="green-node"))
+    svg.append(line(1480, 625, 1518, 625, kind="blue"))
+    svg.append(box(1520, 590, 135, 70, ["Logits", "logitsₜ"], kind="green-node", css="formula"))
+
+    if payload == "none":
+        return
+
+    svg.append(path([(1240, 625), (1240, 360), (1380, 360), (1380, 311)], kind="blue"))
+    svg.append(text(1260, 410, "base hₜᵗᵒᵖ", css="small", anchor="start"))
+    if payload == "fbt":
+        svg.append(box(1210, 250, 140, 80, ["RMSNorm", "hₜᵗᵒᵖ"], kind="orange-node", css="formula"))
+        svg.append(line(1350, 290, 1428, 290, kind="orange"))
+    else:
+        svg.append(line(1190, 290, 1208, 290, kind="purple"))
+        svg.append(box(1210, 255, 140, 70, ["Payload route", "qₚ"], kind="purple-node", css="formula"))
+        svg.append(line(1350, 290, 1360, 290, kind="purple"))
+        svg.append(circle(1380, 290))
+        svg.append(line(1399, 290, 1428, 290, kind="orange"))
+    svg.append(box(1430, 250, 190, 80, ["Payload", "pₜ → step t+1"], kind="orange-node", css="formula"))
 
 
 def vanilla() -> str:
@@ -400,11 +303,9 @@ def vanilla() -> str:
         "Baseline · ordinary residual depth · no cross-column state",
         "Token embedding enters a standard pre-norm residual transformer stack and the top state feeds the language-model head. There is no depth router or recurrent payload.",
     )
-    token_input(svg)
-    svg.append(line(415, 515, 498, 515))
-    stack(svg, routed=False)
-    common_head(svg)
-    svg.append(box(650, 760, 380, 70, ["No recurrent payload"], kind="neutral"))
+    plain_entry(svg, routed=False)
+    wiring_stack(svg, routed=False)
+    lm_outputs(svg, payload="none")
     return finish_svg(svg, "Blue = ordinary residual computation. One column at position t is shown.")
 
 
@@ -414,17 +315,13 @@ def dar() -> str:
         "Vertical-axis widening · transient reads over the current column’s decomposition",
         "The embedding seeds a source bank. Before every attention and MLP sublayer, a zero-initialized query routes over the seed and prior sublayer deltas. The routed mixture enriches the read transiently while the residual stream remains clean.",
     )
-    token_input(svg)
-    svg.append(line(415, 515, 498, 515))
-    stack(
+    plain_entry(svg, routed=True)
+    wiring_stack(
         svg,
         routed=True,
         source_label=["Sources Sℓ", "[eₜ  |  Δa₀, Δm₀, …]", "seed + prior deltas"],
     )
-    svg.append(path([(310, 469), (310, 315), (568, 315)], kind="purple"))
-    svg.append(text(422, 294, "seed eₜ", css="small"))
-    common_head(svg)
-    svg.append(box(650, 760, 380, 70, ["No cross-column payload"], kind="neutral"))
+    lm_outputs(svg, payload="none")
     return finish_svg(
         svg,
         "Purple = zero-init routing. With only seed eₜ, layer-0 attention routing is a no-op.",
@@ -437,10 +334,9 @@ def fbt() -> str:
         "Horizontal-axis widening · previous top state re-enters layer 0 through a mandatory gate",
         "The previous column payload and current token embedding are fused by an asymmetric GLU. The fused input passes through a standard transformer stack. The normalized top state becomes the payload for the next position.",
     )
-    gated_entry(svg)
-    stack(svg, routed=False)
-    common_head(svg)
-    simple_payload(svg)
+    gated_entry(svg, routed=False)
+    wiring_stack(svg, routed=False)
+    lm_outputs(svg, payload="fbt")
     return finish_svg(svg, "Orange = cross-column feedback. The trunk has no depth routers; pₜ is the bare normalized top state.")
 
 
@@ -450,8 +346,8 @@ def df() -> str:
         "Hard combination · gated horizontal feedback + mandatory vertical delta routing",
         "The previous payload and token embedding are fused into u. The fused input seeds DAR-style routing throughout the stack. A dedicated router enriches the top state with a delta-only mixture before forming the next payload.",
     )
-    gated_entry(svg)
-    stack(
+    gated_entry(svg, routed=True)
+    wiring_stack(
         svg,
         routed=True,
         source_label=[
@@ -460,10 +356,7 @@ def df() -> str:
             "depth: all  ·  payload: drop uₜ",
         ],
     )
-    svg.append(path([(480, 515), (480, 315), (568, 315)], kind="purple"))
-    svg.append(text(520, 294, "seed uₜ", css="small"))
-    common_head(svg)
-    routed_payload(svg)
+    lm_outputs(svg, payload="routed")
     return finish_svg(svg, "Hard-everywhere: neither the routed reads nor the recurrent payload has a null escape.")
 
 
@@ -473,10 +366,8 @@ def df_soft() -> str:
         "Soft combination · plain token entry + null-enabled routers everywhere",
         "The token embedding remains the residual-stream input. The previous payload is an ungated standing source beside the embedding and prior deltas. Every depth and payload router includes a learnable null source, so the model can regress to vanilla.",
     )
-    feedback_input(svg)
-    token_input(svg)
-    svg.append(line(415, 515, 498, 515))
-    stack(
+    plain_entry(svg, routed=True, soft=True)
+    wiring_stack(
         svg,
         routed=True,
         source_label=[
@@ -485,11 +376,7 @@ def df_soft() -> str:
             "depth: all  ·  payload: drop pₜ₋₁ and eₜ",
         ],
     )
-    svg.append(path([(235, 299), (500, 299), (500, 295), (568, 295)], kind="orange"))
-    svg.append(path([(310, 469), (310, 335), (568, 335)], kind="purple"))
-    svg.append(text(315, 590, "plain entry  ·  h₀ = eₜ  ·  no GLU", css="small"))
-    common_head(svg)
-    routed_payload(svg)
+    lm_outputs(svg, payload="routed")
     return finish_svg(svg, "Gray = null escape. Choosing null at every router recovers the vanilla path; pₜ₋₁ is never fused into h₀.")
 
 
