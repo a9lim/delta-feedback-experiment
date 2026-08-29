@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import math
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -31,21 +31,44 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=1, resumable=frozenset({1}), surface_version=1
+    version=2, resumable=frozenset({2}), surface_version=2
 )
 
 EXACT_FIELDS = (
-    "arm", "seed", "data_seed", "seq_len", "batch_rows", "micro_rows",
-    "steps", "warmup_steps", "cooldown_frac", "feedback_start", "three_pass",
-    "lr_muon", "wd_muon", "lr_adam", "jitter", "zloss",
-    "vocab_size", "dim", "layers", "heads", "kv_heads", "head_dim",
+    "arm",
+    "seed",
+    "data_seed",
+    "seq_len",
+    "batch_rows",
+    "micro_rows",
+    "steps",
+    "warmup_steps",
+    "cooldown_frac",
+    "feedback_start",
+    "three_pass",
+    "lr_muon",
+    "wd_muon",
+    "lr_adam",
+    "jitter",
+    "zloss",
+    "vocab_size",
+    "dim",
+    "layers",
+    "heads",
+    "kv_heads",
+    "head_dim",
     "intermediate",
 )
 """State-defining settings: a resume takes these from the checkpoint."""
 
 RUNTIME_FIELDS = (
-    "data_dir", "out_dir", "device", "log_every", "eval_every",
-    "snapshot_every", "eval_rows", "grad_checkpoint",
+    "data_dir",
+    "out_dir",
+    "device",
+    "log_every",
+    "eval_every",
+    "snapshot_every",
+    "eval_rows",
 )
 """Per-invocation settings: inherited unless retyped."""
 
@@ -57,25 +80,44 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("tag", type=runs.validate_run_tag, help="run tag")
     parser.add_argument("--arm", choices=ARMS, default="vanilla")
     parser.add_argument("--seed", type=int, default=1, help="init seed")
-    parser.add_argument("--data-seed", type=int, default=0,
-                        help="shared randomness stream; identical across paired arms")
+    parser.add_argument(
+        "--data-seed",
+        type=int,
+        default=0,
+        help="shared randomness stream; identical across paired arms",
+    )
     parser.add_argument("--data-dir", default="data/tokens")
     parser.add_argument("--out-dir", default="runs")
-    parser.add_argument("--resume", action="store_true",
-                        help="continue the tag from its latest snapshot")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue the tag from its latest snapshot",
+    )
 
     schedule = parser.add_argument_group("schedule (state-defining)")
     schedule.add_argument("--steps", type=runs.parse_step_count, default=6700)
     schedule.add_argument("--warmup-steps", type=int, default=200)
     schedule.add_argument("--cooldown-frac", type=float, default=0.25)
-    schedule.add_argument("--feedback-start", type=float, default=0.75,
-                          help="fraction of steps before feedback passes begin")
-    schedule.add_argument("--three-pass", type=float, default=0.12,
-                          help="P(k=3) within the feedback phase (0.12 -> 75/22/3 overall)")
+    schedule.add_argument(
+        "--feedback-start",
+        type=float,
+        default=0.75,
+        help="fraction of steps before feedback passes begin",
+    )
+    schedule.add_argument(
+        "--three-pass",
+        type=float,
+        default=0.12,
+        help="P(k=3) within the feedback phase (0.12 -> 75/22/3 overall)",
+    )
 
     recipe = parser.add_argument_group("recipe (state-defining)")
-    recipe.add_argument("--batch-rows", type=int, default=292,
-                        help="global batch in rows (292 x 1025 tokens ~ FBT's 300K)")
+    recipe.add_argument(
+        "--batch-rows",
+        type=int,
+        default=292,
+        help="global batch in rows (292 x 1025 tokens ~ FBT's 300K)",
+    )
     recipe.add_argument("--micro-rows", type=int, default=4)
     recipe.add_argument("--seq-len", type=int, default=1024)
     recipe.add_argument("--lr-muon", type=float, default=1e-2)
@@ -94,15 +136,17 @@ def build_parser() -> argparse.ArgumentParser:
     trunk.add_argument("--intermediate", type=int, default=3072)
 
     runtime = parser.add_argument_group("runtime")
-    runtime.add_argument("--max-steps", type=runs.parse_step_count, default=None,
-                         help="cap this invocation's additional steps; never "
-                              "rescales the schedule")
+    runtime.add_argument(
+        "--max-steps",
+        type=runs.parse_step_count,
+        default=None,
+        help="cap this invocation's additional steps; never rescales the schedule",
+    )
     runtime.add_argument("--device", default=None)
     runtime.add_argument("--log-every", type=int, default=10)
     runtime.add_argument("--eval-every", type=int, default=100)
     runtime.add_argument("--snapshot-every", type=int, default=500)
     runtime.add_argument("--eval-rows", type=int, default=32)
-    runtime.add_argument("--grad-checkpoint", action="store_true")
     return parser
 
 
@@ -125,20 +169,235 @@ def draw_passes(args, step: int, total: int) -> int:
     generator = torch.Generator().manual_seed(mix(args.data_seed, step, 1))
     return 3 if torch.rand((), generator=generator).item() < args.three_pass else 2
 
-def micro_draws(args, step: int, first_row: int, n_passes: int, n_rows: int,
-                dim: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+
+def micro_draws(
+    args,
+    step: int,
+    first_row: int,
+    n_passes: int,
+    n_rows: int,
+    dim: int,
+    device,
+    *,
+    prefix_out: torch.Tensor | None = None,
+    jitter_out: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """(prefix_lens [k-1, n], jitter [k-1, n, seq_len+1, dim]) for one
     microbatch, keyed by (data seed, step, first global row) — identical
     across arms for any run sharing the batch geometry."""
-    generator = torch.Generator().manual_seed(mix(args.data_seed, step, first_row))
+    if generator is None:
+        generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
+    generator.manual_seed(mix(args.data_seed, step, first_row))
     columns = args.seq_len + 1
-    prefix = torch.randint(
-        1, columns, (n_passes - 1, n_rows), generator=generator
-    )
-    jitter = (
-        torch.rand((n_passes - 1, n_rows, columns, dim), generator=generator) * 2 - 1
-    ) * args.jitter
-    return prefix.to(device), jitter.to(device)
+    shape = (n_passes - 1, n_rows)
+    if prefix_out is None:
+        prefix_out = torch.empty(shape, dtype=torch.long, device=device)
+    torch.randint(1, columns, shape, generator=generator, out=prefix_out)
+    jitter_shape = (n_passes - 1, n_rows, columns, dim)
+    if jitter_out is None:
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        jitter_out = torch.empty(jitter_shape, dtype=dtype, device=device)
+    jitter_out.uniform_(-args.jitter, args.jitter, generator=generator)
+    return prefix_out, jitter_out
+
+
+def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
+    """Measured internal activation policy; the Jobe screen fits k<=3 raw."""
+    if device.type != "cuda":
+        return False
+    cfg = model.cfg
+    screen_work = 4 * 1025 * 768 * 12 * 3
+    work = args.micro_rows * (args.seq_len + 1) * cfg.dim * cfg.layers * n_passes
+    return work > screen_work
+
+
+@dataclass(frozen=True)
+class GraphSpec:
+    n_passes: int
+    want_z: bool
+    checkpoint: bool
+
+
+@dataclass
+class CapturedMicro:
+    spec: GraphSpec
+    rows: torch.Tensor
+    prefix: torch.Tensor | None
+    jitter: torch.Tensor | None
+    loss_sum: torch.Tensor
+    pass1_sum: torch.Tensor
+    graph: torch.cuda.CUDAGraph | None = None
+    active: frozenset[torch.nn.Parameter] = frozenset()
+
+
+class CudaGraphTrainer:
+    """Fixed-address forward/backward graphs for every reachable step mode.
+
+    The model's gradient tensors and every graph input are allocated once.
+    Data and keyed CUDA randomness are copied/drawn into those addresses before
+    replay.  Graphs share a private pool and never overlap; each captured body
+    ends after backward, so no saved activation survives between replays.
+    """
+
+    def __init__(self, model: DFModel, optimizers, args, schedule: Schedule):
+        self.model = model
+        self.optimizers = optimizers
+        self.args = args
+        self.device = next(model.parameters()).device
+        self.micros = args.batch_rows // args.micro_rows
+        self.autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+        self.generator = torch.Generator(device=self.device)
+        self.parameters = [p for p in model.parameters() if p.requires_grad]
+        self.states: dict[GraphSpec, CapturedMicro] = {}
+        specs = self._reachable_specs(schedule)
+        for spec in specs:
+            self.states[spec] = self._allocate(spec)
+
+        active_by_spec = {
+            spec: self._warm(state) for spec, state in self.states.items()
+        }
+        model.zero_grad(set_to_none=True)
+        union = set().union(*active_by_spec.values())
+        self.grad_buffers = {p: torch.zeros_like(p) for p in union}
+        for parameter, gradient in self.grad_buffers.items():
+            parameter.grad = gradient
+
+        pool = torch.cuda.graph_pool_handle()
+        for spec, state in self.states.items():
+            state.active = frozenset(active_by_spec[spec])
+            self._capture(state, pool)
+        self.zero_grad()
+        for optimizer in self.optimizers:
+            warmup = getattr(optimizer, "warmup", None)
+            if warmup is not None:
+                warmup()
+        torch.cuda.synchronize()
+
+    def _reachable_specs(self, schedule: Schedule) -> list[GraphSpec]:
+        specs = set()
+        for step in range(1, schedule.total + 1):
+            want_z = schedule.phase(step)[0] == "cooldown" and self.args.zloss > 0
+            n_passes = (
+                draw_passes(self.args, step, schedule.total)
+                if self.model.cfg.feedback_active
+                else 1
+            )
+            specs.add(
+                GraphSpec(
+                    n_passes,
+                    want_z,
+                    automatic_checkpoint(self.model, n_passes, self.args, self.device),
+                )
+            )
+        return sorted(specs, key=lambda spec: (spec.n_passes, spec.want_z))
+
+    def _allocate(self, spec: GraphSpec) -> CapturedMicro:
+        rows = torch.zeros(
+            self.args.micro_rows,
+            self.args.seq_len + 1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        prefix = jitter = None
+        if spec.n_passes > 1:
+            prefix = torch.ones(
+                spec.n_passes - 1,
+                self.args.micro_rows,
+                dtype=torch.long,
+                device=self.device,
+            )
+            jitter = torch.zeros(
+                spec.n_passes - 1,
+                self.args.micro_rows,
+                self.args.seq_len + 1,
+                self.args.dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        return CapturedMicro(
+            spec,
+            rows,
+            prefix,
+            jitter,
+            torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
+        )
+
+    def _body(self, state: CapturedMicro) -> None:
+        self.model.grad_checkpoint = state.spec.checkpoint
+        with self.autocast:
+            outs = multipass(
+                self.model,
+                state.rows,
+                state.spec.n_passes,
+                prefix_lens=state.prefix,
+                jitter=state.jitter,
+            )
+            z_coef = self.args.zloss if state.spec.want_z else 0.0
+            loss, losses = multipass_loss(self.model, state.rows, outs, z_coef=z_coef)
+        (loss / self.micros).backward()
+        state.loss_sum.add_(loss.detach() / self.micros)
+        state.pass1_sum.add_(losses[0].detach() / self.micros)
+
+    def _warm(self, state: CapturedMicro) -> set[torch.nn.Parameter]:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                self.model.zero_grad(set_to_none=True)
+                self._body(state)
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        return {p for p in self.parameters if p.grad is not None}
+
+    def _capture(self, state: CapturedMicro, pool) -> None:
+        for gradient in self.grad_buffers.values():
+            gradient.zero_()
+        state.loss_sum.zero_()
+        state.pass1_sum.zero_()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool):
+            self._body(state)
+        state.graph = graph
+        state.loss_sum.zero_()
+        state.pass1_sum.zero_()
+
+    def begin(self, spec: GraphSpec) -> CapturedMicro:
+        state = self.states[spec]
+        state.loss_sum.zero_()
+        state.pass1_sum.zero_()
+        return state
+
+    def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
+        state.rows.copy_(rows)
+        if state.spec.n_passes > 1:
+            micro_draws(
+                self.args,
+                step,
+                first,
+                state.spec.n_passes,
+                self.args.micro_rows,
+                self.args.dim,
+                self.device,
+                prefix_out=state.prefix,
+                jitter_out=state.jitter,
+                generator=self.generator,
+            )
+        state.graph.replay()
+
+    def prepare_optimizer(self, state: CapturedMicro) -> None:
+        for parameter in self.parameters:
+            parameter.grad = (
+                self.grad_buffers.get(parameter) if parameter in state.active else None
+            )
+
+    def zero_grad(self) -> None:
+        for parameter in self.parameters:
+            gradient = self.grad_buffers.get(parameter)
+            parameter.grad = gradient
+            if gradient is not None:
+                gradient.zero_()
 
 
 # -- evaluation ----------------------------------------------------------------
@@ -151,15 +410,20 @@ def evaluate(model: DFModel, data_val: TokenData, args, device) -> dict[str, flo
     sums = {}
     counted = 0
     for first in range(0, args.eval_rows, args.micro_rows):
-        rows = data_val.batch(first, min(args.micro_rows, args.eval_rows - first), device)
+        rows = data_val.batch(
+            first, min(args.micro_rows, args.eval_rows - first), device
+        )
         n_passes = 2 if model.cfg.feedback_active else 1
         prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
-        outs = multipass(model, rows, n_passes,
-                         prefix_lens=prefix if n_passes > 1 else None)
+        outs = multipass(
+            model, rows, n_passes, prefix_lens=prefix if n_passes > 1 else None
+        )
         _, losses = multipass_loss(model, rows, outs)
         sums["val"] = sums.get("val", 0.0) + losses[0].item() * rows.shape[0]
         if n_passes > 1:
-            sums["val_fused"] = sums.get("val_fused", 0.0) + losses[1].item() * rows.shape[0]
+            sums["val_fused"] = (
+                sums.get("val_fused", 0.0) + losses[1].item() * rows.shape[0]
+            )
         counted += rows.shape[0]
     model.train()
     return {key: value / counted for key, value in sums.items()}
@@ -270,12 +534,12 @@ def train(argv: list[str] | None = None) -> dict:
             saved, args, EXACT_FIELDS, only=explicit
         )
         if conflicts:
-            raise ValueError(
-                f"resume conflicts with checkpoint settings: {conflicts}"
-            )
+            raise ValueError(f"resume conflicts with checkpoint settings: {conflicts}")
         checkpoints.inherit(
-            args, saved,
-            exact_fields=EXACT_FIELDS, runtime_fields=RUNTIME_FIELDS,
+            args,
+            saved,
+            exact_fields=EXACT_FIELDS,
+            runtime_fields=RUNTIME_FIELDS,
             explicit=explicit,
         )
 
@@ -283,7 +547,6 @@ def train(argv: list[str] | None = None) -> dict:
         raise ValueError("batch-rows must be a multiple of micro-rows")
     schedule = build_schedule(args)
     total = schedule.total
-    feedback_start = round(args.feedback_start * total)
 
     meta = read_meta(args.data_dir)
     if meta["vocab_size"] > args.vocab_size:
@@ -294,18 +557,22 @@ def train(argv: list[str] | None = None) -> dict:
     data_val = TokenData.load(args.data_dir, "val", args.seq_len)
     needed = total * args.batch_rows
     if needed > data_train.rows:
-        raise ValueError(
-            f"schedule needs {needed} rows, stream has {data_train.rows}"
-        )
+        raise ValueError(f"schedule needs {needed} rows, stream has {data_train.rows}")
 
     torch.manual_seed(args.seed)
-    model = DFModel(arm_config(
-        args.arm,
-        vocab_size=args.vocab_size, dim=args.dim, layers=args.layers,
-        heads=args.heads, kv_heads=args.kv_heads, head_dim=args.head_dim,
-        intermediate=args.intermediate, max_seq_len=args.seq_len + 1,
-    )).to(device)
-    model.grad_checkpoint = args.grad_checkpoint
+    model = DFModel(
+        arm_config(
+            args.arm,
+            vocab_size=args.vocab_size,
+            dim=args.dim,
+            layers=args.layers,
+            heads=args.heads,
+            kv_heads=args.kv_heads,
+            head_dim=args.head_dim,
+            intermediate=args.intermediate,
+            max_seq_len=args.seq_len + 1,
+        )
+    ).to(device)
     optimizers = build_optimizers(
         model, lr_muon=args.lr_muon, wd_muon=args.wd_muon, lr_adam=args.lr_adam
     )
@@ -316,11 +583,13 @@ def train(argv: list[str] | None = None) -> dict:
             payload, CONTRACT, model, pair, current_optimizer_groups=False
         )
         # The spool folds the log at this boundary; it needs the source path.
-        telemetry.log("resume", step=telemetry.step_address(start_step, total),
-                      path=str(path))
+        telemetry.log(
+            "resume", step=telemetry.step_address(start_step, total), path=str(path)
+        )
     else:
         telemetry.log(
-            "run", tag=args.tag,
+            "run",
+            tag=args.tag,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
             **{name: getattr(args, name) for name in EXACT_FIELDS},
@@ -337,13 +606,28 @@ def train(argv: list[str] | None = None) -> dict:
         end_step = min(total, start_step + args.max_steps)
     telemetry.log(
         "schedule",
-        warmup_steps=schedule.warmup_steps, preheat_steps=schedule.preheat_steps,
-        heat_steps=schedule.heat_steps, cooldown_steps=schedule.cooldown_steps,
-        start_step=start_step, end_step=end_step, total_steps=total,
+        warmup_steps=schedule.warmup_steps,
+        preheat_steps=schedule.preheat_steps,
+        heat_steps=schedule.heat_steps,
+        cooldown_steps=schedule.cooldown_steps,
+        start_step=start_step,
+        end_step=end_step,
+        total_steps=total,
     )
     model.train()
+    graph_runner = None
+    if device.type == "cuda":
+        graph_runner = CudaGraphTrainer(model, optimizers, args, schedule)
+        torch.cuda.reset_peak_memory_stats()
+        telemetry.log(
+            "execution",
+            flash=int(model.blocks[0].attn.qkv_proj.weight.is_cuda),
+            cce=1,
+            cuda_graphs=len(graph_runner.states),
+            checkpoint_modes=sum(spec.checkpoint for spec in graph_runner.states),
+        )
     process_start = time.monotonic()
-    window_start, window_tokens = process_start, 0
+    window_start, window_tokens, window_pass_tokens = process_start, 0, 0
     summary: dict = {}
     interrupted = False
 
@@ -355,41 +639,66 @@ def train(argv: list[str] | None = None) -> dict:
             n_passes = 1
             if model.cfg.feedback_active:
                 n_passes = draw_passes(args, step, total)
-            # A k-pass step holds all k activation graphs at once; checkpoint
-            # those unconditionally (--grad-checkpoint forces it for k=1 too).
-            model.grad_checkpoint = args.grad_checkpoint or n_passes > 1
+            checkpointing = automatic_checkpoint(model, n_passes, args, device)
 
-            step_loss = 0.0
-            pass1_loss = 0.0
             micros = args.batch_rows // args.micro_rows
-            for micro in range(micros):
-                first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
-                rows = data_train.batch(first_row, args.micro_rows, device)
-                prefix = jitter = None
-                if n_passes > 1:
-                    prefix, jitter = micro_draws(
-                        args, step, first_row, n_passes, rows.shape[0],
-                        args.dim, device,
-                    )
-                with autocast:
-                    outs = multipass(
-                        model, rows, n_passes, prefix_lens=prefix, jitter=jitter
-                    )
-                    loss, losses = multipass_loss(model, rows, outs, z_coef=z_coef)
-                (loss / micros).backward()
-                step_loss += loss.item() / micros
-                pass1_loss += losses[0].item() / micros
+            if graph_runner is not None:
+                spec = GraphSpec(n_passes, z_coef > 0, checkpointing)
+                graph_state = graph_runner.begin(spec)
+                for micro in range(micros):
+                    first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
+                    rows = data_train.batch(first_row, args.micro_rows)
+                    graph_runner.replay(graph_state, rows, step, first_row)
+                step_loss = graph_state.loss_sum.item()
+                pass1_loss = graph_state.pass1_sum.item()
+                graph_runner.prepare_optimizer(graph_state)
+            else:
+                model.grad_checkpoint = checkpointing
+                step_loss = 0.0
+                pass1_loss = 0.0
+                for micro in range(micros):
+                    first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
+                    rows = data_train.batch(first_row, args.micro_rows, device)
+                    prefix = jitter = None
+                    if n_passes > 1:
+                        prefix, jitter = micro_draws(
+                            args,
+                            step,
+                            first_row,
+                            n_passes,
+                            rows.shape[0],
+                            args.dim,
+                            device,
+                        )
+                    with autocast:
+                        outs = multipass(
+                            model,
+                            rows,
+                            n_passes,
+                            prefix_lens=prefix,
+                            jitter=jitter,
+                        )
+                        loss, losses = multipass_loss(model, rows, outs, z_coef=z_coef)
+                    (loss / micros).backward()
+                    step_loss += loss.item() / micros
+                    pass1_loss += losses[0].item() / micros
 
-            grad_norm = math.sqrt(sum(
-                float(p.grad.norm()) ** 2
-                for p in model.parameters() if p.grad is not None
-            ))
+            logging = step % args.log_every == 0 or step == total
+            grad_norm = None
+            if logging:
+                gradients = [p.grad for p in model.parameters() if p.grad is not None]
+                norms = torch._foreach_norm(gradients)
+                grad_norm = torch.stack(norms).norm().item()
             for optimizer in optimizers:
                 optimizer.step()
-            model.zero_grad(set_to_none=True)
+            if graph_runner is not None:
+                graph_runner.zero_grad()
+            else:
+                model.zero_grad(set_to_none=True)
             window_tokens += args.batch_rows * args.seq_len
+            window_pass_tokens += n_passes * args.batch_rows * args.seq_len
 
-            if step % args.log_every == 0 or step == total:
+            if logging:
                 elapsed = time.monotonic() - window_start
                 fields = {
                     "step": telemetry.step_address(step, total),
@@ -400,20 +709,29 @@ def train(argv: list[str] | None = None) -> dict:
                     "lr": telemetry.format_metric(lr),
                     "gnorm": telemetry.format_metric(grad_norm),
                     "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
+                    "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),
                     "elapsed": f"{time.monotonic() - process_start:.1f}",
                 }
                 if device.type == "cuda":
                     fields["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
                 telemetry.log("step", **fields)
-                window_start, window_tokens = time.monotonic(), 0
+                window_start, window_tokens, window_pass_tokens = (
+                    time.monotonic(),
+                    0,
+                    0,
+                )
 
             if step % args.eval_every == 0 or step == total:
                 address = telemetry.step_address(step, total)
                 scores = evaluate(model, data_val, args, device)
-                telemetry.log("eval", step=address, **{
-                    key: telemetry.format_metric(value)
-                    for key, value in scores.items()
-                })
+                telemetry.log(
+                    "eval",
+                    step=address,
+                    **{
+                        key: telemetry.format_metric(value)
+                        for key, value in scores.items()
+                    },
+                )
                 summary.update(scores)
                 for record in route_summary(model, data_val, args, device):
                     telemetry.log("route", step=address, **record)
@@ -423,7 +741,8 @@ def train(argv: list[str] | None = None) -> dict:
                     )
                     model.train()
                     telemetry.log(
-                        "contract", step=address,
+                        "contract",
+                        step=address,
                         loss0=telemetry.format_metric(trace[0]["loss"]),
                         loss8=telemetry.format_metric(trace[-1]["loss"]),
                         upd8=telemetry.format_metric(trace[-1]["update_norm"]),
@@ -447,9 +766,15 @@ def train(argv: list[str] | None = None) -> dict:
                 save_snapshot(args, model, pair, last, protected)
             telemetry.log("yield", step=telemetry.step_address(last, total))
         else:
-            telemetry.log("done", step=telemetry.step_address(total, total),
-                          **{k: telemetry.format_metric(v)
-                             for k, v in summary.items() if k.startswith("val")})
+            telemetry.log(
+                "done",
+                step=telemetry.step_address(total, total),
+                **{
+                    k: telemetry.format_metric(v)
+                    for k, v in summary.items()
+                    if k.startswith("val")
+                },
+            )
     return summary
 
 

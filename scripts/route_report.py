@@ -28,15 +28,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib import colors
+from transformer_experiments import checkpoints
 
 from delta_feedback_experiment.data import TokenData
 from delta_feedback_experiment.model import DFModel, arm_config, multipass
 from delta_feedback_experiment.train import CONTRACT, pick_device
-from transformer_experiments import checkpoints
 
 GEOMETRY = (
-    "vocab_size", "dim", "layers", "heads", "kv_heads", "head_dim",
-    "intermediate", "seq_len",
+    "vocab_size",
+    "dim",
+    "layers",
+    "heads",
+    "kv_heads",
+    "head_dim",
+    "intermediate",
+    "seq_len",
 )
 
 
@@ -87,10 +93,15 @@ def collect(model, data_val, device, rows: int, micro: int):
             for site, weights in out.route_weights.items():
                 w = weights.float()
                 per_token = -(w.clamp_min(1e-12).log() * w).sum(dim=0)
-                batch_stats = torch.stack([
-                    w.max(dim=0).values.mean(),
-                    per_token.mean() / math.log(w.shape[0]),
-                ]).cpu() * n
+                batch_stats = (
+                    torch.stack(
+                        [
+                            w.max(dim=0).values.mean(),
+                            per_token.mean() / math.log(w.shape[0]),
+                        ]
+                    ).cpu()
+                    * n
+                )
                 key = (p, site)
                 sums[key] = sums.get(key, 0.0) + w.mean(dim=(1, 2)).cpu() * n
                 stats[key] = stats.get(key, 0.0) + batch_stats
@@ -192,20 +203,25 @@ def main() -> None:
             shown = "  ".join(f"{n}={v:.3f}" for n, v in top)
             first_row = (0, label) not in means or p == 0
             head = f"{label:<10}{norm:>7.2f}" if first_row else " " * 17
-            print(f"{head}   p{p + 1}    {entropy(w):5.3f}  {max_t:.3f}  {h_tok:.3f}  {shown}")
+            print(
+                f"{head}   p{p + 1}    {entropy(w):5.3f}  {max_t:.3f}  {h_tok:.3f}  {shown}"
+            )
 
     # -- figures ---------------------------------------------------------------
-    norm_map = colors.PowerNorm(0.5, vmin=0, vmax=np.nanmax(
-        [np.nanmax(matrices[p]) for p in matrices]
-    ))
-    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True, constrained_layout=True)
+    norm_map = colors.PowerNorm(
+        0.5, vmin=0, vmax=np.nanmax([np.nanmax(matrices[p]) for p in matrices])
+    )
+    fig, axes = plt.subplots(
+        2, 1, figsize=(11, 9), sharex=True, constrained_layout=True
+    )
     for ax, p, title in zip(axes, (0, 1), ("pass 1 (plain)", "pass 2 (fused)")):
         image = ax.imshow(matrices[p], aspect="auto", cmap="viridis", norm=norm_map)
         ax.set_yticks(range(len(sites)), sites, fontsize=7)
         ax.set_title(f"site routing, {title}", fontsize=10)
         ax.set_ylabel("reading site")
-    axes[1].set_xticks(range(1 + 2 * layers), ["e/u"] + source_names(layers),
-                       fontsize=7, rotation=90)
+    axes[1].set_xticks(
+        range(1 + 2 * layers), ["e/u"] + source_names(layers), fontsize=7, rotation=90
+    )
     axes[1].set_xlabel("source (seed, then sublayer deltas)")
     fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
     fig.suptitle(f"{tag}: depth-routing read maps", fontsize=12)
@@ -232,8 +248,9 @@ def main() -> None:
     ax_norm.plot(depth, attn_norms, "o-", label="attn reader")
     ax_norm.plot(depth, mlp_norms, "s-", label="mlp reader")
     if "payload" in labels:
-        ax_norm.axhline(norms[labels.index("payload")], color="C2", lw=1,
-                        ls=":", label="payload")
+        ax_norm.axhline(
+            norms[labels.index("payload")], color="C2", lw=1, ls=":", label="payload"
+        )
     ax_norm.set_xlabel("layer")
     ax_norm.set_ylabel("|query|")
     ax_norm.set_title("query norms (softmax sharpness)", fontsize=10)

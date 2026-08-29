@@ -21,14 +21,24 @@ import argparse
 from pathlib import Path
 
 import torch
-
-from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DFModel, arm_config, multipass, multipass_loss
-from delta_feedback_experiment.train import CONTRACT, pick_device
 from transformer_experiments import checkpoints
 
+from delta_feedback_experiment.data import TokenData
+from delta_feedback_experiment.model import (
+    DFModel,
+    arm_config,
+    multipass,
+    multipass_loss,
+)
+from delta_feedback_experiment.train import CONTRACT, pick_device
+
 GEOMETRY = (
-    "vocab_size", "dim", "layers", "heads", "kv_heads", "head_dim",
+    "vocab_size",
+    "dim",
+    "layers",
+    "heads",
+    "kv_heads",
+    "head_dim",
     "intermediate",
 )
 
@@ -46,7 +56,8 @@ def main() -> None:
     payload = checkpoints.read(args.snapshot, CONTRACT, map_location="cpu")
     saved = payload["args"]
     cfg = arm_config(
-        saved["arm"], max_seq_len=saved["seq_len"] + 1,
+        saved["arm"],
+        max_seq_len=saved["seq_len"] + 1,
         **{f: saved[f] for f in GEOMETRY},
     )
     if not cfg.feedback_active or not cfg.routing_active:
@@ -79,14 +90,16 @@ def main() -> None:
     model.payload_router.forward = lambda sources, masks, want: (None, None)
     print(f"h_top only     : fused={losses()[1]:.4f}")
     model.payload_router.forward = lambda sources, masks, want: (
-        torch.stack(sources).mean(0), None
+        torch.stack(sources).mean(0),
+        None,
     )
     print(f"uniform        : fused={losses()[1]:.4f}")
 
     results = []
     for i, name in enumerate(names):
-        model.payload_router.forward = (
-            lambda sources, masks, want, i=i: (sources[i], None)
+        model.payload_router.forward = lambda sources, masks, want, i=i: (
+            sources[i],
+            None,
         )
         results.append((name, losses()[1]))
         print(f"force {name:<4}     : fused={results[-1][1]:.4f}", flush=True)

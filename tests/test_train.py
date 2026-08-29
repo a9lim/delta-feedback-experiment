@@ -12,6 +12,7 @@ import torch
 from delta_feedback_experiment.data import TokenData, write_synthetic
 from delta_feedback_experiment.optim import NorMuon, orthogonalize
 from delta_feedback_experiment.train import (
+    automatic_checkpoint,
     build_parser,
     build_schedule,
     draw_passes,
@@ -20,13 +21,44 @@ from delta_feedback_experiment.train import (
 )
 
 TINY_ARGS = [
-    "--vocab-size", "97", "--dim", "32", "--layers", "2", "--heads", "2",
-    "--kv-heads", "1", "--head-dim", "16", "--intermediate", "64",
-    "--seq-len", "16", "--batch-rows", "4", "--micro-rows", "2",
-    "--steps", "8", "--warmup-steps", "2", "--cooldown-frac", "0.25",
-    "--feedback-start", "0.5",
-    "--log-every", "4", "--eval-every", "4", "--snapshot-every", "100",
-    "--eval-rows", "4", "--device", "cpu",
+    "--vocab-size",
+    "97",
+    "--dim",
+    "32",
+    "--layers",
+    "2",
+    "--heads",
+    "2",
+    "--kv-heads",
+    "1",
+    "--head-dim",
+    "16",
+    "--intermediate",
+    "64",
+    "--seq-len",
+    "16",
+    "--batch-rows",
+    "4",
+    "--micro-rows",
+    "2",
+    "--steps",
+    "8",
+    "--warmup-steps",
+    "2",
+    "--cooldown-frac",
+    "0.25",
+    "--feedback-start",
+    "0.5",
+    "--log-every",
+    "4",
+    "--eval-every",
+    "4",
+    "--snapshot-every",
+    "100",
+    "--eval-rows",
+    "4",
+    "--device",
+    "cpu",
 ]
 
 
@@ -42,10 +74,12 @@ def corpus(tmp_path):
 def test_token_data_stitches_shards(tmp_path):
     directory = corpus(tmp_path)
     data = TokenData.load(directory, "train", seq_len=16)
-    whole = np.concatenate([
-        np.fromfile(directory / "train.0000.bin", dtype=np.uint32),
-        np.fromfile(directory / "train.0001.bin", dtype=np.uint32),
-    ])
+    whole = np.concatenate(
+        [
+            np.fromfile(directory / "train.0000.bin", dtype=np.uint32),
+            np.fromfile(directory / "train.0001.bin", dtype=np.uint32),
+        ]
+    )
     assert data.total_tokens == whole.size
     batch = data.batch(0, data.rows)
     assert torch.equal(
@@ -126,11 +160,20 @@ def test_pass_mixture_fractions():
 
 
 def run(tmp_path, tag, extra):
-    directory = corpus(tmp_path) if not (tmp_path / "tokens").exists() else tmp_path / "tokens"
-    return train([
-        tag, "--data-dir", str(directory), "--out-dir", str(tmp_path / "runs"),
-        *TINY_ARGS, *extra,
-    ])
+    directory = (
+        corpus(tmp_path) if not (tmp_path / "tokens").exists() else tmp_path / "tokens"
+    )
+    return train(
+        [
+            tag,
+            "--data-dir",
+            str(directory),
+            "--out-dir",
+            str(tmp_path / "runs"),
+            *TINY_ARGS,
+            *extra,
+        ]
+    )
 
 
 @pytest.mark.parametrize("arm", ["vanilla", "dar", "fbt", "df", "df_soft"])
@@ -170,11 +213,22 @@ def test_multipass_checkpoint_parity():
     """Multi-pass steps checkpoint unconditionally (the k>=2 graphs OOM'd
     the 4090 otherwise); loss and grads must match the plain path."""
     from delta_feedback_experiment.model import (
-        DFModel, arm_config, multipass, multipass_loss,
+        DFModel,
+        arm_config,
+        multipass,
+        multipass_loss,
     )
+
     cfg = arm_config(
-        "df", vocab_size=97, dim=32, layers=2, heads=2, kv_heads=1,
-        head_dim=16, intermediate=64, max_seq_len=17,
+        "df",
+        vocab_size=97,
+        dim=32,
+        layers=2,
+        heads=2,
+        kv_heads=1,
+        head_dim=16,
+        intermediate=64,
+        max_seq_len=17,
     )
     torch.manual_seed(0)
     tokens = torch.randint(0, 97, (2, 17))
@@ -187,9 +241,9 @@ def test_multipass_checkpoint_parity():
         outs = multipass(model, tokens, 2, prefix_lens=prefix)
         loss, _ = multipass_loss(model, tokens, outs)
         loss.backward()
-        grads = torch.cat([
-            p.grad.flatten() for p in model.parameters() if p.grad is not None
-        ])
+        grads = torch.cat(
+            [p.grad.flatten() for p in model.parameters() if p.grad is not None]
+        )
         return loss.item(), grads
 
     plain_loss, plain_grads = run(False)
@@ -198,8 +252,14 @@ def test_multipass_checkpoint_parity():
     assert torch.allclose(plain_grads, checked_grads, rtol=1e-5, atol=1e-7)
 
 
-def test_grad_checkpoint_matches(tmp_path):
-    plain = run(tmp_path, "gc-off", ["--arm", "df", "--max-steps", "3"])
-    checked = run(tmp_path, "gc-on", ["--arm", "df", "--max-steps", "3",
-                                      "--grad-checkpoint"])
-    assert checked["loss"] == pytest.approx(plain["loss"], rel=1e-6)
+def test_checkpoint_policy_is_internal_and_screen_measured():
+    from delta_feedback_experiment.model import DFModel, arm_config
+
+    args = build_parser().parse_args(["x"])
+    with torch.device("meta"):
+        model = DFModel(arm_config("df"))
+    assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
+    args.micro_rows = 8
+    assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", "--grad-checkpoint"])

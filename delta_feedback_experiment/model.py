@@ -36,6 +36,17 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+try:  # CUDA-only wheels; CPU/MPS retain the exact portable fallbacks.
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
+    flash_attn_func = None
+    flash_attn_with_kvcache = None
+
+try:
+    from cut_cross_entropy import linear_cross_entropy
+except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
+    linear_cross_entropy = None
+
 ARMS = ("vanilla", "dar", "fbt", "df", "df_soft")
 
 
@@ -111,6 +122,22 @@ class RMSNorm(nn.Module):
         return (x * self.weight.float()).to(dtype)
 
 
+class ResidualEmbedding(nn.Embedding):
+    """FP32 tied weights, BF16 CUDA activations inside the training autocast.
+
+    ``nn.Embedding`` is not autocast-aware.  Without this explicit boundary its
+    FP32 output silently promotes every residual, payload, and routed source.
+    Outside CUDA autocast (CPU tests and explicit FP32 analysis) it remains an
+    ordinary embedding.
+    """
+
+    def forward(self, tokens: Tensor) -> Tensor:
+        out = super().forward(tokens)
+        if out.is_cuda and torch.is_autocast_enabled("cuda"):
+            return out.to(torch.bfloat16)
+        return out
+
+
 # -- rotary positions ----------------------------------------------------------
 
 
@@ -142,19 +169,20 @@ class KVCache:
     """
 
     def __init__(self, cfg: ModelConfig, batch: int, device, dtype):
-        shape = (cfg.layers, batch, cfg.kv_heads, cfg.max_seq_len, cfg.head_dim)
+        # FlashAttention's native cache layout: [B, S, Hkv, D].
+        shape = (cfg.layers, batch, cfg.max_seq_len, cfg.kv_heads, cfg.head_dim)
         self.k = torch.zeros(shape, device=device, dtype=dtype)
         self.v = torch.zeros(shape, device=device, dtype=dtype)
         self.pos = 0
 
     def update(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
-        """Write this column's k/v [B, kvH, T, hd]; return the full prefix view."""
-        length = k.shape[2]
-        self.k[layer, :, :, self.pos : self.pos + length] = k
-        self.v[layer, :, :, self.pos : self.pos + length] = v
+        """Write k/v [B,T,Hkv,D]; return the full prefix in that layout."""
+        length = k.shape[1]
+        self.k[layer, :, self.pos : self.pos + length] = k
+        self.v[layer, :, self.pos : self.pos + length] = v
         return (
-            self.k[layer, :, :, : self.pos + length],
-            self.v[layer, :, :, : self.pos + length],
+            self.k[layer, :, : self.pos + length],
+            self.v[layer, :, : self.pos + length],
         )
 
     def advance(self, length: int) -> None:
@@ -173,9 +201,9 @@ class Attention(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.q_proj = nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
-        self.k_proj = nn.Linear(cfg.dim, cfg.kv_heads * cfg.head_dim, bias=False)
-        self.v_proj = nn.Linear(cfg.dim, cfg.kv_heads * cfg.head_dim, bias=False)
+        self.q_size = cfg.heads * cfg.head_dim
+        self.kv_size = cfg.kv_heads * cfg.head_dim
+        self.qkv_proj = nn.Linear(cfg.dim, self.q_size + 2 * self.kv_size, bias=False)
         self.o_proj = nn.Linear(cfg.heads * cfg.head_dim, cfg.dim, bias=False)
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps)
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps)
@@ -190,40 +218,86 @@ class Attention(nn.Module):
     ) -> Tensor:
         batch, length, _ = x.shape
         cfg = self.cfg
-        q = self.q_proj(x).view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+        q, k, v = self.qkv_proj(x).split(
+            (self.q_size, self.kv_size, self.kv_size), dim=-1
+        )
+        q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
+        k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
+        v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         q = apply_rope(self.q_norm(q), cos, sin)
         k = apply_rope(self.k_norm(k), cos, sin)
+        q_flash = q.transpose(1, 2)
+        k_flash = k.transpose(1, 2)
+        v_flash = v.transpose(1, 2)
+        use_flash = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
 
-        causal = True
-        if cache is not None:
-            # SDPA's is_causal aligns top-left, which is only correct for a
-            # fresh prefill; appended chunks must be single columns.
-            if length > 1 and cache.pos != 0:
-                raise ValueError("multi-column append to a non-empty cache")
-            k, v = cache.update(layer, k, v)
-            # A single decoded column attends to the whole cached prefix.
-            causal = length > 1
-
-        groups = cfg.heads // cfg.kv_heads
-        if groups > 1:
-            k = k.repeat_interleave(groups, dim=1)
-            v = v.repeat_interleave(groups, dim=1)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
-        out = out.transpose(1, 2).reshape(batch, length, cfg.heads * cfg.head_dim)
+        if cache is not None and length > 1 and cache.pos != 0:
+            raise ValueError("multi-column append to a non-empty cache")
+        if cache is not None and use_flash and flash_attn_with_kvcache is not None:
+            out = flash_attn_with_kvcache(
+                q_flash,
+                cache.k[layer],
+                cache.v[layer],
+                k=k_flash,
+                v=v_flash,
+                cache_seqlens=cache.pos,
+                causal=True,
+            )
+        elif cache is None and use_flash and flash_attn_func is not None:
+            # FlashAttention natively accepts Hq/Hkv GQA without expanding K/V.
+            out = flash_attn_func(q_flash, k_flash, v_flash, causal=True)
+        else:
+            causal = True
+            if cache is not None:
+                k_flash, v_flash = cache.update(layer, k_flash, v_flash)
+                causal = length > 1
+            out = F.scaled_dot_product_attention(
+                q,
+                k_flash.transpose(1, 2),
+                v_flash.transpose(1, 2),
+                is_causal=causal,
+                enable_gqa=cfg.heads != cfg.kv_heads,
+            ).transpose(1, 2)
+        out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
         return self.o_proj(out)
 
 
 class SwiGLU(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.dim, cfg.intermediate, bias=False)
-        self.up_proj = nn.Linear(cfg.dim, cfg.intermediate, bias=False)
+        self.gate_up_proj = nn.Linear(cfg.dim, 2 * cfg.intermediate, bias=False)
         self.down_proj = nn.Linear(cfg.intermediate, cfg.dim, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
+
+
+def _route_algebra(
+    values: Tensor,
+    query: Tensor,
+    key_weight: Tensor,
+    eps: float,
+    present: Tensor | None,
+) -> tuple[Tensor, Tensor]:
+    """RMS-key routing without materializing the normalized source bank."""
+    projected = (query.float() * key_weight.float()).to(values.dtype)
+    dots = (values * projected).float().sum(dim=-1)
+    inv_rms = torch.rsqrt(values.float().square().mean(dim=-1) + eps)
+    logits = dots * inv_rms
+    if present is not None:
+        logits = logits.masked_fill(~present, float("-inf"))
+    weights = logits.softmax(dim=0)
+    routed = (weights.to(values.dtype).unsqueeze(-1) * values).sum(dim=0)
+    return routed, weights
+
+
+_compiled_route_algebra = torch.compile(
+    _route_algebra,
+    fullgraph=True,
+    dynamic=True,
+    mode="max-autotune-no-cudagraphs",
+)
 
 
 class Router(nn.Module):
@@ -255,19 +329,20 @@ class Router(nn.Module):
         if len(sources) < 2:
             return None, None
         values = torch.stack(sources)  # [N, B, T, D]
-        logits = torch.einsum("d,nbtd->nbt", self.query, self.key_norm(values))
+        present = None
         if any(mask is not None for mask in masks):
             present = torch.stack(
                 [
                     mask
                     if mask is not None
-                    else torch.ones_like(logits[0], dtype=torch.bool)
+                    else torch.ones_like(values[0, ..., 0], dtype=torch.bool)
                     for mask in masks
                 ]
             )
-            logits = logits.masked_fill(~present, float("-inf"))
-        weights = logits.softmax(dim=0)
-        routed = torch.einsum("nbt,nbtd->btd", weights, values)
+        route = _compiled_route_algebra if values.is_cuda else _route_algebra
+        routed, weights = route(
+            values, self.query, self.key_norm.weight, self.key_norm.eps, present
+        )
         return routed, (weights.detach() if want_weights else None)
 
 
@@ -320,11 +395,11 @@ class Block(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
         """Returns (h, attn delta, mlp delta, attn weights, mlp weights)."""
         x, w_attn = self._read(h, self.attn_router, sources, p_mask, want_weights)
-        a = self.branch_scale * self.attn(self.attn_norm(x), cos, sin, cache, self.layer)
-        h = h + a
-        x, w_mlp = self._read(
-            h, self.mlp_router, (*sources, a), p_mask, want_weights
+        a = self.branch_scale * self.attn(
+            self.attn_norm(x), cos, sin, cache, self.layer
         )
+        h = h + a
+        x, w_mlp = self._read(h, self.mlp_router, (*sources, a), p_mask, want_weights)
         m = self.branch_scale * self.mlp(self.mlp_norm(x))
         h = h + m
         return h, a, m, w_attn, w_mlp
@@ -368,7 +443,7 @@ class DFModel(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, cfg.dim)
+        self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         if cfg.gated_entry:
@@ -419,6 +494,7 @@ class DFModel(nn.Module):
         p_presence: Tensor | None = None,
         cache: KVCache | None = None,
         want_weights: bool = False,
+        need_payload: bool = True,
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
@@ -457,7 +533,13 @@ class DFModel(nn.Module):
             passed = tuple(sources) if sources is not None else ()
             if checkpointing:
                 h, a, m = torch.utils.checkpoint.checkpoint(
-                    _block_for_checkpoint, block, h, cos, sin, p_mask, *passed,
+                    _block_for_checkpoint,
+                    block,
+                    h,
+                    cos,
+                    sin,
+                    p_mask,
+                    *passed,
                     use_reentrant=False,
                 )
             else:
@@ -474,7 +556,7 @@ class DFModel(nn.Module):
             cache.advance(x.shape[1])
 
         payload = None
-        if cfg.feedback_active:
+        if cfg.feedback_active and need_payload:
             enriched = h
             if cfg.routing_active:
                 deltas = sources[seeds:]
@@ -549,7 +631,9 @@ def multipass(
     if n_passes > 1 and not cfg.feedback_active:
         raise ValueError("multi-pass batches require a feedback-bearing arm")
     e = model.embed_tokens(tokens)
-    out = model.forward_column(e, want_weights=want_weights)
+    out = model.forward_column(
+        e, want_weights=want_weights, need_payload=n_passes > 1 or want_weights
+    )
     outs = [out]
     if n_passes == 1:
         return outs
@@ -564,30 +648,56 @@ def multipass(
         plain = positions[None, :] < prefix_lens[i][:, None]  # [B, T]
         if cfg.soft:
             out = model.forward_column(
-                e, p_source=p_shifted, p_presence=~plain, want_weights=want_weights
+                e,
+                p_source=p_shifted,
+                p_presence=~plain,
+                want_weights=want_weights,
+                need_payload=i < n_passes - 2 or want_weights,
             )
         else:
             fused = model.fuse(p_shifted, e)
             out = model.forward_column(
-                torch.where(plain[..., None], e, fused), want_weights=want_weights
+                torch.where(plain[..., None], e, fused),
+                want_weights=want_weights,
+                need_payload=i < n_passes - 2 or want_weights,
             )
         outs.append(out)
     return outs
 
 
-def _head_losses(model: DFModel, h_chunk: Tensor, target_chunk: Tensor, want_z: bool):
-    logits = model.logits(h_chunk).float()
-    ce = F.cross_entropy(
-        logits.flatten(0, 1), target_chunk.flatten(), reduction="sum"
+def _head_losses(
+    h_chunk: Tensor,
+    target_chunk: Tensor,
+    norm_weight: Tensor,
+    classifier: Tensor,
+    norm_eps: float,
+) -> tuple[Tensor, Tensor]:
+    dtype = h_chunk.dtype
+    normalized = h_chunk.float()
+    normalized = normalized * torch.rsqrt(
+        normalized.square().mean(dim=-1, keepdim=True) + norm_eps
     )
-    if want_z:
-        return ce, logits.logsumexp(dim=-1).square().sum()
-    return ce, ce.new_zeros(())
+    normalized = (normalized * norm_weight.float()).to(dtype)
+    logits = F.linear(normalized, classifier).float()
+    ce = F.cross_entropy(logits.flatten(0, 1), target_chunk.flatten(), reduction="sum")
+    return ce, logits.logsumexp(dim=-1).square().sum()
+
+
+_compiled_head_losses = torch.compile(
+    _head_losses,
+    fullgraph=True,
+    dynamic=False,
+    mode="max-autotune-no-cudagraphs",
+)
 
 
 def sequence_ce(
-    model: DFModel, h_top: Tensor, targets: Tensor, *, want_z: bool = False,
-    chunk: int = 128,
+    model: DFModel,
+    h_top: Tensor,
+    targets: Tensor,
+    *,
+    want_z: bool = False,
+    chunk: int = 1024,
 ) -> tuple[Tensor, Tensor]:
     """(mean CE, mean z²) over [B, T] targets, chunked along the sequence.
 
@@ -597,6 +707,20 @@ def sequence_ce(
     chunk in both forward and backward.
     """
     count = targets.numel()
+    if h_top.is_cuda and not want_z and linear_cross_entropy is not None:
+        # CCE fuses tied unembedding and CE, never materializing [B,T,V].
+        # Its high-threshold gradient filter is an intentional throughput-
+        # first numerical divergence of the authoritative CUDA recipe.
+        normalized = model.final_norm(h_top)
+        ce = linear_cross_entropy(
+            normalized,
+            model.embed_tokens.weight,
+            targets,
+            reduction="mean",
+            filter_eps="high",
+        )
+        return ce, ce.new_zeros((), dtype=torch.float32)
+
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)
     recompute = torch.is_grad_enabled() and h_top.requires_grad
@@ -605,10 +729,23 @@ def sequence_ce(
         t_piece = targets[:, start : start + chunk]
         if recompute:
             ce, z = torch.utils.checkpoint.checkpoint(
-                _head_losses, model, h_piece, t_piece, want_z, use_reentrant=False
+                _compiled_head_losses if h_top.is_cuda else _head_losses,
+                h_piece,
+                t_piece,
+                model.final_norm.weight,
+                model.embed_tokens.weight,
+                model.final_norm.eps,
+                use_reentrant=False,
             )
         else:
-            ce, z = _head_losses(model, h_piece, t_piece, want_z)
+            head = _compiled_head_losses if h_top.is_cuda else _head_losses
+            ce, z = head(
+                h_piece,
+                t_piece,
+                model.final_norm.weight,
+                model.embed_tokens.weight,
+                model.final_norm.eps,
+            )
         ce_sum = ce_sum + ce
         z_sum = z_sum + z
     return ce_sum / count, z_sum / count

@@ -14,6 +14,7 @@ the NorMuon paper's own.
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 
 import torch
 from torch import Tensor
@@ -37,6 +38,46 @@ def orthogonalize(matrix: Tensor, steps: int = 5) -> Tensor:
         gram = x @ x.mT
         x = a * x + (b * gram + c * gram @ gram) @ x
     return x.mT if transposed else x
+
+
+def _normuon_batch(
+    momentum: Tensor,
+    row_moment: Tensor,
+    gradient: Tensor,
+    lr: Tensor,
+    weight_decay: Tensor,
+    momentum_beta: float,
+    beta2: float,
+    eps: float,
+    ns_steps: int,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Batched NorMuon update for a bucket of identically shaped weights."""
+    a, b, c = NS_COEFFS
+    momentum = torch.lerp(momentum, gradient, 1 - momentum_beta)
+    transposed = momentum.shape[-2] > momentum.shape[-1]
+    x = momentum.mT if transposed else momentum
+    x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    for _ in range(ns_steps):
+        gram = x @ x.mT
+        x = a * x + (b * gram + c * gram @ gram) @ x
+    update = x.mT if transposed else x
+    row_moment = torch.lerp(
+        row_moment, update.square().mean(dim=-1, keepdim=True), 1 - beta2
+    )
+    update = update / (row_moment.sqrt() + eps)
+    scale = 0.2 * math.sqrt(update.shape[-2] * update.shape[-1])
+    scale = scale / (update.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    delta = update * scale * -lr
+    decay = 1 - lr * weight_decay
+    return momentum, row_moment, delta, decay
+
+
+_compiled_normuon_batch = torch.compile(
+    _normuon_batch,
+    fullgraph=True,
+    dynamic=True,
+    mode="max-autotune-no-cudagraphs",
+)
 
 
 class NorMuon(torch.optim.Optimizer):
@@ -70,9 +111,40 @@ class NorMuon(torch.optim.Optimizer):
                     )
 
     @torch.no_grad()
+    def warmup(self) -> None:
+        """Compile every CUDA shape bucket without touching optimizer state."""
+        for group in self.param_groups:
+            buckets = defaultdict(list)
+            for parameter in group["params"]:
+                buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
+                    parameter
+                )
+            for (device, dtype, shape), parameters in buckets.items():
+                if device.type != "cuda":
+                    continue
+                batch_shape = (len(parameters), *shape)
+                matrices = torch.zeros(batch_shape, device=device, dtype=dtype)
+                rows = torch.zeros(
+                    len(parameters), shape[0], 1, device=device, dtype=dtype
+                )
+                scalar = torch.zeros((), device=device)
+                _compiled_normuon_batch(
+                    matrices,
+                    rows,
+                    matrices,
+                    scalar,
+                    scalar,
+                    group["momentum"],
+                    group["beta2"],
+                    group["eps"],
+                    group["ns_steps"],
+                )
+
+    @torch.no_grad()
     def step(self, closure=None):
         loss = None if closure is None else closure()
         for group in self.param_groups:
+            buckets = defaultdict(list)
             for parameter in group["params"]:
                 gradient = parameter.grad
                 if gradient is None:
@@ -81,20 +153,50 @@ class NorMuon(torch.optim.Optimizer):
                 if not state:
                     state["momentum"] = torch.zeros_like(parameter)
                     state["row_moment"] = torch.zeros(
-                        parameter.shape[0], 1,
-                        device=parameter.device, dtype=parameter.dtype,
+                        parameter.shape[0],
+                        1,
+                        device=parameter.device,
+                        dtype=parameter.dtype,
                     )
-                momentum = state["momentum"]
-                momentum.lerp_(gradient, 1 - group["momentum"])
-                update = orthogonalize(momentum, group["ns_steps"])
-                row_moment = state["row_moment"]
-                row_moment.lerp_(
-                    update.square().mean(dim=1, keepdim=True), 1 - group["beta2"]
+                buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
+                    parameter
                 )
-                update = update / (row_moment.sqrt() + group["eps"])
-                scale = 0.2 * math.sqrt(parameter.numel()) / (update.norm() + 1e-7)
-                parameter.mul_(1 - group["lr"] * group["weight_decay"])
-                parameter.add_(update, alpha=-group["lr"] * scale)
+
+            for (device, _dtype, _shape), parameters in buckets.items():
+                gradients = torch.stack([parameter.grad for parameter in parameters])
+                momenta = torch.stack(
+                    [self.state[parameter]["momentum"] for parameter in parameters]
+                )
+                row_moments = torch.stack(
+                    [self.state[parameter]["row_moment"] for parameter in parameters]
+                )
+                lr = torch.scalar_tensor(group["lr"], device=device)
+                weight_decay = torch.scalar_tensor(group["weight_decay"], device=device)
+                update_fn = (
+                    _compiled_normuon_batch if device.type == "cuda" else _normuon_batch
+                )
+                momenta, row_moments, deltas, decay = update_fn(
+                    momenta,
+                    row_moments,
+                    gradients,
+                    lr,
+                    weight_decay,
+                    group["momentum"],
+                    group["beta2"],
+                    group["eps"],
+                    group["ns_steps"],
+                )
+                momentum_list = list(momenta.unbind())
+                row_moment_list = list(row_moments.unbind())
+                delta_list = list(deltas.unbind())
+                torch._foreach_copy_(
+                    [self.state[p]["momentum"] for p in parameters], momentum_list
+                )
+                torch._foreach_copy_(
+                    [self.state[p]["row_moment"] for p in parameters], row_moment_list
+                )
+                torch._foreach_mul_(parameters, decay)
+                torch._foreach_add_(parameters, delta_list)
         return loss
 
 
@@ -131,7 +233,15 @@ def build_optimizers(
     """
     matrices, rest = split_parameters(model)
     muon = NorMuon(matrices, lr=lr_muon, weight_decay=wd_muon)
-    adam = torch.optim.Adam(rest, lr=lr_adam, betas=adam_betas, eps=1e-8)
+    use_fused_adam = bool(rest) and rest[0].is_cuda
+    adam = torch.optim.Adam(
+        rest,
+        lr=lr_adam,
+        betas=adam_betas,
+        eps=1e-8,
+        fused=use_fused_adam,
+        capturable=use_fused_adam,
+    )
     for group in muon.param_groups:
         group["stable_lr"] = lr_muon
         group["stable_wd"] = wd_muon
