@@ -228,7 +228,18 @@ def cuda_gate() -> None:
         norms = torch._foreach_norm([parameter.grad for parameter in state.active])
         grad_norm = torch.stack(norms).norm().item()
         if not math.isfinite(grad_norm) or not math.isfinite(state.loss_sum.item()):
-            raise AssertionError(f"nonfinite CUDA result in {spec}")
+            active_names = {
+                id(parameter): name for name, parameter in model.named_parameters()
+            }
+            nonfinite = [
+                active_names.get(id(parameter), "<unnamed>")
+                for parameter in state.active
+                if not torch.isfinite(parameter.grad).all()
+            ]
+            raise AssertionError(
+                f"nonfinite CUDA result in {spec}: loss={state.loss_sum.item()}, "
+                f"grad_norm={grad_norm}, parameters={nonfinite[:12]}"
+            )
         for optimizer in optimizers:
             optimizer.step()
         runner.zero_grad()
