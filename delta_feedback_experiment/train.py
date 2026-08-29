@@ -263,15 +263,15 @@ class CudaGraphTrainer:
         for parameter, gradient in self.grad_buffers.items():
             parameter.grad = gradient
 
+        self._initialize_optimizers()
+        self.zero_grad()
+        torch.cuda.empty_cache()
+
         pool = torch.cuda.graph_pool_handle()
         for spec, state in self.states.items():
             state.active = frozenset(active_by_spec[spec])
             self._capture(state, pool)
         self.zero_grad()
-        for optimizer in self.optimizers:
-            warmup = getattr(optimizer, "warmup", None)
-            if warmup is not None:
-                warmup()
         torch.cuda.synchronize()
 
     def _reachable_specs(self, schedule: Schedule) -> list[GraphSpec]:
@@ -362,6 +362,33 @@ class CudaGraphTrainer:
         state.graph = graph
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+
+    def _initialize_optimizers(self) -> None:
+        """Materialize persistent state before the graph-private pool grows."""
+        if any(optimizer.state for optimizer in self.optimizers):
+            # Resume already restored state; only warm our compiled NorMuon body.
+            for optimizer in self.optimizers:
+                warmup = getattr(optimizer, "warmup", None)
+                if warmup is not None:
+                    warmup()
+            return
+
+        saved = [group["lr"] for opt in self.optimizers for group in opt.param_groups]
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = 0.0
+            optimizer.step()
+        for optimizer in self.optimizers:
+            for values in optimizer.state.values():
+                for value in values.values():
+                    if isinstance(value, torch.Tensor):
+                        value.zero_()
+        for rate, group in zip(
+            saved,
+            (group for opt in self.optimizers for group in opt.param_groups),
+            strict=True,
+        ):
+            group["lr"] = rate
 
     def begin(self, spec: GraphSpec) -> CapturedMicro:
         state = self.states[spec]
