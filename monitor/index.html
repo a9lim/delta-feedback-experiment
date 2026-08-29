@@ -161,11 +161,20 @@ function renderConfig(run) {
 }
 
 // ---------------------------------------------------------------- charts
+function tightLogRange(u, lo, hi) {
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(lo > 0) || hi < lo) return [1, 10];
+  const paddedLo = lo / 1.15, paddedHi = hi * 1.15;
+  // uPlot's log splits must begin on the current magnitude's tick grid. An
+  // arbitrary lower bound can make its increment stop advancing and exhaust
+  // the array. Keep the tight upper bound, but let uPlot snap the lower one.
+  const [safeLo] = uPlot.rangeLog(paddedLo, paddedHi, 10, false);
+  return [safeLo, paddedHi];
+}
 function rebuild() {
   const logY = document.getElementById('logy').checked;
   // Tight log range: NLL sits just above a decade boundary all run, so
   // decade-snapped ranging would waste half the axis.
-  const yLog = logY ? { distr: 3, log: 10, range: (u, lo, hi) => (lo == null || !(lo > 0) ? [null, null] : [lo / 1.15, hi * 1.15]) } : {};
+  const yLog = logY ? { distr: 3, log: 10, range: tightLogRange } : {};
   const ovs = overlayTags();
   const primary = () => runFor(state.selected);
   const marks = () => viewOf(state.selected)?.snapshots ?? [];
