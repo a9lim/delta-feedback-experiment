@@ -34,6 +34,39 @@ claim at this scale; that's the screen's question. Next session: read
 these against design gates in full, then screen prep on the code a9 +
 Codex optimize.
 
+### Routing autopsy of the final checkpoint
+
+`scripts/route_report.py` (new; figures/route-smoke-df1/, re-runnable at
+screen scale) dissects the 1100-step snapshot: static query geometry +
+mean routing maps over 32 val rows, plain and fused pass, with per-token
+max/entropy to separate static wiring from dynamic selection. Verified
+against step-1100 route telemetry (payload maxT 0.981 vs logged 0.9805).
+
+- **Scale context first**: the raw embedding has RMS 0.04 vs deltas at
+  10–305, so *routing mass on the seed is a learned off-switch* (the
+  closest non-soft analogue of DAR's null source) — L0.mlp put 1.000
+  there, i.e. turned itself off. m0 is anomalously large (RMS 44 vs
+  ~12 for m1/m2): layer-0's MLP is the de facto embedding table.
+- **attn readers**: recency band — each reads the 1–2 immediately
+  preceding deltas — except L9/L10/L11.attn, which reach back to **m0**
+  (0.34/0.48/0.81): a learned depth shortcut re-injecting token-local
+  lexical state where the telescoping sum has diluted it.
+- **mlp readers**: near-universal *self-read of their own layer's fresh
+  attn delta* (a_i at 0.78–0.95 for L5–L9), i.e. routing amplifies
+  attn→MLP coupling within the layer; they read attn deltas almost
+  exclusively, rarely MLP deltas. Deep ones (L10/L11.mlp) split over
+  a8/a9/a10 per token (maxT ≫ max of mean → genuine dynamic selection;
+  mid-stack attn sites likewise).
+- **payload router**: collapsed to a delta function on **a8** (0.981;
+  was 0.18 mean-max at step 850 — cooldown sharpened it), identical on
+  plain and fused passes. The feedback channel ships
+  payload_norm(h_top + a8). Router choices are not norm-chasing — the
+  biggest sources (m11 RMS 305, m10 146) get ~0 everywhere.
+- Query norms grow with depth (~0.3→1.3, sharper softmax deep); deep-site
+  queries (L5+) are mutually correlated in direction, payload's included.
+  Pass-1 vs fused routing differs little; largest shift is L1.attn giving
+  the fused entry u 10% (vs 1% to plain e).
+
 ## 2026-08-28 (night) — resume fix; runs.a9l.im tracking page live
 
 Plan settled with a9: once smoke-df1 lands, a9 runs the optimization

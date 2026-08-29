@@ -1,0 +1,252 @@
+"""Dissect a trained snapshot's routing: what each router learned.
+
+Rebuilds the arm's model from a checkpoint and reads its three routing
+components — the per-layer attn readers, the per-layer mlp readers, and
+the payload router — two ways:
+
+- statically: query-vector geometry (norms set the effective softmax
+  temperature since keys are RMS-normed; pairwise cosines say whether
+  sites learned a shared reading direction);
+- empirically: mean routing distributions over held-out rows, on the
+  plain pass and on a fused pass (prefix length 1, the training eval
+  convention), plus per-site entropy.
+
+Writes figures under figures/route-TAG/ and prints a per-site table.
+
+Usage:
+    python scripts/route_report.py runs/smoke-df1.pt.1100 \
+        --data-dir data/tokens-smoke
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from matplotlib import colors
+
+from delta_feedback_experiment.data import TokenData
+from delta_feedback_experiment.model import DFModel, arm_config, multipass
+from delta_feedback_experiment.train import CONTRACT, pick_device
+from transformer_experiments import checkpoints
+
+GEOMETRY = (
+    "vocab_size", "dim", "layers", "heads", "kv_heads", "head_dim",
+    "intermediate", "seq_len",
+)
+
+
+def load_model(path: Path, device) -> tuple[DFModel, dict]:
+    payload = checkpoints.read(path, CONTRACT, map_location="cpu")
+    saved = payload["args"]
+    cfg = arm_config(
+        saved["arm"],
+        max_seq_len=saved["seq_len"] + 1,
+        **{f: saved[f] for f in GEOMETRY if f != "seq_len"},
+    )
+    model = DFModel(cfg)
+    model.load_state_dict(payload["state"])
+    return model.to(device).eval(), saved
+
+
+def source_names(layers: int) -> list[str]:
+    return [f"{kind}{i}" for i in range(layers) for kind in ("a", "m")]
+
+
+def site_names(layers: int) -> list[str]:
+    return [f"L{i}.{kind}" for i in range(layers) for kind in ("attn", "mlp")]
+
+
+@torch.no_grad()
+def collect(model, data_val, device, rows: int, micro: int):
+    """Routing statistics per (pass, site) over `rows` val rows.
+
+    Returns (mean weights [N], per-token stats {max, H_tok}) keyed by
+    (pass, site).  Mean weights say *which* sources a site reads; the
+    per-token mean max and mean normalized entropy say whether that read
+    is static wiring (sharp and identical everywhere) or token-dependent
+    (sharp per token, varied across tokens).
+    """
+    sums: dict[tuple[int, str], torch.Tensor] = {}
+    stats: dict[tuple[int, str], torch.Tensor] = {}
+    norms: dict[int, torch.Tensor] = {}
+    counted = 0
+    for first in range(0, rows, micro):
+        batch = data_val.batch(first, min(micro, rows - first), device)
+        n = batch.shape[0]
+        prefix = torch.ones((1, n), dtype=torch.long, device=device)
+        outs = multipass(model, batch, 2, prefix_lens=prefix, want_weights=True)
+        for p, out in enumerate(outs):
+            values = torch.stack(out.sources)  # [N, B, T, D]
+            rms = values.float().pow(2).mean(-1).sqrt().mean((1, 2)).cpu() * n
+            norms[p] = norms.get(p, 0.0) + rms
+            for site, weights in out.route_weights.items():
+                w = weights.float()
+                per_token = -(w.clamp_min(1e-12).log() * w).sum(dim=0)
+                batch_stats = torch.stack([
+                    w.max(dim=0).values.mean(),
+                    per_token.mean() / math.log(w.shape[0]),
+                ]).cpu() * n
+                key = (p, site)
+                sums[key] = sums.get(key, 0.0) + w.mean(dim=(1, 2)).cpu() * n
+                stats[key] = stats.get(key, 0.0) + batch_stats
+        counted += n
+    return (
+        {key: (value / counted).numpy() for key, value in sums.items()},
+        {key: (value / counted).numpy() for key, value in stats.items()},
+        {key: (value / counted).numpy() for key, value in norms.items()},
+    )
+
+
+def entropy(weights: np.ndarray) -> float:
+    """Normalized entropy of a mean distribution (1 = uniform)."""
+    w = weights[weights > 0]
+    return float(-(w * np.log(w)).sum() / math.log(len(weights)))
+
+
+def site_matrix(means, layers: int, passes=(0, 1)):
+    """[site, source] mean-weight matrices per pass; NaN = source absent.
+
+    Columns: seed (e on pass 0, fused u on pass 1) then a0,m0..a(L-1),m(L-1).
+    """
+    sites = site_names(layers)
+    matrices = {}
+    for p in passes:
+        matrix = np.full((len(sites), 1 + 2 * layers), np.nan)
+        for row, site in enumerate(sites):
+            if (p, site) not in means:
+                continue  # L0.attn routes over a singleton and stays off
+            w = means[(p, site)]
+            matrix[row, : len(w)] = w
+        matrices[p] = matrix
+    return sites, matrices
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser("route report")
+    parser.add_argument("snapshot", type=Path)
+    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--rows", type=int, default=32)
+    parser.add_argument("--micro-rows", type=int, default=4)
+    parser.add_argument("--device", default=None)
+    args = parser.parse_args()
+
+    device = pick_device(args.device)
+    model, saved = load_model(args.snapshot, device)
+    cfg = model.cfg
+    layers = cfg.layers
+    tag = saved.get("tag", args.snapshot.stem)
+    out_dir = Path("figures") / f"route-{tag}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"# {tag} — {saved['arm']}, {layers} layers, dim {cfg.dim}, device {device}")
+
+    # -- static: query geometry ------------------------------------------------
+    queries, labels = [], []
+    for i, block in enumerate(model.blocks):
+        for kind, router in (("attn", block.attn_router), ("mlp", block.mlp_router)):
+            if router is not None:
+                queries.append(router.query.detach().float().cpu())
+                labels.append(f"L{i}.{kind}")
+    if getattr(model, "payload_router", None) is not None:
+        queries.append(model.payload_router.query.detach().float().cpu())
+        labels.append("payload")
+    q = torch.stack(queries)
+    norms = q.norm(dim=1)
+    unit = q / q.norm(dim=1, keepdim=True).clamp_min(1e-12)
+    cosine = (unit @ unit.T).numpy()
+
+    # -- empirical: routing distributions --------------------------------------
+    data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
+    means, stats, norms_by_pass = collect(
+        model, data_val, device, args.rows, args.micro_rows
+    )
+    sites, matrices = site_matrix(means, layers)
+
+    # The routed values are raw (only keys are normed), so source scale
+    # matters for what a read actually adds.
+    print("\nsource RMS norms (seed, then deltas):")
+    for p, rms in sorted(norms_by_pass.items()):
+        shown = "  ".join(
+            f"{name}={value:.2f}"
+            for name, value in zip(["seed"] + source_names(layers), rms)
+        )
+        print(f"  p{p + 1}: {shown}")
+
+    # Console table: per site, per pass — mean-distribution entropy,
+    # per-token mean max / entropy, and top-3 sources.
+    names = ["seed"] + source_names(layers)
+    print(f"\n{'site':<10}{'|q|':>7}   pass  H_mean  maxT  H_tok  top sources")
+    for label, norm in zip(labels, norms):
+        for p in (0, 1):
+            key = (p, label)
+            if key not in means:
+                continue
+            w = means[key]
+            max_t, h_tok = stats[key]
+            local = names[: len(w)] if label != "payload" else source_names(layers)
+            top = sorted(zip(local, w), key=lambda t: -t[1])[:3]
+            shown = "  ".join(f"{n}={v:.3f}" for n, v in top)
+            first_row = (0, label) not in means or p == 0
+            head = f"{label:<10}{norm:>7.2f}" if first_row else " " * 17
+            print(f"{head}   p{p + 1}    {entropy(w):5.3f}  {max_t:.3f}  {h_tok:.3f}  {shown}")
+
+    # -- figures ---------------------------------------------------------------
+    norm_map = colors.PowerNorm(0.5, vmin=0, vmax=np.nanmax(
+        [np.nanmax(matrices[p]) for p in matrices]
+    ))
+    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True, constrained_layout=True)
+    for ax, p, title in zip(axes, (0, 1), ("pass 1 (plain)", "pass 2 (fused)")):
+        image = ax.imshow(matrices[p], aspect="auto", cmap="viridis", norm=norm_map)
+        ax.set_yticks(range(len(sites)), sites, fontsize=7)
+        ax.set_title(f"site routing, {title}", fontsize=10)
+        ax.set_ylabel("reading site")
+    axes[1].set_xticks(range(1 + 2 * layers), ["e/u"] + source_names(layers),
+                       fontsize=7, rotation=90)
+    axes[1].set_xlabel("source (seed, then sublayer deltas)")
+    fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
+    fig.suptitle(f"{tag}: depth-routing read maps", fontsize=12)
+    fig.savefig(out_dir / "site-routing.png", dpi=150)
+
+    if (0, "payload") in means:
+        fig, ax = plt.subplots(figsize=(11, 3.2), constrained_layout=True)
+        x = np.arange(2 * layers)
+        ax.bar(x - 0.2, means[(0, "payload")], 0.4, label="pass 1")
+        ax.bar(x + 0.2, means[(1, "payload")], 0.4, label="pass 2 (fused)")
+        ax.axhline(1 / (2 * layers), color="grey", lw=0.8, ls="--", label="uniform")
+        ax.set_xticks(x, source_names(layers), fontsize=7, rotation=90)
+        ax.set_ylabel("mean weight")
+        ax.set_title(f"{tag}: payload router — what rides to the next column")
+        ax.legend(fontsize=8)
+        fig.savefig(out_dir / "payload-routing.png", dpi=150)
+
+    fig, (ax_norm, ax_cos) = plt.subplots(
+        1, 2, figsize=(11, 4.2), width_ratios=(1, 1.2), constrained_layout=True
+    )
+    depth = np.arange(layers)
+    attn_norms = [norms[labels.index(f"L{i}.attn")] for i in depth]
+    mlp_norms = [norms[labels.index(f"L{i}.mlp")] for i in depth]
+    ax_norm.plot(depth, attn_norms, "o-", label="attn reader")
+    ax_norm.plot(depth, mlp_norms, "s-", label="mlp reader")
+    if "payload" in labels:
+        ax_norm.axhline(norms[labels.index("payload")], color="C2", lw=1,
+                        ls=":", label="payload")
+    ax_norm.set_xlabel("layer")
+    ax_norm.set_ylabel("|query|")
+    ax_norm.set_title("query norms (softmax sharpness)", fontsize=10)
+    ax_norm.legend(fontsize=8)
+    image = ax_cos.imshow(cosine, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax_cos.set_xticks(range(len(labels)), labels, fontsize=6, rotation=90)
+    ax_cos.set_yticks(range(len(labels)), labels, fontsize=6)
+    ax_cos.set_title("query cosine similarity", fontsize=10)
+    fig.colorbar(image, ax=ax_cos, shrink=0.9)
+    fig.suptitle(f"{tag}: router query geometry", fontsize=12)
+    fig.savefig(out_dir / "query-geometry.png", dpi=150)
+    print(f"\nfigures -> {out_dir}/")
+
+
+if __name__ == "__main__":
+    main()
