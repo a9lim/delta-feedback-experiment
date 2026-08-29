@@ -546,6 +546,7 @@ class DFModel(nn.Module):
                     p_mask,
                     *passed,
                     use_reentrant=False,
+                    preserve_rng_state=False,
                 )
             else:
                 h, a, m, w_attn, w_mlp = block(
@@ -757,6 +758,7 @@ def sequence_ce(
                 model.embed_tokens.weight,
                 model.final_norm.eps,
                 use_reentrant=False,
+                preserve_rng_state=False,
             )
         else:
             head = _compiled_head_losses if h_top.is_cuda else _head_losses
