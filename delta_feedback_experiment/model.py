@@ -815,8 +815,12 @@ class _LinearCrossEntropyZFunction(torch.autograd.Function):
         embeddings, classifier, lse, targets, logit_avg = ctx.saved_tensors
         ordering = sort_logit_avg(logit_avg) if logit_avg is not None else None
         scale = 1.0 / lse.numel()
-        de_ce, dc_ce = cce_backward_kernel(
-            grad_ce,
+        # One vocabulary sweep: scaling (p-y) by ce + 2*z*lse gives the
+        # desired probability gradient but over-scales the target subtraction.
+        # Repair that single indexed classifier column below.
+        z_scale = grad_z * (2.0 * lse)
+        de, dc = cce_backward_kernel(
+            grad_ce + z_scale,
             embeddings,
             classifier,
             lse,
@@ -828,21 +832,17 @@ class _LinearCrossEntropyZFunction(torch.autograd.Function):
             vocab_ordering=ordering,
             grad_scale=scale,
         )
-        # With no targets CCE's tile derivative is exactly softmax(logits).
-        de_z, dc_z = cce_backward_kernel(
-            grad_z * (2.0 * lse),
-            embeddings,
-            classifier,
-            lse,
-            None,
-            None,
-            None,
-            targets=None,
-            shift=False,
-            vocab_ordering=None,
-            grad_scale=scale,
+        correction = z_scale * scale
+        de.add_(
+            classifier.index_select(0, targets).to(de.dtype)
+            * correction.to(de.dtype).unsqueeze(1)
         )
-        return de_ce + de_z, dc_ce + dc_z, None
+        dc.index_add_(
+            0,
+            targets,
+            embeddings.to(dc.dtype) * correction.to(dc.dtype).unsqueeze(1),
+        )
+        return de, dc, None
 
 
 def _fixed_cce_z(
