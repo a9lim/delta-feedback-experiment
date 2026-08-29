@@ -36,40 +36,39 @@
 <text class="title" x="60" y="62.0" text-anchor="start"><tspan x="60" y="62.0">DAR · Delta Attention Residuals</tspan></text>
 <text class="subtitle" x="60" y="101.0" text-anchor="start"><tspan x="60" y="101.0">Vertical-axis widening · transient reads over the current column’s decomposition</tspan></text>
 <line class="divider" x1="60" y1="132" x2="1640" y2="132"/>
-<rect class="node neutral" x="45" y="398" width="120" height="72" rx="16"/><text class="formula" x="105.0" y="424.0" text-anchor="middle"><tspan x="105.0" y="424.0">Token</tspan><tspan x="105.0" y="446.0">xₜ</tspan></text>
-<line class="edge blue" x1="165" y1="434" x2="202" y2="434" marker-end="url(#arrow-blue)"/>
-<rect class="node blue-node" x="205" y="390" width="210" height="88" rx="16"/><text class="formula" x="310.0" y="424.0" text-anchor="middle"><tspan x="310.0" y="424.0">Token embedding</tspan><tspan x="310.0" y="446.0">eₜ</tspan></text>
-<line class="edge blue" x1="415" y1="434" x2="498" y2="434" marker-end="url(#arrow-blue)"/>
+<rect class="node neutral" x="45" y="479" width="120" height="72" rx="16"/><text class="formula" x="105.0" y="505.0" text-anchor="middle"><tspan x="105.0" y="505.0">Token</tspan><tspan x="105.0" y="527.0">xₜ</tspan></text>
+<line class="edge blue" x1="165" y1="515" x2="202" y2="515" marker-end="url(#arrow-blue)"/>
+<rect class="node blue-node" x="205" y="471" width="210" height="88" rx="16"/><text class="formula" x="310.0" y="505.0" text-anchor="middle"><tspan x="310.0" y="505.0">Token embedding</tspan><tspan x="310.0" y="527.0">eₜ</tspan></text>
+<line class="edge blue" x1="415" y1="515" x2="498" y2="515" marker-end="url(#arrow-blue)"/>
 <rect class="stack" x="500" y="205" width="680" height="500" rx="24"/>
 <text class="section" x="528" y="243.0" text-anchor="start"><tspan x="528" y="243.0">Transformer block ℓ   × L</tspan></text>
 <text class="small" x="1152" y="243.0" text-anchor="end"><tspan x="1152" y="243.0">pre-norm residual trunk</tspan></text>
-<text class="formula" x="535" y="421.0" text-anchor="middle"><tspan x="535" y="421.0">hℓ</tspan></text>
-<line class="edge blue" x1="518" y1="444" x2="600" y2="444" marker-end="url(#arrow-blue)"/>
-<rect class="node blue-node" x="600" y="396" width="190" height="96" rx="16"/><text class="label" x="695.0" y="434.0" text-anchor="middle"><tspan x="695.0" y="434.0">RMSNorm(h + route)</tspan><tspan x="695.0" y="456.0">Attention → Δaℓ</tspan></text>
-<line class="edge blue" x1="790" y1="444" x2="822" y2="444" marker-end="url(#arrow-blue)"/>
-<circle class="sum" cx="844" cy="444" r="19"/><text class="sum-label" x="844" y="450.0" text-anchor="middle"><tspan x="844" y="450.0">+</tspan></text>
-<line class="edge blue" x1="863" y1="444" x2="890" y2="444" marker-end="url(#arrow-blue)"/>
-<rect class="node blue-node" x="890" y="396" width="190" height="96" rx="16"/><text class="label" x="985.0" y="434.0" text-anchor="middle"><tspan x="985.0" y="434.0">RMSNorm(h + route)</tspan><tspan x="985.0" y="456.0">MLP → Δmℓ</tspan></text>
-<line class="edge blue" x1="1080" y1="444" x2="1107" y2="444" marker-end="url(#arrow-blue)"/>
-<circle class="sum" cx="1128" cy="444" r="19"/><text class="sum-label" x="1128" y="450.0" text-anchor="middle"><tspan x="1128" y="450.0">+</tspan></text>
-<line class="edge blue" x1="1147" y1="444" x2="1210" y2="444" marker-end="url(#arrow-blue)"/>
-<text class="formula" x="1150" y="421.0" text-anchor="middle"><tspan x="1150" y="421.0">hℓ₊₁</tspan></text>
-<rect class="node purple-node" x="615" y="276" width="160" height="68" rx="16"/><text class="label" x="695.0" y="300.0" text-anchor="middle"><tspan x="695.0" y="300.0">Route</tspan><tspan x="695.0" y="322.0">qattn,ℓ</tspan></text>
-<rect class="node purple-node" x="905" y="276" width="160" height="68" rx="16"/><text class="label" x="985.0" y="300.0" text-anchor="middle"><tspan x="985.0" y="300.0">Route</tspan><tspan x="985.0" y="322.0">qmlp,ℓ</tspan></text>
-<line class="edge purple" x1="695" y1="344" x2="695" y2="394" marker-end="url(#arrow-purple)"/>
-<line class="edge purple" x1="985" y1="344" x2="985" y2="394" marker-end="url(#arrow-purple)"/>
-<rect class="node purple-node" x="572" y="570" width="536" height="92" rx="16"/><text class="formula" x="840.0" y="606.0" text-anchor="middle"><tspan x="840.0" y="606.0">Sℓ = [eₜ, Δa₀, Δm₀, …]</tspan><tspan x="840.0" y="628.0">seed + prior sublayer deltas; first attention no-ops</tspan></text>
-<path class="edge purple" d="M 650 570 L 650 310 L 613 310" marker-end="url(#arrow-purple)"/>
-<path class="edge purple" d="M 1030 570 L 1030 310 L 1067 310" marker-end="url(#arrow-purple)"/>
-<path class="edge purple" d="M 740 492 L 740 535 L 805 535 L 805 568" stroke-dasharray="8 7" marker-end="url(#arrow-purple)"/>
-<path class="edge purple" d="M 1030 492 L 1030 535 L 1000 535 L 1000 568" stroke-dasharray="8 7" marker-end="url(#arrow-purple)"/>
-<text class="small" x="840" y="548.0" text-anchor="middle"><tspan x="840" y="548.0">append Δaℓ, Δmℓ</tspan></text>
-<path class="edge purple" d="M 310 478 L 310 615 L 570 615" marker-end="url(#arrow-purple)"/>
-<text class="small" x="392" y="595.0" text-anchor="middle"><tspan x="392" y="595.0">seed S₀ = [eₜ]</tspan></text>
-<rect class="node blue-node" x="1215" y="397" width="190" height="94" rx="16"/><text class="formula" x="1310.0" y="434.0" text-anchor="middle"><tspan x="1310.0" y="434.0">Top state</tspan><tspan x="1310.0" y="456.0">hₜᵗᵒᵖ</tspan></text>
-<line class="edge blue" x1="1180" y1="444" x2="1213" y2="444" marker-end="url(#arrow-blue)"/>
-<rect class="node green-node" x="1460" y="382" width="195" height="124" rx="16"/><text class="label" x="1557.5" y="423.0" text-anchor="middle"><tspan x="1557.5" y="423.0">Final RMSNorm</tspan><tspan x="1557.5" y="445.0">+ tied LM head</tspan><tspan x="1557.5" y="467.0">→ logitsₜ</tspan></text>
-<line class="edge blue" x1="1405" y1="444" x2="1458" y2="444" marker-end="url(#arrow-blue)"/>
+<text class="formula" x="536" y="488.0" text-anchor="middle"><tspan x="536" y="488.0">hℓ</tspan></text>
+<line class="edge blue" x1="518" y1="515" x2="600" y2="515" marker-end="url(#arrow-blue)"/>
+<rect class="node blue-node" x="600" y="467" width="200" height="96" rx="16"/><text class="label" x="700.0" y="505.0" text-anchor="middle"><tspan x="700.0" y="505.0">RMSNorm(h + rᵃℓ)</tspan><tspan x="700.0" y="527.0">Attention → Δaℓ</tspan></text>
+<line class="edge blue" x1="800" y1="515" x2="816" y2="515" marker-end="url(#arrow-blue)"/>
+<circle class="sum" cx="836" cy="515" r="19"/><text class="sum-label" x="836" y="521.0" text-anchor="middle"><tspan x="836" y="521.0">+</tspan></text>
+<line class="edge blue" x1="855" y1="515" x2="870" y2="515" marker-end="url(#arrow-blue)"/>
+<rect class="node blue-node" x="870" y="467" width="200" height="96" rx="16"/><text class="label" x="970.0" y="505.0" text-anchor="middle"><tspan x="970.0" y="505.0">RMSNorm(h + rᵐℓ)</tspan><tspan x="970.0" y="527.0">MLP → Δmℓ</tspan></text>
+<line class="edge blue" x1="1070" y1="515" x2="1086" y2="515" marker-end="url(#arrow-blue)"/>
+<circle class="sum" cx="1106" cy="515" r="19"/><text class="sum-label" x="1106" y="521.0" text-anchor="middle"><tspan x="1106" y="521.0">+</tspan></text>
+<line class="edge blue" x1="1125" y1="515" x2="1180" y2="515" marker-end="url(#arrow-blue)"/>
+<text class="formula" x="1150" y="488.0" text-anchor="middle"><tspan x="1150" y="488.0">hℓ₊₁</tspan></text>
+<rect class="node purple-node" x="570" y="275" width="540" height="80" rx="16"/><text class="formula" x="840.0" y="294.0" text-anchor="middle"><tspan x="840.0" y="294.0">Sources Sℓ</tspan><tspan x="840.0" y="316.0">[eₜ  |  Δa₀, Δm₀, …]</tspan><tspan x="840.0" y="338.0">seed + prior deltas</tspan></text>
+<rect class="node purple-node" x="620" y="380" width="160" height="66" rx="16"/><text class="formula" x="700.0" y="403.0" text-anchor="middle"><tspan x="700.0" y="403.0">rᵃℓ = route</tspan><tspan x="700.0" y="425.0">(Sℓ, qᵃℓ)</tspan></text>
+<rect class="node purple-node" x="890" y="380" width="160" height="66" rx="16"/><text class="formula" x="970.0" y="403.0" text-anchor="middle"><tspan x="970.0" y="403.0">rᵐℓ = route</tspan><tspan x="970.0" y="425.0">(Sℓ, qᵐℓ)</tspan></text>
+<line class="edge purple" x1="700" y1="355" x2="700" y2="378" marker-end="url(#arrow-purple)"/>
+<line class="edge purple" x1="970" y1="355" x2="970" y2="378" marker-end="url(#arrow-purple)"/>
+<line class="edge purple" x1="700" y1="446" x2="700" y2="465" marker-end="url(#arrow-purple)"/>
+<line class="edge purple" x1="970" y1="446" x2="970" y2="465" marker-end="url(#arrow-purple)"/>
+<text class="small" x="840.0" y="635.0" text-anchor="middle"><tspan x="840.0" y="635.0">Each branch delta joins Sℓ before the next routed read.</tspan></text>
+<path class="edge purple" d="M 310 469 L 310 315 L 568 315" marker-end="url(#arrow-purple)"/>
+<text class="small" x="422" y="294.0" text-anchor="middle"><tspan x="422" y="294.0">seed eₜ</tspan></text>
+<rect class="node blue-node" x="1215" y="468" width="190" height="94" rx="16"/><text class="formula" x="1310.0" y="505.0" text-anchor="middle"><tspan x="1310.0" y="505.0">Top state</tspan><tspan x="1310.0" y="527.0">hₜᵗᵒᵖ</tspan></text>
+<line class="edge blue" x1="1180" y1="515" x2="1213" y2="515" marker-end="url(#arrow-blue)"/>
+<rect class="node green-node" x="1460" y="453" width="195" height="124" rx="16"/><text class="label" x="1557.5" y="494.0" text-anchor="middle"><tspan x="1557.5" y="494.0">Final RMSNorm</tspan><tspan x="1557.5" y="516.0">+ tied LM head</tspan><tspan x="1557.5" y="538.0">→ logitsₜ</tspan></text>
+<line class="edge blue" x1="1405" y1="515" x2="1458" y2="515" marker-end="url(#arrow-blue)"/>
+<rect class="node neutral" x="650" y="760" width="380" height="70" rx="16"/><text class="label" x="840.0" y="796.0" text-anchor="middle"><tspan x="840.0" y="796.0">No cross-column payload</tspan></text>
 <line class="divider" x1="60" y1="884" x2="1640" y2="884"/>
-<text class="small" x="60" y="918.0" text-anchor="start"><tspan x="60" y="918.0">Purple = zero-init softmax routing over RMS-normalized keys and raw values. No payload crosses columns.</tspan></text>
+<text class="small" x="60" y="918.0" text-anchor="start"><tspan x="60" y="918.0">Purple = zero-init routing. With only seed eₜ, layer-0 attention routing is a no-op.</tspan></text>
 </svg>
