@@ -19,6 +19,7 @@ references/multi-head-attention-residuals-code/
 logs/**
 !logs/.gitkeep
 runs/
+tmp/
 
 # Python
 __pycache__/
