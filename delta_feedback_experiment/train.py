@@ -214,10 +214,9 @@ def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
         # The standing payload/null sources make DF-soft's retained route bank
         # materially larger than the hard spine at the same pass count.
         return True
-    # k=3 itself fits eagerly, but a fixed graph retains its private pool next
-    # to persistent Adam/NorMuon state.  Checkpointing this rare 3% mode keeps
-    # the common k=1/k=2 graphs raw and leaves optimizer workspace headroom.
-    return work >= screen_work
+    # The exact hard-DF screen k=3 graph is admitted raw after the fused-block
+    # and bespoke-router memory reduction. Larger geometries remain guarded.
+    return work > screen_work
 
 
 @dataclass(frozen=True)

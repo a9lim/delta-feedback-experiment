@@ -277,7 +277,7 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     with torch.device("meta"):
         model = DFModel(arm_config("df"))
     assert not automatic_checkpoint(model, 2, args, torch.device("cuda"))
-    assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
+    assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
     with torch.device("meta"):
         soft = DFModel(arm_config("df_soft"))
     assert automatic_checkpoint(soft, 2, args, torch.device("cuda"))
