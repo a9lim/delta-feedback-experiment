@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def cuda_gate() -> None:
     """Capture and replay every default DF mode at full screen geometry."""
     from torch._dynamo.utils import counters
+    from transformer_experiments import checkpoints
 
     from .cuda_kernels import bespoke_route
     from .cuda_kernels import triton as route_triton
@@ -28,8 +29,14 @@ def cuda_gate() -> None:
         flash_attn_func,
         linear_cross_entropy_apply,
     )
-    from .optim import build_optimizers
-    from .train import CudaGraphTrainer, build_parser, build_schedule
+    from .optim import OptimizerPair, build_optimizers
+    from .train import (
+        CONTRACT,
+        CudaEvalRunner,
+        CudaGraphTrainer,
+        build_parser,
+        build_schedule,
+    )
 
     if flash_attn_func is None or linear_cross_entropy_apply is None:
         raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
@@ -201,6 +208,7 @@ def cuda_gate() -> None:
 
     started = time.monotonic()
     runner = CudaGraphTrainer(model, optimizers, args, schedule)
+    eval_runner = CudaEvalRunner(model, args, runner.pool)
     torch.cuda.synchronize()
     prepared = time.monotonic() - started
     capture_peak = torch.cuda.max_memory_allocated() / 2**30
@@ -208,6 +216,23 @@ def cuda_gate() -> None:
         raise AssertionError(
             f"capture peak leaves unsafe headroom: {capture_peak:.2f} GiB"
         )
+
+    class _ProbeValidation:
+        def __init__(self):
+            self.rows = torch.randint(
+                0,
+                args.vocab_size,
+                (args.eval_rows, args.seq_len + 1),
+                generator=torch.Generator().manual_seed(19),
+            )
+
+        def batch(self, first, count, device=None):
+            rows = self.rows[first : first + count]
+            return rows.to(device) if device is not None else rows
+
+    eval_scores = eval_runner.run(_ProbeValidation())
+    if any(not math.isfinite(value) for value in eval_scores.values()):
+        raise AssertionError(f"nonfinite captured evaluation: {eval_scores}")
 
     compiled = counters["stats"]["unique_graphs"]
     generator = torch.Generator().manual_seed(0)
@@ -248,6 +273,18 @@ def cuda_gate() -> None:
             f"{elapsed * 1000:.1f}ms"
         )
 
+    # Freeze the full model, optimizer, and RNG surface into pinned host memory.
+    # Serialization itself is covered by the root package's CPU atomic-write
+    # test; this gate exercises the CUDA staging stream at production scale.
+    staged = checkpoints.stage(CONTRACT, model, OptimizerPair(optimizers), args, step=3)
+    staged_payload = staged.wait()
+    if any(
+        tensor.device.type != "cpu"
+        for tensor in staged_payload[CONTRACT.state_key].values()
+    ):
+        raise AssertionError("staged checkpoint retained CUDA model tensors")
+    del staged, staged_payload
+
     torch.cuda.synchronize()
     escaped = counters["stats"]["unique_graphs"] - compiled
     if escaped:
@@ -255,7 +292,8 @@ def cuda_gate() -> None:
     print(
         "cuda gate | "
         f"prepare={prepared:.1f}s | peak={capture_peak:.2f}GiB | "
-        f"decode_rel={decode_rel:.4f} | graphs={len(runner.states)} | "
+        f"decode_rel={decode_rel:.4f} | "
+        f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)
     )
 
