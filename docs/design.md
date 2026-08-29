@@ -43,11 +43,44 @@ surprising result (the gate was never necessary).
 
 ## Architecture
 
-Companion arm diagrams: [vanilla](../figures/architectures/vanilla.svg),
-[DAR](../figures/architectures/dar.svg),
-[FBT](../figures/architectures/fbt.svg),
-[DF](../figures/architectures/df.svg), and
-[DF-soft](../figures/architectures/df-soft.svg).
+```text
+# DF
+<payload>─────┐  ┌────→(       sources      )→[route]→[+]────────→<payload>
+              │  │ {   ↓        ↑   ↓       ↑  }       ↑
+              │  │ {[route]     │[route]    │  }       │
+              │  │ {   ↓        │   ↓       │  }       │
+              │  │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
+              ↓  │ {   ↑        ↓   ↑       ↓  }       │
+<embedding>→[GLU]┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
+
+# DF-soft
+<payload>────────┬────→(       sources      )→[route]→[+]────────→<payload>
+                 │ {   ↓        ↑   ↓       ↑  }       ↑
+                 │ {[route]     │[route]    │  }       │
+                 │ {   ↓        │   ↓       │  }       │
+                 │ {  [+]→[Attn]┤  [+]→[MLP]┤  }       │
+                 │ {   ↑        ↓   ↑       ↓  }       │
+<embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
+
+# DAR
+                 ┌────→(       sources      )
+                 │ {   ↓        ↑   ↓       ↑  }
+                 │ {[route]     │[route]    │  }
+                 │ {   ↓        │   ↓       │  }
+                 │ {  [+]→[Attn]┤  [+]→[MLP]┤  }
+                 │ {   ↑        ↓   ↑       ↓  }
+<embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
+
+# FBT
+<payload>─────┐    {  [+]→[Attn]┐  [+]→[MLP]┐  }       ┌─────────→<payload>
+              ↓    {   ↑        ↓   ↑       ↓  }       │
+<embedding>→[GLU]─→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
+
+# Vanilla
+                   {  [+]→[Attn]┐  [+]→[MLP]┐  }
+                   {   ↑        ↓   ↑       ↓  }
+<embedding>───────→{───┴──────→[+]──┴─────→[+]→}────────→[LM head]→<logits>
+```
 
 One decode step of the full model at position t (trial configuration:
 per-sublayer sources). `route(vs, q)` returns
