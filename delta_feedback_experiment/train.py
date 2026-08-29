@@ -271,6 +271,11 @@ class CudaGraphTrainer:
             parameter.grad = gradient
 
         self._initialize_optimizers()
+        for active in active_by_spec.values():
+            for optimizer in self.optimizers:
+                warmup = getattr(optimizer, "warmup", None)
+                if warmup is not None:
+                    warmup(active)
         self.zero_grad()
         torch.cuda.empty_cache()
 

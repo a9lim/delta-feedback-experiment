@@ -10,8 +10,9 @@ applied at the cross-column site. A soft screen-only companion arm makes
 every channel optional and null-sourced, its routing weights reading out
 what a free model actually adopts.
 
-**Status:** design phase. Design settled (2026-08-27); no training code, no
-results yet. See [`docs/findings.md`](docs/findings.md).
+**Status:** the plain-PyTorch harness and optimized Jobe CUDA path are ready;
+no scientific training result exists yet. See
+[`docs/findings.md`](docs/findings.md).
 
 ## Plan shape
 
@@ -32,19 +33,32 @@ uv pip install -e .
 # then:
 cd delta-feedback-experiment
 uv pip install -e .
+
+# Jobe CUDA kernels (the shared environment already carries the pinned wheels):
+uv pip install -e '.[cuda]'
 ```
 
 ## Run
 
-Nothing runnable yet. `scripts/` will hold numbered entry points as the
-harness lands.
+```bash
+df probe
+df train TAG --arm df --data-dir /data/df/tokens
+df queue TAG --arm df --data-dir /data/df/tokens
+df status
+df watch
+```
+
+`df probe` runs the invariant suite everywhere and, when CUDA is present, the
+full 220M/B4/T1025 graph-capture gate. Training uses fixed CUDA graphs,
+FlashAttention, CCE, BF16 residuals, and an internal measured activation plan;
+there are no public kernel or checkpoint-policy switches.
 
 ## Docs map
 
 - [`docs/design.md`](docs/design.md) — the authoritative current design:
   architecture, training, arms, scale plan, evaluation, gates, risks.
-- [`docs/findings.md`](docs/findings.md) — claims and limitations (currently:
-  none).
+- [`docs/findings.md`](docs/findings.md) — scientific and systems evidence,
+  with limitations.
 - [`docs/journal.md`](docs/journal.md) — disposable working notes,
   periodically cleared.
 - [`references/refs.yaml`](references/refs.yaml) — load-bearing papers;

@@ -111,11 +111,13 @@ class NorMuon(torch.optim.Optimizer):
                     )
 
     @torch.no_grad()
-    def warmup(self) -> None:
+    def warmup(self, active: set[torch.nn.Parameter] | None = None) -> None:
         """Compile every CUDA shape bucket without touching optimizer state."""
         for group in self.param_groups:
             buckets = defaultdict(list)
             for parameter in group["params"]:
+                if active is not None and parameter not in active:
+                    continue
                 buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
                     parameter
                 )

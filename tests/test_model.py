@@ -85,7 +85,17 @@ def test_screen_param_count():
     with torch.device("meta"):
         model = DFModel(arm_config("df"))
     total = sum(parameter.numel() for parameter in model.parameters())
-    assert abs(total - 223e6) / 223e6 < 0.02, f"{total/1e6:.1f}M"
+    assert abs(total - 223e6) / 223e6 < 0.02, f"{total / 1e6:.1f}M"
+
+
+def test_large_projections_are_persistently_packed():
+    model = tiny("df")
+    attention = model.blocks[0].attn
+    mlp = model.blocks[0].mlp
+    assert attention.qkv_proj.weight.shape == (64, 32)
+    assert not hasattr(attention, "q_proj")
+    assert mlp.gate_up_proj.weight.shape == (128, 32)
+    assert not hasattr(mlp, "gate_proj")
 
 
 # -- routing semantics ---------------------------------------------------------
@@ -99,15 +109,31 @@ def test_zero_init_routing_uniform():
         assert "L0.attn" not in out.route_weights  # singleton guard
         for site, weights in out.route_weights.items():
             n = weights.shape[0]
-            assert torch.allclose(
-                weights, torch.full_like(weights, 1.0 / n)
-            ), f"{arm} {site}"
+            assert torch.allclose(weights, torch.full_like(weights, 1.0 / n)), (
+                f"{arm} {site}"
+            )
     # DF-soft's null makes layer 0 active from the start: [null, e].
     out = forward(tiny("df_soft"), tokens(), want_weights=True)
     assert out.route_weights["L0.attn"].shape[0] == 2
     for site, weights in out.route_weights.items():
         n = weights.shape[0]
         assert torch.allclose(weights, torch.full_like(weights, 1.0 / n)), site
+
+
+def test_algebraic_router_matches_normalized_reference_in_fp32():
+    model = tiny("dar")
+    router = model.blocks[2].mlp_router
+    with torch.no_grad():
+        router.query.normal_()
+        router.key_norm.weight.uniform_(0.5, 1.5)
+    sources = [torch.randn(2, 7, 32) for _ in range(5)]
+    routed, weights = router(sources, [None] * len(sources), True)
+    values = torch.stack(sources)
+    logits = torch.einsum("d,nbtd->nbt", router.query, router.key_norm(values))
+    reference_weights = logits.softmax(dim=0)
+    reference = torch.einsum("nbt,nbtd->btd", reference_weights, values)
+    assert torch.allclose(weights, reference_weights, rtol=2e-5, atol=2e-6)
+    assert torch.allclose(routed, reference, rtol=2e-5, atol=2e-6)
 
 
 def test_telescoping():
@@ -153,6 +179,7 @@ def test_multipass_k1_is_plain_forward():
     single = multipass(model, toks, 1)
     plain = forward(model, toks)
     assert torch.equal(single[0].h_top, plain.h_top)
+    assert single[0].payload is None  # no consumer exists after the final pass
 
 
 def test_all_plain_prefix_degenerates_to_pass1():
@@ -200,7 +227,12 @@ def test_multipass_loss_shape():
 
 def test_multipass_rejects_feedback_free_arms():
     with pytest.raises(ValueError):
-        multipass(tiny("vanilla"), tokens(), 2, prefix_lens=torch.ones((1, 2), dtype=torch.long))
+        multipass(
+            tiny("vanilla"),
+            tokens(),
+            2,
+            prefix_lens=torch.ones((1, 2), dtype=torch.long),
+        )
 
 
 def test_gradients_reach_the_feedback_machinery():
@@ -300,7 +332,9 @@ def test_contraction_diagnostic_runs():
     model = tiny("df")
     records = iterate_fused(model, tokens(batch=2, length=12), n_iters=3)
     assert len(records) == 3
-    assert all(math.isfinite(r["loss"]) and math.isfinite(r["update_norm"]) for r in records)
+    assert all(
+        math.isfinite(r["loss"]) and math.isfinite(r["update_norm"]) for r in records
+    )
 
 
 def test_shift_right():

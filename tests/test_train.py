@@ -126,6 +126,24 @@ def test_normuon_rejects_vectors():
         NorMuon([torch.nn.Parameter(torch.zeros(8))])
 
 
+def test_batched_normuon_matches_independent_parameters():
+    torch.manual_seed(4)
+    left = [torch.nn.Parameter(torch.randn(12, 8)) for _ in range(3)]
+    right = [torch.nn.Parameter(parameter.detach().clone()) for parameter in left]
+    gradients = [torch.randn_like(parameter) for parameter in left]
+    batched = NorMuon(left, lr=0.03, weight_decay=0.02)
+    singles = [NorMuon([parameter], lr=0.03, weight_decay=0.02) for parameter in right]
+    for parameter, gradient in zip(left, gradients, strict=True):
+        parameter.grad = gradient.clone()
+    for parameter, gradient in zip(right, gradients, strict=True):
+        parameter.grad = gradient.clone()
+    batched.step()
+    for optimizer in singles:
+        optimizer.step()
+    for actual, expected in zip(left, right, strict=True):
+        assert torch.allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+
 # -- schedule and derived randomness -------------------------------------------
 
 

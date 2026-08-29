@@ -52,8 +52,8 @@ PIPELINE = spool.Pipeline(
     phases=(
         spool.Phase(
             name="probe",
-            module="pytest",
-            argv=lambda job: ["tests", "-q"],
+            module="delta_feedback_experiment.probe",
+            argv=lambda job: [],
             log="{tag}.probe.log",
             cache=lambda job: job.commit,
         ),
@@ -83,10 +83,12 @@ STOP_PHASE = "train run"
 def tokenize_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser("df tokenize")
     parser.add_argument("--out", default="data/tokens")
-    parser.add_argument("--target", type=float, default=35e9,
-                        help="train tokens to write")
-    parser.add_argument("--val", type=float, default=30e6,
-                        help="held-out tokens from the stream head")
+    parser.add_argument(
+        "--target", type=float, default=35e9, help="train tokens to write"
+    )
+    parser.add_argument(
+        "--val", type=float, default=30e6, help="held-out tokens from the stream head"
+    )
     parser.add_argument("--config", default="sample-100BT")
     parser.add_argument("--revision", default=None)
     args = parser.parse_args(argv)
@@ -102,13 +104,9 @@ def tokenize_command(argv: list[str]) -> None:
 
 
 def probe_command(argv: list[str]) -> None:
-    import subprocess
+    from .probe import main
 
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", str(ROOT / "tests"), "-q", *argv],
-        check=False,
-    )
-    raise SystemExit(result.returncode)
+    main(argv)
 
 
 def main() -> None:

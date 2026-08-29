@@ -287,10 +287,34 @@ keys, raw values) nest inside. Divergences from the parent papers are
 recorded here when made. WSD permits extending token budgets for matched-
 compute baselines without re-warming.
 
+**Authoritative CUDA numerics and execution.** Jobe training retains FP32
+master weights and optimizer state but makes the embedding output, residual
+stream, feedback payload, and route values explicitly BF16. QKV and SwiGLU
+gate/up weights are persistent packed matrices; this also makes each packed
+matrix one NorMuon object rather than several independently orthogonalized
+objects. FlashAttention handles training, prefill, GQA, and cached decoding.
+The router evaluates its RMS-key dot product algebraically from raw values and
+inverse RMS scalars in a compiled Triton region, avoiding a normalized source
+bank. CCE supplies non-cooldown CE without materialized logits and uses its
+`high` gradient filter; the cooldown CE+z-loss head is separately compiled in
+1024-token chunks. CUDA BF16 jitter is keyed by data seed, step, and row. TF32
+is enabled for NorMuon's batched FP32 Newton-Schulz products. These are
+intentional numerical divergences from the parent implementations; paired arms
+share the same optimized recipe and keyed streams.
+
+Training captures a fixed-address forward/backward CUDA graph for every mode
+reachable under the exact schedule, after compilation and persistent optimizer
+state initialization. No compilation occurs in timed steps. The 4090 screen
+plan runs k=1 and k=2 without activation checkpointing, checkpoints the rare
+k=3 graph, and checkpoints DF-soft from k=2 onward. Larger geometries cross the
+same internal work threshold automatically. The policy is not a public
+experiment knob. The final pass does not construct an unused payload.
+
 **Memory.** No-detach multi-pass times per-sublayer sources compounds
-activation memory. Gradient checkpointing at trial scale; block deltas at
-flagship scale. If trials OOM at k=3 with checkpointing, coarsen sources
-before detaching — detaching changes the objective.
+activation memory. The automatic policy above is authoritative at trial scale;
+block deltas remain the flagship plan. If a larger run exceeds memory with
+checkpointing, coarsen sources before detaching — detaching changes the
+objective.
 
 ## Arms and comparisons
 
