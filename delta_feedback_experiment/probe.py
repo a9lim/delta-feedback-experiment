@@ -62,6 +62,9 @@ def cuda_gate() -> None:
         )
     if embedded.dtype != torch.bfloat16:
         raise AssertionError(f"CUDA residual seed is {embedded.dtype}, not bfloat16")
+    # Do not carry this uncaptured autograd edge into the blocking capture stream.
+    del embedded
+    torch.cuda.synchronize()
 
     started = time.monotonic()
     runner = CudaGraphTrainer(model, optimizers, args, schedule)
