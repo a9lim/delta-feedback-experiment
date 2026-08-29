@@ -42,7 +42,7 @@ def cuda_gate() -> None:
     cce_de, cce_dc = cce_e.grad.float().clone(), cce_c.grad.clone()
     ref_e = cce_e.detach().clone().requires_grad_()
     ref_c = cce_c.detach().clone().requires_grad_()
-    ref_logits = (ref_e @ ref_c.mT).float()
+    ref_logits = (ref_e @ ref_c.to(ref_e.dtype).mT).float()
     ref_ce = torch.nn.functional.cross_entropy(ref_logits, cce_t)
     ref_z = ref_logits.logsumexp(-1).square().mean()
     (ref_ce + 1e-2 * ref_z).backward()
