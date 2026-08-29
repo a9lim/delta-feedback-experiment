@@ -3,6 +3,37 @@
 Disposable working space, periodically cleared. Keep only notes needed for
 active work; anything durable graduates to `design.md` or `findings.md`.
 
+## 2026-08-29 — smoke-df1 landed; all three smoke gates read clean
+
+Exit 0 at 00:29, queue DONE; snapshots at 825/1000/1100 (2.2G each);
+multipass phase held 9.8G and ~4k tok/s on the checkpointed path.
+Readings against the pre-registered smoke gates:
+
+- **Contraction decays** — and dramatically. At the boundary (step 850)
+  the iterated fused map was divergent: loss0=5.585 < loss8=7.656,
+  upd8=4650. Fifty steps later loss8−loss0=0.054, upd8=6.5; by 1100
+  loss0=4.122, loss8=4.124, upd8=**0.042** — five orders of magnitude
+  down, effectively a fixed point. The standing stability gate passes
+  at smoke scale.
+- **val_fused → val**: 8.80 at the boundary, 5.17@850, 4.06@900, then a
+  smooth glide to **3.795** vs plain val **3.774** — a 0.021-nat gap,
+  closing monotonically through cooldown. Fused did not cross *below*
+  plain within the 275-step feedback phase; whether it does is a
+  screen-scale question (longer feedback phase), not a smoke failure.
+- **Pass-1 recovery**: val 3.982@850 → 3.774@1100, final **+0.002 nats
+  vs smoke-v1's 3.772** at matched tokens/steps/seed. Feedback training
+  left the plain-LM path essentially untouched (df's multipass steps do
+  cost extra compute — the matched-compute view is the screen's job).
+- Payload router ended sharpened (max 0.183 from uniform 0.042 pre-
+  boundary) with seed/null still near zero — feedback gradient reached
+  the routing, as designed.
+
+Smoke-level read, kept soft: formation conditions are all present —
+feedback trains, contracts, and doesn't tax the base LM. No advantage
+claim at this scale; that's the screen's question. Next session: read
+these against design gates in full, then screen prep on the code a9 +
+Codex optimize.
+
 ## 2026-08-28 (night) — resume fix; runs.a9l.im tracking page live
 
 Plan settled with a9: once smoke-df1 lands, a9 runs the optimization
