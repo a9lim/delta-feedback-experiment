@@ -19,6 +19,7 @@ import argparse
 import contextlib
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=2, resumable=frozenset({2}), surface_version=2
+    version=3, resumable=frozenset({3}), surface_version=3
 )
 
 EXACT_FIELDS = (
@@ -288,10 +289,10 @@ class CudaGraphTrainer:
         self.zero_grad()
         torch.cuda.empty_cache()
 
-        pool = torch.cuda.graph_pool_handle()
+        self.pool = torch.cuda.graph_pool_handle()
         for spec, state in self.states.items():
             state.active = frozenset(active_by_spec[spec])
-            self._capture(state, pool)
+            self._capture(state, self.pool)
         self.zero_grad()
         torch.cuda.synchronize()
 
@@ -454,9 +455,114 @@ class CudaGraphTrainer:
 # -- evaluation ----------------------------------------------------------------
 
 
+@dataclass
+class CapturedEval:
+    rows: torch.Tensor
+    prefix: torch.Tensor | None
+    val_sum: torch.Tensor
+    fused_sum: torch.Tensor
+    graph: torch.cuda.CUDAGraph | None = None
+
+
+class CudaEvalRunner:
+    """No-grad validation graphs sharing the trainer's private memory pool."""
+
+    def __init__(self, model: DFModel, args, pool):
+        self.model = model
+        self.args = args
+        self.device = next(model.parameters()).device
+        self.autocast = torch.autocast("cuda", dtype=torch.bfloat16)
+        remainder = args.eval_rows % args.micro_rows
+        sizes = {min(args.eval_rows, args.micro_rows)}
+        if remainder:
+            sizes.add(remainder)
+        self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
+
+    def _body(self, state: CapturedEval) -> None:
+        n_passes = 2 if self.model.cfg.feedback_active else 1
+        with self.autocast:
+            outs = multipass(
+                self.model,
+                state.rows,
+                n_passes,
+                prefix_lens=state.prefix,
+            )
+            _, losses = multipass_loss(self.model, state.rows, outs)
+        rows = state.rows.shape[0]
+        state.val_sum.add_(losses[0].detach() * rows)
+        if n_passes > 1:
+            state.fused_sum.add_(losses[1].detach() * rows)
+
+    @torch.no_grad()
+    def _capture(self, rows: int, pool) -> CapturedEval:
+        state = CapturedEval(
+            torch.zeros(
+                rows,
+                self.args.seq_len + 1,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            (
+                torch.ones((1, rows), dtype=torch.long, device=self.device)
+                if self.model.cfg.feedback_active
+                else None
+            ),
+            torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
+        )
+        was_training = self.model.training
+        self.model.eval()
+        self.model.grad_checkpoint = False
+        for _ in range(2):
+            state.val_sum.zero_()
+            state.fused_sum.zero_()
+            self._body(state)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        state.val_sum.zero_()
+        state.fused_sum.zero_()
+        with torch.cuda.graph(graph, pool=pool):
+            self._body(state)
+        state.graph = graph
+        state.val_sum.zero_()
+        state.fused_sum.zero_()
+        self.model.train(was_training)
+        return state
+
+    @torch.no_grad()
+    def run(self, data_val: TokenData) -> dict[str, float]:
+        was_training = self.model.training
+        self.model.eval()
+        total_val = torch.zeros((), dtype=torch.float32, device=self.device)
+        total_fused = torch.zeros_like(total_val)
+        for first in range(0, self.args.eval_rows, self.args.micro_rows):
+            rows = min(self.args.micro_rows, self.args.eval_rows - first)
+            state = self.states[rows]
+            state.val_sum.zero_()
+            state.fused_sum.zero_()
+            state.rows.copy_(data_val.batch(first, rows))
+            state.graph.replay()
+            total_val.add_(state.val_sum)
+            if self.model.cfg.feedback_active:
+                total_fused.add_(state.fused_sum)
+        result = {"val": (total_val / self.args.eval_rows).item()}
+        if self.model.cfg.feedback_active:
+            result["val_fused"] = (total_fused / self.args.eval_rows).item()
+        self.model.train(was_training)
+        return result
+
+
 @torch.no_grad()
-def evaluate(model: DFModel, data_val: TokenData, args, device) -> dict[str, float]:
+def evaluate(
+    model: DFModel,
+    data_val: TokenData,
+    args,
+    device,
+    graph_runner: CudaEvalRunner | None = None,
+) -> dict[str, float]:
     """Paired val losses: pass-1 always; one fused pass on feedback arms."""
+    if graph_runner is not None:
+        return graph_runner.run(data_val)
     model.eval()
     sums = {}
     counted = 0
@@ -530,6 +636,70 @@ def save_snapshot(args, model, pair, step: int, protected: set[int]) -> Path:
         if snapshot_step not in keep:
             snapshot_path.unlink()
     return path
+
+
+def _write_snapshot(
+    path: Path,
+    staged: checkpoints.StagedCheckpoint,
+    args,
+    step: int,
+    protected: set[int],
+) -> Path:
+    checkpoints.write_staged(path, staged)
+    telemetry.log("checkpoint", step=step, path=str(path), kind="snapshot")
+    existing = runs.snapshots(args.tag, args.out_dir)
+    keep = {snapshot_step for snapshot_step, _ in existing[-2:]} | protected
+    for snapshot_step, snapshot_path in existing:
+        if snapshot_step not in keep:
+            snapshot_path.unlink()
+    return path
+
+
+class AsyncSnapshotWriter:
+    """Single-flight immutable staging plus background atomic serialization."""
+
+    def __init__(self, args, model, pair, protected: set[int]):
+        self.args = args
+        self.model = model
+        self.pair = pair
+        self.protected = protected
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot")
+        self.pending: Future[Path] | None = None
+
+    def poll(self, *, wait: bool = False) -> Path | None:
+        if self.pending is None or (not wait and not self.pending.done()):
+            return None
+        result = self.pending.result()
+        self.pending = None
+        return result
+
+    def submit(self, step: int) -> Path:
+        # Snapshot intervals are long; bounding the queue at one keeps pinned
+        # host memory and write failures explicit rather than accumulating them.
+        self.poll(wait=True)
+        path = runs.snapshot_path(self.args.tag, step, self.args.out_dir)
+        staged = checkpoints.stage(CONTRACT, self.model, self.pair, self.args, step)
+        self.pending = self.executor.submit(
+            _write_snapshot,
+            path,
+            staged,
+            self.args,
+            step,
+            self.protected,
+        )
+        return path
+
+    def close(self) -> None:
+        try:
+            self.poll(wait=True)
+        finally:
+            self.executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
 
 # -- the run -------------------------------------------------------------------
@@ -671,23 +841,28 @@ def train(argv: list[str] | None = None) -> dict:
     )
     model.train()
     graph_runner = None
+    eval_graph_runner = None
     if device.type == "cuda":
         graph_runner = CudaGraphTrainer(model, optimizers, args, schedule)
+        eval_graph_runner = CudaEvalRunner(model, args, graph_runner.pool)
         torch.cuda.reset_peak_memory_stats()
         telemetry.log(
             "execution",
             flash=int(model.blocks[0].attn.qkv_proj.weight.is_cuda),
             cce=1,
-            cuda_graphs=len(graph_runner.states),
+            cuda_graphs=len(graph_runner.states) + len(eval_graph_runner.states),
+            eval_graphs=len(eval_graph_runner.states),
             checkpoint_modes=sum(spec.checkpoint for spec in graph_runner.states),
         )
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0
     summary: dict = {}
     interrupted = False
+    snapshot_writer = AsyncSnapshotWriter(args, model, pair, protected)
 
     try:
         for step in range(start_step + 1, end_step + 1):
+            snapshot_writer.poll()
             lr = apply_schedule(optimizers, schedule, step)
             phase = schedule.phase(step)[0]
             z_coef = args.zloss if phase == "cooldown" else 0.0
@@ -778,7 +953,9 @@ def train(argv: list[str] | None = None) -> dict:
 
             if step % args.eval_every == 0 or step == total:
                 address = telemetry.step_address(step, total)
-                scores = evaluate(model, data_val, args, device)
+                scores = evaluate(
+                    model, data_val, args, device, graph_runner=eval_graph_runner
+                )
                 telemetry.log(
                     "eval",
                     step=address,
@@ -804,21 +981,28 @@ def train(argv: list[str] | None = None) -> dict:
                     )
 
             if step % args.snapshot_every == 0 or step in protected:
-                save_snapshot(args, model, pair, step, protected)
+                snapshot_writer.submit(step)
             summary["step"] = step
             summary["loss"] = step_loss
     except KeyboardInterrupt:
         interrupted = True
         step = summary.get("step", start_step)
         if step > start_step:
-            save_snapshot(args, model, pair, step, protected)
+            snapshot_writer.submit(step)
         telemetry.log("interrupt", step=telemetry.step_address(step, total))
+    except BaseException:
+        snapshot_writer.close()
+        raise
+
+    if not interrupted:
+        last = summary.get("step", start_step)
+        if last < total and last > start_step and last % args.snapshot_every:
+            snapshot_writer.submit(last)
+    snapshot_writer.close()
 
     if not interrupted:
         last = summary.get("step", start_step)
         if last < total:
-            if last > start_step and last % args.snapshot_every:
-                save_snapshot(args, model, pair, last, protected)
             telemetry.log("yield", step=telemetry.step_address(last, total))
         else:
             telemetry.log(
