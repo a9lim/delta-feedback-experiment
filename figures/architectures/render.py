@@ -361,29 +361,20 @@ def simple_payload(svg: list[str]) -> None:
     svg.append(box(1460, 757, 195, 76, ["Carry to", "step t+1"], kind="orange-node"))
 
 
-def routed_payload(svg: list[str], *, soft: bool) -> None:
-    source = (
-        ["From Sℓ", "[null, Δa₀, Δm₀, …]"]
-        if soft
-        else ["From Sℓ", "[Δa₀, Δm₀, …]"]
-    )
-    source_kind = "gray-node" if soft else "purple-node"
-    source_edge = "gray" if soft else "purple"
-    svg.append(box(535, 757, 250, 76, source, kind=source_kind, css="formula"))
-    svg.append(line(785, 795, 827, 795, kind=source_edge))
+def routed_payload(svg: list[str]) -> None:
     svg.append(
         box(
-            830,
+            650,
             757,
-            180,
+            260,
             76,
             ["Payload route", "qₚ"],
             kind="purple-node",
             css="formula",
         )
     )
-    svg.append(line(1010, 795, 1288, 795, kind="purple"))
-    svg.append(text(1145, 773, "routed deltas", css="small"))
+    svg.append(line(910, 795, 1288, 795, kind="purple"))
+    svg.append(text(1100, 773, "routed payload view of Sℓ", css="small"))
     svg.append(circle(1310, 795))
     svg.append(path([(1310, 562), (1310, 774)], kind="blue"))
     svg.append(text(1328, 708, "base hₜᵗᵒᵖ", css="small", anchor="start"))
@@ -463,12 +454,16 @@ def df() -> str:
     stack(
         svg,
         routed=True,
-        source_label=["Sources Sℓ", "[uₜ  |  Δa₀, Δm₀, …]", "fused seed + prior deltas"],
+        source_label=[
+            "Sources Sℓ",
+            "[uₜ  |  Δa₀, Δm₀, …]",
+            "depth: all  ·  payload: drop uₜ",
+        ],
     )
     svg.append(path([(480, 515), (480, 315), (568, 315)], kind="purple"))
     svg.append(text(520, 294, "seed uₜ", css="small"))
     common_head(svg)
-    routed_payload(svg, soft=False)
+    routed_payload(svg)
     return finish_svg(svg, "Hard-everywhere: neither the routed reads nor the recurrent payload has a null escape.")
 
 
@@ -487,14 +482,14 @@ def df_soft() -> str:
         source_label=[
             "Sources Sℓ",
             "[null  |  pₜ₋₁  |  eₜ  |  Δa₀, Δm₀, …]",
-            "pₜ₋₁ masked when absent",
+            "depth: all  ·  payload: drop pₜ₋₁ and eₜ",
         ],
     )
     svg.append(path([(235, 299), (500, 299), (500, 295), (568, 295)], kind="orange"))
     svg.append(path([(310, 469), (310, 335), (568, 335)], kind="purple"))
     svg.append(text(315, 590, "plain entry  ·  h₀ = eₜ  ·  no GLU", css="small"))
     common_head(svg)
-    routed_payload(svg, soft=True)
+    routed_payload(svg)
     return finish_svg(svg, "Gray = null escape. Choosing null at every router recovers the vanilla path; pₜ₋₁ is never fused into h₀.")
 
 

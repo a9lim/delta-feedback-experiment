@@ -59,7 +59,7 @@
 <circle class="sum" cx="1106" cy="515" r="19"/><text class="sum-label" x="1106" y="521.0" text-anchor="middle"><tspan x="1106" y="521.0">+</tspan></text>
 <line class="edge blue" x1="1125" y1="515" x2="1180" y2="515" marker-end="url(#arrow-blue)"/>
 <text class="formula" x="1150" y="488.0" text-anchor="middle"><tspan x="1150" y="488.0">hℓ₊₁</tspan></text>
-<rect class="node purple-node" x="570" y="275" width="540" height="80" rx="16"/><text class="formula" x="840.0" y="294.0" text-anchor="middle"><tspan x="840.0" y="294.0">Sources Sℓ</tspan><tspan x="840.0" y="316.0">[uₜ  |  Δa₀, Δm₀, …]</tspan><tspan x="840.0" y="338.0">fused seed + prior deltas</tspan></text>
+<rect class="node purple-node" x="570" y="275" width="540" height="80" rx="16"/><text class="formula" x="840.0" y="294.0" text-anchor="middle"><tspan x="840.0" y="294.0">Sources Sℓ</tspan><tspan x="840.0" y="316.0">[uₜ  |  Δa₀, Δm₀, …]</tspan><tspan x="840.0" y="338.0">depth: all  ·  payload: drop uₜ</tspan></text>
 <rect class="node purple-node" x="620" y="380" width="160" height="66" rx="16"/><text class="formula" x="700.0" y="403.0" text-anchor="middle"><tspan x="700.0" y="403.0">rᵃℓ = route</tspan><tspan x="700.0" y="425.0">(Sℓ, qᵃℓ)</tspan></text>
 <rect class="node purple-node" x="890" y="380" width="160" height="66" rx="16"/><text class="formula" x="970.0" y="403.0" text-anchor="middle"><tspan x="970.0" y="403.0">rᵐℓ = route</tspan><tspan x="970.0" y="425.0">(Sℓ, qᵐℓ)</tspan></text>
 <line class="edge purple" x1="700" y1="355" x2="700" y2="378" marker-end="url(#arrow-purple)"/>
@@ -73,11 +73,9 @@
 <line class="edge blue" x1="1180" y1="515" x2="1213" y2="515" marker-end="url(#arrow-blue)"/>
 <rect class="node green-node" x="1460" y="453" width="195" height="124" rx="16"/><text class="label" x="1557.5" y="494.0" text-anchor="middle"><tspan x="1557.5" y="494.0">Final RMSNorm</tspan><tspan x="1557.5" y="516.0">+ tied LM head</tspan><tspan x="1557.5" y="538.0">→ logitsₜ</tspan></text>
 <line class="edge blue" x1="1405" y1="515" x2="1458" y2="515" marker-end="url(#arrow-blue)"/>
-<rect class="node purple-node" x="535" y="757" width="250" height="76" rx="16"/><text class="formula" x="660.0" y="785.0" text-anchor="middle"><tspan x="660.0" y="785.0">From Sℓ</tspan><tspan x="660.0" y="807.0">[Δa₀, Δm₀, …]</tspan></text>
-<line class="edge purple" x1="785" y1="795" x2="827" y2="795" marker-end="url(#arrow-purple)"/>
-<rect class="node purple-node" x="830" y="757" width="180" height="76" rx="16"/><text class="formula" x="920.0" y="785.0" text-anchor="middle"><tspan x="920.0" y="785.0">Payload route</tspan><tspan x="920.0" y="807.0">qₚ</tspan></text>
-<line class="edge purple" x1="1010" y1="795" x2="1288" y2="795" marker-end="url(#arrow-purple)"/>
-<text class="small" x="1145" y="773.0" text-anchor="middle"><tspan x="1145" y="773.0">routed deltas</tspan></text>
+<rect class="node purple-node" x="650" y="757" width="260" height="76" rx="16"/><text class="formula" x="780.0" y="785.0" text-anchor="middle"><tspan x="780.0" y="785.0">Payload route</tspan><tspan x="780.0" y="807.0">qₚ</tspan></text>
+<line class="edge purple" x1="910" y1="795" x2="1288" y2="795" marker-end="url(#arrow-purple)"/>
+<text class="small" x="1100" y="773.0" text-anchor="middle"><tspan x="1100" y="773.0">routed payload view of Sℓ</tspan></text>
 <circle class="sum" cx="1310" cy="795" r="19"/><text class="sum-label" x="1310" y="801.0" text-anchor="middle"><tspan x="1310" y="801.0">+</tspan></text>
 <path class="edge blue" d="M 1310 562 L 1310 774" marker-end="url(#arrow-blue)"/>
 <text class="small" x="1328" y="708.0" text-anchor="start"><tspan x="1328" y="708.0">base hₜᵗᵒᵖ</tspan></text>
