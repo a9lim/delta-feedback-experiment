@@ -297,10 +297,37 @@ def _route_algebra(
     return routed, weights
 
 
-_compiled_route_algebra = torch.compile(
-    _route_algebra,
+def _route_sources(
+    query: Tensor,
+    key_weight: Tensor,
+    eps: float,
+    present: Tensor | None,
+    *sources: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Static pointer-list router: never copies sources into a value bank."""
+    projected = (query.float() * key_weight.float()).to(sources[0].dtype)
+    logits = torch.stack(
+        [
+            (source * projected).float().sum(dim=-1)
+            * torch.rsqrt(source.float().square().mean(dim=-1) + eps)
+            for source in sources
+        ]
+    )
+    if present is not None:
+        logits = logits.masked_fill(~present, float("-inf"))
+    weights = logits.softmax(dim=0)
+    routed = weights[0].to(sources[0].dtype).unsqueeze(-1) * sources[0]
+    for index in range(1, len(sources)):
+        routed = routed + (
+            weights[index].to(sources[index].dtype).unsqueeze(-1) * sources[index]
+        )
+    return routed, weights
+
+
+_compiled_route_sources = torch.compile(
+    _route_sources,
     fullgraph=True,
-    dynamic=True,
+    dynamic=False,
     mode="max-autotune-no-cudagraphs",
 )
 
@@ -333,21 +360,32 @@ class Router(nn.Module):
             masks = [None] + masks
         if len(sources) < 2:
             return None, None
-        values = torch.stack(sources)  # [N, B, T, D]
         present = None
         if any(mask is not None for mask in masks):
             present = torch.stack(
                 [
                     mask
                     if mask is not None
-                    else torch.ones_like(values[0, ..., 0], dtype=torch.bool)
+                    else torch.ones_like(sources[0][..., 0], dtype=torch.bool)
                     for mask in masks
                 ]
             )
-        route = _compiled_route_algebra if values.is_cuda else _route_algebra
-        routed, weights = route(
-            values, self.query, self.key_norm.weight, self.key_norm.eps, present
-        )
+        if sources[0].is_cuda:
+            routed, weights = _compiled_route_sources(
+                self.query,
+                self.key_norm.weight,
+                self.key_norm.eps,
+                present,
+                *sources,
+            )
+        else:
+            routed, weights = _route_algebra(
+                torch.stack(sources),
+                self.query,
+                self.key_norm.weight,
+                self.key_norm.eps,
+                present,
+            )
         return routed, (weights.detach() if want_weights else None)
 
 
