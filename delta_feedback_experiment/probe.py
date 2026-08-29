@@ -235,7 +235,8 @@ def cuda_gate() -> None:
     eval_scores = eval_runner.run(probe_validation)
     if any(not math.isfinite(value) for value in eval_scores.values()):
         raise AssertionError(f"nonfinite captured evaluation: {eval_scores}")
-    eager_scores = evaluate(model, probe_validation, args, torch.device("cuda"))
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        eager_scores = evaluate(model, probe_validation, args, torch.device("cuda"))
     for key, value in eval_scores.items():
         if not math.isclose(value, eager_scores[key], rel_tol=2e-3, abs_tol=2e-3):
             raise AssertionError(
