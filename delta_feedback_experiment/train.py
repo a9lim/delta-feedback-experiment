@@ -630,18 +630,6 @@ def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dic
 # -- checkpointing -------------------------------------------------------------
 
 
-def save_snapshot(args, model, pair, step: int, protected: set[int]) -> Path:
-    path = runs.snapshot_path(args.tag, step, args.out_dir)
-    checkpoints.save(path, CONTRACT, model, pair, args, step)
-    telemetry.log("checkpoint", step=step, path=str(path), kind="snapshot")
-    existing = runs.snapshots(args.tag, args.out_dir)
-    keep = {s for s, _ in existing[-2:]} | protected
-    for snapshot_step, snapshot_path in existing:
-        if snapshot_step not in keep:
-            snapshot_path.unlink()
-    return path
-
-
 def _write_snapshot(
     path: Path,
     staged: checkpoints.StagedCheckpoint,

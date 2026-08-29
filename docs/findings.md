@@ -22,6 +22,13 @@ on the retained raw candidate. At 73 microbatches per 292-row step, the default
 before optimizer, evaluation, diagnostic, and snapshot overhead. This is
 systems evidence only, not evidence for the DF hypothesis.
 
+A real 292-row k=1 training step through the retained loop completed in 4.8 s
+at 62,388 tok/s, including the optimizer update (graph preparation excluded).
+The loop then staged and background-wrote a 2.26 GB contract-v3 checkpoint;
+the atomic file reloaded on CPU with all 153 model tensors, optimizer-pair
+state, settings, and RNG streams present. The temporary gate snapshot was
+removed after verification.
+
 The live CUDA gate also passed every arm at screen geometry. BF16/TF32, CCE's
 gradient filter and fused exact z-loss backward, the bespoke router's FP32
 reduction order, packed NorMuon matrices, whole-block compilation, and
