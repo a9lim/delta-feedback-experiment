@@ -447,7 +447,6 @@ if triton is not None:
         projected,
         grad_routed,
         weights,
-        logits,
         inv_rms,
         beta,
         grad_projected,
@@ -534,7 +533,10 @@ if triton is not None:
             weight = tl.load(weights + index * bt + token)
             route_beta = tl.load(beta + index * bt + token)
             inverse = tl.load(inv_rms + index * bt + token)
-            score = tl.load(logits + index * bt + token)
+            # ``logits`` carries -inf for absent sources into softmax. Rebuild
+            # the finite pre-mask score here so beta=0 produces an exact zero
+            # gradient rather than the indeterminate 0 * inf.
+            score = tl.sum(value * p, axis=0) * inverse
             source_grad = weight * upstream + route_beta * (
                 p * inverse - score * inverse * inverse * value / dim
             )
@@ -608,14 +610,14 @@ class _BespokeRoute(torch.autograd.Function):
             block_d=mix_block,
             num_warps=4,
         )
-        ctx.save_for_backward(projected, weights, logits, inv_rms, *sources)
+        ctx.save_for_backward(projected, weights, inv_rms, *sources)
         ctx.null_first = null_first
         ctx.shape = (bt, dim)
         return routed, weights.view(n_sources, batch, length)
 
     @staticmethod
     def backward(ctx, grad_routed: Tensor, _grad_weights: Tensor | None):
-        projected, weights, logits, inv_rms, *sources = ctx.saved_tensors
+        projected, weights, inv_rms, *sources = ctx.saved_tensors
         bt, dim = ctx.shape
         n_sources = len(sources)
         padded = _padded_sources(tuple(sources))
@@ -651,7 +653,6 @@ class _BespokeRoute(torch.autograd.Function):
             projected,
             grad_routed,
             weights,
-            logits,
             inv_rms,
             beta,
             grad_projected_tokens,

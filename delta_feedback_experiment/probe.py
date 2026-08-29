@@ -73,9 +73,18 @@ def cuda_gate() -> None:
         ref_key.grad,
         *(source.grad for source in ref_sources),
     )
-    if not torch.allclose(routed, ref_routed, rtol=3e-2, atol=3e-3):
+    # The fused kernel accumulates the value mix in FP32 instead of reproducing
+    # the reference's source-by-source BF16 rounding. Bound that intentional
+    # numerical change by both relative norm and a loose elementwise ceiling.
+    route_rel = torch.linalg.vector_norm(
+        (routed - ref_routed).float()
+    ) / torch.linalg.vector_norm(ref_routed.float())
+    weight_rel = torch.linalg.vector_norm(
+        route_weights - ref_weights
+    ) / torch.linalg.vector_norm(ref_weights)
+    if route_rel >= 0.01 or (routed - ref_routed).abs().max() >= 0.03:
         raise AssertionError("bespoke router value drift")
-    if not torch.allclose(route_weights, ref_weights, rtol=3e-2, atol=3e-3):
+    if weight_rel >= 0.01 or (route_weights - ref_weights).abs().max() >= 0.015:
         raise AssertionError("bespoke router weight drift")
     for actual, expected in zip(route_grads, ref_grads, strict=True):
         if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
