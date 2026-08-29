@@ -618,6 +618,9 @@ class _BespokeRoute(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_routed: Tensor, _grad_weights: Tensor | None):
         projected, weights, inv_rms, *sources = ctx.saved_tensors
+        # Addition and reduction consumers may return a strided view. Triton
+        # receives raw pointers, so normalize the upstream layout explicitly.
+        grad_routed = grad_routed.contiguous()
         bt, dim = ctx.shape
         n_sources = len(sources)
         padded = _padded_sources(tuple(sources))
