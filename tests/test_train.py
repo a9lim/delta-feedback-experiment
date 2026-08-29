@@ -49,8 +49,6 @@ TINY_ARGS = [
     "0.25",
     "--feedback-start",
     "0.5",
-    "--log-every",
-    "4",
     "--eval-every",
     "4",
     "--snapshot-every",
@@ -159,6 +157,11 @@ def test_build_schedule_screen_shape():
     assert schedule.rate_at(6700, 1.0) < 1e-6
 
 
+def test_log_every_flag_is_removed():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", "--log-every", "2"])
+
+
 def test_mix_is_stable():
     assert mix(0, 5, 1) == mix(0, 5, 1)
     assert mix(0, 5, 1) != mix(0, 5, 2)
@@ -195,7 +198,7 @@ def run(tmp_path, tag, extra):
 
 
 @pytest.mark.parametrize("arm", ["vanilla", "dar", "fbt", "df", "df_soft"])
-def test_tiny_run_completes(tmp_path, arm):
+def test_tiny_run_completes(tmp_path, capsys, arm):
     summary = run(tmp_path, f"t-{arm}", ["--arm", arm])
     assert summary["step"] == 8
     assert np.isfinite(summary["loss"])
@@ -204,6 +207,10 @@ def test_tiny_run_completes(tmp_path, arm):
         assert np.isfinite(summary["val_fused"])
     snapshots = list((tmp_path / "runs").glob(f"t-{arm}.pt.*"))
     assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {6, 8}
+    step_records = [
+        line for line in capsys.readouterr().out.splitlines() if line.startswith("step ")
+    ]
+    assert len(step_records) == 8
 
 
 def test_resume_is_exact(tmp_path, capsys):

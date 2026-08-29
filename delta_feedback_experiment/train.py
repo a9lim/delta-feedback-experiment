@@ -66,7 +66,6 @@ RUNTIME_FIELDS = (
     "data_dir",
     "out_dir",
     "device",
-    "log_every",
     "eval_every",
     "snapshot_every",
     "eval_rows",
@@ -144,7 +143,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="cap this invocation's additional steps; never rescales the schedule",
     )
     runtime.add_argument("--device", default=None)
-    runtime.add_argument("--log-every", type=int, default=10)
     runtime.add_argument("--eval-every", type=int, default=100)
     runtime.add_argument("--snapshot-every", type=int, default=500)
     runtime.add_argument("--eval-rows", type=int, default=32)
@@ -905,12 +903,9 @@ def train(argv: list[str] | None = None) -> dict:
                     step_loss += loss.item() / micros
                     pass1_loss += losses[0].item() / micros
 
-            logging = step % args.log_every == 0 or step == total
-            grad_norm = None
-            if logging:
-                gradients = [p.grad for p in model.parameters() if p.grad is not None]
-                norms = torch._foreach_norm(gradients)
-                grad_norm = torch.stack(norms).norm().item()
+            gradients = [p.grad for p in model.parameters() if p.grad is not None]
+            norms = torch._foreach_norm(gradients)
+            grad_norm = torch.stack(norms).norm().item()
             for optimizer in optimizers:
                 optimizer.step()
             if graph_runner is not None:
@@ -920,28 +915,27 @@ def train(argv: list[str] | None = None) -> dict:
             window_tokens += args.batch_rows * args.seq_len
             window_pass_tokens += n_passes * args.batch_rows * args.seq_len
 
-            if logging:
-                elapsed = time.monotonic() - window_start
-                fields = {
-                    "step": telemetry.step_address(step, total),
-                    "phase": phase,
-                    "loss": telemetry.format_metric(step_loss),
-                    "pass1": telemetry.format_metric(pass1_loss),
-                    "k": n_passes,
-                    "lr": telemetry.format_metric(lr),
-                    "gnorm": telemetry.format_metric(grad_norm),
-                    "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
-                    "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),
-                    "elapsed": f"{time.monotonic() - process_start:.1f}",
-                }
-                if device.type == "cuda":
-                    fields["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
-                telemetry.log("step", **fields)
-                window_start, window_tokens, window_pass_tokens = (
-                    time.monotonic(),
-                    0,
-                    0,
-                )
+            elapsed = time.monotonic() - window_start
+            fields = {
+                "step": telemetry.step_address(step, total),
+                "phase": phase,
+                "loss": telemetry.format_metric(step_loss),
+                "pass1": telemetry.format_metric(pass1_loss),
+                "k": n_passes,
+                "lr": telemetry.format_metric(lr),
+                "gnorm": telemetry.format_metric(grad_norm),
+                "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
+                "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),
+                "elapsed": f"{time.monotonic() - process_start:.1f}",
+            }
+            if device.type == "cuda":
+                fields["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
+            telemetry.log("step", **fields)
+            window_start, window_tokens, window_pass_tokens = (
+                time.monotonic(),
+                0,
+                0,
+            )
 
             if step % args.eval_every == 0 or step == total:
                 address = telemetry.step_address(step, total)
