@@ -466,6 +466,14 @@ def _block_for_checkpoint(block, h, cos, sin, p_mask, *sources):
     return h, a, m
 
 
+_compiled_block = torch.compile(
+    _block_for_checkpoint,
+    fullgraph=True,
+    dynamic=True,
+    mode="max-autotune-no-cudagraphs",
+)
+
+
 # -- the model -----------------------------------------------------------------
 
 
@@ -587,7 +595,7 @@ class DFModel(nn.Module):
             passed = tuple(sources) if sources is not None else ()
             if checkpointing:
                 h, a, m = torch.utils.checkpoint.checkpoint(
-                    _block_for_checkpoint,
+                    _compiled_block if h.is_cuda else _block_for_checkpoint,
                     block,
                     h,
                     cos,
@@ -597,6 +605,8 @@ class DFModel(nn.Module):
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
+            elif h.is_cuda and cache is None and not want_weights:
+                h, a, m = _compiled_block(block, h, cos, sin, p_mask, *passed)
             else:
                 h, a, m, w_attn, w_mlp = block(
                     h, cos, sin, cache, p_mask, want_weights, *passed
