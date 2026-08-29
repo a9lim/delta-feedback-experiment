@@ -83,8 +83,9 @@ contract changes.
   the Triton MHDAR router, compiled blocks, CUDA graphs, and asynchronous atomic
   snapshots. Respect Jobe's pinned Torch/FlashAttention environment.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.
-  Queue entries are commit-addressed; do not disturb an active run to update
-  documentation or code.
+  The queue records exact arguments without inspecting Git state. Source
+  changes never stop an active child; the worker refreshes before the next job
+  and runs that job's probe from the current checkout.
 - The screen and same-geometry continuation surfaces are implemented. The
   2B→8B→32B WSD ladder still requires an explicit tested branch-from-heat-end
   continuation path. The 24-layer flagship additionally requires a defined

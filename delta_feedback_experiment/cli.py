@@ -4,7 +4,7 @@ Model-lazy: subcommands import what they need, so ``df --help`` costs
 nothing and the spool worker drives phases as separate processes.
 Durable orchestration (queue, worker, status/watch/stop/clear) is the
 shared ``transformer_experiments.spool``; this module owns only the
-pipeline: a commit-cached offline probe, then the training run.
+pipeline: an offline probe, then the training run.
 """
 
 from __future__ import annotations
@@ -55,7 +55,6 @@ PIPELINE = spool.Pipeline(
             module="delta_feedback_experiment.probe",
             argv=lambda job: [],
             log="{tag}.probe.log",
-            cache=lambda job: job.commit,
         ),
         spool.Phase(
             name="train run",

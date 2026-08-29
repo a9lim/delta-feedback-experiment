@@ -67,6 +67,11 @@ df stop TAG|live|all [--at STEP]
 df clear TAG|all
 ```
 
+The queue records exact arguments but does not freeze or inspect Git state.
+Changing the checkout never stops an active child; the worker refreshes before
+starting the next queued job, and every job runs its probe on the then-current
+source.
+
 The default screen run is 6,700 steps, 292 rows per step, and sequence length
 1,024: 2.003B predicted training tokens. Feedback arms use one pass through
 step 5,025, then draw two or three passes during cooldown. Every step is

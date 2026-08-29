@@ -395,8 +395,10 @@ explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
 and evaluation-row count may change per invocation.
 
 The run retains the latest two snapshots plus the protected end-of-heat and
-end-of-run snapshots. `df queue` runs the commit-cached probe before training;
-queue entries and logs are commit-addressed through the shared spool.
+end-of-run snapshots. `df queue` records exact arguments and runs the probe
+before every training job. Git state is not part of the queue schema: source
+changes do not stop an active child, and the worker refreshes before the next
+queued job so it uses the current checkout.
 
 ## Evaluation
 
