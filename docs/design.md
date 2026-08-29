@@ -88,16 +88,16 @@ tok = sample(lm_head(rmsnorm(h)))
 #                  │ {   ↑        ↓   ↑       ↓  }       │
 # <embedding>──────┴→{───┴──────→[+]──┴─────→[+]→}───────┴→[LM head]→<logits>
 e = embed(tok)
-srcs = [null, p, e]  # optional sources + input seed + deltas
+srcs = [p, e]  # optional inputs + input seed + deltas
 h = e
 for l in layers:
-    a = attn(rmsnorm(h + route(srcs, q_attn[l])))  # routed read
+    a = attn(rmsnorm(h + route([null] + srcs, q_attn[l])))  # routed read
     h = h + a
     srcs.append(a)
-    m = mlp(rmsnorm(h + route(srcs, q_mlp[l])))  # routed read
+    m = mlp(rmsnorm(h + route([null] + srcs, q_mlp[l])))  # routed read
     h = h + m
     srcs.append(m)
-p = rmsnorm(h + route(srcs[2:], q_p))  # additive payload over deltas
+p = rmsnorm(h + route([null] + srcs[2:], q_p))  # optional delta enrichment
 tok = sample(lm_head(rmsnorm(h)))
 
 # MHDAR
