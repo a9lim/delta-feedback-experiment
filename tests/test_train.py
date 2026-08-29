@@ -258,7 +258,8 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     args = build_parser().parse_args(["x"])
     with torch.device("meta"):
         model = DFModel(arm_config("df"))
-    assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
+    assert not automatic_checkpoint(model, 2, args, torch.device("cuda"))
+    assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
     args.micro_rows = 8
     assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
     with pytest.raises(SystemExit):

@@ -209,7 +209,10 @@ def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
     cfg = model.cfg
     screen_work = 4 * 1025 * 768 * 12 * 3
     work = args.micro_rows * (args.seq_len + 1) * cfg.dim * cfg.layers * n_passes
-    return work > screen_work
+    # k=3 itself fits eagerly, but a fixed graph retains its private pool next
+    # to persistent Adam/NorMuon state.  Checkpointing this rare 3% mode keeps
+    # the common k=1/k=2 graphs raw and leaves optimizer workspace headroom.
+    return work >= screen_work
 
 
 @dataclass(frozen=True)
