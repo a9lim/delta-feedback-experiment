@@ -24,6 +24,92 @@ MAX_ROUTE_SOURCES = 27
 if triton is not None:
 
     @triton.jit
+    def _route_pointer(
+        index: tl.constexpr,
+        s0,
+        s1,
+        s2,
+        s3,
+        s4,
+        s5,
+        s6,
+        s7,
+        s8,
+        s9,
+        s10,
+        s11,
+        s12,
+        s13,
+        s14,
+        s15,
+        s16,
+        s17,
+        s18,
+        s19,
+        s20,
+        s21,
+        s22,
+        s23,
+        s24,
+        s25,
+        s26,
+    ):
+        """Select one pointer without materializing a source-value bank."""
+        if index == 0:
+            return s0
+        if index == 1:
+            return s1
+        if index == 2:
+            return s2
+        if index == 3:
+            return s3
+        if index == 4:
+            return s4
+        if index == 5:
+            return s5
+        if index == 6:
+            return s6
+        if index == 7:
+            return s7
+        if index == 8:
+            return s8
+        if index == 9:
+            return s9
+        if index == 10:
+            return s10
+        if index == 11:
+            return s11
+        if index == 12:
+            return s12
+        if index == 13:
+            return s13
+        if index == 14:
+            return s14
+        if index == 15:
+            return s15
+        if index == 16:
+            return s16
+        if index == 17:
+            return s17
+        if index == 18:
+            return s18
+        if index == 19:
+            return s19
+        if index == 20:
+            return s20
+        if index == 21:
+            return s21
+        if index == 22:
+            return s22
+        if index == 23:
+            return s23
+        if index == 24:
+            return s24
+        if index == 25:
+            return s25
+        return s26
+
+    @triton.jit
     def _route_logits_kernel(
         s0,
         s1,
@@ -68,38 +154,39 @@ if triton is not None:
         offsets = tl.arange(0, block_d)
         mask = offsets < dim
         p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
-        sources = (
-            s0,
-            s1,
-            s2,
-            s3,
-            s4,
-            s5,
-            s6,
-            s7,
-            s8,
-            s9,
-            s10,
-            s11,
-            s12,
-            s13,
-            s14,
-            s15,
-            s16,
-            s17,
-            s18,
-            s19,
-            s20,
-            s21,
-            s22,
-            s23,
-            s24,
-            s25,
-            s26,
-        )
         for index in range(n_sources):
+            source = _route_pointer(
+                index,
+                s0,
+                s1,
+                s2,
+                s3,
+                s4,
+                s5,
+                s6,
+                s7,
+                s8,
+                s9,
+                s10,
+                s11,
+                s12,
+                s13,
+                s14,
+                s15,
+                s16,
+                s17,
+                s18,
+                s19,
+                s20,
+                s21,
+                s22,
+                s23,
+                s24,
+                s25,
+                s26,
+            )
             base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(sources[index] + base + offsets, mask=mask, other=0.0).to(
+            value = tl.load(source + base + offsets, mask=mask, other=0.0).to(
                 tl.float32
             )
             inverse = tl.rsqrt(tl.sum(value * value, axis=0) / dim + eps)
@@ -169,38 +256,39 @@ if triton is not None:
         offsets = block * block_d + tl.arange(0, block_d)
         mask = offsets < dim
         total = tl.zeros((block_d,), tl.float32)
-        sources = (
-            s0,
-            s1,
-            s2,
-            s3,
-            s4,
-            s5,
-            s6,
-            s7,
-            s8,
-            s9,
-            s10,
-            s11,
-            s12,
-            s13,
-            s14,
-            s15,
-            s16,
-            s17,
-            s18,
-            s19,
-            s20,
-            s21,
-            s22,
-            s23,
-            s24,
-            s25,
-            s26,
-        )
         for index in range(n_sources):
+            source = _route_pointer(
+                index,
+                s0,
+                s1,
+                s2,
+                s3,
+                s4,
+                s5,
+                s6,
+                s7,
+                s8,
+                s9,
+                s10,
+                s11,
+                s12,
+                s13,
+                s14,
+                s15,
+                s16,
+                s17,
+                s18,
+                s19,
+                s20,
+                s21,
+                s22,
+                s23,
+                s24,
+                s25,
+                s26,
+            )
             base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(sources[index] + base + offsets, mask=mask, other=0.0)
+            value = tl.load(source + base + offsets, mask=mask, other=0.0)
             weight = tl.load(weights + index * bt + token)
             total += value * weight
         tl.store(routed + token * dim + offsets, total, mask=mask)
@@ -253,40 +341,41 @@ if triton is not None:
         n_offsets = tl.arange(0, block_n)
         n_mask = n_offsets < n_sources
         products = tl.zeros((block_n,), tl.float32)
-        sources = (
-            s0,
-            s1,
-            s2,
-            s3,
-            s4,
-            s5,
-            s6,
-            s7,
-            s8,
-            s9,
-            s10,
-            s11,
-            s12,
-            s13,
-            s14,
-            s15,
-            s16,
-            s17,
-            s18,
-            s19,
-            s20,
-            s21,
-            s22,
-            s23,
-            s24,
-            s25,
-            s26,
-        )
         for index in range(n_sources):
+            source = _route_pointer(
+                index,
+                s0,
+                s1,
+                s2,
+                s3,
+                s4,
+                s5,
+                s6,
+                s7,
+                s8,
+                s9,
+                s10,
+                s11,
+                s12,
+                s13,
+                s14,
+                s15,
+                s16,
+                s17,
+                s18,
+                s19,
+                s20,
+                s21,
+                s22,
+                s23,
+                s24,
+                s25,
+                s26,
+            )
             base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(
-                sources[index] + base + d_offsets, mask=d_mask, other=0.0
-            ).to(tl.float32)
+            value = tl.load(source + base + d_offsets, mask=d_mask, other=0.0).to(
+                tl.float32
+            )
             dot = tl.sum(grad * value, axis=0)
             products = tl.where(n_offsets == index, dot, products)
         route_weights = tl.load(
@@ -377,69 +466,71 @@ if triton is not None:
             grad_routed + token * dim + offsets, mask=mask, other=0.0
         ).to(tl.float32)
         grad_p = tl.zeros((block_d,), tl.float32)
-        sources = (
-            s0,
-            s1,
-            s2,
-            s3,
-            s4,
-            s5,
-            s6,
-            s7,
-            s8,
-            s9,
-            s10,
-            s11,
-            s12,
-            s13,
-            s14,
-            s15,
-            s16,
-            s17,
-            s18,
-            s19,
-            s20,
-            s21,
-            s22,
-            s23,
-            s24,
-            s25,
-            s26,
-        )
-        gradients = (
-            g0,
-            g1,
-            g2,
-            g3,
-            g4,
-            g5,
-            g6,
-            g7,
-            g8,
-            g9,
-            g10,
-            g11,
-            g12,
-            g13,
-            g14,
-            g15,
-            g16,
-            g17,
-            g18,
-            g19,
-            g20,
-            g21,
-            g22,
-            g23,
-            g24,
-            g25,
-            g26,
-        )
         for index in range(n_sources):
+            source = _route_pointer(
+                index,
+                s0,
+                s1,
+                s2,
+                s3,
+                s4,
+                s5,
+                s6,
+                s7,
+                s8,
+                s9,
+                s10,
+                s11,
+                s12,
+                s13,
+                s14,
+                s15,
+                s16,
+                s17,
+                s18,
+                s19,
+                s20,
+                s21,
+                s22,
+                s23,
+                s24,
+                s25,
+                s26,
+            )
+            grad_source = _route_pointer(
+                index,
+                g0,
+                g1,
+                g2,
+                g3,
+                g4,
+                g5,
+                g6,
+                g7,
+                g8,
+                g9,
+                g10,
+                g11,
+                g12,
+                g13,
+                g14,
+                g15,
+                g16,
+                g17,
+                g18,
+                g19,
+                g20,
+                g21,
+                g22,
+                g23,
+                g24,
+                g25,
+                g26,
+            )
             source_base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(
-                sources[index] + source_base + offsets, mask=mask, other=0.0
-            ).to(tl.float32)
+            value = tl.load(source + source_base + offsets, mask=mask, other=0.0).to(
+                tl.float32
+            )
             weight = tl.load(weights + index * bt + token)
             route_beta = tl.load(beta + index * bt + token)
             inverse = tl.load(inv_rms + index * bt + token)
@@ -447,7 +538,7 @@ if triton is not None:
             source_grad = weight * upstream + route_beta * (
                 p * inverse - score * inverse * inverse * value / dim
             )
-            tl.store(gradients[index] + token * dim + offsets, source_grad, mask=mask)
+            tl.store(grad_source + token * dim + offsets, source_grad, mask=mask)
             grad_p += route_beta * value * inverse
         tl.store(grad_projected + token * dim + offsets, grad_p, mask=mask)
 
