@@ -66,7 +66,9 @@ The trunk is a bias-free pre-norm decoder with packed QKV projection, grouped
 query attention, per-head Q/K RMSNorm, rotary positions, packed SwiGLU
 gate/up projection, tied embedding/unembedding, and a final RMSNorm. Each
 attention and MLP branch output is scaled by `1/sqrt(2L)` before it is added to
-the residual stream. There is no dropout.
+the residual stream. Screen and token-ladder GQA is ungated: its concatenated
+attention output passes directly through the output projection, with no
+data-dependent output gate. There is no dropout.
 
 Embedding weights and optimizer state remain FP32. Under CUDA autocast, the
 embedding output, residual stream, recurrent payload, and routed values are
@@ -525,13 +527,13 @@ re-warming, and create a new cooldown branch without weakening exact resume.
 
 ### Flagship
 
-The registered flagship is hard DF at approximately 1.20B parameters and 400B
+The registered flagship is hard DF at approximately 1.22B parameters and 400B
 predicted tokens. It has width 1,536, 24 decoder layers, SwiGLU width 6,656,
 context 8,192, and six identical four-layer cells. Its token-mixing schedule is
 exactly:
 
 ```text
-[KDA, KDA, KDA, global GQA] x 6
+[KDA, KDA, KDA, gated global GQA] x 6
 ```
 
 There is no sliding-window attention. Each KDA layer uses 12 heads with
@@ -553,18 +555,37 @@ S_t         = (I - beta_t k_t k_t^T) S_tilde_t + beta_t k_t v_t^T
 o_t         = S_t^T q_t
 ```
 
-The fourth layer of each cell uses the existing dense causal GQA shape: 16
+The fourth layer of each cell uses dense causal, sigmoid-output-gated GQA: 16
 query heads, 8 KV heads, head width 96, per-head Q/K RMSNorm, and a full 8,192-
-token receptive field. The flagship has no explicit positional embedding in
-either mixer: KDA's causal convolution and data-dependent recurrent transition
-carry order and recency, and the global GQA layers use NoPE. This is a deliberate
-synthesis. Kimi Linear supplies KDA, NoPE global attention, and the empirically
-selected 3:1 cadence, but uses global MLA; Qwen3-Next supplies independent
-interval-four Gated DeltaNet/global-GQA precedent, but does not use KDA.
+token receptive field. For the pre-normalized layer input `x_t`, a bias-free
+projection produces one query and one same-width gate coordinate per query-head
+coordinate:
 
-The approximately 1.20B count assumes the geometry and dense KDA projections
-above, tied embeddings, and hard-DF modules. The implementation gate must record
-the exact instantiated count before spend approval.
+```text
+q_t, g_t = split(W_qg x_t)
+z_t      = concat(GQA(q_t, W_k x_t, W_v x_t))
+o_t      = W_o(sigmoid(g_t) * z_t)
+```
+
+The gate acts elementwise on the concatenated attention output before the
+output projection and before the branch's `1/sqrt(2L)` scaling. It does not
+modify attention logits or softmax weights, and it is distinct from KDA's
+delta-update and output gates and from the FBT entry gate. Because the gated
+`o_t` is still the single attention branch delta, the seed-plus-deltas residual
+identity is unchanged.
+
+The flagship has no explicit positional embedding in either mixer: KDA's
+causal convolution and data-dependent recurrent transition carry order and
+recency, and the global GQA layers use NoPE. This is a deliberate synthesis.
+Kimi Linear supplies KDA, NoPE global attention, and the empirically selected
+3:1 cadence, but uses global MLA; Qwen3-Next supplies independent interval-four
+Gated DeltaNet/gated-global-GQA precedent, but does not use KDA.
+
+The approximately 1.22B count assumes the geometry and dense KDA projections
+above, tied embeddings, hard-DF modules, and six width-1,536 GQA gate
+projections. Those gates add 14,155,776 weights to the ungated hybrid. The
+implementation gate must record the exact instantiated count before spend
+approval.
 
 #### Flagship block-delta routing
 
@@ -606,33 +627,16 @@ one repeated pass over the same token positions into the next; the DF payload
 is the only cross-pass state. After the final prefill pass, the KDA and GQA
 caches advance normally over newly generated positions.
 
-#### Flagship transfer and implementation gate
+#### Flagship implementation gate
 
-The 220M ladder establishes the DF mechanism on the implemented all-GQA,
-per-sublayer trunk; it does not by itself validate transfer to a hybrid token
-mixer or a block-delta source bank. Before flagship launch, a matched 220M
-bridge must compare:
-
-1. the promoted per-sublayer, all-GQA hard-DF arm;
-2. all-GQA hard DF with four-layer block-delta routing;
-3. `[KDA, KDA, KDA, global GQA] x 3` hard DF with the same block routing.
-
-The hybrid bridge uses six 128-wide KDA heads, preserving a concatenated width
-of 768. All three bridge arms use the registered tokenizer, data order, two
-paired seeds, feedback draws, optimizer, schedule, 2.003B predicted-token
-budget, and pass-token accounting. The comparison must separate any cost or
-quality change from source coarsening from the subsequent token-mixer change,
-retain healthy Standard and Fused losses, and pass the same contraction gate.
-These bridge comparisons qualify architectural transfer; they are not
-substituted for the factorial findings.
-
-The exact flagship implementation must additionally pass portable/chunkwise/
-recurrent KDA value and gradient parity, convolution- and recurrent-cache
-continuation parity, block-source and payload-source identity tests, exact
-compute and parameter accounting, optimizer partition tests, the width-1,536/
-H=8 router gate, distributed execution, checkpoint portability, and restart
-behavior on the selected hardware. Until those contracts land in code and
-tests, the flagship is specified but not runnable.
+The exact flagship implementation must pass portable/chunkwise/recurrent KDA
+value and gradient parity, convolution- and recurrent-cache continuation
+parity, gated-GQA value and gradient parity against an explicit
+sigmoid-times-attention reference, block-source and payload-source identity
+tests, exact compute and parameter accounting, optimizer partition tests, the
+width-1,536/H=8 router gate, distributed execution, checkpoint portability,
+and restart behavior on the selected hardware. Until those contracts land in
+code and tests, the flagship is specified but not runnable.
 
 ## Gates
 
@@ -670,11 +674,8 @@ Promote only if:
    self-compositions;
 3. routing and same-checkpoint ablations do not reveal a trivial unused or
    bypassed mechanism;
-4. the matched block-delta and KDA/GQA bridge passes without a material loss or
-   contraction regression;
-5. the flagship implementation gate passes on its exact distributed geometry;
-6. a9 explicitly approves the flagship spend with the ladder and bridge
-   evidence in hand.
+4. the flagship implementation gate passes on its exact distributed geometry;
+5. a9 explicitly approves the flagship spend with the ladder evidence in hand.
 
 ## Scope exclusions
 
@@ -700,8 +701,9 @@ introduced into the registered factorial.
   with hard DF before interpreting null mass as lack of utility.
 - The flagship hybrid is a synthesis rather than a reproduced architecture:
   Kimi's 3:1 evidence used KDA with MLA at a different scale, while Qwen3-Next
-  used Gated DeltaNet with global GQA. The matched bridge is required before
-  attributing either result to KDA+GQA or assuming it composes cleanly with DF.
+  used Gated DeltaNet with gated global GQA. Those deployed precedents motivate
+  the mixer and gate choices but do not establish their interaction with DF;
+  realized stability, throughput, and quality remain empirical.
 - KDA's asymptotic cache advantage does not guarantee a realized speedup at an
   8,192-token context. Promotion uses measured end-to-end training, prefill,
   decode, memory, and pass-token costs on the selected hardware.

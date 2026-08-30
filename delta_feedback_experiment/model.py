@@ -225,7 +225,7 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Qwen3-style GQA with per-head QK RMSNorm and rotary positions."""
+    """Ungated screen GQA with per-head QK RMSNorm and rotary positions."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()

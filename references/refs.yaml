@@ -37,6 +37,14 @@ references:
       layers. This is interval-four and GQA precedent only; Qwen3-Next uses
       Gated DeltaNet where the flagship uses KDA.
 
+  - url: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py
+    slug: qwen2025-qwen3-next-attention
+    note: >
+      The released Qwen3-Next attention implementation projects a gate beside
+      each query-head coordinate and applies its sigmoid elementwise to the
+      concatenated attention output before the output projection. The flagship
+      adopts this gate; the screen and token ladder remain ungated.
+
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer
     note: >

@@ -35,6 +35,9 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
+- Screen and token-ladder GQA is ungated. Flagship global GQA instead uses a
+  bias-free query/gate projection and applies an elementwise sigmoid output
+  gate before the output projection and residual-branch scaling.
 - Screen and token-ladder MHDAR sources are the column's actual input seed
   followed by scaled attention and MLP deltas. Flagship routing instead keeps
   one delta per completed four-layer cell plus at most one aggregate partial
@@ -91,10 +94,10 @@ contract changes.
 - The screen and same-geometry continuation surfaces are implemented. The
   2B→8B→32B WSD ladder still requires an explicit tested branch-from-heat-end
   continuation path. The 24-layer flagship is the exact
-  `[KDA, KDA, KDA, global GQA] x 6` hard-DF design in the scale plan; it also
-  requires KDA kernels and cache semantics, block-delta routing, a matched
-  transfer bridge, and distributed execution. Do not describe either path as
-  runnable until those contracts land in code and tests.
+  `[KDA, KDA, KDA, gated global GQA] x 6` hard-DF design in the scale plan; it
+  also requires KDA kernels and cache semantics, gated GQA, block-delta
+  routing, and distributed execution. Do not describe either path as runnable
+  until those contracts land in code and tests.
 - Flagship promotion requires the registered ladder trend, the matched
-  block-delta/KDA-GQA bridge, a clean contraction gate, and explicit spend
-  confirmation from a9.
+  factorial evidence, a clean contraction gate, the exact implementation gate,
+  and explicit spend confirmation from a9.
