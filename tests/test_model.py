@@ -53,17 +53,26 @@ def forward(model, toks, **kwargs):
 
 
 def test_arm_flags():
-    assert not arm_config("vanilla", **TINY).routing_active
-    assert not arm_config("vanilla", **TINY).feedback_active
-    assert arm_config("mhdar", **TINY).routing_active
-    assert not arm_config("mhdar", **TINY).feedback_active
-    assert arm_config("mhdar", **TINY).routing_heads == TINY["kv_heads"]
-    assert arm_config("fbt", **TINY).gated_entry
-    assert not arm_config("fbt", **TINY).routing_active
-    assert arm_config("df", **TINY).gated_entry
-    assert arm_config("df", **TINY).routing_active
+    vanilla = arm_config("vanilla", **TINY)
+    assert not vanilla.routing_active
+    assert not vanilla.feedback_active
+    assert not vanilla.gated_attention
+    mhdar = arm_config("mhdar", **TINY)
+    assert mhdar.routing_active
+    assert not mhdar.feedback_active
+    assert mhdar.gated_attention
+    assert mhdar.routing_heads == TINY["kv_heads"]
+    fbt = arm_config("fbt", **TINY)
+    assert fbt.gated_entry
+    assert not fbt.routing_active
+    assert not fbt.gated_attention
+    df = arm_config("df", **TINY)
+    assert df.gated_entry
+    assert df.routing_active
+    assert df.gated_attention
     soft = arm_config("df_soft", **TINY)
     assert soft.routing_active and soft.feedback_active and not soft.gated_entry
+    assert soft.gated_attention
 
 
 def test_parents_are_deletions():
@@ -83,10 +92,17 @@ def test_parents_are_deletions():
 
 
 def test_screen_param_count():
+    expected = {
+        "vanilla": 222_876_672,
+        "mhdar": 229_991_424,
+        "fbt": 224_058_624,
+        "df": 231_174_912,
+        "df_soft": 230_012_928,
+    }
     with torch.device("meta"):
-        model = DFModel(arm_config("df"))
-    total = sum(parameter.numel() for parameter in model.parameters())
-    assert abs(total - 223e6) / 223e6 < 0.02, f"{total / 1e6:.1f}M"
+        for arm, count in expected.items():
+            model = DFModel(arm_config(arm))
+            assert sum(parameter.numel() for parameter in model.parameters()) == count
 
 
 def test_large_projections_are_persistently_packed():
@@ -95,8 +111,41 @@ def test_large_projections_are_persistently_packed():
     mlp = model.blocks[0].mlp
     assert attention.qkv_proj.weight.shape == (96, 32)
     assert not hasattr(attention, "q_proj")
+    assert model.attention_gates[0].weight.shape == (32, 32)
     assert mlp.gate_up_proj.weight.shape == (128, 32)
     assert not hasattr(mlp, "gate_proj")
+
+
+def test_factorial_initialization_is_paired_by_semantic_factor():
+    models = {arm: tiny(arm, seed=17) for arm in ARMS}
+    states = {arm: model.state_dict() for arm, model in models.items()}
+
+    # Every parameter in vanilla is common and must be byte-identical in every
+    # other cell. Conditional modules cannot advance the common RNG stream.
+    for name, value in states["vanilla"].items():
+        for arm in ARMS[1:]:
+            assert torch.equal(value, states[arm][name]), (arm, name)
+
+    # Each intervention package is also paired between its parent and DF.
+    for layer in range(TINY["layers"]):
+        name = f"attention_gates.{layer}.weight"
+        assert torch.equal(states["mhdar"][name], states["df"][name])
+        assert torch.equal(states["mhdar"][name], states["df_soft"][name])
+    for name in ("fuse_value.weight", "fuse_gate.weight"):
+        assert torch.equal(states["fbt"][name], states["df"][name])
+
+
+def test_zero_gqa_gate_halves_the_ungated_attention_branch():
+    model = tiny("mhdar")
+    attention = model.blocks[0].attn
+    gate_weight = model.attention_gates[0].weight
+    x = torch.randn(2, 7, TINY["dim"])
+    cos, sin = model.rope(x.device, 0, x.shape[1])
+    with torch.no_grad():
+        gate_weight.zero_()
+        ungated = attention(x, cos, sin, None, None, 0)
+        gated = attention(x, cos, sin, gate_weight, None, 0)
+    assert torch.allclose(gated, 0.5 * ungated, atol=1e-6)
 
 
 # -- routing semantics ---------------------------------------------------------
@@ -277,7 +326,12 @@ def test_gradients_reach_the_feedback_machinery():
     outs = multipass(model, toks, 3, prefix_lens=prefix, jitter=jitter)
     total, _ = multipass_loss(model, toks, outs)
     total.backward()
-    for name in ("fuse_value.weight", "fuse_gate.weight", "payload_router.query"):
+    for name in (
+        "attention_gates.0.weight",
+        "fuse_value.weight",
+        "fuse_gate.weight",
+        "payload_router.query",
+    ):
         gradient = dict(model.named_parameters())[name].grad
         assert gradient is not None and gradient.abs().sum() > 0, name
 

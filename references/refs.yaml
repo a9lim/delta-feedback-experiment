@@ -42,8 +42,9 @@ references:
     note: >
       The released Qwen3-Next attention implementation projects a gate beside
       each query-head coordinate and applies its sigmoid elementwise to the
-      concatenated attention output before the output projection. The flagship
-      adopts this gate; the screen and token ladder remain ungated.
+      concatenated attention output before the output projection. The screen
+      architecture package and the flagship adopt this gate; screen `vanilla`
+      and `fbt` remain ungated.
 
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer

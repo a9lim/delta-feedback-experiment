@@ -1,15 +1,15 @@
 # delta-feedback-experiment
 
-This repository tests whether two routing mechanisms improve a transformer
+This repository tests whether two innovation packages improve a transformer
 independently or interact when pretrained together:
 
-- **Multi-Head Delta Attention Residuals (MHDAR)** route each sublayer read over
-  the current column's input seed and earlier attention/MLP deltas, with an
-  independent depth softmax for each feature group.
-- **Full-Bandwidth Transformer (FBT) feedback** carries the previous column's
-  top state into the next column through a mandatory token-gated fusion.
-- **Delta Feedback (DF)** uses MHDAR inside each column and applies the same
-  multi-head delta router to enrich the recurrent payload between columns.
+- **Architecture innovation** combines Multi-Head Delta Attention Residuals
+  (MHDAR) with sigmoid-gated grouped-query attention (GGQA).
+- **Recurrence innovation** uses Full-Bandwidth Transformer (FBT) feedback to
+  carry the previous column's top state into the next through a mandatory
+  token-gated fusion.
+- **Delta Feedback (DF)** combines both packages and applies the multi-head
+  delta router to enrich the recurrent payload between columns.
 
 The primary experiment is the four-cell factorial `{vanilla, mhdar, fbt, df}`.
 `df_soft` is a gated diagnostic arm in which null sources make both routing
@@ -17,12 +17,13 @@ channels optional.
 
 ## Status
 
-The 220M screen campaign is active on Jobe. No matched arm comparison is
-complete, so there are no accepted experiment findings. Its GQA is ungated.
-The screen-scale plain-PyTorch model, deterministic trainer, portable
-fallbacks, and optimized single-GPU CUDA path are implemented. The token-ladder
-continuation and the distributed `[KDA, KDA, KDA, gated global GQA]`
-block-delta flagship path are specified but not yet implemented.
+The screen campaign is active on Jobe. No matched arm comparison is complete,
+so there are no accepted experiment findings. `mhdar`, `df`, and `df_soft` use
+GGQA; `vanilla` and `fbt` use ungated GQA. The screen-scale plain-PyTorch model,
+deterministic trainer, portable fallbacks, and optimized single-GPU CUDA path
+are implemented. The token-ladder continuation and the distributed
+`[KDA, KDA, KDA, gated global GQA]` block-delta flagship path are specified but
+not yet implemented.
 
 See [docs/findings.md](docs/findings.md) for the scientific result surface and
 [docs/design.md](docs/design.md) for the complete experiment contract.
@@ -80,7 +81,7 @@ addressed directly into one fixed token stream. Pass counts are keyed by data
 seed and step; prefix lengths and jitter additionally use the global row, so
 paired arms see identical examples and feedback draws.
 
-Snapshots are immutable, exact-resume checkpoint-contract v4 files under
+Snapshots are immutable, exact-resume checkpoint-contract v5 files under
 `runs/`. `--max-steps` limits only the current invocation; it never rescales the
 state-defining schedule.
 

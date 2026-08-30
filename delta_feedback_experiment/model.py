@@ -2,7 +2,8 @@
 
 The architecture contract is ``docs/design.md``. Everything here is
 arm-agnostic model semantics: the five arms are one class under
-:class:`ModelConfig` flags, and the factorial cells are deletions of DF.
+:class:`ModelConfig` flags.  The architecture axis is MHDAR plus gated GQA;
+the recurrence axis is FBT, and the factorial cells are deletions of DF.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired arms architecturally
 identical in everything but the flags.
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 
 import torch
@@ -76,7 +78,7 @@ ARMS = ("vanilla", "mhdar", "fbt", "df", "df_soft")
 class ModelConfig:
     """Trunk geometry plus the two-axis arm flags.
 
-    Defaults are the registered 220M screen trunk. Routing heads are not an
+    Defaults are the registered screen trunk. Routing heads are not an
     independent knob: every routed arm uses one contiguous feature group per
     KV head (H=4 at screen scale, H=8 at the flagship target). The groups do
     not align to attention projections.
@@ -106,6 +108,11 @@ class ModelConfig:
     @property
     def routing_active(self) -> bool:
         return self.depth_routing or self.soft
+
+    @property
+    def gated_attention(self) -> bool:
+        """The architecture package couples MHDAR to gated GQA."""
+        return self.routing_active
 
     @property
     def routing_heads(self) -> int:
@@ -225,7 +232,7 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Ungated screen GQA with per-head QK RMSNorm and rotary positions."""
+    """Screen GQA; architecture arms supply a sigmoid output-gate weight."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -242,6 +249,7 @@ class Attention(nn.Module):
         x: Tensor,
         cos: Tensor,
         sin: Tensor,
+        gate_weight: Tensor | None,
         cache: KVCache | None,
         layer: int,
     ) -> Tensor:
@@ -288,6 +296,8 @@ class Attention(nn.Module):
                 enable_gqa=cfg.heads != cfg.kv_heads,
             ).transpose(1, 2)
         out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
+        if gate_weight is not None:
+            out = out * torch.sigmoid(F.linear(x, gate_weight))
         return self.o_proj(out)
 
 
@@ -505,6 +515,7 @@ class Block(nn.Module):
         cos: Tensor,
         sin: Tensor,
         cache: KVCache | None,
+        gate_weight: Tensor | None,
         p_mask: Tensor | None,
         want_weights: bool,
         *sources: Tensor,
@@ -512,7 +523,7 @@ class Block(nn.Module):
         """Returns (h, attn delta, mlp delta, attn weights, mlp weights)."""
         x, w_attn = self._read(h, self.attn_router, sources, p_mask, want_weights)
         a = self.branch_scale * self.attn(
-            self.attn_norm(x), cos, sin, cache, self.layer
+            self.attn_norm(x), cos, sin, gate_weight, cache, self.layer
         )
         h = h + a
         x, w_mlp = self._read(h, self.mlp_router, (*sources, a), p_mask, want_weights)
@@ -521,10 +532,12 @@ class Block(nn.Module):
         return h, a, m, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, cos, sin, p_mask, *sources):
+def _block_for_checkpoint(block, h, cos, sin, gate_weight, p_mask, *sources):
     """Tensor-only wrapper for activation checkpointing (no cache, no
     weights) — the recomputation must be free of side effects."""
-    h, a, m, _, _ = block(h, cos, sin, None, p_mask, False, *sources)
+    h, a, m, _, _ = block(
+        h, cos, sin, None, gate_weight, p_mask, False, *sources
+    )
     return h, a, m
 
 
@@ -571,9 +584,19 @@ class DFModel(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        # Capture the exact legacy common-trunk initialization boundary before
+        # constructing any factor-specific random matrices. Restoring it below
+        # keeps every shared parameter byte-identical across arms and preserves
+        # compatibility with the already-running vanilla screen initialization.
+        common_init_state = torch.random.get_rng_state()
+        self.attention_gates = nn.ModuleList(
+            nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
+            for _ in range(cfg.layers if cfg.gated_attention else 0)
+        )
         if cfg.gated_entry:
             self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
@@ -586,7 +609,18 @@ class DFModel(nn.Module):
         self._rope: tuple[Tensor, Tensor] | None = None
         self.grad_checkpoint = False
         """Runtime switch: checkpoint each block during training forwards."""
-        self.apply(self._init_weights)
+        torch.random.set_rng_state(common_init_state)
+        self.embed_tokens.apply(self._init_weights)
+        self.blocks.apply(self._init_weights)
+        self.final_norm.apply(self._init_weights)
+        self._init_factor_linears(
+            self.attention_gates, factor_seed ^ 0x4152434849544543
+        )
+        if cfg.gated_entry:
+            self._init_factor_linears(
+                (self.fuse_value, self.fuse_gate),
+                factor_seed ^ 0x524543555252454E,
+            )
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -595,6 +629,19 @@ class DFModel(nn.Module):
             nn.init.zeros_(module.query)
             if module.null is not None:
                 nn.init.zeros_(module.null)
+
+    @staticmethod
+    def _init_factor_linears(linears: Iterable[nn.Linear], seed: int) -> None:
+        """Initialize one factor from its own seed-stable random stream.
+
+        Conditional factor modules must not shift common initialization, and
+        the same factor must initialize identically in its parent and DF cell.
+        Models are constructed on CPU (or meta for accounting) before moving to
+        an execution device, so one local CPU generator is authoritative.
+        """
+        generator = torch.Generator().manual_seed(seed % ((1 << 63) - 1))
+        for linear in linears:
+            nn.init.normal_(linear.weight, std=0.02, generator=generator)
 
     # -- pieces ----------------------------------------------------------------
 
@@ -659,6 +706,11 @@ class DFModel(nn.Module):
         )
         for block in self.blocks:
             passed = tuple(sources) if sources is not None else ()
+            gate_weight = (
+                self.attention_gates[block.layer].weight
+                if cfg.gated_attention
+                else None
+            )
             if checkpointing:
                 h, a, m = torch.utils.checkpoint.checkpoint(
                     _compiled_block if h.is_cuda else _block_for_checkpoint,
@@ -666,16 +718,26 @@ class DFModel(nn.Module):
                     h,
                     cos,
                     sin,
+                    gate_weight,
                     p_mask,
                     *passed,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             elif h.is_cuda and cache is None and not want_weights:
-                h, a, m = _compiled_block(block, h, cos, sin, p_mask, *passed)
+                h, a, m = _compiled_block(
+                    block, h, cos, sin, gate_weight, p_mask, *passed
+                )
             else:
                 h, a, m, w_attn, w_mlp = block(
-                    h, cos, sin, cache, p_mask, want_weights, *passed
+                    h,
+                    cos,
+                    sin,
+                    cache,
+                    gate_weight,
+                    p_mask,
+                    want_weights,
+                    *passed,
                 )
                 if w_attn is not None:
                     weights_out[f"L{block.layer}.attn"] = w_attn

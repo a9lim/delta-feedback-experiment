@@ -9,34 +9,33 @@ plan, and promotion gates. Accepted scientific evidence belongs in
 
 ## Objective
 
-The experiment tests two axes of information flow in an autoregressive
-transformer:
+The experiment tests two innovation packages in an autoregressive transformer:
 
-1. **Within-column depth routing.** Multi-Head Delta Attention Residuals
-   (MHDAR) let each sublayer read an additive mixture of the current column's
-   input seed and earlier residual deltas. Different contiguous feature groups
-   select depth sources independently.
-2. **Between-column latent feedback.** Full-Bandwidth Transformer (FBT)
-   feedback returns the previous column's top state to layer 0 of the next
-   column through a token-gated fusion, giving latent state another full pass
-   through depth.
+1. **Architecture innovation.** Multi-Head Delta Attention Residuals (MHDAR)
+   let each sublayer read an additive mixture of the current column's input
+   seed and earlier residual deltas, with independent depth selection by
+   contiguous feature group. Every architecture-package layer also uses
+   sigmoid-gated grouped-query attention (GGQA).
+2. **Recurrence innovation.** Full-Bandwidth Transformer (FBT) feedback returns
+   the previous column's top state to layer 0 of the next column through a
+   token-gated fusion, giving latent state another full pass through depth.
 
-The primary question is whether these mechanisms are complementary,
-independent, or redundant when pretrained together. The primary four-cell
-factorial is:
+The primary question is whether these packages are complementary, independent,
+or redundant when pretrained together. The primary four-cell factorial is:
 
-| Arm | Within-column MHDAR | Latent feedback | Entry on feedback passes | Recurrent payload |
-|---|---:|---:|---|---|
-| `vanilla` | no | no | token embedding | none |
-| `mhdar` | yes | no | token embedding | none |
-| `fbt` | no | yes | mandatory FBT fusion | normalized top state |
-| `df` | yes | yes | mandatory FBT fusion | normalized top state plus routed deltas |
+| Arm | Architecture package | Recurrence package | GQA | Parameters |
+|---|---:|---:|---|---:|
+| `vanilla` | no | no | ungated | 222,876,672 |
+| `mhdar` | MHDAR | no | gated | 229,991,424 |
+| `fbt` | no | FBT | ungated | 224,058,624 |
+| `df` | MHDAR | FBT | gated | 231,174,912 |
 
-`df_soft` is a separate screen diagnostic. It keeps a plain token entry and
-puts a zero-initialized learnable null source in every router so that
-within-column routing, previous-payload access, and payload enrichment can each
-be declined by routing mass. It tests adoption; it does not replace the hard
-hybrid in the factorial.
+`df_soft` is a 230,012,928-parameter screen diagnostic. It retains the
+architecture package's GGQA, keeps a plain token entry, and puts a
+zero-initialized learnable null source in every router so that within-column
+routing, previous-payload access, and payload enrichment can each be declined
+by routing mass. It tests adoption; it does not replace the hard hybrid in the
+factorial.
 
 The claim boundary is pretraining behavior under the registered recipe and
 data. No result is a general claim about recurrent transformers, depth routing,
@@ -62,21 +61,34 @@ Every arm uses one `DFModel` implementation and differs only through
 | RMSNorm epsilon | 1e-6 |
 | Routing heads | 4, exactly the KV-head count |
 
-The trunk is a bias-free pre-norm decoder with packed QKV projection, grouped
-query attention, per-head Q/K RMSNorm, rotary positions, packed SwiGLU
+The base trunk is a bias-free pre-norm decoder with packed QKV projection,
+grouped-query attention, per-head Q/K RMSNorm, rotary positions, packed SwiGLU
 gate/up projection, tied embedding/unembedding, and a final RMSNorm. Each
 attention and MLP branch output is scaled by `1/sqrt(2L)` before it is added to
-the residual stream. Screen and token-ladder GQA is ungated: its concatenated
-attention output passes directly through the output projection, with no
-data-dependent output gate. There is no dropout.
+the residual stream. There is no dropout.
+
+The architecture package adds one bias-free gate projection to every attention
+layer. For pre-normalized attention input `x`, it computes:
+
+```text
+q, k, v = split(W_qkv x)
+z       = concat(GQA(q, k, v))
+o       = W_o(sigmoid(W_g x) * z)
+```
+
+The gate has one coordinate per query-head output coordinate and acts before
+the output projection and branch scaling; it does not modify attention logits
+or softmax weights. `mhdar`, `df`, and `df_soft` use this GGQA path.
+`vanilla` and `fbt` omit `W_g` and pass `z` directly to `W_o`. The gate is part
+of the registered architecture axis, not an independently interpreted factor.
 
 Embedding weights and optimizer state remain FP32. Under CUDA autocast, the
 embedding output, residual stream, recurrent payload, and routed values are
 BF16. CPU and MPS use the same semantics through portable PyTorch operations.
 
-## MHDAR depth routing
+## Architecture package: MHDAR and gated GQA
 
-The 220M screen and its same-geometry token ladder use the per-sublayer source
+The screen and its same-geometry token ladder use the per-sublayer source
 layout in this section. The flagship keeps the same routing primitive and
 residual identity but coarsens its source bank into four-layer block deltas as
 specified in the scale plan.
@@ -172,13 +184,13 @@ p_t = payload_norm(h_top,t)
 
 ## Hard Delta Feedback
 
-Hard `df` combines the two axes without adding an alternate route around either
-one:
+Hard `df` combines the two packages without adding an alternate route around
+either one:
 
 1. On a feedback position, fuse the shifted previous payload with the token
    embedding to obtain `u`.
 2. Use `u` as both the residual seed and the first source for every
-   within-column MHDAR site.
+   within-column MHDAR site, and use GGQA in every attention layer.
 3. Preserve the clean residual identity while attention and MLP sites read
    routed mixtures of the seed and completed deltas.
 4. Route over this column's deltas with a dedicated multi-head payload router.
@@ -209,7 +221,7 @@ s = e if payload is None else fuse(payload, e)
 sources = [s]
 h = s
 for block in blocks:
-    a = scaled_attention(rmsnorm(h + route(sources)))
+    a = scaled_gated_attention(rmsnorm(h + route(sources)))
     h = h + a
     sources.append(a)
     m = scaled_mlp(rmsnorm(h + route(sources)))
@@ -224,8 +236,8 @@ hard MHDAR/DF. All later sites have at least two sources.
 
 ## Soft adoption diagnostic
 
-`df_soft` uses the same trunk, multi-pass loop, and routing primitive but removes
-the mandatory FBT entry:
+`df_soft` uses the same GGQA architecture package, multi-pass loop, and routing
+primitive but removes the mandatory FBT entry:
 
 ```text
 stream seed: e
@@ -315,9 +327,12 @@ first_row(step) = (step - 1) * batch_rows
 ```
 
 Paired arms and seeds use the same data directory, `data_seed`, batch geometry,
-and step addresses. Initialization seeds differ only when registering a new
-paired seed. Resumption returns to the same row and the same keyed feedback
-draws.
+and step addresses. One initialization seed produces byte-identical common
+parameters in every arm. Factor-private streams produce identical attention
+gate matrices in `mhdar`, `df`, and `df_soft`, and identical FBT fusion matrices
+in `fbt` and `df`; conditional modules never advance the common stream.
+Initialization seeds differ only when registering a new paired seed. Resumption
+returns to the same row and the same keyed feedback draws.
 
 ## Optimizer and schedule
 
@@ -396,7 +411,7 @@ checkpoint policy switches. Those are execution choices, not factorial axes.
 
 ### Checkpoint contract
 
-Snapshots use checkpoint contract v4 and resume only v4. They contain model,
+Snapshots use checkpoint contract v5 and resume only v5. They contain model,
 both optimizer states, exact state-defining arguments, step, and Python/Torch/
 CUDA RNG state. A resume inherits all state-defining fields and rejects an
 explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
@@ -439,7 +454,9 @@ vanilla as:
 G_A = L_vanilla - L_A
 ```
 
-The factorial interaction is:
+`G_mhdar` is the architecture-package effect, `G_fbt` is the
+recurrence-package effect, and `G_df` is their joint effect. The factorial
+interaction is:
 
 ```text
 I = G_df - G_mhdar - G_fbt
@@ -492,7 +509,7 @@ training an alternative payload rule from scratch.
 
 ## Screen and scale plan
 
-### 220M screen
+### 223–231M screen
 
 The active screen uses the geometry above, 6,700 steps, 2.003B predicted tokens
 per run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
@@ -501,25 +518,27 @@ primary four factorial arms run before the conditional `df_soft` diagnostic.
 The screen is designed to establish:
 
 1. that the shared recipe learns a healthy vanilla baseline;
-2. that the harness can resolve the MHDAR factor under this recipe;
-3. the signs and paired magnitudes of the MHDAR, FBT, and DF effects;
+2. that the harness can resolve the MHDAR-plus-GGQA architecture package under
+   this recipe;
+3. the signs and paired magnitudes of the architecture, recurrence, and joint
+   effects;
 4. whether hard DF is stable under recurrent self-composition;
 5. whether optional within-column and cross-column routes are adopted in
    `df_soft`, if that diagnostic is reached.
 
-The screen runs at about nine predicted tokens per parameter. It is a
-sensitivity and interaction screen, not a decisive test of FBT formation at the
-high token-per-parameter regime.
+The screen runs at 8.7–9.0 predicted tokens per parameter across its arms. It
+is a sensitivity and interaction screen, not a decisive test of FBT formation
+at the high token-per-parameter regime.
 
 ### Token ladder
 
-The registered ladder keeps the 220M trunk and extends selected arms through
+The registered ladder keeps the screen geometry and extends selected arms through
 2B, 8B, and 32B predicted tokens, taking a WSD cooldown branch at each rung and
 continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v4
+This ladder is not currently runnable through exact resume: `steps` is a v5
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without
@@ -657,12 +676,13 @@ A screen comparison is admissible only when the registered paired runs finish
 with the same token stream, batch order, recipe, seeds, and schedule, and all
 feedback arms have healthy contraction traces.
 
-MHDAR must clearly improve on vanilla in Standard mode for the screen to serve
-as a sensitivity gate for few-percent routing effects. A stable FBT null at
-screen scale does not by itself exclude DF from the ladder because the screen
-is far below the registered token-per-parameter regime. DF enters the ladder
-only if its paired effect is credible enough that additional tokens can resolve
-its interaction with both parent factors.
+The MHDAR-plus-GGQA architecture package must clearly improve on vanilla in
+Standard mode for the screen to serve as a sensitivity gate for few-percent
+architecture effects. A stable FBT null at screen scale does not by itself
+exclude DF from the ladder because the screen is far below the registered
+token-per-parameter regime. DF enters the ladder only if its paired effect is
+credible enough that additional tokens can resolve the interaction between the
+two parent packages.
 
 ### Flagship promotion
 
@@ -691,9 +711,9 @@ introduced into the registered factorial.
 - Expected effects are small relative to run noise. Paired data order, paired
   seeds, complete runs, and pass-token accounting are part of the causal
   design.
-- The shared FBT recipe may not reproduce the best standalone MHDAR setting.
-  The MHDAR cell therefore acts as a sensitivity control for this exact recipe,
-  not as a numerical reproduction target.
+- The shared FBT recipe may not reproduce the best standalone MHDAR-plus-GGQA
+  setting. The `mhdar` cell therefore acts as a sensitivity control for this
+  exact architecture package, not as a numerical reproduction target.
 - A low-token FBT null is compatible with missing formation conditions. A null
   that persists across the registered ladder is stronger evidence against the
   current feedback recipe at this model scale.
@@ -707,8 +727,8 @@ introduced into the registered factorial.
 - KDA's asymptotic cache advantage does not guarantee a realized speedup at an
   8,192-token context. Promotion uses measured end-to-end training, prefill,
   decode, memory, and pass-token costs on the selected hardware.
-- Parameter counts differ slightly because feedback fusion and routers add
-  parameters. Always report exact arm parameter counts alongside token and
-  pass-token budgets.
+- Parameter counts differ because architecture gates, feedback fusion, and
+  routers add parameters. Always report exact arm parameter counts alongside
+  token and pass-token budgets.
 - Contraction is a stability condition, not evidence that latent feedback
   improves language modeling or performs serial reasoning.

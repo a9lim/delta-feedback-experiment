@@ -1,12 +1,13 @@
 # AGENTS.md
 
-This repository owns a from-scratch pretraining factorial over two mechanisms:
-multi-head routing over within-column residual deltas and full-bandwidth latent
-feedback between adjacent token columns. The hard hybrid is `df`; `mhdar` and
-`fbt` are its parent-factor deletions; `vanilla` is the shared baseline;
-`df_soft` is an optional-channel diagnostic.
+This repository owns a from-scratch pretraining factorial over two innovation
+packages. The architecture package combines multi-head routing over
+within-column residual deltas with gated GQA; the recurrence package is
+full-bandwidth latent feedback between adjacent token columns. The hard hybrid
+is `df`; `mhdar` and `fbt` are its parent-package deletions; `vanilla` is the
+shared baseline; `df_soft` is an optional-channel diagnostic.
 
-The 220M screen campaign is active. No matched scientific comparison is
+The 223–231M screen campaign is active. No matched scientific comparison is
 complete, and [docs/findings.md](docs/findings.md) must remain empty of
 architecture claims until one is admissible.
 
@@ -35,9 +36,11 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
-- Screen and token-ladder GQA is ungated. Flagship global GQA instead uses a
-  bias-free query/gate projection and applies an elementwise sigmoid output
-  gate before the output projection and residual-branch scaling.
+- Screen and token-ladder `mhdar`, `df`, and `df_soft` use gated GQA as part of
+  the architecture package; `vanilla` and `fbt` use ungated GQA. Every gate is
+  a bias-free projection of the attention input followed by an elementwise
+  sigmoid on the concatenated attention output before output projection and
+  residual-branch scaling. Flagship global GQA uses the same gate semantics.
 - Screen and token-ladder MHDAR sources are the column's actual input seed
   followed by scaled attention and MLP deltas. Flagship routing instead keeps
   one delta per completed four-layer cell plus at most one aggregate partial
@@ -59,9 +62,11 @@ contract changes.
 
 ## Experimental discipline
 
-- Every arm uses the same tokenizer, token stream, row order, initialization
-  seed pairing, feedback random stream, trunk geometry, optimizer recipe, and
-  schedule. Treat any divergence as a different experiment.
+- Every arm uses the same tokenizer, token stream, row order, paired common
+  initialization, feedback random stream, base trunk geometry, optimizer
+  recipe, and schedule. Architecture gates are paired across `mhdar`, `df`,
+  and `df_soft`; FBT fusion weights are paired across `fbt` and `df`. The
+  registered architecture package is the only deliberate trunk divergence.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.
