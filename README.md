@@ -21,7 +21,8 @@ The 220M screen campaign is active on Jobe. No matched arm comparison is
 complete, so there are no accepted experiment findings. The screen-scale
 plain-PyTorch model, deterministic trainer, portable fallbacks, and optimized
 single-GPU CUDA path are implemented. The token-ladder continuation and the
-distributed block-delta flagship path are specified but not yet implemented.
+distributed `[KDA, KDA, KDA, global GQA]` block-delta flagship path are
+specified but not yet implemented.
 
 See [docs/findings.md](docs/findings.md) for the scientific result surface and
 [docs/design.md](docs/design.md) for the complete experiment contract.

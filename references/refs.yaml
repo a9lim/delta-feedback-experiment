@@ -16,8 +16,26 @@ references:
     note: >
       Defines additive routing over residual deltas, with RMS-normalized keys,
       raw values, zero-initialized queries, and per-sublayer or block-delta
-      source layouts. The 220M geometry and delta-source semantics are the
-      current screen basis.
+      source layouts. The 220M experiment uses per-sublayer sources; the
+      flagship uses one completed delta per four-layer cell and one evolving
+      current-cell partial delta.
+
+  - arxiv: "2510.26692"
+    slug: kimi2025-kimi-linear
+    note: >
+      Defines Kimi Delta Attention, its chunkwise and recurrent forms,
+      channel-wise decay, causal short convolutions, sigmoid output gate, NoPE
+      global-attention layers, and the empirically selected 3:1 KDA-to-global
+      MLA cadence. The flagship keeps those KDA and cadence choices but uses
+      dense global GQA instead of MLA.
+
+  - url: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json
+    slug: qwen2025-qwen3-next-config
+    note: >
+      The official released Qwen3-Next configuration sets the full-attention
+      interval to four and uses fewer KV than query heads in those global
+      layers. This is interval-four and GQA precedent only; Qwen3-Next uses
+      Gated DeltaNet where the flagship uses KDA.
 
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer

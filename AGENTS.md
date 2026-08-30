@@ -35,10 +35,12 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
-- MHDAR sources are the column's actual input seed followed by scaled attention
-  and MLP deltas. Routing is a transient pre-norm read; routed values never
-  enter the residual stream directly, so `seed + sum(deltas) == h_top` remains
-  exact.
+- Screen and token-ladder MHDAR sources are the column's actual input seed
+  followed by scaled attention and MLP deltas. Flagship routing instead keeps
+  one delta per completed four-layer cell plus at most one aggregate partial
+  delta for the current cell; individual branch deltas are not sources. Routing
+  is always a transient pre-norm read, so the seed-plus-deltas decomposition of
+  the current residual remains exact.
 - Each routing site uses a zero-initialized width-`D` query, a learnable
   full-width RMS key normalization, raw values, and one source softmax per
   contiguous feature group. The number of routing groups equals `kv_heads`.
@@ -88,8 +90,11 @@ contract changes.
   and runs that job's probe from the current checkout.
 - The screen and same-geometry continuation surfaces are implemented. The
   2B→8B→32B WSD ladder still requires an explicit tested branch-from-heat-end
-  continuation path. The 24-layer flagship additionally requires a defined
-  block-delta source partition and distributed execution. Do not describe
-  either path as runnable until those contracts land in code and tests.
-- Flagship promotion requires the registered ladder trend, a clean contraction
-  gate, and explicit spend confirmation from a9.
+  continuation path. The 24-layer flagship is the exact
+  `[KDA, KDA, KDA, global GQA] x 6` hard-DF design in the scale plan; it also
+  requires KDA kernels and cache semantics, block-delta routing, a matched
+  transfer bridge, and distributed execution. Do not describe either path as
+  runnable until those contracts land in code and tests.
+- Flagship promotion requires the registered ladder trend, the matched
+  block-delta/KDA-GQA bridge, a clean contraction gate, and explicit spend
+  confirmation from a9.
