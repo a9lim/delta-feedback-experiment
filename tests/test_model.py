@@ -82,9 +82,12 @@ def test_arm_flags():
     assert df.gated_attention
 
     screen = arm_config("base")
+    assert screen.intermediate * 6 == screen.dim * 26
     assert screen.pkda_heads == 10
     assert screen.pkda_heads * screen.pkda_head_dim * 3 == screen.dim * 5
     assert screen.routing_heads == 4
+    assert screen.norm_eps == 1e-6
+    assert DFModel(base).blocks[0].attn.norm_eps == base.norm_eps
 
 
 def test_parents_are_deletions():
@@ -105,11 +108,11 @@ def test_parents_are_deletions():
 
 def test_screen_param_count():
     expected = {
-        "vanilla": (222_876_672, 106_189_824),
-        "base": (249_197_352, 132_510_504),
-        "mhdb": (249_252_648, 132_565_800),
-        "fbt": (250_379_304, 133_692_456),
-        "df": (250_436_904, 133_750_056),
+        "vanilla": (229_954_560, 113_267_712),
+        "base": (256_275_240, 139_588_392),
+        "mhdb": (256_330_536, 139_643_688),
+        "fbt": (257_457_192, 140_770_344),
+        "df": (257_514_792, 140_827_944),
     }
     with torch.device("meta"):
         for arm, (total, active_non_embedding) in expected.items():

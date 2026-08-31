@@ -59,7 +59,9 @@ references:
       The upstream PrecondKDA reference layer defines the independent ATK gate
       projections and initialization, bounded preconditioner, auxiliary A-state
       cache, chunkwise training kernel, and fused-recurrent decoding kernel that
-      the screen and flagship implementations reproduce and qualify.
+      the screen and flagship implementations reproduce and qualify. Its output
+      norm defaults to epsilon 1e-5; this experiment deliberately uses its
+      unified model-wide epsilon 1e-6 instead.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/modules/conv/short_conv.py
     slug: fla2026-short-convolution
@@ -100,7 +102,9 @@ references:
       Defines latent feedback through the asymmetric state-value/token-gate
       fusion, Jacobi multi-pass training, prefix mixin, recurrent-state jitter,
       the 75/22/3 pass mixture, contraction diagnostics, depth scaling, and the
-      shared pretraining recipe used by every arm.
+      width-1,536 / intermediate-6,656 trunk geometry. The screen uses its exact
+      half-width intermediate of 3,328. It also supplies the shared pretraining
+      recipe used by every arm.
 
   - arxiv: "2510.05491"
     slug: li2025-normuon

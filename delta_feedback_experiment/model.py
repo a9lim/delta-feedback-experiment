@@ -92,7 +92,7 @@ class ModelConfig:
     heads: int = 8
     kv_heads: int = 4
     head_dim: int = 96
-    intermediate: int = 3072
+    intermediate: int = 3328
     pkda_heads: int = 10
     pkda_head_dim: int = 128
     pkda_conv_size: int = 4
@@ -580,6 +580,7 @@ class Block(nn.Module):
                 num_heads=cfg.pkda_heads,
                 head_dim=cfg.pkda_head_dim,
                 conv_size=cfg.pkda_conv_size,
+                norm_eps=cfg.norm_eps,
             )
             if self.is_pkda
             else Attention(cfg)

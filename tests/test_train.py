@@ -171,8 +171,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 1.0
-    assert CONTRACT.version == 14
-    assert CONTRACT.resumable == frozenset({14})
+    assert CONTRACT.version == 15
+    assert CONTRACT.resumable == frozenset({15})
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(1.0)
@@ -305,32 +305,32 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
 
 
 def test_build_schedule_screen_shape():
-    args = build_parser().parse_args(["x"])  # defaults: 10,205 steps
+    args = build_parser().parse_args(["x"])  # defaults: 10,745 steps
     assert args.batch_rows == 320
     assert args.batch_rows // args.micro_rows == 80
     schedule = build_schedule(args)
-    assert schedule.spans == (200, 0, 7454, 2551)
-    assert schedule.total == 10205
+    assert schedule.spans == (200, 0, 7859, 2686)
+    assert schedule.total == 10745
     assert schedule.phase(200)[0] == "warmup"
     assert schedule.phase(201)[0] == "heat"
-    assert schedule.phase(7655)[0] == "cooldown"
-    assert schedule.rate_at(7654, 1.0) == 1.0
-    assert schedule.rate_at(10205, 1.0) < 1e-6
+    assert schedule.phase(8060)[0] == "cooldown"
+    assert schedule.rate_at(8059, 1.0) == 1.0
+    assert schedule.rate_at(10745, 1.0) < 1e-6
 
 
 def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
     tokens_per_step = 320 * 1024
-    df_active_non_embedding = 133_750_056
-    trials = {25: 10_205, 400: 163_269}
+    df_active_non_embedding = 140_827_944
+    trials = {25: 10_745, 400: 171_909}
 
     for target_ratio, steps in trials.items():
         realized_ratio = steps * tokens_per_step / df_active_non_embedding
         assert realized_ratio == pytest.approx(target_ratio, abs=0.002)
 
-    prime = build_parser().parse_args(["x", "--steps", "163269"])
+    prime = build_parser().parse_args(["x", "--steps", "171909"])
     schedule = build_schedule(prime)
-    assert schedule.spans == (200, 0, 122_252, 40_817)
-    assert round(prime.feedback_start * schedule.total) == 81_634
+    assert schedule.spans == (200, 0, 128_732, 42_977)
+    assert round(prime.feedback_start * schedule.total) == 85_954
 
 
 def test_log_every_flag_is_removed():
@@ -452,12 +452,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11, 12, 13])
+@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[14\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[15\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

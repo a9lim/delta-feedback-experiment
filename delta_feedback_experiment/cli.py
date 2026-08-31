@@ -85,7 +85,7 @@ def tokenize_command(argv: list[str]) -> None:
     parser.add_argument(
         "--target",
         type=float,
-        default=54e9,
+        default=57e9,
         help="total tokenization target, including the held-out prefix",
     )
     parser.add_argument(

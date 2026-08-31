@@ -33,7 +33,7 @@ Primary source roles are indexed in
 | PKDA key/value head width | 128 |
 | PKDA Q/K/V projection width | 2,560 |
 | PKDA convolution width | 4 |
-| RMSNorm epsilon | `1e-6` trunk, `1e-5` PKDA output |
+| RMSNorm epsilon | `1e-6` at every norm site |
 | Explicit position encoding | none |
 
 The token-mixing schedule is exactly:
@@ -88,7 +88,8 @@ establish their interaction.
 ## Residual shell
 
 The model is a bias-free pre-norm decoder with tied embedding/readout, a final
-RMSNorm, packed SwiGLU channel mixers, and no dropout. For layer `l`, the token
+RMSNorm, packed SwiGLU channel mixers, and no dropout. Every RMSNorm, including
+PKDA's gated output norm, uses epsilon `1e-6`. For layer `l`, the token
 mixer and MLP produce already-scaled branch deltas `a_l` and `m_l`:
 
 ```text

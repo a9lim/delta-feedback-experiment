@@ -41,7 +41,7 @@ from .model import (
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=14, resumable=frozenset({14}), surface_version=14
+    version=15, resumable=frozenset({15}), surface_version=15
 )
 
 GRAD_CLIP_NORM = 1.0
@@ -123,7 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     schedule = parser.add_argument_group("schedule (state-defining)")
-    schedule.add_argument("--steps", type=runs.parse_step_count, default=10205)
+    schedule.add_argument("--steps", type=runs.parse_step_count, default=10745)
     schedule.add_argument("--warmup-steps", type=int, default=200)
     schedule.add_argument("--cooldown-frac", type=float, default=0.25)
     schedule.add_argument(
@@ -171,7 +171,7 @@ def build_parser() -> argparse.ArgumentParser:
     trunk.add_argument("--heads", type=int, default=8)
     trunk.add_argument("--kv-heads", type=int, default=4)
     trunk.add_argument("--head-dim", type=int, default=96)
-    trunk.add_argument("--intermediate", type=int, default=3072)
+    trunk.add_argument("--intermediate", type=int, default=3328)
     trunk.add_argument("--pkda-heads", type=int, default=10)
     trunk.add_argument("--pkda-head-dim", type=int, default=128)
     trunk.add_argument("--pkda-conv-size", type=int, default=4)

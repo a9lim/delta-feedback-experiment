@@ -74,7 +74,7 @@ class PreconditionedKDA(nn.Module):
         num_heads: int = 8,
         head_dim: int = 128,
         conv_size: int = 4,
-        norm_eps: float = 1e-5,
+        norm_eps: float = 1e-6,
         squash_x: float = 1.5,
         squash_eps: float = 1e-6,
     ):
