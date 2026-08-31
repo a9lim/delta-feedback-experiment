@@ -36,8 +36,9 @@ No run under the current screen contract is complete, no screen job is active,
 and there are no accepted experiment findings.
 
 The 230–258M screen model, deterministic single-process trainer, portable
-semantics, and optimized Jobe CUDA path are implemented. Its widened v15
-contract requires a fresh Jobe qualification before screen training.
+semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
+runs remain serial because the full v15 DF graph pool reserves 23.00 GiB on
+its 24 GiB RTX 4090.
 
 The next stages are specified but not runnable: a fresh `{base, df}` 400x
 comparison on one 8xH100-80GB Prime node, followed—only after the evidence and

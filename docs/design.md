@@ -211,10 +211,18 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 - internal activation checkpointing above the measured work threshold;
 - asynchronous pinned-host snapshot staging and atomic background writes.
 
-These choices are not exposed as experiment axes. The maximal default `df`
-capture is the qualification target. Its measured allocation, reservation,
-graph count, and replay timings are recorded only after the v15 Jobe probe.
-Screen runs remain serial; concurrent execution is outside the qualified
+These choices are not exposed as experiment axes. The qualified maximal
+default capture is:
+
+| Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
+|---|---:|---:|---:|---:|
+| `df` | 53.8 s | 14.10 GiB | 23.00 GiB | 4 |
+
+Median graph replay is 84.0 ms, 166.9 ms, and 250.0 ms for one, two, and three
+passes. The same probe measures PKDA chunk parity at relative error 0.0040,
+fused output norm-gate parity at 0.0032, and cached decode parity at
+0.0077/0.0139. The reserved graph pool is the concurrency boundary. Screen
+runs remain serial; concurrent execution is outside the qualified
 deterministic path.
 
 ### Checkpoints and queue
