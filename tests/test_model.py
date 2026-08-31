@@ -1,6 +1,6 @@
 """Offline invariants for the DF model family (CPU, tiny config).
 
-These are the design contract's checkable claims: transient-read routing
+These are the architecture contract's checkable claims: transient-read routing
 keeps the stream telescoping, zero-init routing is uniform, the payload
 init-matches the bare top state, the Jacobi passes are token-causal, the
 prefix mixin degenerates to pass 1, and cached sequential decoding equals

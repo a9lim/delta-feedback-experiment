@@ -1,41 +1,56 @@
 # delta-feedback-experiment
 
-This repository tests whether two innovation packages improve a common
-PKDA/GGQA hybrid independently or interact when pretrained together:
+This repository tests whether depth routing and latent recurrence help a common
+hybrid decoder independently or become more useful together.
 
-- **Depth routing** uses Multi-Head Delta Block routing (MHDB) over a column's
-  seed and four-layer block deltas.
-- **Recurrence innovation** uses Full-Bandwidth Transformer (FBT) feedback to
-  carry the previous column's top state into the next through a mandatory
-  token-gated fusion.
-- **Delta Feedback (DF)** combines both packages and applies the multi-head
-  delta router to enrich the recurrent payload between columns.
+The hybrid trunk repeats three recurrent PKDA layers and one dense gated global
+GQA layer. PKDA supplies efficient causal state; global GQA periodically gives
+every token a full-prefix read. Multi-Head Delta Block routing (MHDB) lets each
+sublayer transiently revisit the column seed and completed four-layer deltas.
+Full-Bandwidth Transformer (FBT) carries the previous token column's top state
+through a token-gated entry. Hard Delta Feedback (`df`) combines both and uses
+MHDB to enrich the payload sent to the next column.
 
-The primary factorial is `{base, mhdb, fbt, df}`. All four use
-`[PKDA, PKDA, PKDA, gated global GQA] x 3`; pure-GQA `vanilla` is the external
-trunk control. Every MHDB router has a learnable zero-initialized null source.
+```text
+previous payload + token embedding
+                │
+              FBT gate
+                │
+                v
+ [PKDA, PKDA, PKDA, gated global GQA] x cells
+                │
+        MHDB-routed payload
+                │
+                v
+          next token column
+```
+
+The primary screen is the factorial `{base, mhdb, fbt, df}`. All four share
+the same hybrid trunk; `base` deletes both packages, `mhdb` and `fbt` retain
+one each, and `df` retains both. Pure twelve-layer RoPE GQA `vanilla` is a
+separate whole-trunk control.
 
 ## Status
 
-No screen job is active and no registered screen run is complete, so there are
-no accepted experiment findings. The 8-by-128 PKDA/GGQA screen, deterministic
-trainer, portable
-recurrence, and optimized single-GPU CUDA path are implemented and
-Jobe-qualified. The full DF train/eval graph pool peaks at 12.87 GiB allocated
-and 22.76 GiB reserved across four graphs, so screen jobs remain serial on the
-24 GiB RTX 4090.
-The distributed fresh-400x Prime screen and the distributed 1.335B-parameter,
-441B-token, 20-by-128-PKDA
-`[PKDA, PKDA, PKDA, gated global GQA]` block-delta flagship path are specified
-but not yet implemented.
+No run under the current screen contract is complete, no screen job is active,
+and there are no accepted experiment findings.
 
-See [docs/findings.md](docs/findings.md) for the scientific result surface and
-[docs/design.md](docs/design.md) for the complete experiment contract.
+The 223–243M screen model, deterministic single-process trainer, portable
+semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
+runs remain serial because the full DF graph pool reserves 22.76 GiB on its
+24 GiB RTX 4090.
+
+The next stages are specified but not runnable: a fresh `{base, df}` 400x
+comparison on one 8xH100-80GB Prime node, followed—only after the evidence and
+implementation gates—by the 1.335B-parameter, 441B-token flagship. See
+[docs/architecture.md](docs/architecture.md) for the exact flagship and
+NorMuonH/Adam specification, and [docs/design.md](docs/design.md) for the
+experiment and scale plan.
 
 ## Install
 
-Python 3.12 is required. The shared operational package is installed from the
-workspace root; this project owns the model and trainer.
+Python 3.12 is required. Install the shared operational package from the
+workspace root, then this project:
 
 ```bash
 cd /path/to/transformer-experiments
@@ -54,10 +69,10 @@ uv pip install -e '.[cuda]'
 ## Operate
 
 ```bash
-# Portable invariant suite; adds the full CUDA execution gate on a CUDA host.
+# Portable invariant suite; includes the full CUDA gate on a CUDA host.
 df probe
 
-# Build the fixed FineWeb-Edu/Qwen3 token stream once.
+# Build the canonical FineWeb-Edu/Qwen3 stream.
 df tokenize --out /data/df/tokens
 
 # Run or queue one arm.
@@ -66,45 +81,27 @@ df train example-df-s1 --arm df --seed 1 --data-seed 0 \
 df queue example-df-s1 --arm df --seed 1 --data-seed 0 \
   --data-dir /data/df/tokens
 
-# Inspect or control the detached queue.
+# Inspect and control the detached queue.
 df status
 df watch
 df stop TAG|live|all [--at STEP]
 df clear TAG|all
 ```
 
-The queue records exact arguments but does not freeze or inspect Git state.
-Changing the checkout never stops an active child; the worker refreshes before
-starting the next queued job, and every job runs its probe on the then-current
-source.
+The queue records exact arguments, not Git state. A source change never stops
+an active child; the worker refreshes before the next queued job and runs its
+probe from the current checkout.
 
-The default screen run is 9,614 steps, 320 rows per step, and sequence length
-1,024: 3,150,315,520 predicted training tokens. Its 327,680-token optimizer
-batch exactly matches the flagship, and this is the batch-aligned 25x trial for
-the 126,008,544 active non-embedding parameters in `df`, the largest hybrid
-arm. Feedback arms use one pass through step 4,807, then draw one, two,
-or three passes at a 50%/44%/6% mixture through the rest of heat and cooldown.
-Every step is addressed directly into one fixed token stream. Pass counts are
-keyed by data seed and step; prefix lengths and jitter additionally use the
-global row, so paired arms see identical examples and feedback draws. After
-microbatch accumulation, the global FP32 gradient norm is clipped to 1.0 before
-the shared NorMuonH/Adam step.
+The default Jobe run uses 9,614 steps, 320 rows per step, and 1,024 predictions
+per row: 3,150,315,520 predicted tokens. Feedback starts halfway through the
+schedule and draws one, two, or three passes. Every arm sees the same addressed
+token rows; feedback arms also share deterministic pass, prefix, and jitter
+streams. The global FP32 gradient is clipped to norm 1.0 before the shared
+NorMuonH/Adam update.
 
-There is no continuation ladder or 100x run. If the Jobe screen passes its
-entry gate, `{base, df}` receives the bare-minimum fresh one-seed 400x
-comparison on Prime: both arms start from initialization and global row zero, run
-153,819 optimizer steps, and predicts exactly 50,403,409,920 tokens. Feedback
-begins after step 76,910, halfway through the fresh schedule. The registered
-Prime target is one 8xH100-80GB node with the same 320-row global batch; its DDP,
-durable-storage, parity, restart, and throughput gates are not yet implemented.
-The canonical tokenizer target is 51B stored training tokens so this trial's
-49,222,080 rows are available. This pair measures the complete DF package
-against its shared hybrid baseline; component attribution remains a Jobe-only
-factorial claim.
-
-New snapshots are immutable checkpoint-contract v13 files under `runs/`.
-Only v13 is resumable. `--max-steps` limits only the current invocation; it
-never rescales the state-defining schedule.
+Snapshots use checkpoint contract v13, and only v13 is resumable.
+`--max-steps` limits the current invocation without changing the registered
+schedule.
 
 ## Analysis
 
@@ -113,17 +110,18 @@ python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 ```
 
-The route report summarizes a hard-DF snapshot's per-head block-source weights,
-entropy, head divergence, source and null scale, and query geometry. The payload sweep
-is a same-checkpoint counterfactual for routed feedback content; it is not an
-independently trained arm comparison.
+The route report summarizes per-head block-source selection, null/source
+scale, and query geometry. The payload sweep is a same-checkpoint intervention,
+not a separately trained arm.
 
 ## Documentation
 
-- [docs/design.md](docs/design.md): authoritative architecture, training,
-  comparison, evaluation, scale, and gate contract.
+- [docs/architecture.md](docs/architecture.md): exact flagship architecture,
+  state, parameter accounting, and optimizer contract.
+- [docs/design.md](docs/design.md): comparisons, data, schedules, execution,
+  evaluation, scale plan, and promotion gates.
 - [docs/findings.md](docs/findings.md): accepted experiment findings only.
 - [docs/journal.md](docs/journal.md): disposable active notes.
 - [references/refs.yaml](references/refs.yaml): primary references and their
   current roles.
-- [figures/README.md](figures/README.md): committed experiment-result figures.
+- [figures/README.md](figures/README.md): committed finding figures.

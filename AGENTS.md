@@ -1,138 +1,90 @@
 # AGENTS.md
 
-This repository owns a from-scratch MHDB x FBT pretraining factorial on a
-common PKDA/gated-GQA hybrid trunk. The hard hybrid is `df`; `mhdb` and `fbt`
-are its parent-package deletions; `base` is their shared hybrid baseline. The
-pure-GQA `vanilla` is the external trunk control.
+This repository owns a five-arm pretraining study of MHDB depth routing and FBT
+latent recurrence on a common PKDA/gated-GQA hybrid. The primary factorial is
+`{base, mhdb, fbt, df}`; pure-GQA `vanilla` is the external trunk control.
 
-The 223–243M two-stage screen program has no active job. No matched hybrid
-comparison is complete, and [docs/findings.md](docs/findings.md) must remain
-empty of architecture claims until one is admissible.
+No run under the current screen contract is complete and no job is active. Keep
+[docs/findings.md](docs/findings.md) empty of architecture claims until a
+matched comparison is admissible.
 
-## Documentation contract
+## Documents
 
 - [README.md](README.md) is the concise operator entry point and live status.
-- [docs/design.md](docs/design.md) is the sole architecture, training,
-  evaluation, scale-plan, and promotion contract.
-- [docs/findings.md](docs/findings.md) contains accepted experiment findings
-  only. Do not put unit tests, kernel parity, smoke behavior, throughput,
-  isolated checkpoints, plans, or predictions there.
-- [docs/journal.md](docs/journal.md) is disposable working space. Clear it when
-  notes graduate or become inactive; Git history is the archive.
-- [references/refs.yaml](references/refs.yaml) records the primary sources and
-  only the roles needed by the current design.
-- [figures/README.md](figures/README.md) indexes committed figures that support
-  accepted findings. Generated diagnostics remain ignored until promoted.
+- [docs/architecture.md](docs/architecture.md) is the sole flagship model,
+  state, parameter, and optimizer contract.
+- [docs/design.md](docs/design.md) owns comparisons, data, schedules,
+  execution, evaluation, scaling, and gates.
+- [docs/findings.md](docs/findings.md) contains accepted scientific findings
+  only; engineering tests, throughput, isolated checkpoints, and plans do not
+  belong there.
+- [docs/journal.md](docs/journal.md) is disposable active scratch space.
+- [references/refs.yaml](references/refs.yaml) records current primary-source
+  roles; [figures/README.md](figures/README.md) indexes accepted-result figures.
 
-Keep every active document current-only. State the present contract directly;
-do not retain chronology, provenance narrative, superseded configurations,
-legacy aliases, decision journals, or future extensions outside the defined
-experiment. Update code, tests, CLI help, and documentation together when the
-contract changes.
+Keep active documentation current-only. Remove superseded configurations,
+chronology, compatibility aliases, speculative extensions, and unearned
+claims. Update code, tests, CLI help, and all affected documents together when
+a contract changes.
 
-## Architecture invariants
+## Nonnegotiable model contract
 
-- The model family is one plain-PyTorch `DFModel` configured by the five exact
-  arm names in `ARMS`; do not add parallel model implementations or aliases.
-- Every hybrid arm in either screen uses an exact
-  `[PKDA, PKDA, PKDA, gated global GQA] x 3` trunks: 8 PKDA heads at
-  `d_k = d_v = 128`, causal convolution width 4, NoPE global attention, and
-  8/4-by-96 GQA. `vanilla` remains the exact twelve-layer RoPE GQA trunk. Every
-  global gate is a bias-free projection of the attention input followed by an
-  elementwise sigmoid on the concatenated attention output before output
-  projection and residual-branch scaling.
-- Screen PKDA uses the literal portable recurrence off CUDA and the pinned FLA
-  recomputing chunk kernel on CUDA. Its main and preconditioner gates are
-  independent, recurrent and preconditioner boundary states are FP32, and
-  sequential decoding continues both states plus all three convolution
-  histories. Never silently run the sequential fallback for CUDA training.
-- Every scale uses MHDB sources: the column's actual input seed, one delta per
-  completed four-layer cell, and at most one aggregate partial delta for the
-  current cell. Individual branch deltas are not sources. Every router prepends
-  its own learnable zero-initialized null. Routing is always a transient
-  pre-norm read, so the seed-plus-block-deltas decomposition of the current
-  residual remains exact.
-- Each routing site uses a zero-initialized width-`D` query, a learnable
-  full-width RMS key normalization, raw values, and one source softmax per
-  contiguous feature group. The number of routing groups equals `kv_heads`.
-- Hard DF fuses the shifted payload with the token embedding through the FBT
-  asymmetric GLU, then uses the fused input as the MHDB seed. Its payload is
-  the normalized top state plus a routed mixture over the null, seed, and this
-  column's completed block deltas.
-- Multi-pass feedback is causal, differentiable across passes, and uses the
-  shared prefix-mixin and jitter streams. Do not detach the payload to solve a
-  memory problem; checkpoint blocks or coarsen the source representation.
+- One `DFModel` and the five exact `ARMS` define the family. Do not add parallel
+  implementations or aliases.
+- Every hybrid screen arm is exactly
+  `[PKDA, PKDA, PKDA, gated global GQA] x 3`; `vanilla` is twelve-layer RoPE
+  GQA. The flagship is the corresponding six-cell hard-DF architecture in
+  `architecture.md`.
+- PKDA uses the literal portable recurrence off CUDA and pinned FLA chunk and
+  recurrent kernels on CUDA. Recurrent matrix and preconditioner boundaries
+  are FP32. Never silently use the sequential fallback for CUDA training.
+- MHDB sources are the actual column seed, completed four-layer block deltas,
+  and at most one current-cell partial. Individual branch deltas are not
+  sources. Every site prepends its own learned zero-initialized null.
+- Each router uses a zero-initialized width-`D` query, full-width RMS key
+  statistics, raw values, and one source softmax per contiguous feature group;
+  the group count equals `kv_heads`. Routing is a transient pre-norm read and
+  never changes the telescoping residual identity.
+- Hard DF uses the FBT asymmetric payload-value/token-gate fusion as its MHDB
+  seed. Its payload is the normalized top state plus a routed mixture over the
+  null, seed, and completed block deltas.
+- Multi-pass feedback stays causal and differentiable across passes. Never
+  detach the payload to solve memory pressure.
+- NorMuonH owns ordinary hidden matrices; Adam owns semantic-scale gates,
+  embeddings, norms, routing parameters, PKDA controls, convolutions, and
+  vectors. No group uses weight decay. Clip the global FP32 gradient to norm
+  1.0 immediately before both steps.
 
-## Experimental discipline
+## Evidence discipline
 
-- Every arm within a registered comparison uses the same tokenizer, token
-  stream, row order, feedback random stream, outer geometry, optimizer recipe,
-  and schedule. The complete hybrid
-  trunk is byte-identical across `base`, `mhdb`, `fbt`, and `df`; MHDB weights
-  are paired across `mhdb`/`df`, and FBT weights across `fbt`/`df`. The
-  structurally distinct `vanilla` control retains its exact initialization
-  recipe and state layout.
-- Each screen global batch is 320 rows x 1,024 predictions = 327,680 predicted
-  tokens. Jobe accumulates 80 four-row microbatches; Prime uses 8 ranks x 4
-  rows x 10 accumulation microsteps. This exactly matches the flagship's
-  predicted tokens per optimizer update.
-- Every registered run clips the accumulated global FP32 gradient vector to L2
-  norm 1.0 immediately before its NorMuonH/Adam step. Distributed execution
-  clips only after synchronized accumulation.
-- Report both predicted tokens and token-equivalent compute. A `k`-pass batch
-  costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
-  comparisons.
-- The Jobe primary factorial is `{base, mhdb, fbt, df}`. Prime runs only the
-  bare-minimum `{base,df}` contrast. Report `vanilla` versus `base` separately
-  as the Jobe whole-trunk contrast, and never attribute a Prime `base`/`df`
-  difference to either package individually.
-- Pass-1 validation is the common Standard-mode metric. Feedback arms also
-  report the fully fused second-pass metric. Routing observables and
-  contraction traces are diagnostics, not architecture wins by themselves.
-- A feedback result is not interpretable without the contraction trace. Run
-  the repeated fused-prefill diagnostic throughout training and require stable
-  long-horizon self-composition before scale promotion.
-- Accept a scientific claim only from completed, matched comparisons at the
-  registered seeds/tokens or from a clearly labeled same-checkpoint causal
-  ablation. Keep engineering qualification separate.
+- Registered arms share tokenizer, stream, row order, schedule, optimizer,
+  batch geometry, and keyed feedback randomness. Hybrid trunk weights are
+  paired across all four factorial cells; factor-private weights pair across
+  their parent and `df`.
+- Report exact parameters, predicted tokens, and pass-tokens. A `k`-pass batch
+  costs `k` transformer evaluations; equal steps are not matched compute.
+- Attribute MHDB, FBT, and their interaction only on the Jobe factorial.
+  Prime's `{base, df}` pair tests the complete package only. Report
+  `vanilla - base` separately as a whole-trunk contrast.
+- Pass-1 validation is the common metric. Feedback arms also report the fused
+  metric and contraction trace. Routing summaries are diagnostics, not wins.
+- Accept claims only from completed registered comparisons or clearly labeled
+  same-checkpoint interventions. Keep engineering qualification separate.
 
 ## Runtime and scale boundary
 
-- The project imports telemetry, run/snapshot addressing, checkpoint staging,
-  spool orchestration, `Schedule`, and monitor serving from the workspace root
-  package. Do not reimplement those facilities here.
-- CPU/MPS runs use the semantic PyTorch fallbacks. Jobe is the authoritative
-  single-GPU CUDA surface: BF16 activations, pinned FLA PKDA, FlashAttention,
-  FLA's fused PKDA RMSNorm/output gate, BF16-operand cut cross-entropy, the
-  Triton PKDA control-gradient packer and MHDB router, compiled
-  global-attention blocks, segmented PKDA block compilation, one train CUDA
-  graph per pass count, and asynchronous atomic snapshots. Respect Jobe's pinned
-  Torch/FlashAttention environment.
-- Keep Jobe screen execution serial. Fresh default captures reserve 9.96 GiB
-  for `base`, 10.12 GiB for `mhdb`, and 22.76 GiB for `df`; concurrent
-  execution is outside the qualified deterministic single-GPU path.
-- New snapshots are checkpoint-v13. Reject every older checkpoint version.
-- Inspect `df status`, the active log, and GPU ownership before operating Jobe.
-  The queue records exact arguments without inspecting Git state. Source
-  changes never stop an active child; the worker refreshes before the next job
-  and runs that job's probe from the current checkout.
-- The Jobe 25x screen and a fresh single-process 400x schedule are implemented;
-  there is no continuation ladder or 100x run. After an admissible two-seed,
-  five-arm Jobe screen, Prime receives a fresh one-seed `{base,df}` comparison
-  at 400x: 153,819 steps and 50,403,409,920 predicted tokens per arm,
-  initialized from global row zero rather than a Jobe checkpoint. The target is
-  one Prime 8xH100-80GB node at the shared 327,680-token global batch. Exact DDP
-  row sharding, synchronized norm-1 clipping, durable artifacts, parity,
-  throughput, and restart behavior remain an implementation gate. The 24-layer
-  flagship is the exact
-  `[PKDA, PKDA, PKDA, gated global GQA] x 6` hard-DF design in the scale plan;
-  each PKDA mixer uses 20 query/key heads and 20 value heads at
-  `d_k = d_v = 128`, for width-2,560 projections. Its batch-aligned budget is
-  440,818,728,960 predicted tokens: 400 per 1,102,046,496 active non-embedding
-  parameters, conventionally 441B. The generic mixers and cache semantics now
-  exist, but the flagship still requires exact-geometry distributed execution,
-  memory/throughput qualification, checkpoint portability, and restart tests.
-  Do not describe it as runnable until those contracts land.
-- Flagship promotion requires coherent Jobe factorial and fresh Prime
-  `base`/`df` evidence, a clean contraction gate, the exact implementation gate,
-  and explicit spend confirmation from a9.
+- Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
+  monitor serving, and spool orchestration from the workspace root package.
+- Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
+  the qualified DF graph pool reserves 22.76 GiB. New snapshots are v13 and
+  every older version is rejected.
+- Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
+  The queue stores arguments rather than Git state; a worker refreshes before
+  the next job and runs the current checkout's probe.
+- The implemented local program is the two-seed 25x Jobe screen plus a fresh
+  single-process 400x schedule. Prime DDP and the exact flagship remain gated
+  on distributed parity, durable artifacts, memory/throughput, checkpoint
+  portability, and restart tests.
+- Flagship promotion requires an admissible Jobe factorial, a fresh Prime
+  `{base, df}` result, stable long-horizon contraction, the exact implementation
+  gate, and explicit spend confirmation from a9.

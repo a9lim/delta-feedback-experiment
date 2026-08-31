@@ -1,6 +1,6 @@
 """The DF model family: one trunk with five exact arm configurations.
 
-The architecture contract is ``docs/design.md``. Everything here is
+The architecture contract is ``docs/architecture.md``. Everything here is
 arm-agnostic model semantics: the five arms are one class under
 :class:`ModelConfig` flags. The four factorial cells share the hybrid
 PKDA/gated-GQA trunk; the axes are MHDB and FBT. ``vanilla`` is the pure-GQA
