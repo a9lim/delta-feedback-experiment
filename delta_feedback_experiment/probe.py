@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import statistics
 import subprocess
 import sys
 import time
@@ -440,11 +441,16 @@ def cuda_gate() -> None:
             (args.micro_rows, args.seq_len + 1),
             generator=generator,
         )
-        runner.begin(spec)
-        started = time.monotonic()
-        runner.replay(state, rows, index + 1, index * args.micro_rows)
-        torch.cuda.synchronize()
-        elapsed = time.monotonic() - started
+        samples = []
+        for _ in range(7):
+            runner.zero_grad()
+            runner.begin(spec)
+            torch.cuda.synchronize()
+            started = time.monotonic()
+            runner.replay(state, rows, index + 1, index * args.micro_rows)
+            torch.cuda.synchronize()
+            samples.append(time.monotonic() - started)
+        elapsed = statistics.median(samples[2:])
         runner.prepare_optimizer(state)
         norms = torch._foreach_norm([parameter.grad for parameter in state.active])
         grad_norm = torch.stack(norms).norm().item()

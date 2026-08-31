@@ -97,8 +97,8 @@ contract changes.
   router, compiled global-attention blocks, segmented PKDA block compilation,
   CUDA graphs, and asynchronous atomic snapshots. Respect Jobe's pinned
   Torch/FlashAttention environment.
-- Keep Jobe screen execution serial. Fresh default captures reserve 15.86 GiB
-  for `base`, 16.20 GiB for `mhdb`, and 22.45 GiB for `df`; even the two
+- Keep Jobe screen execution serial. Fresh default captures reserve 13.65 GiB
+  for `base`, 13.97 GiB for `mhdb`, and 23.00 GiB for `df`; even the two
   lightest graph pools cannot safely coexist on the usable 23.50 GiB device.
 - New snapshots are checkpoint-v10. Reject every older checkpoint version.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.

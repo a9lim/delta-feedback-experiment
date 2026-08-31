@@ -441,9 +441,9 @@ Fresh-process capture measurements at the default screen geometry on Jobe are:
 
 | Arm | Peak allocated | Peak reserved | Captured train/eval graphs |
 |---|---:|---:|---:|
-| `base` | 7.39 GiB | 15.86 GiB | 3 |
-| `mhdb` | 7.54 GiB | 16.20 GiB | 3 |
-| `df` | 15.23 GiB | 22.45 GiB | 7 |
+| `base` | 6.43 GiB | 13.65 GiB | 3 |
+| `mhdb` | 6.58 GiB | 13.97 GiB | 3 |
+| `df` | 12.73 GiB | 23.00 GiB | 7 |
 
 The reserved graph pool, not live allocated tensors, is the concurrency
 boundary. Even the two lightest hybrid processes exceed the RTX 4090's usable
