@@ -139,7 +139,7 @@ const CONFIG_GROUPS = [
   ['arm & seeds', ['arm', 'seed', 'data_seed']],
   ['trunk', ['dim', 'layers', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
   ['optimizer', ['lr_muon', 'wd_muon', 'lr_adam', 'zloss']],
-  ['feedback', ['feedback_start', 'three_pass', 'jitter']],
+  ['feedback', ['feedback_start', 'feedback_batch_prob', 'three_pass', 'jitter']],
   ['batch', ['batch_rows', 'micro_rows', 'steps', 'warmup_steps', 'cooldown_frac']],
 ];
 function renderConfig(run) {

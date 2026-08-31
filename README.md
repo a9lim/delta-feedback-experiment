@@ -76,12 +76,13 @@ source.
 
 The default screen run is 6,700 steps, 292 rows per step, and sequence length
 1,024: 2.003B predicted training tokens. Feedback arms use one pass through
-step 5,025, then draw two or three passes during cooldown. Every step is
-addressed directly into one fixed token stream. Pass counts are keyed by data
-seed and step; prefix lengths and jitter additionally use the global row, so
-paired arms see identical examples and feedback draws.
+step 3,350, then draw one, two, or three passes at a 50%/44%/6% mixture through
+the rest of heat and cooldown. Every step is addressed directly into one fixed
+token stream. Pass counts are keyed by data seed and step; prefix lengths and
+jitter additionally use the global row, so paired arms see identical examples
+and feedback draws.
 
-Snapshots are immutable, exact-resume checkpoint-contract v6 files under
+Snapshots are immutable, exact-resume checkpoint-contract v7 files under
 `runs/`. `--max-steps` limits only the current invocation; it never rescales the
 state-defining schedule.
 

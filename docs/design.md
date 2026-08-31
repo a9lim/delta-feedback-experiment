@@ -361,11 +361,13 @@ The default 6,700-step WSD schedule is:
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–5,025 | one pass |
-| Cooldown | 5,026–6,700 | feedback arms draw 2 or 3 passes |
+| Stable heat | 201–3,350 | one pass |
+| Stable heat | 3,351–5,025 | feedback arms draw 1, 2, or 3 passes |
+| Cooldown | 5,026–6,700 | feedback arms draw 1, 2, or 3 passes |
 
-Within cooldown, `P(k=3) = 0.12`; otherwise `k=2`. Across the full run this
-targets the 75%/22%/3% one-/two-/three-pass mixture. The exact draws are
+After step 3,350, `P(k>1) = 0.50` and `P(k=3 | k>1) = 0.12`, giving the
+50%/44%/6% one-/two-/three-pass mixture through the second half of the run.
+Across the full run this targets the 75%/22%/3% mixture. The exact draws are
 deterministic for the registered data seed. The expected compute multiplier for
 a feedback arm is 1.28 transformer passes per predicted token, while
 non-feedback arms remain at 1.0.
@@ -413,7 +415,7 @@ checkpoint policy switches. Those are execution choices, not factorial axes.
 
 ### Checkpoint contract
 
-Snapshots use checkpoint contract v6 and resume only v6. They contain model,
+Snapshots use checkpoint contract v7 and resume only v7. They contain model,
 both optimizer states, exact state-defining arguments, step, and Python/Torch/
 CUDA RNG state. A resume inherits all state-defining fields and rejects an
 explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
@@ -540,7 +542,7 @@ continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v6
+This ladder is not currently runnable through exact resume: `steps` is a v7
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without

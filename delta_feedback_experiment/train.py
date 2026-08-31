@@ -33,7 +33,7 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=6, resumable=frozenset({6}), surface_version=6
+    version=7, resumable=frozenset({7}), surface_version=7
 )
 
 EXACT_FIELDS = (
@@ -47,6 +47,7 @@ EXACT_FIELDS = (
     "warmup_steps",
     "cooldown_frac",
     "feedback_start",
+    "feedback_batch_prob",
     "three_pass",
     "lr_muon",
     "wd_muon",
@@ -72,6 +73,19 @@ RUNTIME_FIELDS = (
     "eval_rows",
 )
 """Per-invocation settings: inherited unless retyped."""
+
+
+def probability(value: str) -> float:
+    """An argparse probability in the closed unit interval."""
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid probability: {value!r}") from exc
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"probability must be finite and in [0, 1], got {value!r}"
+        )
+    return parsed
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -101,15 +115,21 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("--cooldown-frac", type=float, default=0.25)
     schedule.add_argument(
         "--feedback-start",
-        type=float,
-        default=0.75,
-        help="fraction of steps before feedback passes begin",
+        type=probability,
+        default=0.5,
+        help="fraction of steps before the mixed pass curriculum begins",
+    )
+    schedule.add_argument(
+        "--feedback-batch-prob",
+        type=probability,
+        default=0.5,
+        help="P(k > 1) after the mixed pass curriculum begins",
     )
     schedule.add_argument(
         "--three-pass",
-        type=float,
+        type=probability,
         default=0.12,
-        help="P(k=3) within the feedback phase (0.12 -> 75/22/3 overall)",
+        help="P(k = 3 | k > 1) after the mixed pass curriculum begins",
     )
 
     recipe = parser.add_argument_group("recipe (state-defining)")
@@ -167,7 +187,13 @@ def draw_passes(args, step: int, total: int) -> int:
     if step <= round(args.feedback_start * total):
         return 1
     generator = torch.Generator().manual_seed(mix(args.data_seed, step, 1))
-    return 3 if torch.rand((), generator=generator).item() < args.three_pass else 2
+    draw = torch.rand((), generator=generator).item()
+    three_pass_prob = args.feedback_batch_prob * args.three_pass
+    if draw < three_pass_prob:
+        return 3
+    if draw < args.feedback_batch_prob:
+        return 2
+    return 1
 
 
 def micro_draws(

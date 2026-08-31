@@ -49,6 +49,8 @@ TINY_ARGS = [
     "0.25",
     "--feedback-start",
     "0.5",
+    "--feedback-batch-prob",
+    "1",
     "--eval-every",
     "4",
     "--snapshot-every",
@@ -195,6 +197,16 @@ def test_log_every_flag_is_removed():
         build_parser().parse_args(["x", "--log-every", "2"])
 
 
+@pytest.mark.parametrize(
+    "flag",
+    ["--feedback-start", "--feedback-batch-prob", "--three-pass"],
+)
+@pytest.mark.parametrize("value", ["-0.1", "1.1", "nan", "inf"])
+def test_pass_probabilities_reject_values_outside_unit_interval(flag, value):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", flag, value])
+
+
 def test_mix_is_stable():
     assert mix(0, 5, 1) == mix(0, 5, 1)
     assert mix(0, 5, 1) != mix(0, 5, 2)
@@ -203,11 +215,27 @@ def test_mix_is_stable():
 
 def test_pass_mixture_fractions():
     args = build_parser().parse_args(["x", "--steps", "4000"])
+    assert args.feedback_start == 0.5
+    assert args.feedback_batch_prob == 0.5
+    assert args.three_pass == 0.12
+
+    first_half = [draw_passes(args, step, 4000) for step in range(1, 2001)]
+    second_half = [draw_passes(args, step, 4000) for step in range(2001, 4001)]
+    assert set(first_half) == {1}
+
+    second_counts = {k: second_half.count(k) for k in (1, 2, 3)}
+    assert 0.45 < second_counts[1] / 2000 < 0.55
+    assert 0.39 < second_counts[2] / 2000 < 0.49
+    assert 0.04 < second_counts[3] / 2000 < 0.08
+
     counts = {1: 0, 2: 0, 3: 0}
-    for step in range(1, 4001):
-        counts[draw_passes(args, step, 4000)] += 1
-    assert counts[1] == 3000  # feedback starts at 75% exactly
-    assert 0.06 < counts[3] / (counts[2] + counts[3]) < 0.20
+    for n_passes in first_half + second_half:
+        counts[n_passes] += 1
+    assert 0.72 < counts[1] / 4000 < 0.78
+    assert 0.20 < counts[2] / 4000 < 0.24
+    assert 0.02 < counts[3] / 4000 < 0.04
+    mean_passes = sum(n_passes * count for n_passes, count in counts.items()) / 4000
+    assert mean_passes == pytest.approx(1.28, abs=0.03)
 
 
 # -- end-to-end ----------------------------------------------------------------

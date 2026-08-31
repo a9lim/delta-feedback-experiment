@@ -66,9 +66,9 @@ optimizer treatment, not the gate design.
   2B tokens including cooldown, and the mechanism (saturated gates, zero gate
   gradient, dead L0 attention) predicts it stays. All arms are undertrained
   (2B tokens vs ~4.5B Chinchilla-optimal for 224M) but matched.
-- Recurrence package: genuinely schedule-starved, by design. Feedback trains
-  only in cooldown (1675 steps, k=2/3); fused val went from divergent (8.9,
-  untrained) to 0.004 above pass-1 and was still closing at run end;
+- The completed screen's recurrence package was schedule-starved. Feedback
+  trained only in cooldown (1675 steps, k=2/3); fused val went from divergent
+  (8.9, untrained) to 0.004 above pass-1 and was still closing at run end;
   contraction trace clean (loss8 ≈ loss0, upd8 stable). No verdict available;
   `fbt` (ungated, unaffected by the gate pathology) will give the clean
   recurrence-only cell.
@@ -76,9 +76,11 @@ optimizer treatment, not the gate design.
 ### Current decision
 
 - Sigmoid attention-gate projections use Adam at `5e-4`, while FBT's value and
-  token-gate fusion matrices retain their paper-aligned NorMuon treatment. The
-  optimizer-state change advances the checkpoint contract to v6; saturated v5
-  runs remain analysis artifacts and are not resumable into the new recipe.
+  token-gate fusion matrices retain their paper-aligned NorMuon treatment.
+- Feedback arms use one pass through step 3350, then draw one, two, or three
+  passes at 50%/44%/6% through the remaining heat and cooldown. The runnable
+  recipe is checkpoint contract v7; existing saturated runs remain analysis
+  artifacts and are not resumable into it.
 - The next gated run starts from initialization. Its early kill test is the
   step-~400 crossover, with gate mean, saturated fraction, sigmoid derivative,
   weight norm, and attention-delta scale inspected before full-screen spend.
