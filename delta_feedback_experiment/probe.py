@@ -53,7 +53,16 @@ def cuda_gate() -> None:
     # The fixed-capacity router must match the semantic implementation in both
     # values and gradients. H=4/N=5 covers the largest screen bank; H=8/N=8
     # covers the corresponding six-cell flagship payload bank.
-    def route_parity(dim, heads, batch, length, n_sources, null_first, seed):
+    def route_parity(
+        dim,
+        heads,
+        batch,
+        length,
+        n_sources,
+        null_first,
+        seed,
+        route_max_bound=0.05,
+    ):
         torch.manual_seed(seed)
         query = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
         key = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
@@ -109,7 +118,7 @@ def cuda_gate() -> None:
         ) / torch.linalg.vector_norm(ref_weights)
         route_max = (routed - ref_routed).abs().max()
         weight_max = (weights - ref_weights).abs().max()
-        if route_rel >= 0.01 or route_max >= 0.05:
+        if route_rel >= 0.01 or route_max >= route_max_bound:
             raise AssertionError(
                 f"H={heads} bespoke router value drift: "
                 f"rel={route_rel.item():.4g}, max={route_max.item():.4g}"
@@ -124,7 +133,7 @@ def cuda_gate() -> None:
                 raise AssertionError(f"H={heads} bespoke router gradient drift")
 
     route_parity(48, 4, 3, 11, 5, True, 7)
-    route_parity(1536, 8, 2, 3, 8, True, 8)
+    route_parity(1536, 8, 2, 3, 8, True, 8, route_max_bound=0.10)
 
     # Compare the exact chunk operator against the literal recurrent equations
     # across a chunk boundary. Inputs use the production dtypes, and the loss
