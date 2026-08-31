@@ -14,7 +14,7 @@ the payload router — two ways:
 Writes figures under figures/route-TAG/ and prints a per-site table.
 
 Usage:
-    python scripts/route_report.py runs/ladder-df.pt.6700
+    python scripts/route_report.py runs/ladder-df.pt.10536
 """
 
 from __future__ import annotations

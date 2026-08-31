@@ -100,16 +100,18 @@ def test_parents_are_deletions():
 
 def test_screen_param_count():
     expected = {
-        "vanilla": 222_876_672,
-        "base": 241_455_840,
-        "mhdb": 241_511_136,
-        "fbt": 242_637_792,
-        "df": 242_695_392,
+        "vanilla": (222_876_672, 106_189_824),
+        "base": (241_455_840, 124_768_992),
+        "mhdb": (241_511_136, 124_824_288),
+        "fbt": (242_637_792, 125_950_944),
+        "df": (242_695_392, 126_008_544),
     }
     with torch.device("meta"):
-        for arm, count in expected.items():
+        for arm, (total, active_non_embedding) in expected.items():
             model = DFModel(arm_config(arm))
-            assert sum(parameter.numel() for parameter in model.parameters()) == count
+            count = sum(parameter.numel() for parameter in model.parameters())
+            assert count == total
+            assert count - model.embed_tokens.weight.numel() == active_non_embedding
 
 
 def test_large_projections_are_persistently_packed():

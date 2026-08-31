@@ -11,8 +11,8 @@ alternatives are handicapped — read the landscape's shape (which family
 helps, which hurts, how peaked), not absolute gaps.
 
 Usage:
-    python scripts/payload_swap.py runs/ladder-df.pt.6700
-    python scripts/payload_swap.py runs/ladder-df.pt.6700 --head 2
+    python scripts/payload_swap.py runs/ladder-df.pt.10536
+    python scripts/payload_swap.py runs/ladder-df.pt.10536 --head 2
 """
 
 from __future__ import annotations

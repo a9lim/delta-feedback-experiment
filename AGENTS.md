@@ -106,9 +106,9 @@ contract changes.
   The queue records exact arguments without inspecting Git state. Source
   changes never stop an active child; the worker refreshes before the next job
   and runs that job's probe from the current checkout.
-- The screen and same-geometry continuation surfaces are implemented. The
-  2B→8B→32B WSD ladder still requires an explicit tested branch-from-heat-end
-  continuation path. The 24-layer flagship is the exact
+- The 25x screen and same-geometry continuation surfaces are implemented. The
+  25x→100x→400x WSD ladder still requires an explicit tested
+  branch-from-heat-end continuation path. The 24-layer flagship is the exact
   `[PKDA, PKDA, PKDA, gated global GQA] x 6` hard-DF design in the scale plan;
   each PKDA mixer uses 20 query/key heads and 20 value heads at
   `d_k = d_v = 128`, for width-2,560 projections. Its batch-aligned budget is

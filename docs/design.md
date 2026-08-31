@@ -24,13 +24,13 @@ redundant when added to one common hybrid sequence-model trunk:
 The four hybrid arms form the primary MHDB x FBT factorial. Pure-GQA `vanilla`
 is a fifth, external trunk control:
 
-| Arm | Hybrid trunk | MHDB | FBT | Parameters |
-|---|---:|---:|---:|---:|
-| `vanilla` | no | no | no | 222,876,672 |
-| `base` | yes | no | no | 241,455,840 |
-| `mhdb` | yes | yes | no | 241,511,136 |
-| `fbt` | yes | no | yes | 242,637,792 |
-| `df` | yes | yes | yes | 242,695,392 |
+| Arm | Hybrid trunk | MHDB | FBT | Parameters | Active non-embedding |
+|---|---:|---:|---:|---:|---:|
+| `vanilla` | no | no | no | 222,876,672 | 106,189,824 |
+| `base` | yes | no | no | 241,455,840 | 124,768,992 |
+| `mhdb` | yes | yes | no | 241,511,136 | 124,824,288 |
+| `fbt` | yes | no | yes | 242,637,792 | 125,950,944 |
+| `df` | yes | yes | yes | 242,695,392 | 126,008,544 |
 
 The factorial contrasts use `base`, not `vanilla`, as their shared baseline.
 `vanilla` versus `base` isolates the whole PKDA/GGQA trunk replacement. There
@@ -386,16 +386,16 @@ decay; matrix norm control is the explicit Hyperball constraint.
 
 ### Default screen schedule
 
-The default 6,700-step WSD schedule is:
+The default 10,536-step WSD schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–3,350 | one pass |
-| Stable heat | 3,351–5,025 | feedback arms draw 1, 2, or 3 passes |
-| Cooldown | 5,026–6,700 | feedback arms draw 1, 2, or 3 passes |
+| Stable heat | 201–5,268 | one pass |
+| Stable heat | 5,269–7,902 | feedback arms draw 1, 2, or 3 passes |
+| Cooldown | 7,903–10,536 | feedback arms draw 1, 2, or 3 passes |
 
-After step 3,350, `P(k>1) = 0.50` and `P(k=3 | k>1) = 0.12`, giving the
+After step 5,268, `P(k>1) = 0.50` and `P(k=3 | k>1) = 0.12`, giving the
 50%/44%/6% one-/two-/three-pass mixture through the second half of the run.
 Across the full run this targets the 75%/22%/3% mixture. The exact draws are
 deterministic for the registered data seed. The expected compute multiplier for
@@ -568,10 +568,11 @@ training an alternative payload rule from scratch.
 
 ### 223–243M screen
 
-The screen uses the geometry above, 6,700 steps, 2.003B predicted tokens per
-run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. No
-registered screen run is complete. `vanilla` is the external trunk control and
-the four hybrid arms form the primary factorial under checkpoint-v12.
+The screen uses the geometry above, 10,536 steps, 3,150,348,288 predicted
+tokens per run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX
+4090. No registered screen run is complete. `vanilla` is the external trunk
+control and the four hybrid arms form the primary factorial under
+checkpoint-v12.
 
 The screen is designed to establish:
 
@@ -581,23 +582,46 @@ The screen is designed to establish:
 3. whether hard DF is stable under recurrent self-composition;
 4. whether learned null, seed, block, and payload routing paths are adopted.
 
-The screen runs at 8.25–8.99 predicted tokens per parameter across its arms. It
-is a sensitivity and interaction screen, not a decisive test of FBT formation
-at the high token-per-parameter regime.
+The screen runs at 25.00–29.67 predicted tokens per active non-embedding
+parameter across its arms. It is a sensitivity and interaction screen, not a
+decisive test of FBT formation at the high token-per-parameter regime.
 
 ### Token ladder
 
-The registered ladder keeps the screen geometry and extends selected arms through
-2B, 8B, and 32B predicted tokens, taking a WSD cooldown branch at each rung and
-continuing the next rung from that rung's protected pre-cooldown checkpoint.
-Finalist arms share the stream prefix and use one paired seed, with the screen's
-two-seed spread retained as the noise estimate.
+The registered ladder keeps the screen geometry and uses `df`, the largest
+hybrid arm at 126,008,544 active non-embedding parameters, as its conservative
+reference denominator. Whole optimizer batches realize the three cumulative
+rungs as:
 
-This ladder is not currently runnable through exact resume: `steps` is a v12
-state-defining field, and no tested branch-from-heat-end continuation command
-exists. Before ladder launch, code and tests must define a new run address,
-preserve model/optimizer/RNG and row continuity, extend the stable phase without
-re-warming, and create a new cooldown branch without weakening exact resume.
+| Rung | Optimizer steps | Exact predicted tokens | Realized `df` ratio |
+|---:|---:|---:|---:|
+| 25x | 10,536 | 3,150,348,288 | 25.001069 |
+| 100x | 42,143 | 12,601,094,144 | 100.001903 |
+| 400x | 168,569 | 50,403,479,552 | 400.000492 |
+
+Every arm at a rung receives the same exact stream prefix; its realized ratio
+therefore differs only with active parameter count. At the top rung the four
+hybrid factorial arms span 400.000–403.974 predicted tokens per active
+non-embedding parameter, while the structurally smaller `vanilla` control is
+at 474.655. Do not shorten `vanilla` to force its ratio to 400, because that
+would break the matched-data whole-trunk contrast.
+
+The first rung is the two-seed all-arm screen. Selected finalist arms continue
+through the 100x and 400x rungs with one paired seed, taking a WSD cooldown
+branch at each rung and continuing the next rung from that rung's protected
+pre-cooldown checkpoint. The screen's two-seed spread remains the noise
+estimate. Continuation preserves the first rung's absolute feedback boundary
+after step 5,268 rather than recomputing it as half of each later endpoint.
+The ladder therefore matches the flagship's final data ratio, not its
+relative-time feedback curriculum; predicted tokens and token-equivalent
+compute remain separate reported quantities.
+
+The later rungs are not currently runnable through exact resume: `steps` is a
+v12 state-defining field, and no tested branch-from-heat-end continuation
+command exists. Before ladder launch, code and tests must define a new run
+address, preserve model/optimizer/RNG and row continuity, extend the stable
+phase without re-warming, retain the absolute feedback boundary, and create a
+new cooldown branch without weakening exact resume.
 
 ### Flagship
 
@@ -897,7 +921,7 @@ two packages.
 Promote only if:
 
 1. DF's advantage over both parent arms at matched token-equivalent compute
-   holds or grows from 2B through 32B rather than appearing at one rung;
+   holds or grows from 25x through 400x rather than appearing at one rung;
 2. the top-rung feedback map remains stable for at least 30 fused
    self-compositions;
 3. routing and same-checkpoint ablations do not reveal a trivial unused or

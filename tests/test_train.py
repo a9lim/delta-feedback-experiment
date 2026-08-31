@@ -285,15 +285,25 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
 
 
 def test_build_schedule_screen_shape():
-    args = build_parser().parse_args(["x"])  # defaults: 6700 steps
+    args = build_parser().parse_args(["x"])  # defaults: 10,536 steps
     schedule = build_schedule(args)
-    assert schedule.spans == (200, 0, 4825, 1675)
-    assert schedule.total == 6700
+    assert schedule.spans == (200, 0, 7702, 2634)
+    assert schedule.total == 10536
     assert schedule.phase(200)[0] == "warmup"
     assert schedule.phase(201)[0] == "heat"
-    assert schedule.phase(5026)[0] == "cooldown"
-    assert schedule.rate_at(5025, 1.0) == 1.0
-    assert schedule.rate_at(6700, 1.0) < 1e-6
+    assert schedule.phase(7903)[0] == "cooldown"
+    assert schedule.rate_at(7902, 1.0) == 1.0
+    assert schedule.rate_at(10536, 1.0) < 1e-6
+
+
+def test_screen_ladder_matches_registered_active_parameter_ratios():
+    tokens_per_step = 292 * 1024
+    df_active_non_embedding = 126_008_544
+    rungs = {25: 10_536, 100: 42_143, 400: 168_569}
+
+    for target_ratio, steps in rungs.items():
+        realized_ratio = steps * tokens_per_step / df_active_non_embedding
+        assert realized_ratio == pytest.approx(target_ratio, abs=0.002)
 
 
 def test_log_every_flag_is_removed():
