@@ -208,13 +208,12 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 - internal activation checkpointing above the measured work threshold;
 - asynchronous pinned-host snapshot staging and atomic background writes.
 
-These choices are not exposed as experiment axes. Fresh default captures are:
+These choices are not exposed as experiment axes. The qualified maximal
+default capture is:
 
 | Arm | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|
-| `base` | 6.40 GiB | 9.96 GiB | 2 |
-| `mhdb` | 6.55 GiB | 10.12 GiB | 2 |
-| `df` | 12.87 GiB | 22.76 GiB | 4 |
+| `df` | 13.76 GiB | 22.96 GiB | 4 |
 
 The reserved graph pool is the concurrency boundary. Screen runs remain serial
 on Jobe; concurrent execution is outside the qualified deterministic path.

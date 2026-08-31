@@ -37,7 +37,7 @@ and there are no accepted experiment findings.
 
 The 223–250M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
-runs remain serial because the full DF graph pool reserves 22.76 GiB on its
+runs remain serial because the full DF graph pool reserves 22.96 GiB on its
 24 GiB RTX 4090.
 
 The next stages are specified but not runnable: a fresh `{base, df}` 400x
