@@ -23,6 +23,7 @@ so there are no accepted experiment findings. `mhdb`, `df`, and `df_soft` use
 GGQA; `vanilla` and `fbt` use ungated GQA. The screen-scale plain-PyTorch model,
 deterministic trainer, portable fallbacks, and optimized single-GPU CUDA path
 are implemented. The token-ladder continuation and the distributed
+1.335B-parameter, 20-by-128-PKDA
 `[PKDA, PKDA, PKDA, gated global GQA]` block-delta flagship path are specified
 but not yet implemented.
 

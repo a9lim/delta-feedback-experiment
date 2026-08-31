@@ -570,8 +570,9 @@ re-warming, and create a new cooldown branch without weakening exact resume.
 
 ### Flagship
 
-The registered flagship is hard DF at approximately 1.22B parameters and 400B
-predicted tokens. It has width 1,536, 24 decoder layers, SwiGLU width 6,656,
+The registered flagship is hard DF with an analytical parameter count of
+1,335,420,192 and a 400B-predicted-token budget. It has width 1,536, 24 decoder
+layers, SwiGLU width 6,656, the project's tied 151,936-token vocabulary,
 context 8,192, and six identical four-layer cells. Its token-mixing schedule is
 exactly:
 
@@ -579,13 +580,37 @@ exactly:
 [PKDA, PKDA, PKDA, gated global GQA] x 6
 ```
 
-There is no sliding-window attention. Each PKDA layer uses 12 heads with
-`d_k = d_v = 128`, so its concatenated head width is 1,536. Its base recurrence
-keeps the released Kimi Linear parameterization: bias-free Q/K/V projections;
-separate causal depthwise convolutions of width 4 followed by SiLU;
-L2-normalized Q and K; a rank-128 channel-wise decay projection; one sigmoid
-delta-update gate per head; head-wise RMSNorm; a rank-128 sigmoid output gate;
-and a bias-free output projection.
+The operating point has four explicit authority classes:
+
+| Surface | Authority |
+|---|---|
+| Width 1,536, 24 layers, SwiGLU 6,656, GQA 16/8-by-96, context 8,192, 400B tokens, WSD/NorMuon recipe, and latent-feedback schedule | Full-Bandwidth Transformer, inherited directly except for the project's tokenizer and vocabulary |
+| PKDA 20-by-128 geometry, convolution width 4, Q/K L2 normalization, sigmoid output gate, NoPE, and 3:1 hybrid cadence | Kimi Linear paper and released configuration |
+| Apply-to-key recurrence, independent preconditioner gates, `x = 1.5`, bounded squash, initialization, chunk/recurrent forms, FP32 boundary states, and global gradient clip 1.0 | Preconditioned DeltaNet paper and upstream FLA implementation |
+| Sigmoid-gated global GQA | Released Qwen3-Next configuration and implementation |
+| PKDA replacing KDA inside the 3:1 cadence, global GQA replacing MLA, hard DF plus block-delta routing, 151,936-token vocabulary, exact mid-run feedback boundary, 327,680-token batch rounding, and replicated eight-rank execution | Registered project synthesis; these interactions require the promotion and implementation gates |
+
+There is no sliding-window attention. Each PKDA layer uses 20 query/key heads,
+20 value heads, `expand_v = 1`, and `d_k = d_v = 128`, so its key and value
+projection widths are both 2,560. This is not constrained to equal the residual
+width. Kimi Linear's scaling-law table pairs 20 heads with hidden width 1,536
+and fixes `d_k = d_v = 128` throughout its experiments; its released model also
+uses a KDA projection wider than its residual stream. The 20-by-128 geometry is
+therefore the registered operating point rather than a width-preserving
+12-by-128 convenience.
+
+The base recurrence keeps the released Kimi Linear parameterization:
+bias-free Q/K/V projections; separate bias-free causal depthwise convolutions
+of width 4 followed by SiLU; L2-normalized Q and K; a rank-128 channel-wise
+decay projection; one sigmoid delta-update gate per head; head-wise RMSNorm
+with epsilon `1e-5`; a rank-128 sigmoid output gate whose final projection has
+a zero-initialized bias; and a bias-free output projection. All ordinary dense
+and tied-embedding weights are initialized from `Normal(0, 0.02)`. The three
+depthwise convolution weights retain the released implementation's inherited
+`Conv1d` Kaiming-uniform initialization at fan-in 4. RMSNorm weights initialize
+to one; routing queries and nulls initialize to zero. The special KDA and
+preconditioner gate initializations below override the ordinary rule where
+stated.
 
 PKDA applies the stable diagonal apply-to-key preconditioner from
 Preconditioned DeltaNet. Each head maintains an auxiliary nonnegative diagonal
@@ -620,8 +645,10 @@ S_t         = (I - beta_t k_write_t k_t^T) S_tilde_t
 o_t         = S_t^T q_t
 ```
 
-Training uses the chunkwise-parallel PKDA form. Cached decoding uses the
-mathematically equivalent recurrent form and advances both `S_t` and `A_t`.
+Training and long-prompt prefill use the chunkwise-parallel PKDA form with
+fixed chunk size 64. Backward recomputes the large chunk intermediates rather
+than retaining them. Cached autoregressive decoding uses the mathematically
+equivalent single-token recurrent form and advances both `S_t` and `A_t`.
 
 The fourth layer of each cell uses dense causal, sigmoid-output-gated GQA: 16
 query heads, 8 KV heads, head width 96, per-head Q/K RMSNorm, and a full 8,192-
@@ -652,13 +679,92 @@ parameterization, but evaluates pure PKDA rather than this hybrid. Qwen3-Next
 supplies independent interval-four Gated DeltaNet/gated-global-GQA precedent,
 but does not use PKDA.
 
-The approximately 1.22B count assumes the geometry and dense PKDA projections
-above, tied embeddings, hard-DF modules, and six width-1,536 GQA gate
-projections. Relative to KDA, the two width-to-head preconditioner projections
-and three learned per-head vectors add 36,900 parameters per PKDA layer and
-664,200 across the 18 PKDA layers. The GQA gates add 14,155,776 weights to the
-ungated hybrid. The implementation gate must record the exact instantiated
-count before spend approval.
+The analytical count is:
+
+| Component | Parameters |
+|---|---:|
+| Tied embedding and readout | 233,373,696 |
+| 24 SwiGLU channel mixers | 736,100,352 |
+| 18 PKDA mixers | 304,297,632 |
+| 6 gated global GQA mixers, including Q/K norms | 56,624,256 |
+| Hard-DF fusion | 4,718,592 |
+| Trunk, entry, and payload norms | 79,872 |
+| 48 within-column routers and one payload router | 225,792 |
+| **Total** | **1,335,420,192** |
+
+Relative to unpreconditioned KDA, the two width-to-head preconditioner
+projections and three learned per-head vectors add 61,500 parameters per PKDA
+layer and 1,107,000 across the 18 PKDA layers. Relative to the discarded
+12-by-128 sketch, 20-by-128 adds 118,886,976 parameters. The GQA gates add
+14,155,776 weights to the ungated hybrid. The implementation gate must make an
+instantiated model reproduce the analytical total exactly before spend
+approval.
+
+#### Flagship training and execution
+
+The flagship retains the experiment's FineWeb-Edu stream, Qwen3 tokenizer,
+row addressing, paired initialization, hard-DF objective, and optimizer
+partition. Its exact operating schedule is:
+
+| Quantity | Registered value |
+|---|---:|
+| Sequence length | 8,192 predictions |
+| Global batch | 40 sequences = 327,680 predicted tokens |
+| Distributed batch | 8 ranks x microbatch 1 x accumulation 5 |
+| Optimizer steps | 1,220,703 |
+| Exact predicted tokens | 399,999,959,040 |
+| Warmup | steps 1-200 |
+| Stable heat | steps 201-915,527 |
+| Cooldown | steps 915,528-1,220,703 |
+| Feedback boundary | after step 610,351 |
+| Whole-run pass mixture | expected 75% / 22% / 3% for 1 / 2 / 3 passes |
+| Expected token-equivalent compute | approximately 512B pass-tokens |
+
+The 327,680-token batch is the clean eight-rank realization nearest the FBT
+paper's approximately 300K-token batch: every rank processes one full sequence
+per microstep and synchronizes after five microsteps. The first half of the run
+is one-pass. In the second half, hard DF draws 1, 2, or 3 passes with
+probabilities 50%, 44%, and 6%, using the same keyed schedule as the screen;
+the exact realized pass-token count is recorded rather than inferred from the
+expectation.
+
+Learning rates, decay, and the z-loss follow the shared NorMuon/Adam WSD recipe
+above. The flagship additionally clips the accumulated global FP32 gradient
+norm to 1.0 immediately before the optimizer step, matching the 1B PKDA
+training precedent. All PKDA decay, update, output-gate, preconditioner-decay,
+and preconditioner-gain projections remain in Adam; Q/K/V/output projections
+remain in NorMuon. The three-dimensional depthwise convolution weights are
+non-matrix parameters and remain in Adam with no weight decay. All learned KDA
+and preconditioner rate parameters are also exempt from weight decay.
+
+The registered distributed target is eight H100 80GB GPUs under replicated
+DDP, BF16 autocast, FP32 parameters, FP32 gradients at the optimizer boundary,
+and FP32 optimizer state. It uses no tensor, pipeline, context, or parameter
+sharding. Every transformer block is activation-checkpointed on every pass;
+feedback payloads and source banks remain differentiable, and checkpoint
+recomputation does not preserve RNG state because all stochastic feedback
+choices arrive as keyed tensor inputs. Global GQA uses BF16 FlashAttention.
+PKDA uses the upstream-equivalent Triton chunk kernel for training/prefill and
+the fused recurrent kernel for single-token decode. This target remains
+non-runnable until its per-rank memory, graph behavior, parity, and throughput
+pass the implementation gate.
+
+PKDA recurrent matrix and diagonal-preconditioner boundary states are FP32;
+PKDA outputs and convolution caches are BF16. Global-GQA KV caches are BF16.
+At a full 8,192-token prompt, the registered per-sequence token-mixer cache is:
+
+| Cache | Size |
+|---|---:|
+| 18 PKDA matrix states `[20,128,128]` | 22.500 MiB |
+| 18 PKDA preconditioner states `[20,128]` | 0.176 MiB |
+| 18 Q/K/V convolution caches, width 2,560 and history 3 | 0.791 MiB |
+| 6 global-GQA BF16 KV caches `[8192,8,96]` | 144.000 MiB |
+| **Token-mixer total** | **167.467 MiB** |
+
+This total excludes allocator overhead, the width-1,536 DF payload, logits,
+and serving-runtime metadata. A prefill or Jacobi pass still begins with zero
+PKDA state as specified below; FP32 boundary-state precision applies whenever
+a state is materialized or carried across decode calls.
 
 #### Flagship block-delta routing
 

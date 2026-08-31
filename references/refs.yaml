@@ -25,9 +25,19 @@ references:
     note: >
       Defines Kimi Delta Attention, its chunkwise and recurrent forms,
       channel-wise decay, causal short convolutions, sigmoid output gate, NoPE
-      global-attention layers, and the empirically selected 3:1 KDA-to-global
-      MLA cadence. The flagship keeps the KDA substrate and cadence inside
-      PKDA but uses dense global GQA instead of MLA.
+      global-attention layers, the empirically selected 3:1 KDA-to-global MLA
+      cadence, and the width-1,536 scaling-law point with 20 heads and
+      128-dimensional key/value heads. The flagship keeps the KDA substrate
+      and cadence inside PKDA but uses dense global GQA instead of MLA.
+
+  - url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json
+    slug: kimi2025-kimi-linear-config
+    note: >
+      The released Kimi Linear configuration independently fixes BF16 model
+      dtype, normal initialization with standard deviation 0.02, 128-wide KDA
+      heads, convolution width 4, and a KDA projection width larger than the
+      residual width. It is released-model precedent for those operational
+      choices, not a geometry reproduction target.
 
   - arxiv: "2604.21100"
     slug: tumma2026-preconditioned-deltanet
@@ -45,6 +55,22 @@ references:
       projections and initialization, bounded preconditioner, auxiliary A-state
       cache, chunkwise training kernel, and fused-recurrent decoding kernel that
       the flagship implementation must reproduce and qualify.
+
+  - url: https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/conv/short_conv.py
+    slug: fla2026-short-convolution
+    note: >
+      The released KDA/PKDA short convolution is a bias-free depthwise Conv1d
+      with causal history of kernel-size minus one and does not override the
+      framework Conv1d initialization. The flagship preserves those weight,
+      cache-shape, and initialization semantics.
+
+  - url: https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/precond_kda/chunk.py
+    slug: fla2026-preconditioned-kda-chunk
+    note: >
+      The upstream PKDA training operator fixes chunk size 64, returns outputs
+      in the activation dtype, retains FP32 recurrent boundary states, and
+      recomputes large intermediates in backward by default. These are the
+      flagship kernel and precision contracts.
 
   - url: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json
     slug: qwen2025-qwen3-next-config
