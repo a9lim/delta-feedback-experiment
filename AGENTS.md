@@ -1,15 +1,13 @@
 # AGENTS.md
 
-This repository owns a from-scratch pretraining factorial over two innovation
-packages. The architecture package combines multi-head routing over
-within-column residual deltas with gated GQA; the recurrence package is
-full-bandwidth latent feedback between adjacent token columns. The hard hybrid
-is `df`; `mhdb` and `fbt` are its parent-package deletions; `vanilla` is the
-shared baseline; `df_soft` is an optional-channel diagnostic.
+This repository owns a from-scratch MHDB x FBT pretraining factorial on a
+common PKDA/gated-GQA hybrid trunk. The hard hybrid is `df`; `mhdb` and `fbt`
+are its parent-package deletions; `base` is their shared hybrid baseline. The
+completed pure-GQA `vanilla` run is an external trunk control.
 
-The 223–231M screen campaign is active. No matched scientific comparison is
-complete, and [docs/findings.md](docs/findings.md) must remain empty of
-architecture claims until one is admissible.
+The 223–243M screen has no active job. No matched hybrid comparison is complete,
+and [docs/findings.md](docs/findings.md) must remain empty of architecture
+claims until one is admissible.
 
 ## Documentation contract
 
@@ -36,11 +34,18 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
-- Screen and token-ladder `mhdb`, `df`, and `df_soft` use gated GQA as part of
-  the architecture package; `vanilla` and `fbt` use ungated GQA. Every gate is
-  a bias-free projection of the attention input followed by an elementwise
-  sigmoid on the concatenated attention output before output projection and
-  residual-branch scaling. Flagship global GQA uses the same gate semantics.
+- Screen and token-ladder `base`, `mhdb`, `fbt`, and `df` use exact
+  `[PKDA, PKDA, PKDA, gated global GQA] x 3` trunks: 8 PKDA heads at
+  `d_k = d_v = 128`, causal convolution width 4, NoPE global attention, and
+  8/4-by-96 GQA. `vanilla` remains the exact twelve-layer RoPE GQA trunk. Every
+  global gate is a bias-free projection of the attention input followed by an
+  elementwise sigmoid on the concatenated attention output before output
+  projection and residual-branch scaling.
+- Screen PKDA uses the literal portable recurrence off CUDA and the pinned FLA
+  recomputing chunk kernel on CUDA. Its main and preconditioner gates are
+  independent, recurrent and preconditioner boundary states are FP32, and
+  sequential decoding continues both states plus all three convolution
+  histories. Never silently run the sequential fallback for CUDA training.
 - Every scale uses MHDB sources: the column's actual input seed, one delta per
   completed four-layer cell, and at most one aggregate partial delta for the
   current cell. Individual branch deltas are not sources. Every router prepends
@@ -54,26 +59,23 @@ contract changes.
   asymmetric GLU, then uses the fused input as the MHDB seed. Its payload is
   the normalized top state plus a routed mixture over the null, seed, and this
   column's completed block deltas.
-- `df_soft` keeps the plain token embedding as the stream seed and exposes the
-  shifted payload as a masked standing source. Its payload router uses the same
-  null, seed, and completed-block bank as hard DF.
 - Multi-pass feedback is causal, differentiable across passes, and uses the
   shared prefix-mixin and jitter streams. Do not detach the payload to solve a
   memory problem; checkpoint blocks or coarsen the source representation.
 
 ## Experimental discipline
 
-- Every arm uses the same tokenizer, token stream, row order, paired common
-  initialization, feedback random stream, base trunk geometry, optimizer
-  recipe, and schedule. Architecture gates are paired across `mhdb`, `df`,
-  and `df_soft`; FBT fusion weights are paired across `fbt` and `df`. The
-  registered architecture package is the only deliberate trunk divergence.
+- Every arm uses the same tokenizer, token stream, row order, feedback random
+  stream, outer geometry, optimizer recipe, and schedule. The complete hybrid
+  trunk is byte-identical across `base`, `mhdb`, `fbt`, and `df`; MHDB weights
+  are paired across `mhdb`/`df`, and FBT weights across `fbt`/`df`. The
+  structurally distinct `vanilla` control retains its exact completed-run
+  initialization and state layout.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.
-- The primary factorial is `{vanilla, mhdb, fbt, df}`. `df_soft` is run only
-  as the adoption diagnostic defined in the design and is not substituted for
-  hard DF.
+- The primary factorial is `{base, mhdb, fbt, df}`. Report `vanilla` versus
+  `base` separately as the whole-trunk contrast.
 - Pass-1 validation is the common Standard-mode metric. Feedback arms also
   report the fully fused second-pass metric. Routing observables and
   contraction traces are diagnostics, not architecture wins by themselves.
@@ -90,9 +92,12 @@ contract changes.
   spool orchestration, `Schedule`, and monitor serving from the workspace root
   package. Do not reimplement those facilities here.
 - CPU/MPS runs use the semantic PyTorch fallbacks. Jobe is the authoritative
-  single-GPU CUDA surface: BF16 activations, FlashAttention, cut cross-entropy,
-  the Triton MHDB router, compiled blocks, CUDA graphs, and asynchronous atomic
-  snapshots. Respect Jobe's pinned Torch/FlashAttention environment.
+  single-GPU CUDA surface: BF16 activations, pinned FLA PKDA, FlashAttention,
+  cut cross-entropy, the Triton MHDB router, compiled global-attention blocks,
+  CUDA graphs, and asynchronous atomic snapshots. Respect Jobe's pinned
+  Torch/FlashAttention environment.
+- New snapshots are checkpoint-v9. Checkpoint-v8 is resumable only for the
+  preserved vanilla trunk; reject every superseded intervention-arm v8 state.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.
   The queue records exact arguments without inspecting Git state. Source
   changes never stop an active child; the worker refreshes before the next job
@@ -104,10 +109,10 @@ contract changes.
   each PKDA mixer uses 20 query/key heads and 20 value heads at
   `d_k = d_v = 128`, for width-2,560 projections. Its batch-aligned budget is
   440,818,728,960 predicted tokens: 400 per 1,102,046,496 active non-embedding
-  parameters, conventionally 441B. It also requires PKDA kernels and
-  recurrent/preconditioner cache semantics, gated GQA, block-delta routing,
-  and distributed execution. Do not describe either path as runnable until
-  those contracts land in code and tests.
+  parameters, conventionally 441B. The generic mixers and cache semantics now
+  exist, but the flagship still requires exact-geometry distributed execution,
+  memory/throughput qualification, checkpoint portability, and restart tests.
+  Do not describe it as runnable until those contracts land.
 - Flagship promotion requires the registered ladder trend, the matched
   factorial evidence, a clean contraction gate, the exact implementation gate,
   and explicit spend confirmation from a9.

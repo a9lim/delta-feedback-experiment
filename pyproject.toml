@@ -1,7 +1,7 @@
 [project]
 name = "delta-feedback-experiment"
-version = "0.3.0"
-description = "Pretraining factorial: MHDB plus gated GQA x full-bandwidth latent feedback."
+version = "0.4.0"
+description = "Pretraining factorial: MHDB x full-bandwidth feedback on a PKDA/GGQA hybrid."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "CC-BY-SA-4.0"
@@ -19,6 +19,7 @@ dependencies = [
 cuda = [
     "cut-cross-entropy==25.1.1",
     "flash-attn==2.8.3.post1",
+    "flash-linear-attention[cuda] @ git+https://github.com/fla-org/flash-linear-attention.git@35dceaee5408e69a555fec34cb215c93c375dabe",
 ]
 
 [project.scripts]
@@ -27,6 +28,9 @@ df = "delta_feedback_experiment.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["delta_feedback_experiment"]

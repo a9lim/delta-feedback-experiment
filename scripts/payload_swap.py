@@ -67,7 +67,7 @@ def main() -> None:
         **{f: saved[f] for f in GEOMETRY},
     )
     if not cfg.feedback_active or not cfg.routing_active:
-        raise SystemExit("the payload sweep needs a payload router (df/df_soft)")
+        raise SystemExit("the payload sweep needs the df payload router")
     if args.head is not None and not 0 <= args.head < cfg.routing_heads:
         raise SystemExit(
             f"--head must be in [0, {cfg.routing_heads - 1}], got {args.head}"

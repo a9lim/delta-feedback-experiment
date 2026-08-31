@@ -1,28 +1,28 @@
 # delta-feedback-experiment
 
-This repository tests whether two innovation packages improve a transformer
-independently or interact when pretrained together:
+This repository tests whether two innovation packages improve a common
+PKDA/GGQA hybrid independently or interact when pretrained together:
 
-- **Architecture innovation** combines Multi-Head Delta Block routing (MHDB)
-  with sigmoid-gated grouped-query attention (GGQA).
+- **Depth routing** uses Multi-Head Delta Block routing (MHDB) over a column's
+  seed and four-layer block deltas.
 - **Recurrence innovation** uses Full-Bandwidth Transformer (FBT) feedback to
   carry the previous column's top state into the next through a mandatory
   token-gated fusion.
 - **Delta Feedback (DF)** combines both packages and applies the multi-head
   delta router to enrich the recurrent payload between columns.
 
-The primary experiment is the four-cell factorial `{vanilla, mhdb, fbt, df}`.
-`df_soft` is a diagnostic arm that exposes the previous payload as an optional
-routing source rather than using hard FBT entry. Every MHDB router has a
-learnable zero-initialized null source.
+The primary factorial is `{base, mhdb, fbt, df}`. All four use
+`[PKDA, PKDA, PKDA, gated global GQA] x 3`; the completed pure-GQA `vanilla`
+run is retained as an external trunk control. Every MHDB router has a learnable
+zero-initialized null source.
 
 ## Status
 
-The screen campaign is active on Jobe. No matched arm comparison is complete,
-so there are no accepted experiment findings. `mhdb`, `df`, and `df_soft` use
-GGQA; `vanilla` and `fbt` use ungated GQA. The screen-scale plain-PyTorch model,
-deterministic trainer, portable fallbacks, and optimized single-GPU CUDA path
-are implemented. The token-ladder continuation and the distributed
+No screen job is active. The completed vanilla record is retained, but no
+matched hybrid comparison is complete, so there are no accepted experiment
+findings. The 8-by-128 PKDA/GGQA screen, deterministic trainer, portable
+recurrence, and optimized single-GPU CUDA path are implemented. The
+token-ladder continuation and the distributed
 1.335B-parameter, 441B-token, 20-by-128-PKDA
 `[PKDA, PKDA, PKDA, gated global GQA]` block-delta flagship path are specified
 but not yet implemented.
@@ -84,9 +84,10 @@ token stream. Pass counts are keyed by data seed and step; prefix lengths and
 jitter additionally use the global row, so paired arms see identical examples
 and feedback draws.
 
-Snapshots are immutable, exact-resume checkpoint-contract v8 files under
-`runs/`. `--max-steps` limits only the current invocation; it never rescales the
-state-defining schedule.
+New snapshots are immutable checkpoint-contract v9 files under `runs/`.
+Completed v8 vanilla snapshots remain exactly resumable; other v8 arms are
+rejected. `--max-steps` limits only the current invocation; it never rescales
+the state-defining schedule.
 
 ## Analysis
 

@@ -36,6 +36,10 @@ TINY_ARGS = [
     "16",
     "--intermediate",
     "64",
+    "--pkda-heads",
+    "2",
+    "--pkda-head-dim",
+    "16",
     "--seq-len",
     "16",
     "--batch-rows",
@@ -153,11 +157,13 @@ def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
             "df",
             vocab_size=97,
             dim=32,
-            layers=2,
+            layers=4,
             heads=2,
             kv_heads=2,
             head_dim=16,
             intermediate=64,
+            pkda_heads=2,
+            pkda_head_dim=16,
             max_seq_len=17,
         )
     )
@@ -166,13 +172,18 @@ def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
     normuon_names = {names[id(parameter)] for parameter in normuon}
     adam_names = {names[id(parameter)] for parameter in adam}
 
-    assert {f"attention_gates.{layer}.weight" for layer in range(2)} <= adam_names
+    assert "attention_gates.0.weight" in adam_names
     assert "embed_tokens.weight" in adam_names
     assert "blocks.0.attn_router.query" in adam_names
     assert "blocks.0.attn_router.key_norm.weight" in adam_names
     assert "fuse_value.weight" in normuon_names
     assert "fuse_gate.weight" in normuon_names
-    assert "blocks.0.attn.qkv_proj.weight" in normuon_names
+    assert "blocks.0.attn.q_proj.weight" in normuon_names
+    assert "blocks.3.attn.qkv_proj.weight" in normuon_names
+    assert "blocks.0.attn.decay_down.weight" in adam_names
+    assert "blocks.0.attn.precond_decay_proj.weight" in adam_names
+    assert "blocks.0.attn.output_gate_up.weight" in adam_names
+    assert "blocks.0.attn.q_conv.weight" in adam_names
     assert "blocks.0.mlp.gate_up_proj.weight" in normuon_names
     assert not (normuon_names & adam_names)
     assert len(normuon_names) + len(adam_names) == len(names)
@@ -191,7 +202,7 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
             return rows.to(device) if device is not None else rows
 
     args = SimpleNamespace(eval_rows=2)
-    for arm in ("mhdb", "df", "df_soft"):
+    for arm in ("mhdb", "df"):
         model = DFModel(
             arm_config(
                 arm,
@@ -202,6 +213,8 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
                 kv_heads=2,
                 head_dim=16,
                 intermediate=64,
+                pkda_heads=2,
+                pkda_head_dim=16,
                 max_seq_len=16,
             )
         )
@@ -209,13 +222,6 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
         assert records
         assert all("null" in record and record["null_rms"] == 0 for record in records)
         assert all("seed" in record for record in records)
-        if arm == "df_soft":
-            assert all(
-                "prev" in record for record in records if record["site"] != "payload"
-            )
-            assert "prev" not in next(
-                record for record in records if record["site"] == "payload"
-            )
 
 
 # -- schedule and derived randomness -------------------------------------------
@@ -299,13 +305,13 @@ def run(tmp_path, tag, extra):
     )
 
 
-@pytest.mark.parametrize("arm", ["vanilla", "mhdb", "fbt", "df", "df_soft"])
+@pytest.mark.parametrize("arm", ["vanilla", "base", "mhdb", "fbt", "df"])
 def test_tiny_run_completes(tmp_path, capsys, arm):
     summary = run(tmp_path, f"t-{arm}", ["--arm", arm])
     assert summary["step"] == 8
     assert np.isfinite(summary["loss"])
     assert np.isfinite(summary["val"])
-    if arm in ("fbt", "df", "df_soft"):
+    if arm in ("fbt", "df"):
         assert np.isfinite(summary["val_fused"])
     snapshots = list((tmp_path / "runs").glob(f"t-{arm}.pt.*"))
     assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {6, 8}
@@ -338,8 +344,30 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
         run(tmp_path, "conf", ["--arm", "df", "--resume", "--dim", "64"])
 
 
+def rewrite_latest_as_v8(tmp_path, tag):
+    snapshots = list((tmp_path / "runs").glob(f"{tag}.pt.*"))
+    path = max(snapshots, key=lambda item: int(item.name.rsplit(".", 1)[1]))
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["version"] = 8
+    for field in ("pkda_heads", "pkda_head_dim", "pkda_conv_size"):
+        payload["args"].pop(field)
+    torch.save(payload, path)
+
+
+def test_checkpoint_v8_resume_is_vanilla_only(tmp_path, capsys):
+    run(tmp_path, "old-vanilla", ["--arm", "vanilla", "--max-steps", "5"])
+    rewrite_latest_as_v8(tmp_path, "old-vanilla")
+    resumed = run(tmp_path, "old-vanilla", ["--arm", "vanilla", "--resume"])
+    assert resumed["step"] == 8
+
+    run(tmp_path, "old-df", ["--arm", "df", "--max-steps", "2"])
+    rewrite_latest_as_v8(tmp_path, "old-df")
+    with pytest.raises(ValueError, match="only for the preserved vanilla"):
+        run(tmp_path, "old-df", ["--arm", "df", "--resume"])
+
+
 def test_multipass_checkpoint_parity():
-    """The guarded larger/DF-soft modes preserve plain-path loss and grads."""
+    """The guarded larger modes preserve plain-path loss and gradients."""
     from delta_feedback_experiment.model import (
         DFModel,
         arm_config,
@@ -356,6 +384,8 @@ def test_multipass_checkpoint_parity():
         kv_heads=2,
         head_dim=16,
         intermediate=64,
+        pkda_heads=2,
+        pkda_head_dim=16,
         max_seq_len=17,
     )
     torch.manual_seed(0)
@@ -388,9 +418,6 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
         model = DFModel(arm_config("df"))
     assert not automatic_checkpoint(model, 2, args, torch.device("cuda"))
     assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
-    with torch.device("meta"):
-        soft = DFModel(arm_config("df_soft"))
-    assert automatic_checkpoint(soft, 2, args, torch.device("cuda"))
     args.micro_rows = 8
     assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
     with pytest.raises(SystemExit):

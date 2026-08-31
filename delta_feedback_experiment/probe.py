@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 import subprocess
 import sys
@@ -31,6 +32,7 @@ def cuda_gate() -> None:
         linear_cross_entropy_apply,
     )
     from .optim import OptimizerPair, build_optimizers
+    from .pkda import PreconditionedKDA, pkda_cuda_available
     from .train import (
         CONTRACT,
         CudaEvalRunner,
@@ -45,10 +47,12 @@ def cuda_gate() -> None:
         raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
     if route_triton is None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
+    if not pkda_cuda_available():
+        raise RuntimeError("Jobe gate requires the pinned FLA PKDA kernels")
 
     # The fixed-capacity router must match the semantic implementation in both
-    # values and gradients. H=4/N=6 covers the largest screen bank (DF-soft
-    # with previous payload); H=8/N=9 covers the corresponding flagship bank.
+    # values and gradients. H=4/N=5 covers the largest screen bank; H=8/N=8
+    # covers the corresponding six-cell flagship payload bank.
     def route_parity(dim, heads, batch, length, n_sources, null_first, seed):
         torch.manual_seed(seed)
         query = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
@@ -119,8 +123,75 @@ def cuda_gate() -> None:
             if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
                 raise AssertionError(f"H={heads} bespoke router gradient drift")
 
-    route_parity(48, 4, 3, 11, 6, True, 7)
-    route_parity(1536, 8, 2, 3, 9, True, 8)
+    route_parity(48, 4, 3, 11, 5, True, 7)
+    route_parity(1536, 8, 2, 3, 8, True, 8)
+
+    # Compare the exact chunk operator against the literal recurrent equations
+    # across a chunk boundary. Inputs use the production dtypes, and the loss
+    # reaches every recurrence input plus the learned main-decay and
+    # preconditioner-center parameters.
+    torch.manual_seed(9)
+    pkda_ref = PreconditionedKDA(32, num_heads=2, head_dim=16).train()
+    pkda_cuda = copy.deepcopy(pkda_ref).cuda().train()
+    shapes = {
+        "q": (1, 65, 2, 16),
+        "k": (1, 65, 2, 16),
+        "v": (1, 65, 2, 16),
+        "raw_decay": (1, 65, 2, 16),
+        "beta": (1, 65, 2),
+        "precond_decay": (1, 65, 2),
+        "precond_beta": (1, 65, 2),
+    }
+    pkda_inputs = {}
+    pkda_cuda_inputs = {}
+    for name, shape in shapes.items():
+        dtype = torch.float32 if name == "precond_decay" else torch.bfloat16
+        value = torch.randn(shape, dtype=dtype)
+        if name == "precond_decay":
+            value = -value.abs()
+        elif name in {"beta", "precond_beta"}:
+            value = value.sigmoid()
+        pkda_inputs[name] = value.requires_grad_()
+        pkda_cuda_inputs[name] = value.detach().cuda().requires_grad_()
+    pkda_expected, _, _ = pkda_ref._portable_recurrence(
+        **pkda_inputs,
+        state=None,
+        a_state=None,
+        output_final_state=False,
+    )
+    pkda_actual, _, _ = pkda_cuda._cuda_recurrence(
+        **pkda_cuda_inputs,
+        state=None,
+        a_state=None,
+        output_final_state=False,
+    )
+    pkda_cotangent = torch.randn_like(pkda_expected)
+    (pkda_expected.float() * pkda_cotangent.float()).mean().backward()
+    (pkda_actual.float() * pkda_cotangent.cuda().float()).mean().backward()
+
+    def relative_error(actual, expected):
+        return (
+            torch.linalg.vector_norm((actual - expected).float())
+            / torch.linalg.vector_norm(expected.float()).clamp_min(1e-8)
+        ).item()
+
+    pkda_value_rel = relative_error(pkda_actual.cpu(), pkda_expected)
+    if pkda_value_rel >= 0.05:
+        raise AssertionError(f"PKDA chunk value drift: {pkda_value_rel:.4f}")
+    for name in shapes:
+        grad_rel = relative_error(
+            pkda_cuda_inputs[name].grad.cpu(), pkda_inputs[name].grad
+        )
+        if grad_rel >= 0.15:
+            raise AssertionError(f"PKDA chunk {name} gradient drift: {grad_rel:.4f}")
+    for name in ("A_log", "dt_bias", "log_precond_center"):
+        expected = dict(pkda_ref.named_parameters())[name].grad
+        actual = dict(pkda_cuda.named_parameters())[name].grad.cpu()
+        grad_rel = relative_error(actual, expected)
+        if grad_rel >= 0.15:
+            raise AssertionError(f"PKDA chunk {name} gradient drift: {grad_rel:.4f}")
+    del pkda_ref, pkda_cuda, pkda_inputs, pkda_cuda_inputs
+    del pkda_expected, pkda_actual, pkda_cotangent
 
     # CCE-native z-loss must retain the full-logit scalar and gradient semantics
     # while never constructing the classifier-wide activation in the real path.
@@ -151,45 +222,53 @@ def cuda_gate() -> None:
     # Exercise both FlashAttention entry points: full causal attention and the
     # in-place native GQA KV cache. BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
-    decode_cfg = arm_config(
-        "vanilla",
-        vocab_size=1000,
-        dim=128,
-        layers=3,
-        heads=4,
-        kv_heads=2,
-        head_dim=32,
-        intermediate=256,
-        max_seq_len=16,
-    )
-    torch.manual_seed(0)
-    decode_model = DFModel(decode_cfg).cuda().eval()
-    decode_tokens = torch.randint(0, 1000, (2, 12), device="cuda")
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        full = decode_model.forward_column(
-            decode_model.embed_tokens(decode_tokens)
-        ).h_top
-        cache = KVCache(decode_cfg, 2, "cuda", torch.bfloat16)
-        prefill = decode_model.forward_column(
-            decode_model.embed_tokens(decode_tokens[:, :5]), cache=cache
+    def decode_parity(arm: str, layers: int) -> float:
+        decode_cfg = arm_config(
+            arm,
+            vocab_size=1000,
+            dim=128,
+            layers=layers,
+            heads=4,
+            kv_heads=2,
+            head_dim=32,
+            intermediate=256,
+            pkda_heads=2,
+            pkda_head_dim=128,
+            max_seq_len=16,
         )
-        pieces = [prefill.h_top]
-        for column in range(5, decode_tokens.shape[1]):
-            pieces.append(
-                decode_model.step(
-                    decode_tokens[:, column : column + 1], None, cache
-                ).h_top
+        torch.manual_seed(0)
+        decode_model = DFModel(decode_cfg).cuda().eval()
+        decode_tokens = torch.randint(0, 1000, (2, 12), device="cuda")
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            full = decode_model.forward_column(
+                decode_model.embed_tokens(decode_tokens)
+            ).h_top
+            cache = KVCache(decode_cfg, 2, "cuda", torch.bfloat16)
+            prefill = decode_model.forward_column(
+                decode_model.embed_tokens(decode_tokens[:, :5]), cache=cache
             )
-        incremental = torch.cat(pieces, dim=1)
-    decode_rel = (
-        torch.linalg.vector_norm((full - incremental).float())
-        / torch.linalg.vector_norm(full.float())
-    ).item()
-    if decode_rel >= 0.02:
-        raise AssertionError(f"FlashAttention cache parity drift: {decode_rel:.4f}")
-    del decode_model, decode_tokens, full, cache, prefill, pieces, incremental
+            pieces = [prefill.h_top]
+            for column in range(5, decode_tokens.shape[1]):
+                pieces.append(
+                    decode_model.step(
+                        decode_tokens[:, column : column + 1], None, cache
+                    ).h_top
+                )
+            incremental = torch.cat(pieces, dim=1)
+        relative = (
+            torch.linalg.vector_norm((full - incremental).float())
+            / torch.linalg.vector_norm(full.float())
+        ).item()
+        if relative >= 0.025:
+            raise AssertionError(f"{arm} cache parity drift: {relative:.4f}")
+        del decode_model, decode_tokens, full, cache, prefill, pieces, incremental
+        return relative
+
+    vanilla_decode_rel = decode_parity("vanilla", 3)
+    hybrid_decode_rel = decode_parity("base", 4)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
     args = build_parser().parse_args(["cuda-probe", "--arm", "df"])
     schedule = build_schedule(args)
@@ -234,6 +313,7 @@ def cuda_gate() -> None:
     torch.cuda.synchronize()
     prepared = time.monotonic() - started
     capture_peak = torch.cuda.max_memory_allocated() / 2**30
+    capture_reserved = torch.cuda.max_memory_reserved() / 2**30
     if capture_peak >= 22.0:
         raise AssertionError(
             f"capture peak leaves unsafe headroom: {capture_peak:.2f} GiB"
@@ -337,8 +417,10 @@ def cuda_gate() -> None:
         raise AssertionError(f"{escaped} compiled graph(s) escaped preparation")
     print(
         "cuda gate | "
-        f"prepare={prepared:.1f}s | peak={capture_peak:.2f}GiB | "
-        f"decode_rel={decode_rel:.4f} | "
+        f"prepare={prepared:.1f}s | allocated={capture_peak:.2f}GiB | "
+        f"reserved={capture_reserved:.2f}GiB | "
+        f"pkda_rel={pkda_value_rel:.4f} | "
+        f"decode_rel={vanilla_decode_rel:.4f}/{hybrid_decode_rel:.4f} | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)
     )

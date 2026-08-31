@@ -2,8 +2,9 @@
 
 The architecture contract is ``docs/design.md``. Everything here is
 arm-agnostic model semantics: the five arms are one class under
-:class:`ModelConfig` flags.  The architecture axis is MHDB plus gated GQA;
-the recurrence axis is FBT, and the factorial cells are deletions of DF.
+:class:`ModelConfig` flags. The four factorial cells share the hybrid
+PKDA/gated-GQA trunk; the axes are MHDB and FBT. ``vanilla`` preserves the
+completed pure-GQA control.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired arms architecturally
 identical in everything but the flags.
@@ -39,6 +40,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .pkda import PreconditionedKDA
+
 try:  # Triton is deliberately a CUDA-only optimization dependency.
     from .cuda_kernels import bespoke_route
     from .cuda_kernels import triton as route_triton
@@ -73,17 +76,18 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     indexed_neg_dot_forward_kernel = None
     _handle_eps = None
 
-ARMS = ("vanilla", "mhdb", "fbt", "df", "df_soft")
+ARMS = ("vanilla", "base", "mhdb", "fbt", "df")
 
 
 @dataclass(frozen=True)
 class ModelConfig:
     """Trunk geometry plus the two-axis arm flags.
 
-    Defaults are the registered screen trunk. Routing heads are not an
-    independent knob: every routed arm uses one contiguous feature group per
-    KV head (H=4 at screen scale, H=8 at the flagship target). The groups do
-    not align to attention projections.
+    Defaults are the registered screen geometry. ``vanilla`` uses the legacy
+    pure-GQA trunk; every other arm uses the 3:1 PKDA/gated-global-GQA hybrid.
+    Routing heads are not an independent knob: every routed arm uses one
+    contiguous feature group per KV head. The groups do not align to mixer
+    projections.
     """
 
     vocab_size: int = 151936
@@ -93,11 +97,17 @@ class ModelConfig:
     kv_heads: int = 4
     head_dim: int = 96
     intermediate: int = 3072
+    pkda_heads: int = 8
+    pkda_head_dim: int = 128
+    pkda_conv_size: int = 4
     max_seq_len: int = 1024
     rope_theta: float = 1e6
     norm_eps: float = 1e-6
     routing_block_size: int = 4
     """Exact MHDB cell width in transformer layers."""
+
+    hybrid: bool = False
+    """Use [PKDA, PKDA, PKDA, gated global GQA] cells."""
 
     block_routing: bool = False
     """MHDB axis: multi-head block-delta routing before every sublayer."""
@@ -105,22 +115,22 @@ class ModelConfig:
     feedback: bool = False
     """FBT axis: gated entry plus a payload for the next column."""
 
-    soft: bool = False
-    """DF-soft: both machineries as free choices — plain entry, standing
-    [p_prev, e] sources, and the same MHDB routers as the hard arms."""
-
     def __post_init__(self) -> None:
         if self.routing_block_size < 1:
             raise ValueError("routing block size must be positive")
+        if self.pkda_heads < 1 or self.pkda_head_dim < 1:
+            raise ValueError("PKDA head count and dimension must be positive")
+        if self.pkda_conv_size < 1:
+            raise ValueError("PKDA convolution width must be positive")
 
     @property
     def routing_active(self) -> bool:
-        return self.block_routing or self.soft
+        return self.block_routing
 
     @property
     def gated_attention(self) -> bool:
-        """The architecture package couples MHDB to gated GQA."""
-        return self.routing_active
+        """Every global attention layer in the hybrid trunk is gated."""
+        return self.hybrid
 
     @property
     def routing_heads(self) -> int:
@@ -134,22 +144,33 @@ class ModelConfig:
 
     @property
     def feedback_active(self) -> bool:
-        return self.feedback or self.soft
+        return self.feedback
 
     @property
     def gated_entry(self) -> bool:
         """Whether the payload enters through the mandatory GLU fuse."""
-        return self.feedback and not self.soft
+        return self.feedback
+
+    def is_pkda_layer(self, layer: int) -> bool:
+        return self.hybrid and layer % 4 != 3
+
+    @property
+    def global_attention_layers(self) -> tuple[int, ...]:
+        if not self.hybrid:
+            return tuple(range(self.layers))
+        return tuple(
+            layer for layer in range(self.layers) if not self.is_pkda_layer(layer)
+        )
 
 
 def arm_config(arm: str, **overrides) -> ModelConfig:
     """The named arm's configuration; overrides adjust instantiated geometry."""
     flags = {
         "vanilla": {},
-        "mhdb": {"block_routing": True},
-        "fbt": {"feedback": True},
-        "df": {"block_routing": True, "feedback": True},
-        "df_soft": {"soft": True},
+        "base": {"hybrid": True},
+        "mhdb": {"hybrid": True, "block_routing": True},
+        "fbt": {"hybrid": True, "feedback": True},
+        "df": {"hybrid": True, "block_routing": True, "feedback": True},
     }
     if arm not in flags:
         raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")
@@ -211,45 +232,89 @@ def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class KVCache:
-    """Preallocated per-layer key/value cache for sequential decoding.
+    """Hybrid decoding cache with dense KV and fixed-size PKDA states.
 
-    All layers write at the same position range; the caller advances the
-    shared position once per column via :meth:`advance`.
+    Only global-attention layers receive KV slots. PKDA layers retain their
+    FP32 matrix/preconditioner states and three short-convolution histories.
+    The caller advances the shared position once per column.
     """
 
     def __init__(self, cfg: ModelConfig, batch: int, device, dtype):
+        self.cfg = cfg
+        self.global_slots = {
+            layer: slot for slot, layer in enumerate(cfg.global_attention_layers)
+        }
         # FlashAttention's native cache layout: [B, S, Hkv, D].
-        shape = (cfg.layers, batch, cfg.max_seq_len, cfg.kv_heads, cfg.head_dim)
+        shape = (
+            len(self.global_slots),
+            batch,
+            cfg.max_seq_len,
+            cfg.kv_heads,
+            cfg.head_dim,
+        )
         self.k = torch.zeros(shape, device=device, dtype=dtype)
         self.v = torch.zeros(shape, device=device, dtype=dtype)
+        self.pkda_states: dict[
+            int,
+            tuple[
+                Tensor,
+                Tensor,
+                tuple[Tensor, Tensor, Tensor],
+            ],
+        ] = {}
         self.pos = 0
+
+    def attention_tensors(self, layer: int) -> tuple[Tensor, Tensor]:
+        slot = self.global_slots[layer]
+        return self.k[slot], self.v[slot]
 
     def update(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Write k/v [B,T,Hkv,D]; return the full prefix in that layout."""
+        slot = self.global_slots[layer]
         length = k.shape[1]
-        self.k[layer, :, self.pos : self.pos + length] = k
-        self.v[layer, :, self.pos : self.pos + length] = v
+        self.k[slot, :, self.pos : self.pos + length] = k
+        self.v[slot, :, self.pos : self.pos + length] = v
         return (
-            self.k[layer, :, : self.pos + length],
-            self.v[layer, :, : self.pos + length],
+            self.k[slot, :, : self.pos + length],
+            self.v[slot, :, : self.pos + length],
         )
+
+    def pkda_state(
+        self, layer: int
+    ) -> tuple[
+        Tensor | None,
+        Tensor | None,
+        tuple[Tensor, Tensor, Tensor] | None,
+    ]:
+        return self.pkda_states.get(layer, (None, None, None))
+
+    def update_pkda(
+        self,
+        layer: int,
+        state: Tensor,
+        a_state: Tensor,
+        conv_state: tuple[Tensor, Tensor, Tensor],
+    ) -> None:
+        self.pkda_states[layer] = (state, a_state, conv_state)
 
     def advance(self, length: int) -> None:
         self.pos += length
 
     def reset(self) -> None:
         self.pos = 0
+        self.pkda_states.clear()
 
 
 # -- trunk modules -------------------------------------------------------------
 
 
 class Attention(nn.Module):
-    """Screen GQA; architecture arms supply a sigmoid output-gate weight."""
+    """Dense GQA: RoPE for vanilla, NoPE plus sigmoid gate in the hybrid."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
+        self.use_rope = not cfg.hybrid
         self.q_size = cfg.heads * cfg.head_dim
         self.kv_size = cfg.kv_heads * cfg.head_dim
         self.qkv_proj = nn.Linear(cfg.dim, self.q_size + 2 * self.kv_size, bias=False)
@@ -260,8 +325,8 @@ class Attention(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cos: Tensor,
-        sin: Tensor,
+        cos: Tensor | None,
+        sin: Tensor | None,
         gate_weight: Tensor | None,
         cache: KVCache | None,
         layer: int,
@@ -274,8 +339,13 @@ class Attention(nn.Module):
         q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
         k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
-        q = apply_rope(self.q_norm(q), cos, sin)
-        k = apply_rope(self.k_norm(k), cos, sin)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.use_rope:
+            if cos is None or sin is None:
+                raise ValueError("vanilla GQA requires rotary position tables")
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
         q_flash = q.transpose(1, 2)
         k_flash = k.transpose(1, 2)
         v_flash = v.transpose(1, 2)
@@ -284,10 +354,11 @@ class Attention(nn.Module):
         if cache is not None and length > 1 and cache.pos != 0:
             raise ValueError("multi-column append to a non-empty cache")
         if cache is not None and use_flash and flash_attn_with_kvcache is not None:
+            cache_k, cache_v = cache.attention_tensors(layer)
             out = flash_attn_with_kvcache(
                 q_flash,
-                cache.k[layer],
-                cache.v[layer],
+                cache_k,
+                cache_v,
                 k=k_flash,
                 v=v_flash,
                 cache_seqlens=cache.pos,
@@ -417,9 +488,8 @@ class Router(nn.Module):
 
     A learnable zero-init null vector is always prepended.  Its key is
     rmsnorm(0)=0, so its logit is exactly zero at init and routing mass on it
-    initially adds nothing.  A per-source presence mask (True = present at
-    that position) supports DF-soft's prefix mixin, where the p_prev source
-    exists only at fused positions.
+    initially adds nothing. The primitive retains an optional source-presence
+    mask for kernel parity, although every registered screen source is present.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -500,9 +570,24 @@ class Block(nn.Module):
     def __init__(self, cfg: ModelConfig, layer: int):
         super().__init__()
         self.layer = layer
+        self.is_pkda = cfg.is_pkda_layer(layer)
+        self.global_gate_index = (
+            cfg.global_attention_layers.index(layer)
+            if cfg.hybrid and not self.is_pkda
+            else None
+        )
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.mlp_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.attn = Attention(cfg)
+        self.attn = (
+            PreconditionedKDA(
+                cfg.dim,
+                num_heads=cfg.pkda_heads,
+                head_dim=cfg.pkda_head_dim,
+                conv_size=cfg.pkda_conv_size,
+            )
+            if self.is_pkda
+            else Attention(cfg)
+        )
         self.mlp = SwiGLU(cfg)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
         self.has_prior_partial = layer % cfg.routing_block_size != 0
@@ -513,48 +598,57 @@ class Block(nn.Module):
             self.attn_router = None
             self.mlp_router = None
 
-    def _read(self, h, router, sources, p_mask, want_weights):
-        """p_mask masks sources[0] and is passed only when that source is
-        the standing previous-column payload."""
+    def _read(self, h, router, sources, want_weights):
         if router is None or not sources:
             return h, None
         masks: list[Tensor | None] = [None] * len(sources)
-        if p_mask is not None:
-            masks[0] = p_mask
         routed, weights = router(list(sources), masks, want_weights)
         return (h if routed is None else h + routed), weights
 
     def forward(
         self,
         h: Tensor,
-        cos: Tensor,
-        sin: Tensor,
+        cos: Tensor | None,
+        sin: Tensor | None,
         cache: KVCache | None,
         gate_weight: Tensor | None,
-        p_mask: Tensor | None,
         want_weights: bool,
         *sources: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
         """Returns (h, attn delta, mlp delta, attn weights, mlp weights)."""
-        x, w_attn = self._read(h, self.attn_router, sources, p_mask, want_weights)
-        a = self.branch_scale * self.attn(
-            self.attn_norm(x), cos, sin, gate_weight, cache, self.layer
-        )
+        x, w_attn = self._read(h, self.attn_router, sources, want_weights)
+        normalized = self.attn_norm(x)
+        if self.is_pkda:
+            state = a_state = conv_state = None
+            if cache is not None:
+                state, a_state, conv_state = cache.pkda_state(self.layer)
+            mixed, state, a_state, conv_state = self.attn(
+                normalized,
+                state=state,
+                a_state=a_state,
+                conv_state=conv_state,
+                output_final_state=cache is not None,
+            )
+            if cache is not None:
+                cache.update_pkda(self.layer, state, a_state, conv_state)
+        else:
+            mixed = self.attn(normalized, cos, sin, gate_weight, cache, self.layer)
+        a = self.branch_scale * mixed
         h = h + a
         if self.mlp_router is not None and self.has_prior_partial:
             mlp_sources = (*sources[:-1], sources[-1] + a)
         else:
             mlp_sources = (*sources, a)
-        x, w_mlp = self._read(h, self.mlp_router, mlp_sources, p_mask, want_weights)
+        x, w_mlp = self._read(h, self.mlp_router, mlp_sources, want_weights)
         m = self.branch_scale * self.mlp(self.mlp_norm(x))
         h = h + m
         return h, a, m, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, cos, sin, gate_weight, p_mask, *sources):
+def _block_for_checkpoint(block, h, cos, sin, gate_weight, *sources):
     """Tensor-only wrapper for activation checkpointing (no cache, no
     weights) — the recomputation must be free of side effects."""
-    h, a, m, _, _ = block(h, cos, sin, None, gate_weight, p_mask, False, *sources)
+    h, a, m, _, _ = block(h, cos, sin, None, gate_weight, False, *sources)
     return h, a, m
 
 
@@ -590,8 +684,8 @@ class ColumnOutput:
     """Site → source-axis labels matching ``route_weights`` exactly."""
 
     sources: list[Tensor] | None
-    """Final stored bank (standing sources then completed block deltas).
-    The stream reconstructs from its last seed plus the block deltas."""
+    """Final stored bank: the seed followed by completed block deltas.
+    The stream reconstructs from that seed plus the block deltas."""
 
     source_names: tuple[str, ...]
     """Names corresponding one-for-one with ``sources``."""
@@ -616,7 +710,9 @@ class DFModel(nn.Module):
         common_init_state = torch.random.get_rng_state()
         self.attention_gates = nn.ModuleList(
             nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
-            for _ in range(cfg.layers if cfg.gated_attention else 0)
+            for _ in range(
+                len(cfg.global_attention_layers) if cfg.gated_attention else 0
+            )
         )
         if cfg.gated_entry:
             self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
@@ -646,6 +742,8 @@ class DFModel(nn.Module):
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
             nn.init.normal_(module.weight, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                nn.init.zeros_(module.bias)
         elif isinstance(module, Router):
             nn.init.zeros_(module.query)
             nn.init.zeros_(module.null)
@@ -685,36 +783,27 @@ class DFModel(nn.Module):
         self,
         x: Tensor,
         *,
-        p_source: Tensor | None = None,
-        p_presence: Tensor | None = None,
         cache: KVCache | None = None,
         want_weights: bool = False,
         need_payload: bool = True,
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
-        x is whatever the columns' input actually is: plain embeddings on
-        pass 1 and Standard decoding, the fused u for spine feedback
-        passes, always plain e for DF-soft.  p_source is DF-soft's
-        standing previous-column payload (already shifted); p_presence
-        [B, T] marks the positions where it exists (prefix-mixin rows are
-        absent).  With a cache, positions start at cache.pos and the
-        cache is advanced by T.
+        ``x`` is the actual column input: plain embeddings on pass 1 and
+        Standard decoding, or the fused FBT input on feedback passes. With a
+        cache, positions start at ``cache.pos`` and every mixer cache advances
+        by ``T`` exactly once.
         """
         cfg = self.cfg
         start = cache.pos if cache is not None else 0
-        cos, sin = self.rope(x.device, start, x.shape[1])
+        cos, sin = (
+            (None, None) if cfg.hybrid else self.rope(x.device, start, x.shape[1])
+        )
 
         sources: list[Tensor] | None = None
         source_names: list[str] = []
-        p_mask = None
         if cfg.routing_active:
-            sources = []
-            if p_source is not None:
-                sources.append(p_source)
-                source_names.append("prev")
-                p_mask = p_presence
-            sources.append(x)
+            sources = [x]
             source_names.append("seed")
         seeds = len(sources) if sources is not None else 0
 
@@ -741,27 +830,25 @@ class DFModel(nn.Module):
                 passed_names.append(f"partial{block_index}")
             passed = tuple(passed_sources)
             gate_weight = (
-                self.attention_gates[block.layer].weight
-                if cfg.gated_attention
+                self.attention_gates[block.global_gate_index].weight
+                if block.global_gate_index is not None
                 else None
             )
+            block_fn = _block_for_checkpoint if block.is_pkda else _compiled_block
             if checkpointing:
                 h, _a, _m = torch.utils.checkpoint.checkpoint(
-                    _compiled_block if h.is_cuda else _block_for_checkpoint,
+                    block_fn if h.is_cuda else _block_for_checkpoint,
                     block,
                     h,
                     cos,
                     sin,
                     gate_weight,
-                    p_mask,
                     *passed,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             elif h.is_cuda and cache is None and not want_weights:
-                h, _a, _m = _compiled_block(
-                    block, h, cos, sin, gate_weight, p_mask, *passed
-                )
+                h, _a, _m = block_fn(block, h, cos, sin, gate_weight, *passed)
             else:
                 h, _a, _m, w_attn, w_mlp = block(
                     h,
@@ -769,7 +856,6 @@ class DFModel(nn.Module):
                     sin,
                     cache,
                     gate_weight,
-                    p_mask,
                     want_weights,
                     *passed,
                 )
@@ -837,15 +923,10 @@ class DFModel(nn.Module):
         """Decode one column: tokens [B, 1], payload [B, 1, D] from the
         previous column (None for Standard decoding and non-feedback arms)."""
         e = self.embed_tokens(tokens)
-        if payload is not None and self.cfg.gated_entry:
-            x, p_source = self.fuse(payload, e), None
-        elif payload is not None:
-            x, p_source = e, payload
-        else:
-            x, p_source = e, None
-        return self.forward_column(
-            x, p_source=p_source, cache=cache, want_weights=want_weights
-        )
+        if payload is not None and not self.cfg.feedback_active:
+            raise ValueError("a feedback-free arm cannot consume a payload")
+        x = self.fuse(payload, e) if payload is not None else e
+        return self.forward_column(x, cache=cache, want_weights=want_weights)
 
 
 # -- multi-pass training forward ----------------------------------------------
@@ -893,21 +974,12 @@ def multipass(
             p = p + jitter[i]
         p_shifted = shift_right(p)
         plain = positions[None, :] < prefix_lens[i][:, None]  # [B, T]
-        if cfg.soft:
-            out = model.forward_column(
-                e,
-                p_source=p_shifted,
-                p_presence=~plain,
-                want_weights=want_weights,
-                need_payload=i < n_passes - 2 or want_weights,
-            )
-        else:
-            fused = model.fuse(p_shifted, e)
-            out = model.forward_column(
-                torch.where(plain[..., None], e, fused),
-                want_weights=want_weights,
-                need_payload=i < n_passes - 2 or want_weights,
-            )
+        fused = model.fuse(p_shifted, e)
+        out = model.forward_column(
+            torch.where(plain[..., None], e, fused),
+            want_weights=want_weights,
+            need_payload=i < n_passes - 2 or want_weights,
+        )
         outs.append(out)
     return outs
 
@@ -1166,11 +1238,8 @@ def iterate_fused(
         for _ in range(n_iters):
             previous = out.h_top
             p_shifted = shift_right(out.payload)
-            if cfg.soft:
-                out = model.forward_column(e, p_source=p_shifted, p_presence=~plain)
-            else:
-                fused = model.fuse(p_shifted, e)
-                out = model.forward_column(torch.where(plain[..., None], e, fused))
+            fused = model.fuse(p_shifted, e)
+            out = model.forward_column(torch.where(plain[..., None], e, fused))
             loss, _ = sequence_ce(model, out.h_top[:, :-1], tokens[:, 1:])
             delta = (out.h_top - previous).float().norm(dim=-1).mean()
             records.append({"loss": loss.item(), "update_norm": delta.item()})

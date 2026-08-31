@@ -26,11 +26,11 @@ references:
       Defines Kimi Delta Attention, its chunkwise and recurrent forms,
       channel-wise decay, causal short convolutions, sigmoid output gate, NoPE
       global-attention layers, the empirically selected 3:1 KDA-to-global MLA
-      cadence, and the width-1,536 scaling-law point with 20 heads and
-      128-dimensional key/value heads. Its scaling convention reports active
-      parameters without embedding parameters. The flagship keeps the KDA
-      substrate and cadence inside PKDA but uses dense global GQA instead of
-      MLA.
+      cadence, fixed 128-dimensional key/value heads, and the width-1,536
+      scaling-law point with 20 heads. Its scaling convention reports active
+      parameters without embedding parameters. The screen and flagship keep
+      the KDA substrate and cadence inside PKDA but use dense global GQA
+      instead of MLA.
 
   - url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json
     slug: kimi2025-kimi-linear-config
@@ -47,32 +47,34 @@ references:
       Defines Preconditioned KDA: an apply-to-key diagonal approximation to the
       inverse key Gram, with independent preconditioner decay and gain, a
       stable log-space squash onto [1/x, x], chunkwise and recurrent forms, and
-      language-model evidence at 340M and 1B. The flagship uses the registered
-      x=1.5 PKDA parameterization rather than unpreconditioned KDA.
+      language-model evidence at 340M and 1B. The screen reproduces the 340M
+      model's 8-by-128 recurrence geometry at a different outer width, and both
+      scales use the registered x=1.5 PKDA parameterization rather than
+      unpreconditioned KDA.
 
-  - url: https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/precond_kda.py
+  - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/layers/precond_kda.py
     slug: fla2026-preconditioned-kda
     note: >
       The upstream PrecondKDA reference layer defines the independent ATK gate
       projections and initialization, bounded preconditioner, auxiliary A-state
       cache, chunkwise training kernel, and fused-recurrent decoding kernel that
-      the flagship implementation must reproduce and qualify.
+      the screen and flagship implementations reproduce and qualify.
 
-  - url: https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/conv/short_conv.py
+  - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/modules/conv/short_conv.py
     slug: fla2026-short-convolution
     note: >
       The released KDA/PKDA short convolution is a bias-free depthwise Conv1d
       with causal history of kernel-size minus one and does not override the
-      framework Conv1d initialization. The flagship preserves those weight,
+      framework Conv1d initialization. Both scales preserve those weight,
       cache-shape, and initialization semantics.
 
-  - url: https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/precond_kda/chunk.py
+  - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/ops/precond_kda/chunk.py
     slug: fla2026-preconditioned-kda-chunk
     note: >
       The upstream PKDA training operator fixes chunk size 64, returns outputs
       in the activation dtype, retains FP32 recurrent boundary states, and
       recomputes large intermediates in backward by default. These are the
-      flagship kernel and precision contracts.
+      screen and flagship kernel and precision contracts.
 
   - url: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json
     slug: qwen2025-qwen3-next-config
@@ -80,16 +82,16 @@ references:
       The official released Qwen3-Next configuration sets the full-attention
       interval to four and uses fewer KV than query heads in those global
       layers. This is interval-four and GQA precedent only; Qwen3-Next uses
-      Gated DeltaNet where the flagship uses PKDA.
+      Gated DeltaNet where this experiment uses PKDA.
 
   - url: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py
     slug: qwen2025-qwen3-next-attention
     note: >
       The released Qwen3-Next attention implementation projects a gate beside
       each query-head coordinate and applies its sigmoid elementwise to the
-      concatenated attention output before the output projection. The screen
-      architecture package and the flagship adopt this gate; screen `vanilla`
-      and `fbt` remain ungated.
+      concatenated attention output before the output projection. Every hybrid
+      screen arm and the flagship adopt this gate; only the external screen
+      `vanilla` control remains ungated.
 
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer

@@ -9,44 +9,44 @@ plan, and promotion gates. Accepted scientific evidence belongs in
 
 ## Objective
 
-The experiment tests two innovation packages in an autoregressive transformer:
+The registered screen asks whether Multi-Head Delta Block routing (MHDB) and
+Full-Bandwidth Transformer (FBT) feedback are complementary, independent, or
+redundant when added to one common hybrid sequence-model trunk:
 
-1. **Architecture innovation.** Multi-Head Delta Block routing (MHDB) lets each
-   sublayer read an additive mixture of a learned null, the current column's
-   input seed, completed four-layer block deltas, and the current block's
-   partial delta, with independent depth selection by contiguous feature
-   group. Every architecture-package layer also uses sigmoid-gated
-   grouped-query attention (GGQA).
-2. **Recurrence innovation.** Full-Bandwidth Transformer (FBT) feedback returns
-   the previous column's top state to layer 0 of the next column through a
-   token-gated fusion, giving latent state another full pass through depth.
+1. **MHDB** lets each sublayer read an additive mixture of a learned null, the
+   current column's input seed, completed four-layer block deltas, and the
+   current block's partial delta, with independent depth selection by
+   contiguous feature group.
+2. **FBT** returns the previous column's top state to layer 0 of the next
+   column through a token-gated fusion, giving latent state another full pass
+   through depth.
 
-The primary question is whether these packages are complementary, independent,
-or redundant when pretrained together. The primary four-cell factorial is:
+The four hybrid arms form the primary MHDB x FBT factorial. The completed
+pure-GQA `vanilla` run remains a fifth, external trunk control:
 
-| Arm | Architecture package | Recurrence package | GQA | Parameters |
-|---|---:|---:|---|---:|
-| `vanilla` | no | no | ungated | 222,876,672 |
-| `mhdb` | MHDB | no | gated | 230,009,856 |
-| `fbt` | no | FBT | ungated | 224,058,624 |
-| `df` | MHDB | FBT | gated | 231,194,112 |
+| Arm | Hybrid trunk | MHDB | FBT | Parameters |
+|---|---:|---:|---:|---:|
+| `vanilla` | no | no | no | 222,876,672 |
+| `base` | yes | no | no | 241,455,840 |
+| `mhdb` | yes | yes | no | 241,511,136 |
+| `fbt` | yes | no | yes | 242,637,792 |
+| `df` | yes | yes | yes | 242,695,392 |
 
-`df_soft` is a 230,012,928-parameter screen diagnostic. It retains MHDB and
-GGQA, keeps a plain token entry, and exposes the shifted previous payload as a
-masked standing routing source. Every routed arm already has a learnable
-zero-initialized null at every site, so `df_soft` isolates optional feedback
-entry rather than also changing within-column nullability. It tests adoption;
-it does not replace the hard hybrid in the factorial.
+The factorial contrasts use `base`, not `vanilla`, as their shared baseline.
+`vanilla` versus `base` isolates the whole PKDA/GGQA trunk replacement. The
+old vanilla state layout and initialization are byte-identical under the
+current code, so its completed screen record remains admissible without a
+rerun. There is no optional-feedback arm.
 
 The claim boundary is pretraining behavior under the registered recipe and
 data. No result is a general claim about recurrent transformers, depth routing,
 reasoning, or adaptive computation without a dedicated evaluation that supports
 that claim.
 
-## Common transformer trunk
+## Screen trunks
 
-Every arm uses one `DFModel` implementation and differs only through
-`ModelConfig` flags. The screen trunk is:
+Every arm uses one `DFModel` implementation and exact `ModelConfig` flags.
+Shared channel mixing and outer geometry are:
 
 | Field | Value |
 |---|---:|
@@ -62,15 +62,21 @@ Every arm uses one `DFModel` implementation and differs only through
 | RMSNorm epsilon | 1e-6 |
 | Routing heads | 4, exactly the KV-head count |
 | Routing block size | 4 layers |
+| PKDA heads | 8 |
+| PKDA key/value head width | 128 |
+| PKDA Q/K/V projection width | 1,024 |
+| PKDA convolution width | 4 |
 
-The base trunk is a bias-free pre-norm decoder with packed QKV projection,
-grouped-query attention, per-head Q/K RMSNorm, rotary positions, packed SwiGLU
-gate/up projection, tied embedding/unembedding, and a final RMSNorm. Each
-attention and MLP branch output is scaled by `1/sqrt(2L)` before it is added to
-the residual stream. There is no dropout.
+`vanilla` is the preserved bias-free pre-norm GQA decoder: twelve RoPE GQA
+layers, packed QKV projection, per-head Q/K RMSNorm, and no output gate. The
+four factorial arms replace its token mixers with exactly:
 
-The architecture package adds one bias-free gate projection to every attention
-layer. For pre-normalized attention input `x`, it computes:
+```text
+[PKDA, PKDA, PKDA, gated global GQA] x 3
+```
+
+All hybrid global-attention layers are dense, causal, and NoPE. For their
+pre-normalized input `x` they compute:
 
 ```text
 q, k, v = split(W_qkv x)
@@ -80,15 +86,35 @@ o       = W_o(sigmoid(W_g x) * z)
 
 The gate has one coordinate per query-head output coordinate and acts before
 the output projection and branch scaling; it does not modify attention logits
-or softmax weights. `mhdb`, `df`, and `df_soft` use this GGQA path.
-`vanilla` and `fbt` omit `W_g` and pass `z` directly to `W_o`. The gate is part
-of the registered architecture axis, not an independently interpreted factor.
+or softmax weights. PKDA's causal short convolution carries order and recency,
+so the hybrid has no explicit positional embedding in either mixer.
+
+Each screen PKDA mixer uses 8 query/key heads and 8 value heads with
+`d_k = d_v = 128`. This is the directly reproduced 340M Preconditioned
+DeltaNet geometry, with Kimi Linear's fixed 128-dimensional KDA heads and 3:1
+hybrid cadence. Its base parameterization is bias-free Q/K/V projection;
+separate causal depthwise convolutions followed by SiLU; L2-normalized Q/K;
+rank-128 channel-wise decay; one sigmoid delta-update gate per head; head-wise
+RMSNorm at epsilon `1e-5`; a rank-128 sigmoid output gate; and a bias-free
+output projection.
+
+The diagonal apply-to-key preconditioner has independent scalar decay and gain
+projections, `x = 1.5`, `eps = 1e-6`, a learned log-space center initialized to
+`-0.2`, decay rates sampled on `[1,16]`, and softplus time constants sampled
+log-uniformly on `[0.001,0.1]`. CUDA training uses the pinned upstream FLA
+chunk operator at chunk size 64 with internal backward recomputation. CPU and
+MPS execute the literal recurrent equations. CUDA cannot silently fall back to
+that sequential reference.
+
+Every arm retains the same packed SwiGLU, tied embedding/readout, and final
+RMSNorm. Each token-mixer and MLP branch output is scaled by `1/sqrt(2L)`
+before residual addition. There is no dropout.
 
 Embedding weights and optimizer state remain FP32. Under CUDA autocast, the
 embedding output, residual stream, recurrent payload, and routed values are
 BF16. CPU and MPS use the same semantics through portable PyTorch operations.
 
-## Architecture package: MHDB and gated GQA
+## MHDB package
 
 The screen, same-geometry token ladder, and flagship all use the same
 four-layer block-delta source contract. Individual attention and MLP branch
@@ -152,14 +178,12 @@ h_current = seed + sum(completed block deltas) + current partial delta
 
 The routed mixture is added only to the sublayer's pre-norm read; it is never
 accumulated directly into `h`. This transient-read rule preserves the exact
-telescoping identity. On hard-arm and pass-1 sites, the zero-query non-null
+telescoping identity. On routed pass-1 sites, the zero-query non-null
 mixture is a scalar multiple of `h`, so the following RMSNorm makes routing
 functionally inert up to its epsilon.
 
-For `mhdb`, the seed is the token embedding `e`. For hard `df`, the seed is
-`e` on pass 1 and the fused input `u` on feedback passes. For `df_soft`, the
-stream seed is always `e`; the previous payload is an additional standing
-source only where the prefix mask marks it present.
+For `mhdb`, the seed is the token embedding `e`. For `df`, the seed is `e` on
+pass 1 and the fused input `u` on feedback passes.
 
 ## FBT latent feedback
 
@@ -178,10 +202,11 @@ There is no additive token-embedding bypass on a feedback position. Prompt
 positions and all pass-1 positions use `e_t` directly because no recurrent
 payload is present.
 
-The cache stores attention keys and values for the actual column inputs. During
-sequential feedback decoding, only the immediately previous payload is carried
-outside the cache; each generated column consumes it once and emits the next
-payload.
+During sequential hybrid decoding, the cache stores KV only for the three
+global GQA layers. Each PKDA layer instead retains its fixed-size FP32 recurrent
+matrix, FP32 diagonal-preconditioner state, and three short-convolution
+histories. Only the immediately previous FBT payload is carried outside the
+mixer caches; each generated column consumes it once and emits the next.
 
 The `fbt` payload is:
 
@@ -197,7 +222,7 @@ either one:
 1. On a feedback position, fuse the shifted previous payload with the token
    embedding to obtain `u`.
 2. Use `u` as both the residual seed and the first source for every
-   within-column MHDB site, and use GGQA in every attention layer.
+   within-column MHDB site, and run the common PKDA/GGQA hybrid trunk.
 3. Preserve the clean residual identity while attention and MLP sites read
    routed mixtures of the null, seed, completed block deltas, and current
    partial block delta.
@@ -234,7 +259,7 @@ for cell in four_layer_cells:
     for layer in cell:
         partial = [] at cell entry else [h - cell_start]
         sources = [null, s, *completed, *partial]
-        a = scaled_gated_attention(rmsnorm(h + route(sources)))
+        a = scaled_hybrid_mixer(rmsnorm(h + route(sources)))
         h = h + a
         partial = h - cell_start
         m = scaled_mlp(rmsnorm(h + route([null, s, *completed, partial])))
@@ -246,33 +271,6 @@ logits = tied_head(final_norm(h))
 
 The first attention router sees `[null, seed]`; all routed sites are active and
 can learn to select their null.
-
-## Soft adoption diagnostic
-
-`df_soft` uses the same GGQA architecture package, multi-pass loop, and routing
-primitive but removes the mandatory FBT entry:
-
-```text
-stream seed: e
-within-column sources: [null, p_previous_if_present, e,
-                        completed_blocks, current_partial_if_nonzero]
-payload sources: [payload_null, e, completed_blocks]
-payload: payload_norm(h_top + route(payload_sources))
-```
-
-The previous-payload source is masked out on the plain prefix. The null and
-token seed remain available everywhere. On pass 1 there is no previous-payload
-source, but null-sourced within-column routing is already active. This creates a
-within-run adoption contrast: depth routing trains from step 1, whereas the
-feedback source appears only in the feedback phase.
-
-The previous payload is not a payload-output source: the outgoing bank matches
-hard DF and contains only the current column's null, seed, and completed block
-deltas. The learned null is a trainable source, not a hard zero clamp. Its mass
-and RMS, previous-payload mass, token-seed mass, and block-delta masses are
-observables. High null mass with a near-zero null value shows non-adoption at
-that site; it does not by itself establish that the mechanism is useless under
-a mandatory entry or a different formation schedule.
 
 ## Multi-pass training
 
@@ -293,9 +291,7 @@ transformer evaluations. The shift and prefix mask preserve token causality.
 Gradients from later-pass losses reach the earlier states, payload router, and
 entry gate.
 
-For hard feedback arms, suffix inputs are FBT-fused. For `df_soft`, suffix
-inputs remain plain embeddings and the shifted payload becomes a masked routing
-source. Non-feedback arms always use one pass.
+Feedback suffix inputs are FBT-fused. Non-feedback arms always use one pass.
 
 ### Prefix mixin and jitter
 
@@ -343,12 +339,13 @@ first_row(step) = (step - 1) * batch_rows
 ```
 
 Paired arms and seeds use the same data directory, `data_seed`, batch geometry,
-and step addresses. One initialization seed produces byte-identical common
-parameters in every arm. Factor-private streams produce identical attention
-gate matrices in `mhdb`, `df`, and `df_soft`, and identical FBT fusion matrices
-in `fbt` and `df`; conditional modules never advance the common stream.
-Initialization seeds differ only when registering a new paired seed. Resumption
-returns to the same row and the same keyed feedback draws.
+and step addresses. One initialization seed produces a byte-identical hybrid
+trunk in `base`, `mhdb`, `fbt`, and `df`, identical MHDB parameters in `mhdb`
+and `df`, and identical FBT fusion weights in `fbt` and `df`; conditional
+modules never advance a shared stream. The structurally different `vanilla`
+control retains its exact previous initialization. Initialization seeds differ
+only when registering a new paired seed. Resumption returns to the same row and
+the same keyed feedback draws.
 
 ## Optimizer and schedule
 
@@ -362,11 +359,11 @@ Every arm uses the same recipe.
   rate `1e-2`, momentum `0.95`, row second-moment beta `0.95`, five
   Newton-Schulz steps, epsilon `1e-8`, decoupled weight decay `0.01`.
 - **Adam:** scale-sensitive gate-producing projections, tied embeddings,
-  RMSNorm weights, routing queries, null vectors, and all other non-matrix
-  parameters. At screen scale the exception is the sigmoid GGQA output gate.
-  In the flagship it also covers PKDA's main decay, delta-update, output-gate,
-  preconditioner-decay, and preconditioner-gain projections. Defaults: learning
-  rate `5e-4`, betas `(0.9, 0.95)`, epsilon `1e-8`, no weight decay.
+  RMSNorm weights, routing queries, null vectors, depthwise convolution
+  weights, and all other non-matrix parameters. This includes every GGQA gate
+  and PKDA's main decay, delta-update, output-gate, preconditioner-decay, and
+  preconditioner-gain projection. Defaults: learning rate `5e-4`, betas
+  `(0.9, 0.95)`, epsilon `1e-8`, no weight decay.
 
 NorMuon orthogonalizes the momentum, normalizes rows by their second moments,
 and globally rescales the update to Frobenius norm `0.2 * sqrt(m*n)` before
@@ -403,28 +400,30 @@ state-defining field.
 
 ### Portable path
 
-CPU and MPS use PyTorch scaled-dot-product attention, the algebraic MHDB
-router, chunked tied-head cross-entropy, eager execution, and the same model,
-loss, optimizer, data, and checkpoint semantics. This path owns fast invariant
-tests and analysis.
+CPU and MPS use PyTorch scaled-dot-product attention, the literal recurrent
+PKDA equations, the algebraic MHDB router, chunked tied-head cross-entropy,
+eager execution, and the same model, loss, optimizer, data, and checkpoint
+semantics. This path owns fast invariant tests and analysis.
 
 ### CUDA path
 
 The authoritative Jobe screen path uses:
 
 - BF16 trunk activations with FP32 weights and optimizer state;
+- the pinned upstream FLA PKDA chunk kernel with chunk size 64, FP32 boundary
+  states, and recomputed backward intermediates;
 - FlashAttention for full-sequence, prefill, GQA, and cached decoding;
 - a fixed-capacity Triton MHDB router over source pointers, with full-width RMS
   scores, per-head masked softmaxes, FP32 value accumulation, and an analytic
   backward that retains cross-head RMS coupling;
 - cut cross-entropy for the tied head, including the exact squared
   log-partition gradient without materializing vocabulary-wide logits;
-- full-block compilation around attention kernels;
+- full-block compilation around global-attention kernels and eager optimized
+  PKDA kernel boundaries;
 - fixed-address forward/backward CUDA graphs for every schedule-reachable train
   mode and shared-pool no-grad validation graphs;
 - BF16 keyed jitter drawn directly into graph input buffers;
-- internal activation checkpointing for `df_soft` feedback modes and geometries
-  above the measured screen work threshold;
+- internal activation checkpointing above the measured screen work threshold;
 - asynchronous snapshot staging to pinned host memory followed by atomic
   background serialization.
 
@@ -433,11 +432,14 @@ checkpoint policy switches. Those are execution choices, not factorial axes.
 
 ### Checkpoint contract
 
-Snapshots use checkpoint contract v8 and resume only v8. They contain model,
-both optimizer states, exact state-defining arguments, step, and Python/Torch/
-CUDA RNG state. A resume inherits all state-defining fields and rejects an
-explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
-and evaluation-row count may change per invocation.
+New snapshots use checkpoint contract v9 and resume v9. The completed
+checkpoint-v8 `vanilla` state is also exactly resumable because its module,
+optimizer, and initialization surfaces are unchanged; every other v8 arm is
+rejected. Snapshots contain model, both optimizer states, exact state-defining
+arguments, step, and Python/Torch/CUDA RNG state. A resume inherits all
+state-defining fields and rejects an explicit conflict. Runtime paths, device,
+evaluation cadence, snapshot cadence, and evaluation-row count may change per
+invocation.
 
 The run retains the latest two snapshots plus the protected end-of-heat and
 end-of-run snapshots. `df queue` records exact arguments and runs the probe
@@ -463,32 +465,33 @@ The inference modes are:
 - **Fused:** an additional fused prompt pass, then the same latent-feedback
   decode loop.
 
-Here “Soft” names the FBT decoding mode and is unrelated to the `df_soft` arm.
 No-feedback arms use their Standard metric when a factorial table is shown for
 Soft or Fused mode.
 
 ### Effect and interaction
 
-For validation loss `L` (lower is better), define the gain of arm `A` over
-vanilla as:
+For validation loss `L` (lower is better), define factorial gains over the
+hybrid `base` arm:
 
 ```text
-G_A = L_vanilla - L_A
+G_A = L_base - L_A
 ```
 
-`G_mhdb` is the architecture-package effect, `G_fbt` is the
-recurrence-package effect, and `G_df` is their joint effect. The factorial
-interaction is:
+`G_mhdb` is the MHDB effect, `G_fbt` is the recurrence effect, and `G_df` is
+their joint effect. The factorial interaction is:
 
 ```text
 I = G_df - G_mhdb - G_fbt
-  = L_mhdb + L_fbt - L_df - L_vanilla
+  = L_mhdb + L_fbt - L_df - L_base
 ```
 
 `I > 0` is superadditive loss reduction, `I = 0` is additive, and `I < 0` is
 subadditive. Compute the statistic on paired checkpoints and per decode mode,
 then aggregate paired seed differences. Do not mix Standard, Soft, and Fused
 losses inside one interaction estimate.
+
+Report `L_vanilla - L_base` separately as the whole hybrid-trunk contrast. It
+is not an MHDB or FBT main effect and does not enter `I`.
 
 Equal step counts are matched-data comparisons, not matched-compute
 comparisons. Report predicted tokens and pass-tokens for every point. A
@@ -519,8 +522,7 @@ scale, query norm, and query cosine similarity.
 The important source labels are:
 
 - null mass and null-vector RMS at every routed site;
-- within-column seed mass (`e` for `mhdb`, `u` for hard `df` feedback passes);
-- previous-payload mass in `df_soft`;
+- within-column seed mass (`e` for `mhdb`, `u` for `df` feedback passes);
 - completed-block and current-partial mass at attention and MLP sites;
 - seed and completed-block mass at payload sites.
 
@@ -533,24 +535,22 @@ training an alternative payload rule from scratch.
 
 ## Screen and scale plan
 
-### 223–231M screen
+### 223–243M screen
 
-The active screen uses the geometry above, 6,700 steps, 2.003B predicted tokens
-per run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
-primary four factorial arms run before the conditional `df_soft` diagnostic.
+The screen uses the geometry above, 6,700 steps, 2.003B predicted tokens per
+run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
+completed `vanilla` run is retained; the four hybrid factorial arms are new
+runs under checkpoint-v9.
 
 The screen is designed to establish:
 
-1. that the shared recipe learns a healthy vanilla baseline;
-2. that the harness can resolve the MHDB-plus-GGQA architecture package under
-   this recipe;
-3. the signs and paired magnitudes of the architecture, recurrence, and joint
-   effects;
-4. whether hard DF is stable under recurrent self-composition;
-5. whether optional within-column and cross-column routes are adopted in
-   `df_soft`, if that diagnostic is reached.
+1. whether the hybrid trunk improves on the completed vanilla control;
+2. the signs and paired magnitudes of the MHDB, recurrence, and joint effects
+   within one shared hybrid trunk;
+3. whether hard DF is stable under recurrent self-composition;
+4. whether learned null, seed, block, and payload routing paths are adopted.
 
-The screen runs at 8.7–9.0 predicted tokens per parameter across its arms. It
+The screen runs at 8.25–8.99 predicted tokens per parameter across its arms. It
 is a sensitivity and interaction screen, not a decisive test of FBT formation
 at the high token-per-parameter regime.
 
@@ -562,7 +562,7 @@ continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v8
+This ladder is not currently runnable through exact resume: `steps` is a v9
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without
@@ -617,8 +617,8 @@ PKDA applies the stable diagonal apply-to-key preconditioner from
 Preconditioned DeltaNet. Each head maintains an auxiliary nonnegative diagonal
 state `A_t` with its own scalar decay `alpha_P_t` and gain `beta_P_t`. Their
 input projections and learned gate parameters are independent of the main KDA
-decay and update gate; they are not tied. The per-head positive center is
-parameterized as `mu = exp(log_mu)` with `log_mu` initialized to `-0.2`.
+decay and update gate; they are not tied. The learned per-head log-space center
+`c` is initialized to `-0.2`.
 The preconditioner decay rate is initialized with `exp(A_P)` sampled uniformly
 on `[1, 16]`; its softplus time constant is initialized log-uniformly on
 `[0.001, 0.1]`. The squash uses `x = 1.5`, `eps = 1e-6`, disables the optional
@@ -635,8 +635,8 @@ log_alpha_P_t = -exp(A_P) * softplus(W_alpha_P x_t + b_alpha_P)
 alpha_P_t     = exp(log_alpha_P_t)
 beta_P_t      = sigmoid(W_beta_P x_t)
 A_t           = alpha_P_t A_(t-1) + beta_P_t (k_t ⊙ k_t)
-mu             = exp(log_mu)
-r_t            = log(A_t + eps) - mu
+c              = learned log-space center, initialized to -0.2
+r_t            = log(A_t + eps) - c
 s_t            = r_t / (1 + abs(r_t))
 B_t            = exp(-log(1.5) * s_t)
 k_write_t      = B_t ⊙ k_t
@@ -806,10 +806,9 @@ Routing remains a transient pre-norm read and never accumulates directly into
 the residual stream. The hard-DF payload router routes over its null, the seed,
 and the six completed cell deltas `[Delta_0, ..., Delta_5]`. The deepest hard
 within-column router and the payload router therefore each have at most eight
-sources. A DF-soft within-column router has at most nine when the previous
-payload is present. This is the block form described by the Delta Attention
-Residuals and Attention Residuals papers, rather than an ad hoc bank of
-individual attention and MLP outputs.
+sources. This is the block form described by the Delta Attention Residuals and
+Attention Residuals papers, rather than an ad hoc bank of individual attention
+and MLP outputs.
 
 PKDA state is local to one transformer evaluation. A Jacobi or fused-prefill
 pass starts every PKDA matrix state, diagonal preconditioner state, and
@@ -851,13 +850,14 @@ A screen comparison is admissible only when the registered paired runs finish
 with the same token stream, batch order, recipe, seeds, and schedule, and all
 feedback arms have healthy contraction traces.
 
-The MHDB-plus-GGQA architecture package must clearly improve on vanilla in
-Standard mode for the screen to serve as a sensitivity gate for few-percent
-architecture effects. A stable FBT null at screen scale does not by itself
-exclude DF from the ladder because the screen is far below the registered
+The hybrid `base` arm must clearly improve on vanilla in Standard mode for the
+screen to justify replacing the old trunk. Within the hybrid factorial, MHDB
+must produce a resolvable paired effect for the screen to serve as a
+sensitivity gate. A stable FBT null at screen scale does not by itself exclude
+DF from the ladder because the screen is far below the registered
 token-per-parameter regime. DF enters the ladder only if its paired effect is
 credible enough that additional tokens can resolve the interaction between the
-two parent packages.
+two packages.
 
 ### Flagship promotion
 
@@ -886,14 +886,12 @@ introduced into the registered factorial.
 - Expected effects are small relative to run noise. Paired data order, paired
   seeds, complete runs, and pass-token accounting are part of the causal
   design.
-- The shared FBT recipe may not reproduce the best standalone MHDB-plus-GGQA
-  setting. The `mhdb` cell therefore acts as a sensitivity control for this
-  exact architecture package, not as a numerical reproduction target.
+- The 8-by-128 PKDA/GGQA screen is a scale-adapted synthesis. The `base` cell
+  measures that trunk directly, and `mhdb` measures routing conditional on it;
+  neither is a numerical reproduction target for its source paper.
 - A low-token FBT null is compatible with missing formation conditions. A null
   that persists across the registered ladder is stronger evidence against the
   current feedback recipe at this model scale.
-- `df_soft` non-adoption can reflect optimization path dependence. Compare it
-  with hard DF before interpreting null mass as lack of utility.
 - The flagship hybrid is a synthesis rather than a reproduced architecture:
   Kimi's 3:1 evidence used unpreconditioned KDA with MLA, Preconditioned
   DeltaNet evaluated pure PKDA at different context and training budgets, and

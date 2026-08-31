@@ -33,7 +33,7 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=8, resumable=frozenset({8}), surface_version=8
+    version=9, resumable=frozenset({8, 9}), surface_version=8
 )
 
 EXACT_FIELDS = (
@@ -61,6 +61,9 @@ EXACT_FIELDS = (
     "kv_heads",
     "head_dim",
     "intermediate",
+    "pkda_heads",
+    "pkda_head_dim",
+    "pkda_conv_size",
 )
 """State-defining settings: a resume takes these from the checkpoint."""
 
@@ -155,6 +158,9 @@ def build_parser() -> argparse.ArgumentParser:
     trunk.add_argument("--kv-heads", type=int, default=4)
     trunk.add_argument("--head-dim", type=int, default=96)
     trunk.add_argument("--intermediate", type=int, default=3072)
+    trunk.add_argument("--pkda-heads", type=int, default=8)
+    trunk.add_argument("--pkda-head-dim", type=int, default=128)
+    trunk.add_argument("--pkda-conv-size", type=int, default=4)
 
     runtime = parser.add_argument_group("runtime")
     runtime.add_argument(
@@ -229,19 +235,14 @@ def micro_draws(
 
 
 def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
-    """Measured internal activation policy; the Jobe screen fits k<=3 raw."""
+    """Measured internal activation policy for the registered screen."""
     if device.type != "cuda":
         return False
     cfg = model.cfg
     screen_work = 4 * 1025 * 768 * 12 * 3
     work = args.micro_rows * (args.seq_len + 1) * cfg.dim * cfg.layers * n_passes
-    if cfg.soft and n_passes >= 2:
-        # DF-soft retains the standing previous-payload path across passes in
-        # addition to the stream.  Keep its feedback graphs checkpointed even
-        # though MHDB has coarsened the within-column source bank.
-        return True
-    # The exact hard-DF screen k=3 graph is admitted raw after the fused-block
-    # and bespoke-router memory reduction. Larger geometries remain guarded.
+    # PKDA's kernel recomputes its chunk intermediates internally. The exact
+    # screen k=3 graph is admitted raw; larger geometries remain guarded.
     return work > screen_work
 
 
@@ -618,8 +619,7 @@ def evaluate(
 
 @torch.no_grad()
 def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dict]:
-    """Per-site routing observables from one val microbatch (a fused pass
-    on feedback arms, so DF-soft's p_prev source is present)."""
+    """Per-site routing observables from one validation microbatch."""
     if not model.cfg.routing_active:
         return []
     model.eval()
@@ -779,6 +779,18 @@ def train(argv: list[str] | None = None) -> dict:
         payload = checkpoints.read(path, CONTRACT, map_location="cpu")
         CONTRACT.check_resumable(path, payload["version"])
         saved = payload["args"]
+        if payload["version"] == 8:
+            if saved.get("arm") != "vanilla":
+                raise ValueError(
+                    f"{path}: checkpoint-v8 is resumable only for the preserved "
+                    "vanilla trunk"
+                )
+            # These fields did not exist in v8 and do not participate in the
+            # vanilla graph. Carry the current invocation's inert values into
+            # the first v9 continuation snapshot.
+            saved.setdefault("pkda_heads", args.pkda_heads)
+            saved.setdefault("pkda_head_dim", args.pkda_head_dim)
+            saved.setdefault("pkda_conv_size", args.pkda_conv_size)
         missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
         if missing:
             raise ValueError(f"{path}: checkpoint lacks settings {missing}")
@@ -823,6 +835,9 @@ def train(argv: list[str] | None = None) -> dict:
             kv_heads=args.kv_heads,
             head_dim=args.head_dim,
             intermediate=args.intermediate,
+            pkda_heads=args.pkda_heads,
+            pkda_head_dim=args.pkda_head_dim,
+            pkda_conv_size=args.pkda_conv_size,
             max_seq_len=args.seq_len + 1,
         )
     ).to(device)
