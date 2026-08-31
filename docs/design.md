@@ -341,12 +341,14 @@ Every arm uses the same recipe.
 ### Parameter groups
 
 - **NorMuon:** every trainable two-dimensional weight except the tied
-  embedding/unembedding. Defaults: learning rate `1e-2`, momentum `0.95`, row
-  second-moment beta `0.95`, five Newton-Schulz steps, epsilon `1e-8`, decoupled
-  weight decay `0.01`.
-- **Adam:** tied embeddings, RMSNorm weights, routing queries, null vectors, and
-  all other non-matrix parameters. Defaults: learning rate `5e-4`, betas
-  `(0.9, 0.95)`, epsilon `1e-8`, no weight decay.
+  embedding/unembedding and sigmoid attention-gate projections. This includes
+  the FBT value and token-gate fusion matrices. Defaults: learning rate `1e-2`,
+  momentum `0.95`, row second-moment beta `0.95`, five Newton-Schulz steps,
+  epsilon `1e-8`, decoupled weight decay `0.01`.
+- **Adam:** sigmoid attention-gate projections, tied embeddings, RMSNorm
+  weights, routing queries, null vectors, and all other non-matrix parameters.
+  Defaults: learning rate `5e-4`, betas `(0.9, 0.95)`, epsilon `1e-8`, no
+  weight decay.
 
 NorMuon orthogonalizes the momentum, normalizes rows by their second moments,
 and globally rescales the update to Frobenius norm `0.2 * sqrt(m*n)` before
@@ -411,7 +413,7 @@ checkpoint policy switches. Those are execution choices, not factorial axes.
 
 ### Checkpoint contract
 
-Snapshots use checkpoint contract v5 and resume only v5. They contain model,
+Snapshots use checkpoint contract v6 and resume only v6. They contain model,
 both optimizer states, exact state-defining arguments, step, and Python/Torch/
 CUDA RNG state. A resume inherits all state-defining fields and rejects an
 explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
@@ -538,7 +540,7 @@ continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v5
+This ladder is not currently runnable through exact resume: `steps` is a v6
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without

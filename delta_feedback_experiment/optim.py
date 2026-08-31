@@ -1,5 +1,6 @@
-"""The experiment optimizer stack: NorMuon for hidden matrices and Adam
-for everything else under WSD with cooldown weight-decay scaling.
+"""The experiment optimizer stack: NorMuon for ordinary hidden matrices and
+Adam for scale-sensitive attention gates plus non-matrix parameters under WSD
+with cooldown weight-decay scaling.
 
 NorMuon (arXiv:2510.05491): EMA momentum, Newton-Schulz
 orthogonalization, then neuron-wise (row) second-moment normalization
@@ -203,14 +204,18 @@ class NorMuon(torch.optim.Optimizer):
 def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
     """(NorMuon matrices, Adam rest) per the FBT/NorMuon convention.
 
-    Hidden 2D weights get NorMuon; the tied embedding/unembedding, norms,
-    routing queries, null sources, and every other vector go to Adam.
+    Ordinary hidden 2D weights get NorMuon.  The tied
+    embedding/unembedding and sigmoid attention-gate projections are explicit
+    matrix exceptions; they join norms, routing queries, null sources, and
+    every other vector in Adam.  FBT's value and token-gate fusion matrices
+    retain the paper-aligned NorMuon treatment.
     """
     matrices, rest = [], []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if parameter.ndim == 2 and "embed_tokens" not in name:
+        adam_matrix = "embed_tokens" in name or name.startswith("attention_gates.")
+        if parameter.ndim == 2 and not adam_matrix:
             matrices.append(parameter)
         else:
             rest.append(parameter)

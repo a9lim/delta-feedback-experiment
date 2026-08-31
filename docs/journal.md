@@ -2,8 +2,9 @@
 
 ## Screen midpoint diagnosis: gated arms trail vanilla (2026-08-30)
 
-Status: `vanilla` and `df` complete; `mhdar` mid-heat (~step 3800); `fbt`,
-`df_soft` queued. Working diagnosis, not an accepted finding.
+Status: `vanilla` and `df` complete; the matching `mhdar` run was stopped at
+step 4095 after reproducing the gated-arm dynamics; `fbt` and `df_soft` are not
+queued. Working diagnosis, not an accepted finding.
 
 ### Observed ordering
 
@@ -28,7 +29,7 @@ Status: `vanilla` and `df` complete; `mhdar` mid-heat (~step 3800); `fbt`,
 - **Gates made static** (per-coordinate batch mean, token dependence removed):
   5.724. The binary masks are strongly token-dependent — learned hard routing,
   not static pruning.
-- **Routing queries zeroed** (exact identity read): 3.907. MHDAR routing is
+- **Routing queries zeroed** (uniform-source intervention): 3.907. MHDAR routing is
   adopted and load-bearing.
 
 Gate activation stats (`df.6700`, identical shape at `df.5025` and
@@ -72,17 +73,16 @@ optimizer treatment, not the gate design.
   `fbt` (ungated, unaffected by the gate pathology) will give the clean
   recurrence-only cell.
 
-### Open decisions
+### Current decision
 
-- Gate temperature control before further gated spend: move `W_g` to the Adam
-  group (matches the reference treatment), or RMS-bound the gate
-  pre-activation with a learnable scalar temperature. Kill-test: few-hundred-
-  step paired `mhdar` rerun; the signature to kill is the step-~400 crossover.
-- `df_soft` is queued after `fbt` (~13h out) and, as a gated arm, inherits the
-  same dynamics; its adoption observables would be read through saturated-gate
-  co-adaptation. Decide whether to hold it for the gate fix.
-- Worth adding gate saturation (mean gate, frac saturated, `W_g` norm) to
-  training telemetry before the next gated run.
+- Sigmoid attention-gate projections use Adam at `5e-4`, while FBT's value and
+  token-gate fusion matrices retain their paper-aligned NorMuon treatment. The
+  optimizer-state change advances the checkpoint contract to v6; saturated v5
+  runs remain analysis artifacts and are not resumable into the new recipe.
+- The next gated run starts from initialization. Its early kill test is the
+  step-~400 crossover, with gate mean, saturated fraction, sigmoid derivative,
+  weight norm, and attention-delta scale inspected before full-screen spend.
+- `df_soft` remains held until the attention-gate treatment passes that test.
 
 Probe scripts are session scratch (`/tmp/ckpt_diag.py`, `/tmp/causal_probe.py`
 on Jobe); promote into `scripts/` only if they earn a place.

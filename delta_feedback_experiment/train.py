@@ -33,7 +33,7 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=5, resumable=frozenset({5}), surface_version=5
+    version=6, resumable=frozenset({6}), surface_version=6
 )
 
 EXACT_FIELDS = (

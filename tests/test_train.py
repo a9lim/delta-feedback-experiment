@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from delta_feedback_experiment.data import TokenData, write_synthetic
-from delta_feedback_experiment.optim import NorMuon, orthogonalize
+from delta_feedback_experiment.optim import NorMuon, orthogonalize, split_parameters
 from delta_feedback_experiment.train import (
     automatic_checkpoint,
     build_parser,
@@ -140,6 +140,39 @@ def test_batched_normuon_matches_independent_parameters():
         optimizer.step()
     for actual, expected in zip(left, right, strict=True):
         assert torch.allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
+    from delta_feedback_experiment.model import DFModel, arm_config
+
+    model = DFModel(
+        arm_config(
+            "df",
+            vocab_size=97,
+            dim=32,
+            layers=2,
+            heads=2,
+            kv_heads=2,
+            head_dim=16,
+            intermediate=64,
+            max_seq_len=17,
+        )
+    )
+    normuon, adam = split_parameters(model)
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    normuon_names = {names[id(parameter)] for parameter in normuon}
+    adam_names = {names[id(parameter)] for parameter in adam}
+
+    assert {f"attention_gates.{layer}.weight" for layer in range(2)} <= adam_names
+    assert "embed_tokens.weight" in adam_names
+    assert "blocks.0.attn_router.query" in adam_names
+    assert "blocks.0.attn_router.key_norm.weight" in adam_names
+    assert "fuse_value.weight" in normuon_names
+    assert "fuse_gate.weight" in normuon_names
+    assert "blocks.0.attn.qkv_proj.weight" in normuon_names
+    assert "blocks.0.mlp.gate_up_proj.weight" in normuon_names
+    assert not (normuon_names & adam_names)
+    assert len(normuon_names) + len(adam_names) == len(names)
 
 
 # -- schedule and derived randomness -------------------------------------------

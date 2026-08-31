@@ -81,7 +81,7 @@ addressed directly into one fixed token stream. Pass counts are keyed by data
 seed and step; prefix lengths and jitter additionally use the global row, so
 paired arms see identical examples and feedback draws.
 
-Snapshots are immutable, exact-resume checkpoint-contract v5 files under
+Snapshots are immutable, exact-resume checkpoint-contract v6 files under
 `runs/`. `--max-steps` limits only the current invocation; it never rescales the
 state-defining schedule.
 
