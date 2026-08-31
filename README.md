@@ -21,8 +21,10 @@ zero-initialized null source.
 No screen job is active. The completed vanilla record is retained, but no
 matched hybrid comparison is complete, so there are no accepted experiment
 findings. The 8-by-128 PKDA/GGQA screen, deterministic trainer, portable
-recurrence, and optimized single-GPU CUDA path are implemented. The
-token-ladder continuation and the distributed
+recurrence, and optimized single-GPU CUDA path are implemented and
+Jobe-qualified. The full DF train/eval graph pool peaks at 15.23 GiB allocated
+and 22.45 GiB reserved, so screen jobs remain serial on the 24 GiB RTX 4090.
+The token-ladder continuation and the distributed
 1.335B-parameter, 441B-token, 20-by-128-PKDA
 `[PKDA, PKDA, PKDA, gated global GQA]` block-delta flagship path are specified
 but not yet implemented.

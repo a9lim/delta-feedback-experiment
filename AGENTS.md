@@ -96,6 +96,9 @@ contract changes.
   cut cross-entropy, the Triton MHDB router, compiled global-attention blocks,
   CUDA graphs, and asynchronous atomic snapshots. Respect Jobe's pinned
   Torch/FlashAttention environment.
+- Keep Jobe screen execution serial. Fresh default captures reserve 15.86 GiB
+  for `base`, 16.20 GiB for `mhdb`, and 22.45 GiB for `df`; even the two
+  lightest graph pools cannot safely coexist on the usable 23.50 GiB device.
 - New snapshots are checkpoint-v9. Checkpoint-v8 is resumable only for the
   preserved vanilla trunk; reject every superseded intervention-arm v8 state.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.

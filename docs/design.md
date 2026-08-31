@@ -430,6 +430,21 @@ The authoritative Jobe screen path uses:
 The public experiment surface does not expose kernel, graph, or activation
 checkpoint policy switches. Those are execution choices, not factorial axes.
 
+Fresh-process capture measurements at the default screen geometry on Jobe are:
+
+| Arm | Peak allocated | Peak reserved | Captured train/eval graphs |
+|---|---:|---:|---:|
+| `base` | 7.39 GiB | 15.86 GiB | 3 |
+| `mhdb` | 7.54 GiB | 16.20 GiB | 3 |
+| `df` | 15.23 GiB | 22.45 GiB | 7 |
+
+The reserved graph pool, not live allocated tensors, is the concurrency
+boundary. Even the two lightest hybrid processes exceed the RTX 4090's usable
+23.50 GiB when their reservations are combined. Screen jobs therefore remain
+serial on Jobe; use the durable queue rather than process-level co-training.
+PKDA's memory savings are retained as safety headroom and make the registered
+three-pass DF modes fit, but do not justify a concurrent-run mode.
+
 ### Checkpoint contract
 
 New snapshots use checkpoint contract v9 and resume v9. The completed
