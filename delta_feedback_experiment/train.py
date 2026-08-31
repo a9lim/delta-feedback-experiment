@@ -41,7 +41,7 @@ from .model import (
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=11, resumable=frozenset({11}), surface_version=11
+    version=12, resumable=frozenset({12}), surface_version=12
 )
 
 EXACT_FIELDS = (
@@ -57,8 +57,7 @@ EXACT_FIELDS = (
     "feedback_start",
     "feedback_batch_prob",
     "three_pass",
-    "lr_muon",
-    "wd_muon",
+    "lr_h",
     "lr_adam",
     "jitter",
     "zloss",
@@ -152,8 +151,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recipe.add_argument("--micro-rows", type=int, default=4)
     recipe.add_argument("--seq-len", type=int, default=1024)
-    recipe.add_argument("--lr-muon", type=float, default=1e-2)
-    recipe.add_argument("--wd-muon", type=float, default=0.01)
+    recipe.add_argument(
+        "--lr-h",
+        type=float,
+        default=1e-2,
+        help="dimensionless NorMuonH relative step",
+    )
     recipe.add_argument("--lr-adam", type=float, default=5e-4)
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -425,7 +428,7 @@ class CudaGraphTrainer:
     def _initialize_optimizers(self) -> None:
         """Materialize persistent state before the graph-private pool grows."""
         if any(optimizer.state for optimizer in self.optimizers):
-            # Resume already restored state; only warm our compiled NorMuon body.
+            # Resume already restored state; only warm the compiled NorMuonH body.
             for optimizer in self.optimizers:
                 warmup = getattr(optimizer, "warmup", None)
                 if warmup is not None:
@@ -439,8 +442,8 @@ class CudaGraphTrainer:
             optimizer.step()
         for optimizer in self.optimizers:
             for values in optimizer.state.values():
-                for value in values.values():
-                    if isinstance(value, torch.Tensor):
+                for name, value in values.items():
+                    if isinstance(value, torch.Tensor) and name != "radius":
                         value.zero_()
         for rate, group in zip(
             saved,
@@ -789,7 +792,7 @@ def train(argv: list[str] | None = None) -> dict:
     args = parser.parse_args(argv)
     device = pick_device(args.device)
     if device.type == "cuda":
-        # Ada's TF32 tensor cores materially accelerate NorMuon's FP32 batched
+        # Ada's TF32 tensor cores materially accelerate NorMuonH's FP32 batched
         # Newton-Schulz products; the trunk itself runs BF16 under autocast.
         torch.set_float32_matmul_precision("high")
 
@@ -850,9 +853,7 @@ def train(argv: list[str] | None = None) -> dict:
             max_seq_len=args.seq_len + 1,
         )
     ).to(device)
-    optimizers = build_optimizers(
-        model, lr_muon=args.lr_muon, wd_muon=args.wd_muon, lr_adam=args.lr_adam
-    )
+    optimizers = build_optimizers(model, lr_h=args.lr_h, lr_adam=args.lr_adam)
     pair = OptimizerPair(optimizers)
 
     if payload is not None:
@@ -912,7 +913,7 @@ def train(argv: list[str] | None = None) -> dict:
     try:
         for step in range(start_step + 1, end_step + 1):
             snapshot_writer.poll()
-            lr = apply_schedule(optimizers, schedule, step)
+            lr_h = apply_schedule(optimizers, schedule, step)
             phase = schedule.phase(step)[0]
             z_coef = args.zloss if phase == "cooldown" else 0.0
             n_passes = 1
@@ -981,7 +982,7 @@ def train(argv: list[str] | None = None) -> dict:
                 "loss": telemetry.format_metric(step_loss),
                 "pass1": telemetry.format_metric(pass1_loss),
                 "k": n_passes,
-                "lr": telemetry.format_metric(lr),
+                "lr_h": telemetry.format_metric(lr_h),
                 "gnorm": telemetry.format_metric(grad_norm),
                 "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
                 "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),

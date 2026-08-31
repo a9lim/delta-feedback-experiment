@@ -10,7 +10,12 @@ import pytest
 import torch
 
 from delta_feedback_experiment.data import TokenData, write_synthetic
-from delta_feedback_experiment.optim import NorMuon, orthogonalize, split_parameters
+from delta_feedback_experiment.optim import (
+    NorMuonH,
+    build_optimizers,
+    orthogonalize,
+    split_parameters,
+)
 from delta_feedback_experiment.train import (
     automatic_checkpoint,
     build_parser,
@@ -110,34 +115,39 @@ def test_orthogonalize_singular_values():
         assert singular.min() > 0.2, shape
 
 
-def test_normuon_descends():
+def test_normuonh_descends_on_its_initial_frobenius_sphere():
     torch.manual_seed(0)
-    target = torch.randn(16, 8)
-    weight = torch.nn.Parameter(torch.zeros(16, 8))
-    optimizer = NorMuon([weight], lr=0.1, weight_decay=0.0)
+    weight = torch.nn.Parameter(torch.randn(16, 8))
+    initial_radius = weight.detach().norm()
+    target = torch.randn_like(weight)
+    target.mul_(initial_radius / target.norm())
+    optimizer = NorMuonH([weight], lr=0.05)
     first = None
-    for _ in range(300):
+    for _ in range(200):
         loss = (weight - target).square().mean()
         first = loss.item() if first is None else first
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-    # Constant-RMS updates oscillate near the optimum at ~(0.2*lr) scale.
-    assert loss.item() < 0.02 * first
+        assert torch.allclose(weight.norm(), initial_radius, rtol=2e-6, atol=2e-6)
+    assert loss.item() < 0.05 * first
+    assert torch.equal(optimizer.state[weight]["radius"], initial_radius)
 
 
-def test_normuon_rejects_vectors():
+def test_normuonh_rejects_vectors_and_zero_radius():
     with pytest.raises(ValueError):
-        NorMuon([torch.nn.Parameter(torch.zeros(8))])
+        NorMuonH([torch.nn.Parameter(torch.zeros(8))])
+    with pytest.raises(ValueError, match="nonzero initial Frobenius radius"):
+        NorMuonH([torch.nn.Parameter(torch.zeros(8, 8))])
 
 
-def test_batched_normuon_matches_independent_parameters():
+def test_batched_normuonh_matches_independent_parameters():
     torch.manual_seed(4)
     left = [torch.nn.Parameter(torch.randn(12, 8)) for _ in range(3)]
     right = [torch.nn.Parameter(parameter.detach().clone()) for parameter in left]
     gradients = [torch.randn_like(parameter) for parameter in left]
-    batched = NorMuon(left, lr=0.03, weight_decay=0.02)
-    singles = [NorMuon([parameter], lr=0.03, weight_decay=0.02) for parameter in right]
+    batched = NorMuonH(left, lr=0.03)
+    singles = [NorMuonH([parameter], lr=0.03) for parameter in right]
     for parameter, gradient in zip(left, gradients, strict=True):
         parameter.grad = gradient.clone()
     for parameter, gradient in zip(right, gradients, strict=True):
@@ -149,7 +159,7 @@ def test_batched_normuon_matches_independent_parameters():
         assert torch.allclose(actual, expected, rtol=2e-5, atol=2e-6)
 
 
-def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
+def test_semantic_scale_gates_use_adam_and_value_matrices_use_normuonh():
     from delta_feedback_experiment.model import DFModel, arm_config
 
     model = DFModel(
@@ -167,26 +177,31 @@ def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
             max_seq_len=17,
         )
     )
-    normuon, adam = split_parameters(model)
+    normuonh, adam = split_parameters(model)
     names = {id(parameter): name for name, parameter in model.named_parameters()}
-    normuon_names = {names[id(parameter)] for parameter in normuon}
+    normuonh_names = {names[id(parameter)] for parameter in normuonh}
     adam_names = {names[id(parameter)] for parameter in adam}
 
     assert "attention_gates.0.weight" in adam_names
     assert "embed_tokens.weight" in adam_names
     assert "blocks.0.attn_router.query" in adam_names
     assert "blocks.0.attn_router.key_norm.weight" in adam_names
-    assert "fuse_value.weight" in normuon_names
-    assert "fuse_gate.weight" in normuon_names
-    assert "blocks.0.attn.q_proj.weight" in normuon_names
-    assert "blocks.3.attn.qkv_proj.weight" in normuon_names
+    assert "fuse_value.weight" in normuonh_names
+    assert "fuse_gate.weight" in adam_names
+    assert "blocks.0.attn.q_proj.weight" in normuonh_names
+    assert "blocks.3.attn.qkv_proj.weight" in normuonh_names
     assert "blocks.0.attn.control_proj.weight" in adam_names
     assert "blocks.0.attn.decay_up.weight" in adam_names
     assert "blocks.0.attn.output_gate_up.weight" in adam_names
     assert "blocks.0.attn.q_conv.weight" in adam_names
-    assert "blocks.0.mlp.gate_up_proj.weight" in normuon_names
-    assert not (normuon_names & adam_names)
-    assert len(normuon_names) + len(adam_names) == len(names)
+    assert "blocks.0.mlp.gate_up_proj.weight" in normuonh_names
+    assert not (normuonh_names & adam_names)
+    assert len(normuonh_names) + len(adam_names) == len(names)
+
+    normuonh_optimizer, adam_optimizer = build_optimizers(model)
+    assert isinstance(normuonh_optimizer, NorMuonH)
+    assert "weight_decay" not in normuonh_optimizer.param_groups[0]
+    assert adam_optimizer.param_groups[0]["weight_decay"] == 0
 
 
 def test_route_summary_reports_universal_nulls_and_payload_seed():
@@ -284,6 +299,12 @@ def test_build_schedule_screen_shape():
 def test_log_every_flag_is_removed():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--log-every", "2"])
+
+
+@pytest.mark.parametrize("flag", ["--lr-muon", "--wd-muon"])
+def test_legacy_optimizer_flags_are_removed(flag):
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", flag, "0.01"])
 
 
 @pytest.mark.parametrize(
@@ -394,12 +415,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [8, 9, 10])
+@pytest.mark.parametrize("version", [9, 10, 11])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[11\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[12\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

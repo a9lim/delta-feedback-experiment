@@ -3,7 +3,7 @@
 This repository owns a from-scratch MHDB x FBT pretraining factorial on a
 common PKDA/gated-GQA hybrid trunk. The hard hybrid is `df`; `mhdb` and `fbt`
 are its parent-package deletions; `base` is their shared hybrid baseline. The
-completed pure-GQA `vanilla` run is an external trunk control.
+pure-GQA `vanilla` is the external trunk control.
 
 The 223–243M screen has no active job. No matched hybrid comparison is complete,
 and [docs/findings.md](docs/findings.md) must remain empty of architecture
@@ -69,8 +69,8 @@ contract changes.
   stream, outer geometry, optimizer recipe, and schedule. The complete hybrid
   trunk is byte-identical across `base`, `mhdb`, `fbt`, and `df`; MHDB weights
   are paired across `mhdb`/`df`, and FBT weights across `fbt`/`df`. The
-  structurally distinct `vanilla` control retains its exact completed-run
-  initialization and state layout.
+  structurally distinct `vanilla` control retains its exact initialization
+  recipe and state layout.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.
@@ -101,7 +101,7 @@ contract changes.
 - Keep Jobe screen execution serial. Fresh default captures reserve 9.96 GiB
   for `base`, 10.12 GiB for `mhdb`, and 22.76 GiB for `df`; concurrent
   execution is outside the qualified deterministic single-GPU path.
-- New snapshots are checkpoint-v11. Reject every older checkpoint version.
+- New snapshots are checkpoint-v12. Reject every older checkpoint version.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.
   The queue records exact arguments without inspecting Git state. Source
   changes never stop an active child; the worker refreshes before the next job

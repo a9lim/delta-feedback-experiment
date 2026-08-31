@@ -105,9 +105,18 @@ references:
     slug: li2025-normuon
     note: >
       Defines NorMuon: momentum, Newton-Schulz orthogonalization, neuron-wise
-      second-moment normalization, and global update rescaling. The experiment
-      applies it to non-embedding two-dimensional weights and uses Adam for the
-      remaining parameters.
+      second-moment normalization, and global update rescaling. NorMuon supplies
+      the base matrix direction inside NorMuonH; Hyperball normalization replaces
+      its global rescaling before the parameter update.
+
+  - arxiv: "2606.16899"
+    slug: chen2026-hyperball
+    note: >
+      Defines Hyperball's fixed initial Frobenius radius, unit-Frobenius base
+      update, dimensionless relative step, and exact radial projection. The
+      experiment applies it to every NorMuon matrix except the semantic FBT
+      token-gate projection, uses plain Adam for all semantic-scale parameters,
+      and uses no weight decay.
 
   - arxiv: "2603.15031"
     slug: kimi2026-attention-residuals

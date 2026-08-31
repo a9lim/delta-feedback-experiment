@@ -390,8 +390,7 @@ def cuda_gate() -> None:
     )
     optimizers = build_optimizers(
         model,
-        lr_muon=args.lr_muon,
-        wd_muon=args.wd_muon,
+        lr_h=args.lr_h,
         lr_adam=args.lr_adam,
     )
     with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -502,6 +501,14 @@ def cuda_gate() -> None:
         records.append(
             f"k={spec.n_passes}/ckpt={int(spec.checkpoint)}:{elapsed * 1000:.1f}ms"
         )
+
+    radius_errors = []
+    for parameter, optimizer_state in optimizers[0].state.items():
+        radius = optimizer_state["radius"]
+        radius_errors.append((parameter.norm() - radius).abs() / radius)
+    max_radius_error = torch.stack(radius_errors).max().item()
+    if max_radius_error > 5e-6:
+        raise AssertionError(f"NorMuonH Frobenius-radius drift: {max_radius_error:.3e}")
 
     # Freeze the full model, optimizer, and RNG surface into pinned host memory.
     # Serialization itself is covered by the root package's CPU atomic-write

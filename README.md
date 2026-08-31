@@ -12,15 +12,14 @@ PKDA/GGQA hybrid independently or interact when pretrained together:
   delta router to enrich the recurrent payload between columns.
 
 The primary factorial is `{base, mhdb, fbt, df}`. All four use
-`[PKDA, PKDA, PKDA, gated global GQA] x 3`; the completed pure-GQA `vanilla`
-run is retained as an external trunk control. Every MHDB router has a learnable
-zero-initialized null source.
+`[PKDA, PKDA, PKDA, gated global GQA] x 3`; pure-GQA `vanilla` is the external
+trunk control. Every MHDB router has a learnable zero-initialized null source.
 
 ## Status
 
-No screen job is active. The completed vanilla record is retained, but no
-matched hybrid comparison is complete, so there are no accepted experiment
-findings. The 8-by-128 PKDA/GGQA screen, deterministic trainer, portable
+No screen job is active and no registered screen run is complete, so there are
+no accepted experiment findings. The 8-by-128 PKDA/GGQA screen, deterministic
+trainer, portable
 recurrence, and optimized single-GPU CUDA path are implemented and
 Jobe-qualified. The full DF train/eval graph pool peaks at 12.87 GiB allocated
 and 22.76 GiB reserved across four graphs, so screen jobs remain serial on the
@@ -87,8 +86,8 @@ token stream. Pass counts are keyed by data seed and step; prefix lengths and
 jitter additionally use the global row, so paired arms see identical examples
 and feedback draws.
 
-New snapshots are immutable checkpoint-contract v11 files under `runs/`.
-Only v11 is resumable. `--max-steps` limits only the current invocation; it
+New snapshots are immutable checkpoint-contract v12 files under `runs/`.
+Only v12 is resumable. `--max-steps` limits only the current invocation; it
 never rescales the state-defining schedule.
 
 ## Analysis

@@ -21,8 +21,8 @@ redundant when added to one common hybrid sequence-model trunk:
    column through a token-gated fusion, giving latent state another full pass
    through depth.
 
-The four hybrid arms form the primary MHDB x FBT factorial. The completed
-pure-GQA `vanilla` run remains a fifth, external trunk control:
+The four hybrid arms form the primary MHDB x FBT factorial. Pure-GQA `vanilla`
+is a fifth, external trunk control:
 
 | Arm | Hybrid trunk | MHDB | FBT | Parameters |
 |---|---:|---:|---:|---:|
@@ -33,10 +33,8 @@ pure-GQA `vanilla` run remains a fifth, external trunk control:
 | `df` | yes | yes | yes | 242,695,392 |
 
 The factorial contrasts use `base`, not `vanilla`, as their shared baseline.
-`vanilla` versus `base` isolates the whole PKDA/GGQA trunk replacement. The
-old vanilla state layout and initialization are byte-identical under the
-current code, so its completed screen record remains admissible without a
-rerun. There is no optional-feedback arm.
+`vanilla` versus `base` isolates the whole PKDA/GGQA trunk replacement. There
+is no optional-feedback arm.
 
 The claim boundary is pretraining behavior under the registered recipe and
 data. No result is a general claim about recurrent transformers, depth routing,
@@ -351,7 +349,7 @@ and step addresses. One initialization seed produces a byte-identical hybrid
 trunk in `base`, `mhdb`, `fbt`, and `df`, identical MHDB parameters in `mhdb`
 and `df`, and identical FBT fusion weights in `fbt` and `df`; conditional
 modules never advance a shared stream. The structurally different `vanilla`
-control retains its exact previous initialization. Initialization seeds differ
+control retains its exact registered initialization recipe. Initialization seeds differ
 only when registering a new paired seed. Resumption returns to the same row and
 the same keyed feedback draws.
 
@@ -361,21 +359,30 @@ Every arm uses the same recipe.
 
 ### Parameter groups
 
-- **NorMuon:** every trainable two-dimensional weight except the tied
+- **NorMuonH:** every trainable two-dimensional weight except the tied
   embedding/unembedding and scale-sensitive gate-producing projections. This
-  includes the FBT value and token-gate fusion matrices. Defaults: learning
-  rate `1e-2`, momentum `0.95`, row second-moment beta `0.95`, five
-  Newton-Schulz steps, epsilon `1e-8`, decoupled weight decay `0.01`.
+  includes the FBT value projection but excludes the FBT token-gate projection.
+  Defaults: dimensionless Hyperball learning rate `1e-2`, momentum `0.95`, row
+  second-moment beta `0.95`, five Newton-Schulz steps, and epsilon `1e-8`.
 - **Adam:** scale-sensitive gate-producing projections, tied embeddings,
   RMSNorm weights, routing queries, null vectors, depthwise convolution
-  weights, and all other non-matrix parameters. This includes every GGQA gate
-  and PKDA's packed control projection, main-decay expansion, and output-gate
-  expansion. Defaults: learning rate `5e-4`, betas `(0.9, 0.95)`, epsilon
-  `1e-8`, no weight decay.
+  weights, and all other non-matrix parameters. This includes the FBT token
+  gate, every GGQA gate, and PKDA's packed control projection, main-decay
+  expansion, and output-gate expansion. Defaults: learning rate `5e-4`, betas
+  `(0.9, 0.95)`, epsilon `1e-8`, and no weight decay.
 
-NorMuon orthogonalizes the momentum, normalizes rows by their second moments,
-and globally rescales the update to Frobenius norm `0.2 * sqrt(m*n)` before
-applying learning rate and decoupled decay.
+For each NorMuonH matrix, let `R = ||W_0||_F` be its initial FP32 Frobenius
+radius and let `U_t` be the NorMuon direction after EMA momentum,
+Newton-Schulz orthogonalization, and neuron-wise second-moment normalization.
+The optimizer applies the exact Hyperball update
+
+```text
+W_(t+1) = R * Normalize_F(W_t - lr_h * R * Normalize_F(U_t)).
+```
+
+The radius is checkpointed with optimizer state and must remain fixed across
+every eager, captured, staged, and resumed step. No optimizer group uses weight
+decay; matrix norm control is the explicit Hyperball constraint.
 
 ### Default screen schedule
 
@@ -395,10 +402,8 @@ deterministic for the registered data seed. The expected compute multiplier for
 a feedback arm is 1.28 transformer passes per predicted token, while
 non-feedback arms remain at 1.0.
 
-Learning rates follow the shared WSD multiplier. NorMuon weight decay stays at
-its stable value through warmup and heat, then is multiplied by the normalized
-learning-rate factor during cooldown. The z-loss is active only during
-cooldown.
+Both learning rates follow the shared WSD multiplier. The z-loss is active only
+during cooldown.
 
 `--max-steps` caps the number of additional steps in one process. It does not
 change the schedule, feedback boundary, protected checkpoints, or any
@@ -461,7 +466,7 @@ the registered three-pass DF modes fit.
 
 ### Checkpoint contract
 
-New snapshots use checkpoint contract v11, and only v11 is resumable.
+New snapshots use checkpoint contract v12, and only v12 is resumable.
 Snapshots contain model, both optimizer states, exact state-defining arguments,
 step, and Python/Torch/CUDA RNG state. A resume inherits all state-defining
 fields and rejects an explicit conflict. Runtime paths, device, evaluation
@@ -564,13 +569,13 @@ training an alternative payload rule from scratch.
 ### 223–243M screen
 
 The screen uses the geometry above, 6,700 steps, 2.003B predicted tokens per
-run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
-completed `vanilla` run is retained; the four hybrid factorial arms are new
-runs under checkpoint-v11.
+run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. No
+registered screen run is complete. `vanilla` is the external trunk control and
+the four hybrid arms form the primary factorial under checkpoint-v12.
 
 The screen is designed to establish:
 
-1. whether the hybrid trunk improves on the completed vanilla control;
+1. whether the hybrid trunk improves on the vanilla control;
 2. the signs and paired magnitudes of the MHDB, recurrence, and joint effects
    within one shared hybrid trunk;
 3. whether hard DF is stable under recurrent self-composition;
@@ -588,7 +593,7 @@ continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v10
+This ladder is not currently runnable through exact resume: `steps` is a v12
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without
@@ -611,7 +616,7 @@ The operating point has four explicit authority classes:
 
 | Surface | Authority |
 |---|---|
-| Width 1,536, 24 layers, SwiGLU 6,656, GQA 16/8-by-96, context 8,192, nominal 1B/400B-token scale, WSD/NorMuon recipe, and latent-feedback schedule | Full-Bandwidth Transformer, inherited directly except for the project's tokenizer and vocabulary |
+| Width 1,536, 24 layers, SwiGLU 6,656, GQA 16/8-by-96, context 8,192, nominal 1B/400B-token scale, WSD/NorMuonH recipe, and latent-feedback schedule | Full-Bandwidth Transformer, inherited directly except for the project's tokenizer and vocabulary |
 | PKDA 20-by-128 geometry, convolution width 4, Q/K L2 normalization, sigmoid output gate, NoPE, and 3:1 hybrid cadence | Kimi Linear paper and released configuration |
 | Apply-to-key recurrence, independent preconditioner gates, `x = 1.5`, bounded squash, initialization, chunk/recurrent forms, FP32 boundary states, and global gradient clip 1.0 | Preconditioned DeltaNet paper and upstream FLA implementation |
 | Sigmoid-gated global GQA | Released Qwen3-Next configuration and implementation |
@@ -767,14 +772,14 @@ probabilities 50%, 44%, and 6%, using the same keyed schedule as the screen;
 the exact realized pass-token count is recorded rather than inferred from the
 expectation.
 
-Learning rates, decay, and the z-loss follow the shared NorMuon/Adam WSD recipe
-above. The flagship additionally clips the accumulated global FP32 gradient
+Learning rates and the z-loss follow the shared NorMuonH/Adam WSD recipe above.
+The flagship additionally clips the accumulated global FP32 gradient
 norm to 1.0 immediately before the optimizer step, matching the 1B PKDA
 training precedent. The packed PKDA control projection, main-decay expansion,
 and output-gate expansion remain in Adam; Q/K/V/output projections remain in
-NorMuon. The three-dimensional depthwise convolution weights are non-matrix
+NorMuonH. The three-dimensional depthwise convolution weights are non-matrix
 parameters and remain in Adam with no weight decay. All learned KDA and
-preconditioner rate parameters are also exempt from weight decay.
+preconditioner rate parameters also remain in plain Adam.
 
 The registered distributed target is eight H100 80GB GPUs under replicated
 DDP, BF16 autocast, FP32 parameters, FP32 gradients at the optimizer boundary,
@@ -865,8 +870,9 @@ code and tests, the flagship is specified but not runnable.
 `df probe` must pass at the queued commit. On Jobe this includes portable tests,
 Triton router value/weight/gradient parity for H=4 and H=8, cut-cross-entropy
 z-loss parity, cached FlashAttention recurrence, captured/eager evaluation
-parity, every schedule-reachable CUDA graph, finite optimizer updates,
-contraction-monitor execution, and production-scale checkpoint staging.
+parity, every schedule-reachable CUDA graph, finite optimizer updates, exact
+NorMuonH Frobenius-radius preservation, contraction-monitor execution, and
+production-scale checkpoint staging.
 
 Engineering qualification establishes implementation sensitivity and numerical
 coherence. It is not an experiment finding.
