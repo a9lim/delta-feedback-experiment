@@ -58,9 +58,13 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 
 try:
     from cut_cross_entropy import linear_cross_entropy
-    from cut_cross_entropy.utils import compute_z_loss
+    from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
+    from cut_cross_entropy.utils import _handle_eps, compute_z_loss
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     linear_cross_entropy = None
+    CCEParams = None
+    linear_cross_entropy_apply = None
+    _handle_eps = None
     compute_z_loss = None
 
 ARMS = ("vanilla", "base", "mhdb", "fbt", "df")
@@ -1054,18 +1058,47 @@ _compiled_head_losses = torch.compile(
 def _fixed_cce_z(
     embeddings: Tensor, classifier: Tensor, targets: Tensor
 ) -> tuple[Tensor, Tensor]:
-    """Current CCE's fused CE and differentiable log-partition loss."""
-    if linear_cross_entropy is None or compute_z_loss is None:
+    """Current CCE with capture-safe preprocessing and differentiable LSE.
+
+    Every training target is a real vocabulary id, so CCE's public
+    ``ignore_index`` discovery would always produce ``valids=None``. Construct
+    that exact pinned-C CCE request directly: its data-dependent ``nonzero`` is
+    illegal inside CUDA graph capture, while its forward and new differentiable
+    LSE backward are otherwise the authoritative implementation.
+    """
+    if (
+        CCEParams is None
+        or linear_cross_entropy_apply is None
+        or _handle_eps is None
+        or compute_z_loss is None
+    ):
         raise RuntimeError("cut-cross-entropy is unavailable")
     embeddings = embeddings.contiguous().flatten(0, -2)
     targets = targets.contiguous().flatten()
-    ce, lse = linear_cross_entropy(
+    if targets.data_ptr() % 16:
+        targets = F.pad(targets, (0, 1))[:-1]
+    params = CCEParams(
+        targets=targets,
+        valids=None,
+        softcap=None,
+        reduction="mean",
+        filter_eps=_handle_eps("auto", embeddings.dtype),
+        shift=0,
+        batch_shape=targets.shape,
+        accum_e_fp32=False,
+        accum_c_fp32=False,
+        filter_e_grad=True,
+        filter_c_grad=True,
+        vocab_parallel_options=None,
+        return_lse=True,
+    )
+    ce, lse = linear_cross_entropy_apply(
         embeddings,
         classifier,
-        targets,
-        return_lse=True,
-        filter_eps="auto",
+        None,
+        params,
     )
+    assert lse is not None
     return ce, compute_z_loss(lse)
 
 
