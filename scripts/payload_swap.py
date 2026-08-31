@@ -1,10 +1,10 @@
 """Counterfactual payload sweep: what should ride to the next column?
 
-Forces the MHDAR payload enrichment to each single delta in turn (plus none /
-uniform), either across all heads or in one selected head, and measures fused val loss under the
-training eval convention (one fused pass, prefix length 1).  Answers
-whether the trained router's choice is a family preference, a specific
-peak, or a no-op.
+Forces the MHDB payload enrichment to each null, seed, or completed-block source
+in turn (plus none / uniform), either across all heads or in one selected head,
+and measures fused val loss under the training eval convention (one fused pass,
+prefix length 1).  Answers whether the trained router's choice is a family
+preference, a specific peak, or a no-op.
 
 Caveat: the fuse/entry weights co-adapted to the *trained* payload, so
 alternatives are handicapped — read the landscape's shape (which family
@@ -93,7 +93,7 @@ def main() -> None:
             batches += 1
         return sums[0] / batches, sums[1] / batches
 
-    names = [f"{kind}{i}" for i in range(cfg.layers) for kind in ("a", "m")]
+    names = ["null", "seed"] + [f"block{i}" for i in range(cfg.routing_blocks)]
     val, fused = losses()
     print(f"trained router : val={val:.4f}  fused={fused:.4f}")
 
@@ -101,16 +101,23 @@ def main() -> None:
     model.payload_router.forward = lambda sources, masks, want: (None, None)
     print(f"h_top only     : fused={losses()[1]:.4f}")
     model.payload_router.forward = lambda sources, masks, want: (
-        torch.stack(sources).mean(0),
+        torch.stack([model.payload_router.null.expand_as(sources[0]), *sources]).mean(
+            0
+        ),
         None,
     )
     print(f"uniform        : fused={losses()[1]:.4f}")
+
+    def selected_source(sources, index):
+        if index == 0:
+            return model.payload_router.null.expand_as(sources[0])
+        return sources[index - 1]
 
     results = []
     for i, name in enumerate(names):
         if args.head is None:
             model.payload_router.forward = lambda sources, masks, want, i=i: (
-                sources[i],
+                selected_source(sources, i),
                 None,
             )
         else:
@@ -121,7 +128,8 @@ def main() -> None:
                 head_dim = dim // cfg.routing_heads
                 routed = routed.reshape(batch, length, cfg.routing_heads, head_dim)
                 routed = routed.clone()
-                routed[:, :, args.head] = sources[i].reshape(
+                chosen = selected_source(sources, i)
+                routed[:, :, args.head] = chosen.reshape(
                     batch, length, cfg.routing_heads, head_dim
                 )[:, :, args.head]
                 return routed.reshape(batch, length, dim), None

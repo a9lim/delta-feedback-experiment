@@ -1,7 +1,7 @@
 [project]
 name = "delta-feedback-experiment"
-version = "0.2.0"
-description = "Pretraining factorial: MHDAR plus gated GQA x full-bandwidth latent feedback."
+version = "0.3.0"
+description = "Pretraining factorial: MHDB plus gated GQA x full-bandwidth latent feedback."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "CC-BY-SA-4.0"

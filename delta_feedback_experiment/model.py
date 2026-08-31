@@ -2,7 +2,7 @@
 
 The architecture contract is ``docs/design.md``. Everything here is
 arm-agnostic model semantics: the five arms are one class under
-:class:`ModelConfig` flags.  The architecture axis is MHDAR plus gated GQA;
+:class:`ModelConfig` flags.  The architecture axis is MHDB plus gated GQA;
 the recurrence axis is FBT, and the factorial cells are deletions of DF.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired arms architecturally
@@ -10,18 +10,20 @@ identical in everything but the flags.
 
 Semantics worth naming because they are easy to get subtly wrong:
 
-- Multi-head depth routing is a *transient read*: each KV-sized channel
+- Multi-head block-delta routing is a *transient read*: each KV-sized channel
   group has its own softmax over sources; the concatenated convex mixtures
   enriches one sublayer's pre-norm input and is never accumulated into
   the residual stream, so the stream stays the clean telescoping sum
-  ``seed + sum(deltas) = h_top``.
-- The source list seeds with the column's actual input (complete
-  decomposition), and a routing site is a no-op until it can see two
-  sources — the singleton seed would route weight 1 onto itself.
-- The payload router uses the same multi-head primitive over deltas only
-  (never the seed), additively on
-  top of the top state; DF-soft's routers all carry a learnable
-  zero-initialized null source.
+  ``seed + sum(block_deltas) = h_top``.
+- Every router prepends its own learnable zero-initialized null.  The remaining
+  within-column bank is the actual input seed, completed four-layer block
+  deltas, and at most one current-block partial delta.  Those non-null sources
+  exactly decompose the current residual stream.
+- The payload router uses the same multi-head primitive over the seed and all
+  completed block deltas, additively on top of the top state.  At zero-query
+  initialization its uniform non-null mixture is therefore collinear with the
+  top state, so the following RMSNorm makes enrichment functionally inert up
+  to its epsilon.
 - Sublayer branch outputs are scaled ``1/sqrt(2L)``, so deltas — and hence
   routing sources — are the scaled outputs.
 """
@@ -71,7 +73,7 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     indexed_neg_dot_forward_kernel = None
     _handle_eps = None
 
-ARMS = ("vanilla", "mhdar", "fbt", "df", "df_soft")
+ARMS = ("vanilla", "mhdb", "fbt", "df", "df_soft")
 
 
 @dataclass(frozen=True)
@@ -94,30 +96,41 @@ class ModelConfig:
     max_seq_len: int = 1024
     rope_theta: float = 1e6
     norm_eps: float = 1e-6
+    routing_block_size: int = 4
+    """Exact MHDB cell width in transformer layers."""
 
-    depth_routing: bool = False
-    """MHDAR axis: multi-head delta routing before every sublayer."""
+    block_routing: bool = False
+    """MHDB axis: multi-head block-delta routing before every sublayer."""
 
     feedback: bool = False
     """FBT axis: gated entry plus a payload for the next column."""
 
     soft: bool = False
     """DF-soft: both machineries as free choices — plain entry, standing
-    [p_prev, e] sources, a null source in every router."""
+    [p_prev, e] sources, and the same MHDB routers as the hard arms."""
+
+    def __post_init__(self) -> None:
+        if self.routing_block_size < 1:
+            raise ValueError("routing block size must be positive")
 
     @property
     def routing_active(self) -> bool:
-        return self.depth_routing or self.soft
+        return self.block_routing or self.soft
 
     @property
     def gated_attention(self) -> bool:
-        """The architecture package couples MHDAR to gated GQA."""
+        """The architecture package couples MHDB to gated GQA."""
         return self.routing_active
 
     @property
     def routing_heads(self) -> int:
-        """The authoritative MHDAR scaling rule: H equals KV-head count."""
+        """The authoritative MHDB scaling rule: H equals KV-head count."""
         return self.kv_heads
+
+    @property
+    def routing_blocks(self) -> int:
+        """Number of completed block deltas emitted by a full column."""
+        return (self.layers + self.routing_block_size - 1) // self.routing_block_size
 
     @property
     def feedback_active(self) -> bool:
@@ -130,12 +143,12 @@ class ModelConfig:
 
 
 def arm_config(arm: str, **overrides) -> ModelConfig:
-    """The named arm's configuration; overrides adjust trunk geometry only."""
+    """The named arm's configuration; overrides adjust instantiated geometry."""
     flags = {
         "vanilla": {},
-        "mhdar": {"depth_routing": True},
+        "mhdb": {"block_routing": True},
         "fbt": {"feedback": True},
-        "df": {"depth_routing": True, "feedback": True},
+        "df": {"block_routing": True, "feedback": True},
         "df_soft": {"soft": True},
     }
     if arm not in flags:
@@ -314,7 +327,7 @@ class SwiGLU(nn.Module):
 
 def _check_route_geometry(dim: int, num_heads: int) -> int:
     if num_heads < 2:
-        raise ValueError("MHDAR requires at least two routing heads")
+        raise ValueError("MHDB requires at least two routing heads")
     if dim % num_heads:
         raise ValueError(
             f"model dimension {dim} must be divisible by {num_heads} routing heads"
@@ -330,7 +343,7 @@ def _route_algebra(
     present: Tensor | None,
     num_heads: int,
 ) -> tuple[Tensor, Tensor]:
-    """MHDAR algebra over a pre-stacked source bank.
+    """MHDB algebra over a pre-stacked source bank.
 
     RMS statistics remain full-width, while each contiguous channel group has
     its own source-axis softmax.  Values are mixed only inside their group;
@@ -363,7 +376,7 @@ def _route_sources(
     num_heads: int,
     *sources: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """Static MHDAR pointer-list router: never copies a value bank."""
+    """Static MHDB pointer-list router: never copies a value bank."""
     batch, length, dim = sources[0].shape
     head_dim = _check_route_geometry(dim, num_heads)
     projected = (query.float() * key_weight.float()).to(sources[0].dtype)
@@ -400,13 +413,13 @@ _compiled_route_sources = torch.compile(
 
 
 class Router(nn.Module):
-    """One MHDAR site: per-group softmaxes, RMS-normed keys, raw values.
+    """One MHDB site: per-group softmaxes, RMS-normed keys, raw values.
 
-    With a null source (DF-soft), a learnable zero-init vector is
-    prepended — its key is rmsnorm(0)=0, so its logit is exactly zero at
-    init and routing mass on it adds (initially) nothing.  A per-source
-    presence mask (True = present at that position) supports DF-soft's
-    prefix mixin, where the p_prev source exists only at fused positions.
+    A learnable zero-init null vector is always prepended.  Its key is
+    rmsnorm(0)=0, so its logit is exactly zero at init and routing mass on it
+    initially adds nothing.  A per-source presence mask (True = present at
+    that position) supports DF-soft's prefix mixin, where the p_prev source
+    exists only at fused positions.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -415,7 +428,7 @@ class Router(nn.Module):
         self.num_heads = cfg.routing_heads
         self.query = nn.Parameter(torch.zeros(cfg.dim))
         self.key_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.null = nn.Parameter(torch.zeros(cfg.dim)) if cfg.soft else None
+        self.null = nn.Parameter(torch.zeros(cfg.dim))
 
     def forward(
         self,
@@ -424,9 +437,8 @@ class Router(nn.Module):
         want_weights: bool,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Return a routed addition and weights shaped ``[N,B,T,H]``."""
-        if self.null is not None:
-            sources = [self.null.expand_as(sources[0])] + sources
-            masks = [None] + masks
+        sources = [self.null.expand_as(sources[0])] + sources
+        masks = [None] + masks
         if len(sources) < 2:
             return None, None
         present = None
@@ -446,7 +458,7 @@ class Router(nn.Module):
             routed, weights = bespoke_route(
                 projected,
                 present,
-                self.null is not None,
+                True,
                 self.key_norm.eps,
                 self.num_heads,
                 tuple(sources),
@@ -476,11 +488,12 @@ class Block(nn.Module):
     """One layer: (routed read →) attention, (routed read →) MLP.
 
     The routed read enriches the sublayer's pre-norm input only; the
-    residual stream accumulates just the scaled branch outputs, which
-    are also the deltas the caller appends to the source list.  The
-    forward is pure — sources in, deltas out, no list mutation — so it
-    can sit under activation checkpointing, whose backward recomputes
-    the forward.
+    residual stream accumulates just the scaled branch outputs. The caller
+    combines them into a completed four-layer delta; within a cell, the MLP
+    read replaces the incoming partial with that partial plus its attention
+    delta. The forward is pure — sources in, branch deltas out, no list
+    mutation — so it can sit under activation checkpointing, whose backward
+    recomputes the forward.
     """
 
     def __init__(self, cfg: ModelConfig, layer: int):
@@ -491,6 +504,7 @@ class Block(nn.Module):
         self.attn = Attention(cfg)
         self.mlp = SwiGLU(cfg)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
+        self.has_prior_partial = layer % cfg.routing_block_size != 0
         if cfg.routing_active:
             self.attn_router = Router(cfg)
             self.mlp_router = Router(cfg)
@@ -526,7 +540,11 @@ class Block(nn.Module):
             self.attn_norm(x), cos, sin, gate_weight, cache, self.layer
         )
         h = h + a
-        x, w_mlp = self._read(h, self.mlp_router, (*sources, a), p_mask, want_weights)
+        if self.mlp_router is not None and self.has_prior_partial:
+            mlp_sources = (*sources[:-1], sources[-1] + a)
+        else:
+            mlp_sources = (*sources, a)
+        x, w_mlp = self._read(h, self.mlp_router, mlp_sources, p_mask, want_weights)
         m = self.branch_scale * self.mlp(self.mlp_norm(x))
         h = h + m
         return h, a, m, w_attn, w_mlp
@@ -535,9 +553,7 @@ class Block(nn.Module):
 def _block_for_checkpoint(block, h, cos, sin, gate_weight, p_mask, *sources):
     """Tensor-only wrapper for activation checkpointing (no cache, no
     weights) — the recomputation must be free of side effects."""
-    h, a, m, _, _ = block(
-        h, cos, sin, None, gate_weight, p_mask, False, *sources
-    )
+    h, a, m, _, _ = block(h, cos, sin, None, gate_weight, p_mask, False, *sources)
     return h, a, m
 
 
@@ -569,10 +585,15 @@ class ColumnOutput:
     route_weights: dict[str, Tensor]
     """Site → per-head softmax weights [N, B, T, H], when requested."""
 
+    route_source_names: dict[str, tuple[str, ...]]
+    """Site → source-axis labels matching ``route_weights`` exactly."""
+
     sources: list[Tensor] | None
-    """The routed source list (seeds then deltas); None off the routing
-    arms.  References into the forward graph, so effectively free — the
-    stream at any depth reconstructs as seed + cumsum(deltas)."""
+    """Final stored bank (standing sources then completed block deltas).
+    The stream reconstructs from its last seed plus the block deltas."""
+
+    source_names: tuple[str, ...]
+    """Names corresponding one-for-one with ``sources``."""
 
     n_seeds: int
     """How many leading entries of ``sources`` are seeds, not deltas."""
@@ -588,10 +609,9 @@ class DFModel(nn.Module):
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        # Capture the exact legacy common-trunk initialization boundary before
+        # Capture the exact common-trunk initialization boundary before
         # constructing any factor-specific random matrices. Restoring it below
-        # keeps every shared parameter byte-identical across arms and preserves
-        # compatibility with the already-running vanilla screen initialization.
+        # keeps every shared parameter byte-identical across arms.
         common_init_state = torch.random.get_rng_state()
         self.attention_gates = nn.ModuleList(
             nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
@@ -627,8 +647,7 @@ class DFModel(nn.Module):
             nn.init.normal_(module.weight, std=0.02)
         elif isinstance(module, Router):
             nn.init.zeros_(module.query)
-            if module.null is not None:
-                nn.init.zeros_(module.null)
+            nn.init.zeros_(module.null)
 
     @staticmethod
     def _init_factor_linears(linears: Iterable[nn.Linear], seed: int) -> None:
@@ -686,17 +705,21 @@ class DFModel(nn.Module):
         cos, sin = self.rope(x.device, start, x.shape[1])
 
         sources: list[Tensor] | None = None
+        source_names: list[str] = []
         p_mask = None
         if cfg.routing_active:
             sources = []
             if p_source is not None:
                 sources.append(p_source)
+                source_names.append("prev")
                 p_mask = p_presence
             sources.append(x)
+            source_names.append("seed")
         seeds = len(sources) if sources is not None else 0
 
         h = x
         weights_out: dict[str, Tensor] = {}
+        route_source_names: dict[str, tuple[str, ...]] = {}
         checkpointing = (
             self.grad_checkpoint
             and self.training
@@ -704,15 +727,25 @@ class DFModel(nn.Module):
             and cache is None
             and not want_weights
         )
+        block_start = h
         for block in self.blocks:
-            passed = tuple(sources) if sources is not None else ()
+            block_index = block.layer // cfg.routing_block_size
+            block_offset = block.layer % cfg.routing_block_size
+            if block_offset == 0:
+                block_start = h
+            passed_sources = list(sources) if sources is not None else []
+            passed_names = list(source_names)
+            if sources is not None and block_offset:
+                passed_sources.append(h - block_start)
+                passed_names.append(f"partial{block_index}")
+            passed = tuple(passed_sources)
             gate_weight = (
                 self.attention_gates[block.layer].weight
                 if cfg.gated_attention
                 else None
             )
             if checkpointing:
-                h, a, m = torch.utils.checkpoint.checkpoint(
+                h, _a, _m = torch.utils.checkpoint.checkpoint(
                     _compiled_block if h.is_cuda else _block_for_checkpoint,
                     block,
                     h,
@@ -725,11 +758,11 @@ class DFModel(nn.Module):
                     preserve_rng_state=False,
                 )
             elif h.is_cuda and cache is None and not want_weights:
-                h, a, m = _compiled_block(
+                h, _a, _m = _compiled_block(
                     block, h, cos, sin, gate_weight, p_mask, *passed
                 )
             else:
-                h, a, m, w_attn, w_mlp = block(
+                h, _a, _m, w_attn, w_mlp = block(
                     h,
                     cos,
                     sin,
@@ -740,11 +773,24 @@ class DFModel(nn.Module):
                     *passed,
                 )
                 if w_attn is not None:
-                    weights_out[f"L{block.layer}.attn"] = w_attn
+                    site = f"L{block.layer}.attn"
+                    weights_out[site] = w_attn
+                    route_source_names[site] = ("null", *passed_names)
                 if w_mlp is not None:
-                    weights_out[f"L{block.layer}.mlp"] = w_mlp
-            if sources is not None:
-                sources.extend((a, m))
+                    site = f"L{block.layer}.mlp"
+                    weights_out[site] = w_mlp
+                    mlp_names = (
+                        passed_names
+                        if block.has_prior_partial
+                        else [*passed_names, f"partial{block_index}"]
+                    )
+                    route_source_names[site] = ("null", *mlp_names)
+            if sources is not None and (
+                block_offset == cfg.routing_block_size - 1
+                or block.layer == cfg.layers - 1
+            ):
+                sources.append(h - block_start)
+                source_names.append(f"block{block_index}")
         if cache is not None:
             cache.advance(x.shape[1])
 
@@ -752,12 +798,17 @@ class DFModel(nn.Module):
         if cfg.feedback_active and need_payload:
             enriched = h
             if cfg.routing_active:
-                deltas = sources[seeds:]
+                payload_sources = [sources[seeds - 1], *sources[seeds:]]
                 routed, weights = self.payload_router(
-                    deltas, [None] * len(deltas), want_weights
+                    payload_sources, [None] * len(payload_sources), want_weights
                 )
                 if weights is not None:
                     weights_out["payload"] = weights
+                    route_source_names["payload"] = (
+                        "null",
+                        "seed",
+                        *source_names[seeds:],
+                    )
                 if routed is not None:
                     enriched = h + routed
             payload = self.payload_norm(enriched)
@@ -766,7 +817,9 @@ class DFModel(nn.Module):
             h_top=h,
             payload=payload,
             route_weights=weights_out,
+            route_source_names=route_source_names,
             sources=sources,
+            source_names=tuple(source_names),
             n_seeds=seeds,
         )
 

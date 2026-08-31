@@ -58,10 +58,6 @@ def load_model(path: Path, device) -> tuple[DFModel, dict]:
     return model.to(device).eval(), saved
 
 
-def source_names(layers: int) -> list[str]:
-    return [f"{kind}{i}" for i in range(layers) for kind in ("a", "m")]
-
-
 def site_names(layers: int) -> list[str]:
     return [f"L{i}.{kind}" for i in range(layers) for kind in ("attn", "mlp")]
 
@@ -81,6 +77,8 @@ def collect(model, data_val, device, rows: int, micro: int):
     stats: dict[tuple[int, str], torch.Tensor] = {}
     divergences: dict[tuple[int, str], torch.Tensor] = {}
     norms: dict[int, torch.Tensor] = {}
+    final_source_names: dict[int, tuple[str, ...]] = {}
+    route_source_names: dict[tuple[int, str], tuple[str, ...]] = {}
     counted = 0
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
@@ -91,7 +89,9 @@ def collect(model, data_val, device, rows: int, micro: int):
             values = torch.stack(out.sources)  # [N, B, T, D]
             rms = values.float().pow(2).mean(-1).sqrt().mean((1, 2)).cpu() * n
             norms[p] = norms.get(p, 0.0) + rms
+            final_source_names[p] = out.source_names
             for site, weights in out.route_weights.items():
+                route_source_names[p, site] = out.route_source_names[site]
                 w = weights.float()
                 per_token = -(w.clamp_min(1e-12).log() * w).sum(dim=0)
                 head_mean = w.mean(dim=-1, keepdim=True)
@@ -121,6 +121,8 @@ def collect(model, data_val, device, rows: int, micro: int):
         {key: (value / counted).numpy() for key, value in stats.items()},
         {key: float(value / counted) for key, value in divergences.items()},
         {key: (value / counted).numpy() for key, value in norms.items()},
+        final_source_names,
+        route_source_names,
     )
 
 
@@ -130,23 +132,30 @@ def entropy(weights: np.ndarray) -> float:
     return float(-(w * np.log(w)).sum() / math.log(len(weights)))
 
 
-def site_matrix(means, layers: int, heads: int, passes=(0, 1)):
+def site_matrix(means, route_names, cfg, passes=(0, 1)):
     """[site, source] mean-weight matrices per pass and head; NaN = absent.
 
-    Columns: seed (e on pass 0, fused u on pass 1) then a0,m0..a(L-1),m(L-1).
+    Columns cover the union of null, standing, completed-block, and
+    current-partial labels.  Each row is placed by label rather than source
+    position because the bank changes at block boundaries.
     """
-    sites = site_names(layers)
+    sites = site_names(cfg.layers)
+    columns = ["null", "prev", "seed"]
+    columns += [f"block{i}" for i in range(cfg.routing_blocks)]
+    columns += [f"partial{i}" for i in range(cfg.routing_blocks)]
+    column_index = {name: index for index, name in enumerate(columns)}
     matrices = {}
     for p in passes:
-        for head in range(heads):
-            matrix = np.full((len(sites), 1 + 2 * layers), np.nan)
+        for head in range(cfg.routing_heads):
+            matrix = np.full((len(sites), len(columns)), np.nan)
             for row, site in enumerate(sites):
                 if (p, site) not in means:
-                    continue  # L0.attn routes over a singleton and stays off
+                    continue
                 w = means[(p, site)][:, head]
-                matrix[row, : len(w)] = w
+                for name, value in zip(route_names[p, site], w, strict=True):
+                    matrix[row, column_index[name]] = value
             matrices[p, head] = matrix
-    return sites, matrices
+    return sites, columns, matrices
 
 
 def main() -> None:
@@ -168,14 +177,18 @@ def main() -> None:
     print(f"# {tag} — {saved['arm']}, {layers} layers, dim {cfg.dim}, device {device}")
 
     # -- static: query geometry ------------------------------------------------
-    queries, labels = [], []
+    queries, null_rms, labels = [], [], []
     for i, block in enumerate(model.blocks):
         for kind, router in (("attn", block.attn_router), ("mlp", block.mlp_router)):
             if router is not None:
                 queries.append(router.query.detach().float().cpu())
+                null_rms.append(router.null.detach().float().square().mean().sqrt())
                 labels.append(f"L{i}.{kind}")
     if getattr(model, "payload_router", None) is not None:
         queries.append(model.payload_router.query.detach().float().cpu())
+        null_rms.append(
+            model.payload_router.null.detach().float().square().mean().sqrt()
+        )
         labels.append("payload")
     q = torch.stack(queries)
     norms = q.norm(dim=1)
@@ -184,28 +197,33 @@ def main() -> None:
 
     # -- empirical: routing distributions --------------------------------------
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
-    means, stats, divergences, norms_by_pass = collect(
-        model, data_val, device, args.rows, args.micro_rows
-    )
-    sites, matrices = site_matrix(means, layers, cfg.routing_heads)
+    (
+        means,
+        stats,
+        divergences,
+        norms_by_pass,
+        final_source_names,
+        route_source_names,
+    ) = collect(model, data_val, device, args.rows, args.micro_rows)
+    sites, columns, matrices = site_matrix(means, route_source_names, cfg)
 
     # The routed values are raw (only keys are normed), so source scale
     # matters for what a read actually adds.
-    print("\nsource RMS norms (seed, then deltas):")
+    print("\nfinal-bank source RMS norms:")
     for p, rms in sorted(norms_by_pass.items()):
         shown = "  ".join(
             f"{name}={value:.2f}"
-            for name, value in zip(["seed"] + source_names(layers), rms)
+            for name, value in zip(final_source_names[p], rms, strict=True)
         )
         print(f"  p{p + 1}: {shown}")
 
     # Console table: per site, per pass — mean-distribution entropy,
     # per-token mean max / entropy, and top-3 sources.
-    names = ["seed"] + source_names(layers)
     print(
-        f"\n{'site':<10}{'|q|':>7}   pass head H_mean  maxT  H_tok head-JS  top sources"
+        f"\n{'site':<10}{'|q|':>7}{'nullRMS':>9}   "
+        "pass head H_mean  maxT  H_tok head-JS  top sources"
     )
-    for label, norm in zip(labels, norms):
+    for label, norm, null_scale in zip(labels, norms, null_rms, strict=True):
         for p in (0, 1):
             key = (p, label)
             if key not in means:
@@ -213,11 +231,15 @@ def main() -> None:
             for route_head in range(cfg.routing_heads):
                 w = means[key][:, route_head]
                 max_t, h_tok = stats[key][route_head]
-                local = names[: len(w)] if label != "payload" else source_names(layers)
+                local = route_source_names[p, label]
                 top = sorted(zip(local, w), key=lambda t: -t[1])[:3]
                 shown = "  ".join(f"{n}={v:.3f}" for n, v in top)
                 first_row = ((0, label) not in means or p == 0) and route_head == 0
-                site = f"{label:<10}{norm:>7.2f}" if first_row else " " * 17
+                site = (
+                    f"{label:<10}{norm:>7.2f}{null_scale:>9.3f}"
+                    if first_row
+                    else " " * 26
+                )
                 js = f"{divergences[key]:.3f}" if route_head == 0 else "  ·  "
                 print(
                     f"{site}   p{p + 1}   h{route_head:<2}  {entropy(w):5.3f}  "
@@ -251,14 +273,14 @@ def main() -> None:
                 ax.set_ylabel("reading site")
             if route_head == cfg.routing_heads - 1:
                 ax.set_xticks(
-                    range(1 + 2 * layers),
-                    ["e/u"] + source_names(layers),
+                    range(len(columns)),
+                    columns,
                     fontsize=7,
                     rotation=90,
                 )
-                ax.set_xlabel("source (seed, then sublayer deltas)")
+                ax.set_xlabel("MHDB source")
     fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
-    fig.suptitle(f"{tag}: MHDAR read maps", fontsize=12)
+    fig.suptitle(f"{tag}: MHDB read maps", fontsize=12)
     fig.savefig(out_dir / "site-routing.png", dpi=150)
 
     if (0, "payload") in means:
@@ -277,12 +299,13 @@ def main() -> None:
             ax.set_yticks(range(cfg.routing_heads), range(cfg.routing_heads))
             ax.set_ylabel("routing head")
             ax.set_title(title)
+        payload_names = route_source_names[0, "payload"]
         axes[-1].set_xticks(
-            range(2 * layers), source_names(layers), fontsize=7, rotation=90
+            range(len(payload_names)), payload_names, fontsize=7, rotation=90
         )
-        axes[-1].set_xlabel("delta source")
+        axes[-1].set_xlabel("payload source")
         fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
-        fig.suptitle(f"{tag}: MHDAR payload — what rides to the next column")
+        fig.suptitle(f"{tag}: MHDB payload — what rides to the next column")
         fig.savefig(out_dir / "payload-routing.png", dpi=150)
 
     fig, (ax_norm, ax_cos) = plt.subplots(

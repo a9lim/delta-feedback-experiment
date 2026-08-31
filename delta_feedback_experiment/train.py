@@ -33,7 +33,7 @@ from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipas
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=7, resumable=frozenset({7}), surface_version=7
+    version=8, resumable=frozenset({8}), surface_version=8
 )
 
 EXACT_FIELDS = (
@@ -236,8 +236,9 @@ def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
     screen_work = 4 * 1025 * 768 * 12 * 3
     work = args.micro_rows * (args.seq_len + 1) * cfg.dim * cfg.layers * n_passes
     if cfg.soft and n_passes >= 2:
-        # The standing payload/null sources make DF-soft's retained route bank
-        # materially larger than the hard spine at the same pass count.
+        # DF-soft retains the standing previous-payload path across passes in
+        # addition to the stream.  Keep its feedback graphs checkpointed even
+        # though MHDB has coarsened the within-column source bank.
         return True
     # The exact hard-DF screen k=3 graph is admitted raw after the fused-block
     # and bespoke-router memory reduction. Larger geometries remain guarded.
@@ -628,7 +629,6 @@ def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dic
         out = multipass(model, rows, 2, prefix_lens=prefix, want_weights=True)[-1]
     else:
         out = multipass(model, rows, 1, want_weights=True)[0]
-    soft = model.cfg.soft
     records = []
     for site, weights in out.route_weights.items():
         w = weights.float()
@@ -647,16 +647,17 @@ def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dic
             "max": round(w.max(dim=0).values.mean().item(), 4),
             "head_js": round(head_js.item(), 4),
         }
-        offset = 0
-        if soft:
-            record["null"] = round(mean[0].item(), 4)
-            offset = 1
+        names = out.route_source_names[site]
+        for label in ("null", "prev", "seed"):
+            if label in names:
+                record[label] = round(mean[names.index(label)].item(), 4)
         if site == "payload":
-            records.append(record)
-            continue
-        if out.n_seeds == 2:  # standing p_prev present (DF-soft fused pass)
-            record["prev"] = round(mean[offset].item(), 4)
-        record["seed"] = round(mean[offset + out.n_seeds - 1].item(), 4)
+            router = model.payload_router
+        else:
+            layer_kind, sublayer = site.split(".")
+            block = model.blocks[int(layer_kind[1:])]
+            router = getattr(block, f"{sublayer}_router")
+        record["null_rms"] = round(router.null.float().square().mean().sqrt().item(), 4)
         records.append(record)
     model.train()
     return records
@@ -844,6 +845,7 @@ def train(argv: list[str] | None = None) -> dict:
             tag=args.tag,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
+            routing_block_size=model.cfg.routing_block_size,
             **{name: getattr(args, name) for name in EXACT_FIELDS},
         )
 

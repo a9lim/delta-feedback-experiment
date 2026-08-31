@@ -16,9 +16,9 @@ references:
     note: >
       Defines additive routing over residual deltas, with RMS-normalized keys,
       raw values, zero-initialized queries, and per-sublayer or block-delta
-      source layouts. The 220M experiment uses per-sublayer sources; the
-      flagship uses one completed delta per four-layer cell and one evolving
-      current-cell partial delta.
+      source layouts. The current experiment uses one completed delta per
+      four-layer cell and one evolving current-cell partial delta at every
+      scale.
 
   - arxiv: "2510.26692"
     slug: kimi2025-kimi-linear

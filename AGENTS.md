@@ -4,7 +4,7 @@ This repository owns a from-scratch pretraining factorial over two innovation
 packages. The architecture package combines multi-head routing over
 within-column residual deltas with gated GQA; the recurrence package is
 full-bandwidth latent feedback between adjacent token columns. The hard hybrid
-is `df`; `mhdar` and `fbt` are its parent-package deletions; `vanilla` is the
+is `df`; `mhdb` and `fbt` are its parent-package deletions; `vanilla` is the
 shared baseline; `df_soft` is an optional-channel diagnostic.
 
 The 223–231M screen campaign is active. No matched scientific comparison is
@@ -36,26 +36,27 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
-- Screen and token-ladder `mhdar`, `df`, and `df_soft` use gated GQA as part of
+- Screen and token-ladder `mhdb`, `df`, and `df_soft` use gated GQA as part of
   the architecture package; `vanilla` and `fbt` use ungated GQA. Every gate is
   a bias-free projection of the attention input followed by an elementwise
   sigmoid on the concatenated attention output before output projection and
   residual-branch scaling. Flagship global GQA uses the same gate semantics.
-- Screen and token-ladder MHDAR sources are the column's actual input seed
-  followed by scaled attention and MLP deltas. Flagship routing instead keeps
-  one delta per completed four-layer cell plus at most one aggregate partial
-  delta for the current cell; individual branch deltas are not sources. Routing
-  is always a transient pre-norm read, so the seed-plus-deltas decomposition of
-  the current residual remains exact.
+- Every scale uses MHDB sources: the column's actual input seed, one delta per
+  completed four-layer cell, and at most one aggregate partial delta for the
+  current cell. Individual branch deltas are not sources. Every router prepends
+  its own learnable zero-initialized null. Routing is always a transient
+  pre-norm read, so the seed-plus-block-deltas decomposition of the current
+  residual remains exact.
 - Each routing site uses a zero-initialized width-`D` query, a learnable
   full-width RMS key normalization, raw values, and one source softmax per
   contiguous feature group. The number of routing groups equals `kv_heads`.
 - Hard DF fuses the shifted payload with the token embedding through the FBT
-  asymmetric GLU, then uses the fused input as the MHDAR seed. Its payload is
-  the normalized top state plus a routed mixture over this column's deltas.
-- `df_soft` keeps the plain token embedding as the stream seed, exposes the
-  shifted payload as a masked standing source, and prepends a learnable null to
-  every router, including the payload router.
+  asymmetric GLU, then uses the fused input as the MHDB seed. Its payload is
+  the normalized top state plus a routed mixture over the null, seed, and this
+  column's completed block deltas.
+- `df_soft` keeps the plain token embedding as the stream seed and exposes the
+  shifted payload as a masked standing source. Its payload router uses the same
+  null, seed, and completed-block bank as hard DF.
 - Multi-pass feedback is causal, differentiable across passes, and uses the
   shared prefix-mixin and jitter streams. Do not detach the payload to solve a
   memory problem; checkpoint blocks or coarsen the source representation.
@@ -64,13 +65,13 @@ contract changes.
 
 - Every arm uses the same tokenizer, token stream, row order, paired common
   initialization, feedback random stream, base trunk geometry, optimizer
-  recipe, and schedule. Architecture gates are paired across `mhdar`, `df`,
+  recipe, and schedule. Architecture gates are paired across `mhdb`, `df`,
   and `df_soft`; FBT fusion weights are paired across `fbt` and `df`. The
   registered architecture package is the only deliberate trunk divergence.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.
-- The primary factorial is `{vanilla, mhdar, fbt, df}`. `df_soft` is run only
+- The primary factorial is `{vanilla, mhdb, fbt, df}`. `df_soft` is run only
   as the adoption diagnostic defined in the design and is not substituted for
   hard DF.
 - Pass-1 validation is the common Standard-mode metric. Feedback arms also
@@ -90,7 +91,7 @@ contract changes.
   package. Do not reimplement those facilities here.
 - CPU/MPS runs use the semantic PyTorch fallbacks. Jobe is the authoritative
   single-GPU CUDA surface: BF16 activations, FlashAttention, cut cross-entropy,
-  the Triton MHDAR router, compiled blocks, CUDA graphs, and asynchronous atomic
+  the Triton MHDB router, compiled blocks, CUDA graphs, and asynchronous atomic
   snapshots. Respect Jobe's pinned Torch/FlashAttention environment.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.
   The queue records exact arguments without inspecting Git state. Source

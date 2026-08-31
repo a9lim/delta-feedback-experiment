@@ -57,11 +57,12 @@ def test_arm_flags():
     assert not vanilla.routing_active
     assert not vanilla.feedback_active
     assert not vanilla.gated_attention
-    mhdar = arm_config("mhdar", **TINY)
-    assert mhdar.routing_active
-    assert not mhdar.feedback_active
-    assert mhdar.gated_attention
-    assert mhdar.routing_heads == TINY["kv_heads"]
+    mhdb = arm_config("mhdb", **TINY)
+    assert mhdb.routing_active
+    assert not mhdb.feedback_active
+    assert mhdb.gated_attention
+    assert mhdb.routing_heads == TINY["kv_heads"]
+    assert mhdb.routing_block_size == 4
     fbt = arm_config("fbt", **TINY)
     assert fbt.gated_entry
     assert not fbt.routing_active
@@ -78,25 +79,26 @@ def test_arm_flags():
 def test_parents_are_deletions():
     """Every parent's parameter set is a strict subset of DF's."""
     names = {arm: {name for name, _ in tiny(arm).named_parameters()} for arm in ARMS}
-    assert names["vanilla"] < names["mhdar"] < names["df"]
+    assert names["vanilla"] < names["mhdb"] < names["df"]
     assert names["vanilla"] < names["fbt"] < names["df"]
     # The union misses exactly the payload router, which needs both axes.
-    assert names["df"] - (names["mhdar"] | names["fbt"]) == {
+    assert names["df"] - (names["mhdb"] | names["fbt"]) == {
         "payload_router.query",
         "payload_router.key_norm.weight",
+        "payload_router.null",
     }
-    # DF-soft: routing plus payload machinery and nulls, but no GLU entry.
-    assert any("null" in name for name in names["df_soft"])
-    assert not any("null" in name for name in names["df"])
+    # Every routed arm has per-site nulls; DF-soft omits the GLU entry.
+    for arm in ("mhdb", "df", "df_soft"):
+        assert any("null" in name for name in names[arm])
     assert not any("fuse_" in name for name in names["df_soft"])
 
 
 def test_screen_param_count():
     expected = {
         "vanilla": 222_876_672,
-        "mhdar": 229_991_424,
+        "mhdb": 230_009_856,
         "fbt": 224_058_624,
-        "df": 231_174_912,
+        "df": 231_194_112,
         "df_soft": 230_012_928,
     }
     with torch.device("meta"):
@@ -129,14 +131,18 @@ def test_factorial_initialization_is_paired_by_semantic_factor():
     # Each intervention package is also paired between its parent and DF.
     for layer in range(TINY["layers"]):
         name = f"attention_gates.{layer}.weight"
-        assert torch.equal(states["mhdar"][name], states["df"][name])
-        assert torch.equal(states["mhdar"][name], states["df_soft"][name])
+        assert torch.equal(states["mhdb"][name], states["df"][name])
+        assert torch.equal(states["mhdb"][name], states["df_soft"][name])
+        for kind in ("attn", "mlp"):
+            null = f"blocks.{layer}.{kind}_router.null"
+            assert torch.equal(states["mhdb"][null], states["df"][null])
+            assert torch.equal(states["mhdb"][null], states["df_soft"][null])
     for name in ("fuse_value.weight", "fuse_gate.weight"):
         assert torch.equal(states["fbt"][name], states["df"][name])
 
 
 def test_zero_gqa_gate_halves_the_ungated_attention_branch():
-    model = tiny("mhdar")
+    model = tiny("mhdb")
     attention = model.blocks[0].attn
     gate_weight = model.attention_gates[0].weight
     x = torch.randn(2, 7, TINY["dim"])
@@ -152,51 +158,44 @@ def test_zero_gqa_gate_halves_the_ungated_attention_branch():
 
 
 def test_zero_init_routing_uniform():
-    """Zero-init queries route uniformly wherever a site is active, and the
-    singleton-seed sites are inactive on the seed-only arms."""
-    for arm in ("mhdar", "df"):
+    """Zero-init queries route uniformly, including over every null."""
+    for arm in ("mhdb", "df", "df_soft"):
         out = forward(tiny(arm), tokens(), want_weights=True)
-        assert "L0.attn" not in out.route_weights  # singleton guard
+        assert out.route_source_names["L0.attn"] == ("null", "seed")
         for site, weights in out.route_weights.items():
             n = weights.shape[0]
             assert weights.shape[-1] == TINY["kv_heads"]
             assert torch.allclose(weights, torch.full_like(weights, 1.0 / n)), (
                 f"{arm} {site}"
             )
-    # DF-soft's null makes layer 0 active from the start: [null, e].
-    out = forward(tiny("df_soft"), tokens(), want_weights=True)
-    assert out.route_weights["L0.attn"].shape[0] == 2
-    for site, weights in out.route_weights.items():
-        n = weights.shape[0]
-        assert torch.allclose(weights, torch.full_like(weights, 1.0 / n)), site
 
 
 def test_algebraic_router_matches_normalized_reference_in_fp32():
-    model = tiny("mhdar")
+    model = tiny("mhdb")
     router = model.blocks[2].mlp_router
     with torch.no_grad():
         router.query.normal_()
         router.key_norm.weight.uniform_(0.5, 1.5)
     sources = [torch.randn(2, 7, 32) for _ in range(5)]
     routed, weights = router(sources, [None] * len(sources), True)
-    values = torch.stack(sources)
+    values = torch.stack([router.null.expand_as(sources[0]), *sources])
     h = model.cfg.routing_heads
     k = model.cfg.dim // h
     logits = torch.einsum(
         "hk,nbthk->nbth",
         router.query.view(h, k),
-        router.key_norm(values).view(5, 2, 7, h, k),
+        router.key_norm(values).view(6, 2, 7, h, k),
     )
     reference_weights = logits.softmax(dim=0)
     reference = torch.einsum(
-        "nbth,nbthk->bthk", reference_weights, values.view(5, 2, 7, h, k)
+        "nbth,nbthk->bthk", reference_weights, values.view(6, 2, 7, h, k)
     ).reshape(2, 7, 32)
     assert torch.allclose(weights, reference_weights, rtol=2e-5, atol=2e-6)
     assert torch.allclose(routed, reference, rtol=2e-5, atol=2e-6)
 
 
 def test_routing_heads_can_select_different_sources():
-    model = tiny("mhdar")
+    model = tiny("mhdb")
     router = model.blocks[2].mlp_router
     source0 = torch.zeros(1, 1, TINY["dim"])
     source1 = torch.zeros_like(source0)
@@ -205,8 +204,8 @@ def test_routing_heads_can_select_different_sources():
     with torch.no_grad():
         router.query.fill_(8)
     routed, weights = router([source0, source1], [None, None], True)
-    assert weights[:, 0, 0, 0].argmax().item() == 0
-    assert weights[:, 0, 0, 1].argmax().item() == 1
+    assert weights[:, 0, 0, 0].argmax().item() == 1
+    assert weights[:, 0, 0, 1].argmax().item() == 2
     assert routed[..., :16].mean() > 0.99
     assert routed[..., 16:].mean() > 0.99
 
@@ -214,15 +213,19 @@ def test_routing_heads_can_select_different_sources():
 def test_single_head_routing_and_unknown_arm_are_rejected():
     with pytest.raises(ValueError, match="unknown arm"):
         arm_config("dar", **TINY)
-    cfg = arm_config("mhdar", **(TINY | {"kv_heads": 1}))
+    with pytest.raises(ValueError, match="unknown arm"):
+        arm_config("mhdar", **TINY)
+    cfg = arm_config("mhdb", **(TINY | {"kv_heads": 1}))
     with pytest.raises(ValueError, match="at least two"):
         DFModel(cfg)
+    with pytest.raises(ValueError, match="block size"):
+        arm_config("mhdb", **(TINY | {"routing_block_size": 0}))
 
 
 def test_telescoping():
     """The stream is exactly seed + Σdeltas at the top — transient-read
     routing never leaks into the residual stream."""
-    for arm in ("mhdar", "df", "df_soft"):
+    for arm in ("mhdb", "df", "df_soft"):
         model = tiny(arm)
         # Sharpen every query so routing is far from uniform — the identity
         # must hold because of *semantics*, not because routing is ~0.
@@ -237,16 +240,53 @@ def test_telescoping():
         assert torch.allclose(out.h_top, rebuilt, atol=1e-5), arm
 
 
-def test_payload_init_identity():
-    """At zero-init the DF payload is rmsnorm(h + mean(deltas)) =
-    rmsnorm(h(1+1/N) − seed/N): uniform routing over deltas only, seed
-    exempt.  FBT's payload is the bare normed top state."""
+def test_block_sources_and_current_partial_labels():
     model = tiny("df")
-    out = forward(model, tokens())
-    deltas = out.sources[out.n_seeds :]
-    n = len(deltas)
-    expected = model.payload_norm(out.h_top * (1 + 1 / n) - out.sources[0] / n)
-    assert torch.allclose(out.payload, expected, atol=1e-5)
+    out = forward(model, tokens(), want_weights=True)
+    assert out.source_names == ("seed", "block0")
+    assert out.route_source_names["L0.attn"] == ("null", "seed")
+    assert out.route_source_names["L0.mlp"] == ("null", "seed", "partial0")
+    assert out.route_source_names["L2.attn"] == ("null", "seed", "partial0")
+    assert out.route_source_names["payload"] == ("null", "seed", "block0")
+
+
+def test_four_layer_block_boundaries():
+    config = TINY | {"layers": 9}
+    torch.manual_seed(0)
+    model = DFModel(arm_config("mhdb", **config)).eval()
+    out = model.forward_column(model.embed_tokens(tokens()), want_weights=True)
+    assert out.source_names == ("seed", "block0", "block1", "block2")
+    assert out.route_source_names["L4.attn"] == ("null", "seed", "block0")
+    assert out.route_source_names["L5.attn"] == (
+        "null",
+        "seed",
+        "block0",
+        "partial1",
+    )
+    assert out.route_source_names["L8.attn"] == (
+        "null",
+        "seed",
+        "block0",
+        "block1",
+    )
+    rebuilt = out.sources[0] + torch.stack(out.sources[1:]).sum(0)
+    assert torch.allclose(out.h_top, rebuilt, atol=1e-5)
+
+
+def test_payload_init_matches_bare_top_state():
+    """The null-plus-complete decomposition is collinear with h at init."""
+    for arm in ("df", "df_soft"):
+        model = tiny(arm)
+        out = forward(model, tokens())
+        n_sources = 1 + (len(out.sources) - out.n_seeds + 1)
+        expected = model.payload_norm(out.h_top * (1 + 1 / n_sources))
+        assert torch.allclose(out.payload, expected, atol=1e-5), arm
+        assert torch.allclose(
+            out.payload,
+            model.payload_norm(out.h_top),
+            rtol=3e-3,
+            atol=3e-3,
+        ), arm
 
     model = tiny("fbt")
     out = forward(model, tokens())

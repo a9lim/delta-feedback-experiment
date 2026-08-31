@@ -3,22 +3,23 @@
 This repository tests whether two innovation packages improve a transformer
 independently or interact when pretrained together:
 
-- **Architecture innovation** combines Multi-Head Delta Attention Residuals
-  (MHDAR) with sigmoid-gated grouped-query attention (GGQA).
+- **Architecture innovation** combines Multi-Head Delta Block routing (MHDB)
+  with sigmoid-gated grouped-query attention (GGQA).
 - **Recurrence innovation** uses Full-Bandwidth Transformer (FBT) feedback to
   carry the previous column's top state into the next through a mandatory
   token-gated fusion.
 - **Delta Feedback (DF)** combines both packages and applies the multi-head
   delta router to enrich the recurrent payload between columns.
 
-The primary experiment is the four-cell factorial `{vanilla, mhdar, fbt, df}`.
-`df_soft` is a gated diagnostic arm in which null sources make both routing
-channels optional.
+The primary experiment is the four-cell factorial `{vanilla, mhdb, fbt, df}`.
+`df_soft` is a diagnostic arm that exposes the previous payload as an optional
+routing source rather than using hard FBT entry. Every MHDB router has a
+learnable zero-initialized null source.
 
 ## Status
 
 The screen campaign is active on Jobe. No matched arm comparison is complete,
-so there are no accepted experiment findings. `mhdar`, `df`, and `df_soft` use
+so there are no accepted experiment findings. `mhdb`, `df`, and `df_soft` use
 GGQA; `vanilla` and `fbt` use ungated GQA. The screen-scale plain-PyTorch model,
 deterministic trainer, portable fallbacks, and optimized single-GPU CUDA path
 are implemented. The token-ladder continuation and the distributed
@@ -82,7 +83,7 @@ token stream. Pass counts are keyed by data seed and step; prefix lengths and
 jitter additionally use the global row, so paired arms see identical examples
 and feedback draws.
 
-Snapshots are immutable, exact-resume checkpoint-contract v7 files under
+Snapshots are immutable, exact-resume checkpoint-contract v8 files under
 `runs/`. `--max-steps` limits only the current invocation; it never rescales the
 state-defining schedule.
 
@@ -93,8 +94,8 @@ python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 ```
 
-The route report summarizes a hard-DF snapshot's per-head source weights,
-entropy, head divergence, source scale, and query geometry. The payload sweep
+The route report summarizes a hard-DF snapshot's per-head block-source weights,
+entropy, head divergence, source and null scale, and query geometry. The payload sweep
 is a same-checkpoint counterfactual for routed feedback content; it is not an
 independently trained arm comparison.
 

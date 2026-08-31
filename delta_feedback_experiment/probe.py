@@ -47,8 +47,8 @@ def cuda_gate() -> None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
 
     # The fixed-capacity router must match the semantic implementation in both
-    # values and gradients. H=4 covers the screen; H=8 with a shared null row
-    # covers flagship width and DF-soft's specialized pointer branch.
+    # values and gradients. H=4/N=6 covers the largest screen bank (DF-soft
+    # with previous payload); H=8/N=9 covers the corresponding flagship bank.
     def route_parity(dim, heads, batch, length, n_sources, null_first, seed):
         torch.manual_seed(seed)
         query = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
@@ -119,8 +119,8 @@ def cuda_gate() -> None:
             if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
                 raise AssertionError(f"H={heads} bespoke router gradient drift")
 
-    route_parity(48, 4, 3, 11, 6, False, 7)
-    route_parity(1536, 8, 2, 3, 4, True, 8)
+    route_parity(48, 4, 3, 11, 6, True, 7)
+    route_parity(1536, 8, 2, 3, 9, True, 8)
 
     # CCE-native z-loss must retain the full-logit scalar and gradient semantics
     # while never constructing the classifier-wide activation in the real path.

@@ -17,6 +17,7 @@ from delta_feedback_experiment.train import (
     build_schedule,
     draw_passes,
     mix,
+    route_summary,
     train,
 )
 
@@ -177,6 +178,46 @@ def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
     assert len(normuon_names) + len(adam_names) == len(names)
 
 
+def test_route_summary_reports_universal_nulls_and_payload_seed():
+    from types import SimpleNamespace
+
+    from delta_feedback_experiment.model import DFModel, arm_config
+
+    class Validation:
+        rows = torch.randint(0, 97, (2, 12), generator=torch.Generator().manual_seed(3))
+
+        def batch(self, first, count, device=None):
+            rows = self.rows[first : first + count]
+            return rows.to(device) if device is not None else rows
+
+    args = SimpleNamespace(eval_rows=2)
+    for arm in ("mhdb", "df", "df_soft"):
+        model = DFModel(
+            arm_config(
+                arm,
+                vocab_size=97,
+                dim=32,
+                layers=2,
+                heads=2,
+                kv_heads=2,
+                head_dim=16,
+                intermediate=64,
+                max_seq_len=16,
+            )
+        )
+        records = route_summary(model, Validation(), args, torch.device("cpu"))
+        assert records
+        assert all("null" in record and record["null_rms"] == 0 for record in records)
+        assert all("seed" in record for record in records)
+        if arm == "df_soft":
+            assert all(
+                "prev" in record for record in records if record["site"] != "payload"
+            )
+            assert "prev" not in next(
+                record for record in records if record["site"] == "payload"
+            )
+
+
 # -- schedule and derived randomness -------------------------------------------
 
 
@@ -258,7 +299,7 @@ def run(tmp_path, tag, extra):
     )
 
 
-@pytest.mark.parametrize("arm", ["vanilla", "mhdar", "fbt", "df", "df_soft"])
+@pytest.mark.parametrize("arm", ["vanilla", "mhdb", "fbt", "df", "df_soft"])
 def test_tiny_run_completes(tmp_path, capsys, arm):
     summary = run(tmp_path, f"t-{arm}", ["--arm", arm])
     assert summary["step"] == 8

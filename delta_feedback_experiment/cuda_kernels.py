@@ -1,4 +1,4 @@
-"""Bespoke CUDA kernels for the MHDAR x FBT hot path.
+"""Bespoke CUDA kernels for the MHDB x FBT hot path.
 
 The portable semantic implementations remain in :mod:`model`.  This module is
 optional at import time and exposes only kernels whose fixed screen geometry
@@ -535,7 +535,7 @@ def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int]:
     tile = block_h * block_k
     if tile > 8192:
         raise RuntimeError(
-            f"MHDAR routing tile {block_h}x{block_k} is too large "
+            f"MHDB routing tile {block_h}x{block_k} is too large "
             f"(H={num_heads}, D/H={head_dim})"
         )
     num_warps = 8 if tile >= 4096 else (4 if tile >= 1024 else 2)
@@ -545,7 +545,7 @@ def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int]:
 def _check_route_dims(dim: int, num_heads: int) -> int:
     if num_heads < 2 or dim % num_heads:
         raise RuntimeError(
-            f"MHDAR requires at least two heads dividing hidden size; "
+            f"MHDB requires at least two heads dividing hidden size; "
             f"got D={dim}, H={num_heads}"
         )
     return dim // num_heads

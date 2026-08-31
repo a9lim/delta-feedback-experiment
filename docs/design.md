@@ -11,11 +11,12 @@ plan, and promotion gates. Accepted scientific evidence belongs in
 
 The experiment tests two innovation packages in an autoregressive transformer:
 
-1. **Architecture innovation.** Multi-Head Delta Attention Residuals (MHDAR)
-   let each sublayer read an additive mixture of the current column's input
-   seed and earlier residual deltas, with independent depth selection by
-   contiguous feature group. Every architecture-package layer also uses
-   sigmoid-gated grouped-query attention (GGQA).
+1. **Architecture innovation.** Multi-Head Delta Block routing (MHDB) lets each
+   sublayer read an additive mixture of a learned null, the current column's
+   input seed, completed four-layer block deltas, and the current block's
+   partial delta, with independent depth selection by contiguous feature
+   group. Every architecture-package layer also uses sigmoid-gated
+   grouped-query attention (GGQA).
 2. **Recurrence innovation.** Full-Bandwidth Transformer (FBT) feedback returns
    the previous column's top state to layer 0 of the next column through a
    token-gated fusion, giving latent state another full pass through depth.
@@ -26,16 +27,16 @@ or redundant when pretrained together. The primary four-cell factorial is:
 | Arm | Architecture package | Recurrence package | GQA | Parameters |
 |---|---:|---:|---|---:|
 | `vanilla` | no | no | ungated | 222,876,672 |
-| `mhdar` | MHDAR | no | gated | 229,991,424 |
+| `mhdb` | MHDB | no | gated | 230,009,856 |
 | `fbt` | no | FBT | ungated | 224,058,624 |
-| `df` | MHDAR | FBT | gated | 231,174,912 |
+| `df` | MHDB | FBT | gated | 231,194,112 |
 
-`df_soft` is a 230,012,928-parameter screen diagnostic. It retains the
-architecture package's GGQA, keeps a plain token entry, and puts a
-zero-initialized learnable null source in every router so that within-column
-routing, previous-payload access, and payload enrichment can each be declined
-by routing mass. It tests adoption; it does not replace the hard hybrid in the
-factorial.
+`df_soft` is a 230,012,928-parameter screen diagnostic. It retains MHDB and
+GGQA, keeps a plain token entry, and exposes the shifted previous payload as a
+masked standing routing source. Every routed arm already has a learnable
+zero-initialized null at every site, so `df_soft` isolates optional feedback
+entry rather than also changing within-column nullability. It tests adoption;
+it does not replace the hard hybrid in the factorial.
 
 The claim boundary is pretraining behavior under the registered recipe and
 data. No result is a general claim about recurrent transformers, depth routing,
@@ -60,6 +61,7 @@ Every arm uses one `DFModel` implementation and differs only through
 | RoPE theta | 1,000,000 |
 | RMSNorm epsilon | 1e-6 |
 | Routing heads | 4, exactly the KV-head count |
+| Routing block size | 4 layers |
 
 The base trunk is a bias-free pre-norm decoder with packed QKV projection,
 grouped-query attention, per-head Q/K RMSNorm, rotary positions, packed SwiGLU
@@ -78,7 +80,7 @@ o       = W_o(sigmoid(W_g x) * z)
 
 The gate has one coordinate per query-head output coordinate and acts before
 the output projection and branch scaling; it does not modify attention logits
-or softmax weights. `mhdar`, `df`, and `df_soft` use this GGQA path.
+or softmax weights. `mhdb`, `df`, and `df_soft` use this GGQA path.
 `vanilla` and `fbt` omit `W_g` and pass `z` directly to `W_o`. The gate is part
 of the registered architecture axis, not an independently interpreted factor.
 
@@ -86,12 +88,11 @@ Embedding weights and optimizer state remain FP32. Under CUDA autocast, the
 embedding output, residual stream, recurrent payload, and routed values are
 BF16. CPU and MPS use the same semantics through portable PyTorch operations.
 
-## Architecture package: MHDAR and gated GQA
+## Architecture package: MHDB and gated GQA
 
-The screen and its same-geometry token ladder use the per-sublayer source
-layout in this section. The flagship keeps the same routing primitive and
-residual identity but coarsens its source bank into four-layer block deltas as
-specified in the scale plan.
+The screen, same-geometry token ladder, and flagship all use the same
+four-layer block-delta source contract. Individual attention and MLP branch
+deltas are never retained as separate addressable sources.
 
 ### Router
 
@@ -117,10 +118,11 @@ while the source softmax and value mixture are independent per group. Splitting
 one width-`D` query into groups adds no query parameters relative to a
 single-head delta router.
 
-Zero query initialization makes every active head uniform over its available
-sources. A hard router with fewer than two sources is a no-op. In `df_soft`, a
-learnable width-`D` null vector is prepended at every site; it is initialized to
-zero, so even the first attention site has two choices.
+Every routing site owns a learnable width-`D` null vector initialized to zero
+and prepends it to the source bank. Zero query initialization makes every head
+uniform over its available sources, including the null. Null mass initially
+adds nothing; after training, its mass must be interpreted together with the
+null vector's RMS because the learned value need not remain zero.
 
 ### Sources and residual identity
 
@@ -131,25 +133,30 @@ For a column input seed `s`, layer `l` produces scaled attention and MLP deltas
 h_top = s + sum_l (a_l + m_l)
 ```
 
-At the attention read in layer `l`, the available sources are the seed and all
-completed earlier deltas. At the MLP read, `a_l` is also available. A routed
-mixture is added only to that sublayer's pre-norm read:
+Partition the layers into consecutive four-layer cells. If `c_b` is the
+residual at entry to cell `b`, define:
 
 ```text
-x_attn = h + route(s, a_0, m_0, ..., m_(l-1))
-a_l = scale * attention(rmsnorm(x_attn))
-h = h + a_l
-
-x_mlp = h + route(s, a_0, m_0, ..., m_(l-1), a_l)
-m_l = scale * mlp(rmsnorm(x_mlp))
-h = h + m_l
+partial_b = h_current - c_b
+Delta_b   = h_cell_exit - c_b
 ```
 
-The routed value is not accumulated directly into `h`. This transient-read
-rule preserves the exact telescoping identity and makes every stored source a
-real component of the column state rather than another cumulative state.
+At a site in cell `b`, the bank is the site-local null, the column seed, one
+completed `Delta_j` for every earlier cell, and `partial_b` when it is nonzero.
+The MLP site sees the partial after adding its layer's attention delta. At the
+cell boundary, the partial becomes the single completed `Delta_b`. Thus:
 
-For `mhdar`, the seed is the token embedding `e`. For hard `df`, the seed is
+```text
+h_current = seed + sum(completed block deltas) + current partial delta
+```
+
+The routed mixture is added only to the sublayer's pre-norm read; it is never
+accumulated directly into `h`. This transient-read rule preserves the exact
+telescoping identity. On hard-arm and pass-1 sites, the zero-query non-null
+mixture is a scalar multiple of `h`, so the following RMSNorm makes routing
+functionally inert up to its epsilon.
+
+For `mhdb`, the seed is the token embedding `e`. For hard `df`, the seed is
 `e` on pass 1 and the fused input `u` on feedback passes. For `df_soft`, the
 stream seed is always `e`; the previous payload is an additional standing
 source only where the prefix mask marks it present.
@@ -190,25 +197,27 @@ either one:
 1. On a feedback position, fuse the shifted previous payload with the token
    embedding to obtain `u`.
 2. Use `u` as both the residual seed and the first source for every
-   within-column MHDAR site, and use GGQA in every attention layer.
+   within-column MHDB site, and use GGQA in every attention layer.
 3. Preserve the clean residual identity while attention and MLP sites read
-   routed mixtures of the seed and completed deltas.
-4. Route over this column's deltas with a dedicated multi-head payload router.
+   routed mixtures of the null, seed, completed block deltas, and current
+   partial block delta.
+4. Route over the null, seed, and completed block deltas with a dedicated
+   multi-head payload router.
 5. Add the routed enrichment to the full top state and normalize the result.
 
-For the screen and token ladder, with
-`Delta = [a_0, m_0, ..., a_(L-1), m_(L-1)]`:
+With `Delta = [Delta_0, ..., Delta_(B-1)]` for the completed four-layer cells:
 
 ```text
-r_payload = route(Delta; q_payload)
+r_payload = route(null, seed, Delta; q_payload)
 p = payload_norm(h_top + r_payload)
 ```
 
-The payload router excludes the seed. The base `h_top` guarantees that the full
-column state is retained; the routed term selects which changes made in this
-column receive an additional cross-column path. The router has no null source,
-so delta enrichment carries unit softmax mass in every head. At initialization
-it is the mean of the scaled deltas.
+The base `h_top` guarantees that the full column state is retained; the routed
+term selects which component receives an additional cross-column path. At
+zero-query initialization, the null contributes zero and the other sources sum
+to `h_top`, so the routed addition is `h_top / (B + 2)`. The following RMSNorm
+therefore makes the initial payload equal to the bare normalized top state up
+to its epsilon, matching the FBT payload functionally at initialization.
 
 The payload query is not conditioned on the next token. Token-dependent control
 occurs in the FBT entry gate after the payload shifts to the next position.
@@ -218,21 +227,25 @@ An equivalent high-level pass is:
 ```python
 e = embed(tokens)
 s = e if payload is None else fuse(payload, e)
-sources = [s]
 h = s
-for block in blocks:
-    a = scaled_gated_attention(rmsnorm(h + route(sources)))
-    h = h + a
-    sources.append(a)
-    m = scaled_mlp(rmsnorm(h + route(sources)))
-    h = h + m
-    sources.append(m)
-payload = payload_norm(h + route(sources[1:], q_payload))
+completed = []
+for cell in four_layer_cells:
+    cell_start = h
+    for layer in cell:
+        partial = [] at cell entry else [h - cell_start]
+        sources = [null, s, *completed, *partial]
+        a = scaled_gated_attention(rmsnorm(h + route(sources)))
+        h = h + a
+        partial = h - cell_start
+        m = scaled_mlp(rmsnorm(h + route([null, s, *completed, partial])))
+        h = h + m
+    completed.append(h - cell_start)
+payload = payload_norm(h + route([payload_null, s, *completed], q_payload))
 logits = tied_head(final_norm(h))
 ```
 
-The first attention router sees only the seed and therefore acts as a no-op in
-hard MHDAR/DF. All later sites have at least two sources.
+The first attention router sees `[null, seed]`; all routed sites are active and
+can learn to select their null.
 
 ## Soft adoption diagnostic
 
@@ -241,9 +254,10 @@ primitive but removes the mandatory FBT entry:
 
 ```text
 stream seed: e
-standing sources on a fused suffix: [p_previous, e]
-router sources at every site: [learnable_null, standing_sources, deltas_so_far]
-payload: payload_norm(h_top + route([learnable_null, deltas]))
+within-column sources: [null, p_previous_if_present, e,
+                        completed_blocks, current_partial_if_nonzero]
+payload sources: [payload_null, e, completed_blocks]
+payload: payload_norm(h_top + route(payload_sources))
 ```
 
 The previous-payload source is masked out on the plain prefix. The null and
@@ -252,11 +266,13 @@ source, but null-sourced within-column routing is already active. This creates a
 within-run adoption contrast: depth routing trains from step 1, whereas the
 feedback source appears only in the feedback phase.
 
-The learned null is a trainable source, not a hard zero clamp. Its mass, the
-previous-payload mass, the token-seed mass, and the payload-router null mass are
-observables. A high null mass shows non-adoption at that site; it does not by
-itself establish that the corresponding mechanism is useless under a mandatory
-entry or a different formation schedule.
+The previous payload is not a payload-output source: the outgoing bank matches
+hard DF and contains only the current column's null, seed, and completed block
+deltas. The learned null is a trainable source, not a hard zero clamp. Its mass
+and RMS, previous-payload mass, token-seed mass, and block-delta masses are
+observables. High null mass with a near-zero null value shows non-adoption at
+that site; it does not by itself establish that the mechanism is useless under
+a mandatory entry or a different formation schedule.
 
 ## Multi-pass training
 
@@ -329,7 +345,7 @@ first_row(step) = (step - 1) * batch_rows
 Paired arms and seeds use the same data directory, `data_seed`, batch geometry,
 and step addresses. One initialization seed produces byte-identical common
 parameters in every arm. Factor-private streams produce identical attention
-gate matrices in `mhdar`, `df`, and `df_soft`, and identical FBT fusion matrices
+gate matrices in `mhdb`, `df`, and `df_soft`, and identical FBT fusion matrices
 in `fbt` and `df`; conditional modules never advance the common stream.
 Initialization seeds differ only when registering a new paired seed. Resumption
 returns to the same row and the same keyed feedback draws.
@@ -385,7 +401,7 @@ state-defining field.
 
 ### Portable path
 
-CPU and MPS use PyTorch scaled-dot-product attention, the algebraic MHDAR
+CPU and MPS use PyTorch scaled-dot-product attention, the algebraic MHDB
 router, chunked tied-head cross-entropy, eager execution, and the same model,
 loss, optimizer, data, and checkpoint semantics. This path owns fast invariant
 tests and analysis.
@@ -396,7 +412,7 @@ The authoritative Jobe screen path uses:
 
 - BF16 trunk activations with FP32 weights and optimizer state;
 - FlashAttention for full-sequence, prefill, GQA, and cached decoding;
-- a fixed-capacity Triton MHDAR router over source pointers, with full-width RMS
+- a fixed-capacity Triton MHDB router over source pointers, with full-width RMS
   scores, per-head masked softmaxes, FP32 value accumulation, and an analytic
   backward that retains cross-head RMS coupling;
 - cut cross-entropy for the tied head, including the exact squared
@@ -415,7 +431,7 @@ checkpoint policy switches. Those are execution choices, not factorial axes.
 
 ### Checkpoint contract
 
-Snapshots use checkpoint contract v7 and resume only v7. They contain model,
+Snapshots use checkpoint contract v8 and resume only v8. They contain model,
 both optimizer states, exact state-defining arguments, step, and Python/Torch/
 CUDA RNG state. A resume inherits all state-defining fields and rejects an
 explicit conflict. Runtime paths, device, evaluation cadence, snapshot cadence,
@@ -458,13 +474,13 @@ vanilla as:
 G_A = L_vanilla - L_A
 ```
 
-`G_mhdar` is the architecture-package effect, `G_fbt` is the
+`G_mhdb` is the architecture-package effect, `G_fbt` is the
 recurrence-package effect, and `G_df` is their joint effect. The factorial
 interaction is:
 
 ```text
-I = G_df - G_mhdar - G_fbt
-  = L_mhdar + L_fbt - L_df - L_vanilla
+I = G_df - G_mhdb - G_fbt
+  = L_mhdb + L_fbt - L_df - L_vanilla
 ```
 
 `I > 0` is superadditive loss reduction, `I = 0` is additive, and `I < 0` is
@@ -500,13 +516,15 @@ scale, query norm, and query cosine similarity.
 
 The important source labels are:
 
-- within-column seed mass (`e` for `mhdar`, `u` for hard `df` feedback passes);
-- previous-payload, token-seed, and null mass in `df_soft`;
-- per-delta mass at attention, MLP, and payload sites.
+- null mass and null-vector RMS at every routed site;
+- within-column seed mass (`e` for `mhdb`, `u` for hard `df` feedback passes);
+- previous-payload mass in `df_soft`;
+- completed-block and current-partial mass at attention and MLP sites;
+- seed and completed-block mass at payload sites.
 
 `scripts/route_report.py` produces held-out route maps and query geometry from
 a hard-DF checkpoint. `scripts/payload_swap.py` replaces the learned payload
-mixture with top-only, uniform, or single-delta alternatives on the same
+mixture with top-only, uniform, or single-source alternatives on the same
 weights. The sweep is a co-adapted same-checkpoint intervention: its landscape
 identifies sensitive payload content but does not estimate the effect of
 training an alternative payload rule from scratch.
@@ -522,7 +540,7 @@ primary four factorial arms run before the conditional `df_soft` diagnostic.
 The screen is designed to establish:
 
 1. that the shared recipe learns a healthy vanilla baseline;
-2. that the harness can resolve the MHDAR-plus-GGQA architecture package under
+2. that the harness can resolve the MHDB-plus-GGQA architecture package under
    this recipe;
 3. the signs and paired magnitudes of the architecture, recurrence, and joint
    effects;
@@ -542,7 +560,7 @@ continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v7
+This ladder is not currently runnable through exact resume: `steps` is a v8
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without
@@ -622,24 +640,25 @@ partial_b = h_current - c_b
 Delta_b   = h_cell_exit - c_b
 ```
 
-At a routing site in cell `b`, the source bank is the column seed, one completed
-`Delta_j` for every earlier cell, and one `partial_b` when it is nonzero. The
-first mixer in a cell therefore sees only the seed and completed earlier cells;
-later sites see those sources plus one evolving aggregate for the current cell.
-At the boundary, `partial_b` becomes the single completed `Delta_b`. This keeps
-the exact decomposition:
+At a routing site in cell `b`, the source bank is the site-local null, column
+seed, one completed `Delta_j` for every earlier cell, and one `partial_b` when
+it is nonzero. The first mixer in a cell therefore sees the null, seed, and
+completed earlier cells; later sites also see one evolving aggregate for the
+current cell. At the boundary, `partial_b` becomes the single completed
+`Delta_b`. The non-null column sources keep the exact decomposition:
 
 ```text
 h_current = seed + sum(completed cell deltas) + current partial delta
 ```
 
 Routing remains a transient pre-norm read and never accumulates directly into
-the residual stream. The hard-DF payload router excludes the seed and routes
-over the six completed cell deltas `[Delta_0, ..., Delta_5]`. The deepest
-within-column router therefore has at most seven sources: the seed, five
-completed cells, and one current partial cell. This is the block form described
-by the Delta Attention Residuals and Attention Residuals papers, rather than an
-ad hoc bank of individual attention and MLP outputs.
+the residual stream. The hard-DF payload router routes over its null, the seed,
+and the six completed cell deltas `[Delta_0, ..., Delta_5]`. The deepest hard
+within-column router and the payload router therefore each have at most eight
+sources. A DF-soft within-column router has at most nine when the previous
+payload is present. This is the block form described by the Delta Attention
+Residuals and Attention Residuals papers, rather than an ad hoc bank of
+individual attention and MLP outputs.
 
 KDA state is local to one transformer evaluation. A Jacobi or fused-prefill
 pass starts every KDA recurrent and convolution state from zero and advances it
@@ -680,7 +699,7 @@ A screen comparison is admissible only when the registered paired runs finish
 with the same token stream, batch order, recipe, seeds, and schedule, and all
 feedback arms have healthy contraction traces.
 
-The MHDAR-plus-GGQA architecture package must clearly improve on vanilla in
+The MHDB-plus-GGQA architecture package must clearly improve on vanilla in
 Standard mode for the screen to serve as a sensitivity gate for few-percent
 architecture effects. A stable FBT null at screen scale does not by itself
 exclude DF from the ladder because the screen is far below the registered
@@ -715,8 +734,8 @@ introduced into the registered factorial.
 - Expected effects are small relative to run noise. Paired data order, paired
   seeds, complete runs, and pass-token accounting are part of the causal
   design.
-- The shared FBT recipe may not reproduce the best standalone MHDAR-plus-GGQA
-  setting. The `mhdar` cell therefore acts as a sensitivity control for this
+- The shared FBT recipe may not reproduce the best standalone MHDB-plus-GGQA
+  setting. The `mhdb` cell therefore acts as a sensitivity control for this
   exact architecture package, not as a numerical reproduction target.
 - A low-token FBT null is compatible with missing formation conditions. A null
   that persists across the registered ladder is stronger evidence against the
