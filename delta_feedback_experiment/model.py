@@ -58,8 +58,6 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 try:
     from cut_cross_entropy import linear_cross_entropy
     from cut_cross_entropy.cce import (
-        CCEParams,
-        linear_cross_entropy_apply,
         sort_logit_avg,
     )
     from cut_cross_entropy.cce_backward import cce_backward_kernel
@@ -68,8 +66,6 @@ try:
     from cut_cross_entropy.utils import _handle_eps
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     linear_cross_entropy = None
-    CCEParams = None
-    linear_cross_entropy_apply = None
     sort_logit_avg = None
     cce_backward_kernel = None
     cce_lse_forward_kernel = None
@@ -1020,30 +1016,6 @@ _compiled_head_losses = torch.compile(
 )
 
 
-def _fixed_cce(embeddings: Tensor, classifier: Tensor, targets: Tensor) -> Tensor:
-    """CCE for dense fixed training targets, without capture-unsafe ``nonzero``.
-
-    CCE's public wrapper constructs an ignore-index map even when every token is
-    valid.  Our packed stream has no ignored targets, so call its pinned core
-    with ``valids=None`` and retain its high-throughput gradient filter.
-    """
-    batch_shape = targets.shape
-    embeddings = embeddings.contiguous().flatten(0, -2)
-    targets = targets.contiguous().flatten()
-    params = CCEParams(
-        targets=targets,
-        valids=None,
-        softcap=None,
-        reduction="mean",
-        filter_eps=_handle_eps("high", embeddings.dtype),
-        shift=False,
-        batch_shape=batch_shape,
-    )
-    return linear_cross_entropy_apply(
-        embeddings, classifier.to(embeddings.dtype), params
-    )
-
-
 class _LinearCrossEntropyZFunction(torch.autograd.Function):
     """CCE's tiled linear CE plus exact mean-square log-partition loss.
 
@@ -1124,7 +1096,7 @@ class _LinearCrossEntropyZFunction(torch.autograd.Function):
 def _fixed_cce_z(
     embeddings: Tensor, classifier: Tensor, targets: Tensor
 ) -> tuple[Tensor, Tensor]:
-    """Dense capture-safe CCE and z-loss for the packed training stream."""
+    """Dense capture-safe CCE and z-loss with a BF16 tied classifier operand."""
     embeddings = embeddings.contiguous().flatten(0, -2)
     targets = targets.contiguous().flatten()
     return _LinearCrossEntropyZFunction.apply(

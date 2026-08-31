@@ -100,6 +100,9 @@ output projection. One packed Adam-side hidden-width projection supplies five
 non-overlapping control slices: the main-decay bottleneck, delta-update logits,
 preconditioner-decay logits, preconditioner-gain logits, and output-gate
 bottleneck. Packing changes neither parameter count nor optimizer semantics.
+Its CUDA backward writes the five slice gradients directly into one contiguous
+packed buffer for the shared projection GEMMs instead of invoking split
+autograd's concatenation.
 
 The diagonal apply-to-key preconditioner has independent scalar decay and gain
 projections, `x = 1.5`, `eps = 1e-6`, a learned log-space center initialized to
@@ -115,7 +118,9 @@ before residual addition. There is no dropout.
 
 Embedding weights and optimizer state remain FP32. Under CUDA autocast, the
 embedding output, residual stream, recurrent payload, and routed values are
-BF16. CPU and MPS use the same semantics through portable PyTorch operations.
+BF16. The tied classifier is converted to BF16 only at the cut-cross-entropy
+operand boundary; its authoritative parameter and accumulated gradient remain
+FP32. CPU and MPS use the same semantics through portable PyTorch operations.
 
 ## MHDB package
 
@@ -421,14 +426,16 @@ The authoritative Jobe screen path uses:
 - a fixed-capacity Triton MHDB router over source pointers, with full-width RMS
   scores, per-head masked softmaxes, FP32 value accumulation, and an analytic
   backward that retains cross-head RMS coupling;
-- cut cross-entropy for the tied head, including the exact squared
-  log-partition gradient without materializing vocabulary-wide logits;
+- cut cross-entropy with a BF16 tied-classifier operand, including the exact
+  squared log-partition gradient without materializing vocabulary-wide logits;
+- a dedicated Triton backward packer for the five PKDA control gradients;
 - full-block compilation around global-attention kernels and segmented PKDA
   block compilation that graph-breaks at the opaque FLA recurrence while
   compiling the projections, controls, routing, MLP, and residual work around
   it;
-- fixed-address forward/backward CUDA graphs for every schedule-reachable train
-  mode and shared-pool no-grad validation graphs;
+- one fixed-address forward/backward CUDA graph per reachable pass count, with
+  a device-side FP32 coefficient selecting zero or cooldown z-loss, plus
+  shared-pool no-grad validation graphs;
 - BF16 keyed jitter drawn directly into graph input buffers;
 - internal activation checkpointing above the measured screen work threshold;
 - asynchronous snapshot staging to pinned host memory followed by atomic
@@ -441,20 +448,20 @@ Fresh-process capture measurements at the default screen geometry on Jobe are:
 
 | Arm | Peak allocated | Peak reserved | Captured train/eval graphs |
 |---|---:|---:|---:|
-| `base` | 6.43 GiB | 13.65 GiB | 3 |
-| `mhdb` | 6.58 GiB | 13.97 GiB | 3 |
-| `df` | 12.73 GiB | 23.00 GiB | 7 |
+| `base` | 6.40 GiB | 9.96 GiB | 2 |
+| `mhdb` | 6.55 GiB | 10.12 GiB | 2 |
+| `df` | 12.87 GiB | 22.76 GiB | 4 |
 
 The reserved graph pool, not live allocated tensors, is the concurrency
-boundary. Even the two lightest hybrid processes exceed the RTX 4090's usable
-23.50 GiB when their reservations are combined. Screen jobs therefore remain
-serial on Jobe; use the durable queue rather than process-level co-training.
-PKDA's memory savings are retained as safety headroom and make the registered
-three-pass DF modes fit, but do not justify a concurrent-run mode.
+boundary. Screen jobs remain serial on Jobe: concurrent processes would
+compete for the same GPU execution capacity and are outside the qualified
+deterministic path. Use the durable queue rather than process-level
+co-training. PKDA's memory savings are retained as safety headroom and make
+the registered three-pass DF modes fit.
 
 ### Checkpoint contract
 
-New snapshots use checkpoint contract v10, and only v10 is resumable.
+New snapshots use checkpoint contract v11, and only v11 is resumable.
 Snapshots contain model, both optimizer states, exact state-defining arguments,
 step, and Python/Torch/CUDA RNG state. A resume inherits all state-defining
 fields and rejects an explicit conflict. Runtime paths, device, evaluation
@@ -559,7 +566,7 @@ training an alternative payload rule from scratch.
 The screen uses the geometry above, 6,700 steps, 2.003B predicted tokens per
 run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
 completed `vanilla` run is retained; the four hybrid factorial arms are new
-runs under checkpoint-v10.
+runs under checkpoint-v11.
 
 The screen is designed to establish:
 

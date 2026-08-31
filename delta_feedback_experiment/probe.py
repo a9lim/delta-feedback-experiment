@@ -30,7 +30,7 @@ def cuda_gate() -> None:
         arm_config,
         flash_attn_func,
         iterate_fused,
-        linear_cross_entropy_apply,
+        linear_cross_entropy,
     )
     from .optim import OptimizerPair, build_optimizers
     from .pkda import (
@@ -50,7 +50,7 @@ def cuda_gate() -> None:
         route_summary,
     )
 
-    if flash_attn_func is None or linear_cross_entropy_apply is None:
+    if flash_attn_func is None or linear_cross_entropy is None:
         raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
     if route_triton is None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
