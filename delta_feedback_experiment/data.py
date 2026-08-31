@@ -6,8 +6,8 @@ Layout under a data directory (default ``data/tokens``):
     val.bin              the held-out slice — the stream's first tokens
     train.0000.bin ...   uint32 shards, one contiguous stream
 
-The val slice comes first so the train stream can extend indefinitely
-(ladder rungs) without ever touching held-out documents.  Rows are
+The val slice comes first so the train stream can cover both registered
+screen budgets without ever touching held-out documents.  Rows are
 non-overlapping ``seq_len+1``-token windows addressed by a global row
 index, so batch ``step`` is the same bytes for every arm — the paired
 data order contract — and a resumed run addresses the identical rows.
@@ -62,7 +62,7 @@ def tokenize(
     assert eos is not None
     if revision is None:
         # Pin the dataset commit so the stream is reproducible: the full
-        # 35B tokenization and any smoke-sized one must be byte-prefixes
+        # 51B tokenization and any smoke-sized one must be byte-prefixes
         # of the same stream.
         from huggingface_hub import HfApi
 

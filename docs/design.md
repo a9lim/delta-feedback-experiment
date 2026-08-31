@@ -122,7 +122,7 @@ FP32. CPU and MPS use the same semantics through portable PyTorch operations.
 
 ## MHDB package
 
-The screen, same-geometry token ladder, and flagship all use the same
+The Jobe screen, fresh Prime screen, and flagship all use the same
 four-layer block-delta source contract. Individual attention and MLP branch
 deltas are never retained as separate addressable sources.
 
@@ -384,7 +384,12 @@ The radius is checkpointed with optimizer state and must remain fixed across
 every eager, captured, staged, and resumed step. No optimizer group uses weight
 decay; matrix norm control is the explicit Hyperball constraint.
 
-### Default screen schedule
+After all microbatches have accumulated, every registered run clips the single
+global FP32 gradient vector to L2 norm 1.0 immediately before the NorMuonH and
+Adam steps. The reported `gnorm` is the norm before clipping. Non-finite global
+norms terminate the run rather than being projected or skipped.
+
+### Default Jobe screen schedule
 
 The default 9,614-step WSD schedule is:
 
@@ -466,7 +471,7 @@ the registered three-pass DF modes fit.
 
 ### Checkpoint contract
 
-New snapshots use checkpoint contract v12, and only v12 is resumable.
+New snapshots use checkpoint contract v13, and only v13 is resumable.
 Snapshots contain model, both optimizer states, exact state-defining arguments,
 step, and Python/Torch/CUDA RNG state. A resume inherits all state-defining
 fields and rejects an explicit conflict. Runtime paths, device, evaluation
@@ -566,14 +571,14 @@ training an alternative payload rule from scratch.
 
 ## Screen and scale plan
 
-### 223–243M screen
+### Jobe 25x discovery screen
 
-The screen uses the geometry above, a 320-row global batch, 9,614 steps,
+The Jobe screen uses the geometry above, a 320-row global batch, 9,614 steps,
 3,150,315,520 predicted tokens per run, FineWeb-Edu, two paired initialization
 seeds, and Jobe's RTX 4090. The 327,680 predicted tokens per optimizer update
 exactly match the registered flagship batch. No registered screen run is
 complete. `vanilla` is the external trunk control and the four hybrid arms
-form the primary factorial under checkpoint-v12.
+form the primary factorial under checkpoint-v13.
 
 The screen is designed to establish:
 
@@ -583,46 +588,62 @@ The screen is designed to establish:
 3. whether hard DF is stable under recurrent self-composition;
 4. whether learned null, seed, block, and payload routing paths are adopted.
 
-The screen runs at 25.00–29.67 predicted tokens per active non-embedding
+The Jobe screen runs at 25.00–29.67 predicted tokens per active non-embedding
 parameter across its arms. It is a sensitivity and interaction screen, not a
 decisive test of FBT formation at the high token-per-parameter regime.
 
-### Token ladder
+### Fresh Prime 400x confirmation screen
 
-The registered ladder keeps the screen geometry and uses `df`, the largest
-hybrid arm at 126,008,544 active non-embedding parameters, as its conservative
-reference denominator. Whole optimizer batches realize the three cumulative
-rungs as:
+There is no continued-pretraining ladder and no 100x run. After an admissible
+Jobe result, the primary hybrid factorial `{base, mhdb, fbt, df}` is pretrained
+from fresh initialization on rented Prime Intellect GPUs for 153,819 optimizer
+steps and 50,403,409,920 predicted tokens per arm. Every Prime arm uses paired
+seed 1, data seed 0, and the same stream prefix beginning at global row zero;
+none loads a Jobe model or optimizer checkpoint. `vanilla` remains the Jobe-only
+external trunk control because the Prime trial tests the package factorial at
+the high-token regime rather than repeating the already gated trunk decision.
 
-| Rung | Optimizer steps | Exact predicted tokens | Realized `df` ratio |
-|---:|---:|---:|---:|
-| 25x | 9,614 | 3,150,315,520 | 25.000809 |
-| 100x | 38,455 | 12,600,934,400 | 100.000635 |
-| 400x | 153,819 | 50,403,409,920 | 399.999939 |
+The largest arm, `df`, has 126,008,544 active non-embedding parameters and
+realizes 399.999939 predicted tokens per active parameter. Equal data gives the
+other hybrid arms slightly larger ratios:
 
-Every arm at a rung receives the same exact stream prefix; its realized ratio
-therefore differs only with active parameter count. At the top rung the four
-hybrid factorial arms span 400.000–403.974 predicted tokens per active
-non-embedding parameter, while the structurally smaller `vanilla` control is
-at 474.654. Do not shorten `vanilla` to force its ratio to 400, because that
-would break the matched-data whole-trunk contrast.
+| Arm | Optimizer steps | Exact predicted tokens | Realized active ratio |
+|---|---:|---:|---:|
+| `base` | 153,819 | 50,403,409,920 | 403.973849 |
+| `mhdb` | 153,819 | 50,403,409,920 | 403.794892 |
+| `fbt` | 153,819 | 50,403,409,920 | 400.182867 |
+| `df` | 153,819 | 50,403,409,920 | 399.999939 |
 
-The first rung is the two-seed all-arm screen. Selected finalist arms continue
-through the 100x and 400x rungs with one paired seed, taking a WSD cooldown
-branch at each rung and continuing the next rung from that rung's protected
-pre-cooldown checkpoint. The screen's two-seed spread remains the noise
-estimate. Continuation preserves the first rung's absolute feedback boundary
-after step 4,807 rather than recomputing it as half of each later endpoint.
-The ladder therefore matches the flagship's final data ratio, not its
-relative-time feedback curriculum; predicted tokens and token-equivalent
-compute remain separate reported quantities.
+This is one fresh WSD schedule rather than a branch or concatenation:
 
-The later rungs are not currently runnable through exact resume: `steps` is a
-v12 state-defining field, and no tested branch-from-heat-end continuation
-command exists. Before ladder launch, code and tests must define a new run
-address, preserve model/optimizer/RNG and row continuity, extend the stable
-phase without re-warming, retain the absolute feedback boundary, and create a
-new cooldown branch without weakening exact resume.
+| Phase | Steps | Pass behavior |
+|---|---:|---|
+| Warmup | 1–200 | one pass |
+| Stable heat | 201–76,910 | one pass |
+| Stable heat | 76,911–115,364 | feedback arms draw 1, 2, or 3 passes |
+| Cooldown | 115,365–153,819 | feedback arms draw 1, 2, or 3 passes |
+
+Feedback therefore begins halfway through this run and preserves the
+flagship's expected whole-run 75%/22%/3% pass mixture and 1.28 pass-token
+multiplier. The 51B-token canonical training stream covers the 49,222,080
+rows required by this schedule; 1,025 stored tokens per row correspond to
+1,024 predicted tokens.
+
+The registered Prime execution target is one eight-H100-80GB node under
+replicated DDP: 8 ranks x 4 rows per microbatch x 10 accumulation microsteps =
+320 global rows and 327,680 predicted tokens per optimizer update. Global row
+assignment must cover one contiguous 320-row interval per step without overlap,
+and the norm-1 clip must be computed after synchronized gradient accumulation.
+Training data, snapshots, logs, and the final artifacts live on persistent
+storage rather than node-local ephemeral storage.
+
+The fresh 400x schedule is already expressible as a new run with
+`--steps 153819`; distributed Prime execution is not yet runnable. Its
+implementation gate must add exact row sharding, DDP accumulation and global
+clipping, rank-safe telemetry and snapshots, persistent-storage staging,
+cross-rank optimizer parity, restart tests, and a Prime H100 throughput and
+memory qualification. The qualified configuration and projected rental cost
+must be reviewed before provisioning the full trial.
 
 ### Flagship
 
@@ -797,9 +818,8 @@ probabilities 50%, 44%, and 6%, using the same keyed schedule as the screen;
 the exact realized pass-token count is recorded rather than inferred from the
 expectation.
 
-Learning rates and the z-loss follow the shared NorMuonH/Adam WSD recipe above.
-The flagship additionally clips the accumulated global FP32 gradient
-norm to 1.0 immediately before the optimizer step, matching the 1B PKDA
+Learning rates, global gradient clipping, and the z-loss follow the shared
+NorMuonH/Adam WSD recipe above, with the norm-1 clip matching the 1B PKDA
 training precedent. The packed PKDA control projection, main-decay expansion,
 and output-gate expansion remain in Adam; Q/K/V/output projections remain in
 NorMuonH. The three-dimensional depthwise convolution weights are non-matrix
@@ -902,33 +922,40 @@ production-scale checkpoint staging.
 Engineering qualification establishes implementation sensitivity and numerical
 coherence. It is not an experiment finding.
 
-### Screen admissibility and ladder entry
+### Jobe admissibility and Prime entry
 
-A screen comparison is admissible only when the registered paired runs finish
+A Jobe screen comparison is admissible only when the registered paired runs finish
 with the same token stream, batch order, recipe, seeds, and schedule, and all
 feedback arms have healthy contraction traces.
 
 The hybrid `base` arm must clearly improve on vanilla in Standard mode for the
 screen to justify replacing the old trunk. Within the hybrid factorial, MHDB
 must produce a resolvable paired effect for the screen to serve as a
-sensitivity gate. A stable FBT null at screen scale does not by itself exclude
-DF from the ladder because the screen is far below the registered
-token-per-parameter regime. DF enters the ladder only if its paired effect is
-credible enough that additional tokens can resolve the interaction between the
-two packages.
+sensitivity gate. A stable FBT null at 25x does not by itself exclude the Prime
+trial because the Jobe screen is far below the registered token-per-parameter
+regime. The Prime spend proceeds only if DF's paired effect is credible enough
+that a fresh high-token factorial can resolve the interaction between the two
+packages and every feedback arm remains stable under self-composition.
+
+The Prime comparison is admissible only when all four arms start from fresh
+paired initialization, consume the same row-zero stream prefix under the
+153,819-step schedule, and complete on the same qualified distributed recipe.
+Jobe checkpoints are cross-hardware diagnostics only and cannot initialize a
+Prime arm.
 
 ### Flagship promotion
 
 Promote only if:
 
-1. DF's advantage over both parent arms at matched token-equivalent compute
-   holds or grows from 25x through 400x rather than appearing at one rung;
-2. the top-rung feedback map remains stable for at least 30 fused
+1. the fresh Prime 400x factorial shows DF's advantage over both parent arms at
+   matched token-equivalent compute, with an interaction direction coherent
+   with the two-seed Jobe screen rather than a single-arm improvement;
+2. the Prime feedback map remains stable for at least 30 fused
    self-compositions;
 3. routing and same-checkpoint ablations do not reveal a trivial unused or
    bypassed mechanism;
 4. the flagship implementation gate passes on its exact distributed geometry;
-5. a9 explicitly approves the flagship spend with the ladder evidence in hand.
+5. a9 explicitly approves the flagship spend with both screen results in hand.
 
 ## Scope exclusions
 
@@ -948,8 +975,8 @@ introduced into the registered factorial.
   measures that trunk directly, and `mhdb` measures routing conditional on it;
   neither is a numerical reproduction target for its source paper.
 - A low-token FBT null is compatible with missing formation conditions. A null
-  that persists across the registered ladder is stronger evidence against the
-  current feedback recipe at this model scale.
+  in the fresh 400x Prime factorial is stronger evidence against the current
+  feedback recipe at this model scale.
 - The flagship hybrid is a synthesis rather than a reproduced architecture:
   Kimi's 3:1 evidence used unpreconditioned KDA with MLA, Preconditioned
   DeltaNet evaluated pure PKDA at different context and training budgets, and

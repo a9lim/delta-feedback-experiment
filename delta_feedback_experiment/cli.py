@@ -83,7 +83,10 @@ def tokenize_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser("df tokenize")
     parser.add_argument("--out", default="data/tokens")
     parser.add_argument(
-        "--target", type=float, default=35e9, help="train tokens to write"
+        "--target",
+        type=float,
+        default=51e9,
+        help="total tokenization target, including the held-out prefix",
     )
     parser.add_argument(
         "--val", type=float, default=30e6, help="held-out tokens from the stream head"

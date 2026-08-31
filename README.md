@@ -24,8 +24,8 @@ recurrence, and optimized single-GPU CUDA path are implemented and
 Jobe-qualified. The full DF train/eval graph pool peaks at 12.87 GiB allocated
 and 22.76 GiB reserved across four graphs, so screen jobs remain serial on the
 24 GiB RTX 4090.
-The token-ladder continuation and the distributed
-1.335B-parameter, 441B-token, 20-by-128-PKDA
+The distributed fresh-400x Prime screen and the distributed 1.335B-parameter,
+441B-token, 20-by-128-PKDA
 `[PKDA, PKDA, PKDA, gated global GQA]` block-delta flagship path are specified
 but not yet implemented.
 
@@ -80,20 +80,28 @@ source.
 
 The default screen run is 9,614 steps, 320 rows per step, and sequence length
 1,024: 3,150,315,520 predicted training tokens. Its 327,680-token optimizer
-batch exactly matches the flagship, and this is the batch-aligned 25x rung for
+batch exactly matches the flagship, and this is the batch-aligned 25x trial for
 the 126,008,544 active non-embedding parameters in `df`, the largest hybrid
 arm. Feedback arms use one pass through step 4,807, then draw one, two,
 or three passes at a 50%/44%/6% mixture through the rest of heat and cooldown.
 Every step is addressed directly into one fixed token stream. Pass counts are
 keyed by data seed and step; prefix lengths and jitter additionally use the
-global row, so paired arms see identical examples and feedback draws.
+global row, so paired arms see identical examples and feedback draws. After
+microbatch accumulation, the global FP32 gradient norm is clipped to 1.0 before
+the shared NorMuonH/Adam step.
 
-The same-geometry ladder uses exact 25x, 100x, and 400x rungs at 9,614,
-38,455, and 153,819 optimizer steps. Its branch-from-heat-end continuation path
-remains an implementation gate; only the first rung is currently runnable.
+There is no continuation ladder or 100x run. If the Jobe screen passes its
+entry gate, `{base, mhdb, fbt, df}` receives a fresh one-seed 400x pretraining
+trial on Prime: every arm starts from initialization and global row zero, runs
+153,819 optimizer steps, and predicts exactly 50,403,409,920 tokens. Feedback
+begins after step 76,910, halfway through the fresh schedule. The registered
+Prime target is one 8xH100-80GB node with the same 320-row global batch; its DDP,
+durable-storage, parity, restart, and throughput gates are not yet implemented.
+The canonical tokenizer target is 51B stored training tokens so this trial's
+49,222,080 rows are available.
 
-New snapshots are immutable checkpoint-contract v12 files under `runs/`.
-Only v12 is resumable. `--max-steps` limits only the current invocation; it
+New snapshots are immutable checkpoint-contract v13 files under `runs/`.
+Only v13 is resumable. `--max-steps` limits only the current invocation; it
 never rescales the state-defining schedule.
 
 ## Analysis

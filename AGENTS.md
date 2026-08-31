@@ -5,9 +5,9 @@ common PKDA/gated-GQA hybrid trunk. The hard hybrid is `df`; `mhdb` and `fbt`
 are its parent-package deletions; `base` is their shared hybrid baseline. The
 pure-GQA `vanilla` is the external trunk control.
 
-The 223–243M screen has no active job. No matched hybrid comparison is complete,
-and [docs/findings.md](docs/findings.md) must remain empty of architecture
-claims until one is admissible.
+The 223–243M two-stage screen program has no active job. No matched hybrid
+comparison is complete, and [docs/findings.md](docs/findings.md) must remain
+empty of architecture claims until one is admissible.
 
 ## Documentation contract
 
@@ -34,7 +34,7 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
-- Screen and token-ladder `base`, `mhdb`, `fbt`, and `df` use exact
+- Both screen trials' `base`, `mhdb`, `fbt`, and `df` use exact
   `[PKDA, PKDA, PKDA, gated global GQA] x 3` trunks: 8 PKDA heads at
   `d_k = d_v = 128`, causal convolution width 4, NoPE global attention, and
   8/4-by-96 GQA. `vanilla` remains the exact twelve-layer RoPE GQA trunk. Every
@@ -65,15 +65,20 @@ contract changes.
 
 ## Experimental discipline
 
-- Every arm uses the same tokenizer, token stream, row order, feedback random
-  stream, outer geometry, optimizer recipe, and schedule. The complete hybrid
+- Every arm within a registered comparison uses the same tokenizer, token
+  stream, row order, feedback random stream, outer geometry, optimizer recipe,
+  and schedule. The complete hybrid
   trunk is byte-identical across `base`, `mhdb`, `fbt`, and `df`; MHDB weights
   are paired across `mhdb`/`df`, and FBT weights across `fbt`/`df`. The
   structurally distinct `vanilla` control retains its exact initialization
   recipe and state layout.
-- The screen global batch is 320 rows x 1,024 predictions = 327,680 predicted
-  tokens, accumulated as 80 four-row microbatches. This exactly matches the
-  flagship's predicted tokens per optimizer update.
+- Each screen global batch is 320 rows x 1,024 predictions = 327,680 predicted
+  tokens. Jobe accumulates 80 four-row microbatches; Prime uses 8 ranks x 4
+  rows x 10 accumulation microsteps. This exactly matches the flagship's
+  predicted tokens per optimizer update.
+- Every registered run clips the accumulated global FP32 gradient vector to L2
+  norm 1.0 immediately before its NorMuonH/Adam step. Distributed execution
+  clips only after synchronized accumulation.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.
@@ -104,14 +109,20 @@ contract changes.
 - Keep Jobe screen execution serial. Fresh default captures reserve 9.96 GiB
   for `base`, 10.12 GiB for `mhdb`, and 22.76 GiB for `df`; concurrent
   execution is outside the qualified deterministic single-GPU path.
-- New snapshots are checkpoint-v12. Reject every older checkpoint version.
+- New snapshots are checkpoint-v13. Reject every older checkpoint version.
 - Inspect `df status`, the active log, and GPU ownership before operating Jobe.
   The queue records exact arguments without inspecting Git state. Source
   changes never stop an active child; the worker refreshes before the next job
   and runs that job's probe from the current checkout.
-- The 25x screen and same-geometry continuation surfaces are implemented. The
-  25x→100x→400x WSD ladder still requires an explicit tested
-  branch-from-heat-end continuation path. The 24-layer flagship is the exact
+- The Jobe 25x screen and a fresh single-process 400x schedule are implemented;
+  there is no continuation ladder or 100x run. After an admissible two-seed,
+  five-arm Jobe screen, Prime receives a fresh one-seed `{base,mhdb,fbt,df}`
+  factorial at 400x: 153,819 steps and 50,403,409,920 predicted tokens per arm,
+  initialized from global row zero rather than a Jobe checkpoint. The target is
+  one Prime 8xH100-80GB node at the shared 327,680-token global batch. Exact DDP
+  row sharding, synchronized norm-1 clipping, durable artifacts, parity,
+  throughput, and restart behavior remain an implementation gate. The 24-layer
+  flagship is the exact
   `[PKDA, PKDA, PKDA, gated global GQA] x 6` hard-DF design in the scale plan;
   each PKDA mixer uses 20 query/key heads and 20 value heads at
   `d_k = d_v = 128`, for width-2,560 projections. Its batch-aligned budget is
@@ -120,6 +131,6 @@ contract changes.
   exist, but the flagship still requires exact-geometry distributed execution,
   memory/throughput qualification, checkpoint portability, and restart tests.
   Do not describe it as runnable until those contracts land.
-- Flagship promotion requires the registered ladder trend, the matched
-  factorial evidence, a clean contraction gate, the exact implementation gate,
-  and explicit spend confirmation from a9.
+- Flagship promotion requires coherent Jobe and fresh Prime factorial evidence,
+  a clean contraction gate, the exact implementation gate, and explicit spend
+  confirmation from a9.

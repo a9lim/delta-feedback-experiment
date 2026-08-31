@@ -17,9 +17,12 @@ from delta_feedback_experiment.optim import (
     split_parameters,
 )
 from delta_feedback_experiment.train import (
+    CONTRACT,
+    GRAD_CLIP_NORM,
     automatic_checkpoint,
     build_parser,
     build_schedule,
+    clip_gradients,
     draw_passes,
     mix,
     route_summary,
@@ -157,6 +160,23 @@ def test_batched_normuonh_matches_independent_parameters():
         optimizer.step()
     for actual, expected in zip(left, right, strict=True):
         assert torch.allclose(actual, expected, rtol=2e-5, atol=2e-6)
+
+
+def test_global_gradient_clip_uses_one_accumulated_vector():
+    first = torch.nn.Parameter(torch.zeros(2))
+    second = torch.nn.Parameter(torch.zeros(1))
+    first.grad = torch.tensor([3.0, 4.0])
+    second.grad = torch.tensor([12.0])
+
+    preclip = clip_gradients([first, second])
+
+    assert GRAD_CLIP_NORM == 1.0
+    assert CONTRACT.version == 13
+    assert CONTRACT.resumable == frozenset({13})
+    assert preclip == pytest.approx(13.0)
+    clipped = torch.cat([first.grad, second.grad])
+    assert clipped.norm().item() == pytest.approx(1.0)
+    assert clipped.tolist() == pytest.approx([3 / 13, 4 / 13, 12 / 13])
 
 
 def test_semantic_scale_gates_use_adam_and_value_matrices_use_normuonh():
@@ -298,14 +318,19 @@ def test_build_schedule_screen_shape():
     assert schedule.rate_at(9614, 1.0) < 1e-6
 
 
-def test_screen_ladder_matches_registered_active_parameter_ratios():
+def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
     tokens_per_step = 320 * 1024
     df_active_non_embedding = 126_008_544
-    rungs = {25: 9_614, 100: 38_455, 400: 153_819}
+    trials = {25: 9_614, 400: 153_819}
 
-    for target_ratio, steps in rungs.items():
+    for target_ratio, steps in trials.items():
         realized_ratio = steps * tokens_per_step / df_active_non_embedding
         assert realized_ratio == pytest.approx(target_ratio, abs=0.002)
+
+    prime = build_parser().parse_args(["x", "--steps", "153819"])
+    schedule = build_schedule(prime)
+    assert schedule.spans == (200, 0, 115_164, 38_455)
+    assert round(prime.feedback_start * schedule.total) == 76_910
 
 
 def test_log_every_flag_is_removed():
@@ -427,12 +452,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11])
+@pytest.mark.parametrize("version", [9, 10, 11, 12])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[12\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[13\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

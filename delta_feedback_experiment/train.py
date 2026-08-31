@@ -41,8 +41,11 @@ from .model import (
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=12, resumable=frozenset({12}), surface_version=12
+    version=13, resumable=frozenset({13}), surface_version=13
 )
+
+GRAD_CLIP_NORM = 1.0
+"""Global FP32 gradient-norm ceiling shared by every registered run."""
 
 EXACT_FIELDS = (
     "arm",
@@ -786,6 +789,17 @@ def build_schedule(args) -> Schedule:
     return schedule
 
 
+def clip_gradients(parameters) -> float:
+    """Clip one accumulated global gradient vector and return its pre-clip norm."""
+    total_norm = torch.nn.utils.clip_grad_norm_(
+        parameters,
+        max_norm=GRAD_CLIP_NORM,
+        norm_type=2.0,
+        error_if_nonfinite=True,
+    )
+    return total_norm.item()
+
+
 def train(argv: list[str] | None = None) -> dict:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -870,6 +884,7 @@ def train(argv: list[str] | None = None) -> dict:
             tag=args.tag,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
+            grad_clip=GRAD_CLIP_NORM,
             routing_block_size=model.cfg.routing_block_size,
             **{name: getattr(args, name) for name in EXACT_FIELDS},
         )
@@ -963,9 +978,7 @@ def train(argv: list[str] | None = None) -> dict:
                     step_loss += loss.item() / micros
                     pass1_loss += losses[0].item() / micros
 
-            gradients = [p.grad for p in model.parameters() if p.grad is not None]
-            norms = torch._foreach_norm(gradients)
-            grad_norm = torch.stack(norms).norm().item()
+            grad_norm = clip_gradients(model.parameters())
             for optimizer in optimizers:
                 optimizer.step()
             if graph_runner is not None:

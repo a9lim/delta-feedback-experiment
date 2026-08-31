@@ -45,6 +45,7 @@ def cuda_gate() -> None:
         CudaGraphTrainer,
         build_parser,
         build_schedule,
+        clip_gradients,
         evaluate,
         execution_fields,
         route_summary,
@@ -480,8 +481,7 @@ def cuda_gate() -> None:
             samples.append(time.monotonic() - started)
         elapsed = statistics.median(samples[2:])
         runner.prepare_optimizer(state)
-        norms = torch._foreach_norm([parameter.grad for parameter in state.active])
-        grad_norm = torch.stack(norms).norm().item()
+        grad_norm = clip_gradients(model.parameters())
         if not math.isfinite(grad_norm) or not math.isfinite(state.loss_sum.item()):
             active_names = {
                 id(parameter): name for name, parameter in model.named_parameters()
