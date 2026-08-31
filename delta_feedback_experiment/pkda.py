@@ -15,6 +15,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .cuda_kernels import pack_control_gradients
+
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
     from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.precond_kda import (
@@ -33,6 +35,27 @@ def pkda_cuda_available() -> bool:
         and fused_recurrent_precond_kda is not None
         and rms_norm_gated is not None
     )
+
+
+class _PackedControlSplit(torch.autograd.Function):
+    """Five views whose CUDA backward owns one contiguous gradient buffer."""
+
+    @staticmethod
+    def forward(ctx, packed: Tensor, splits: tuple[int, ...]):
+        ctx.splits = splits
+        ctx.save_for_backward(packed)
+        return packed.split(splits, dim=-1)
+
+    @staticmethod
+    def backward(ctx, *gradients: Tensor | None):
+        (packed,) = ctx.saved_tensors
+        materialized = tuple(
+            gradient.contiguous()
+            if gradient is not None
+            else packed.new_zeros((*packed.shape[:-1], size))
+            for gradient, size in zip(gradients, ctx.splits, strict=True)
+        )
+        return pack_control_gradients(materialized), None
 
 
 class PreconditionedKDA(nn.Module):
@@ -191,7 +214,7 @@ class PreconditionedKDA(nn.Module):
             precond_decay_logits,
             precond_beta_logits,
             output_gate_hidden,
-        ) = self.control_proj(x).split(self.control_splits, dim=-1)
+        ) = _PackedControlSplit.apply(self.control_proj(x), self.control_splits)
         raw_decay = self.decay_up(decay_hidden).reshape(
             *x.shape[:2], self.num_heads, self.head_dim
         )

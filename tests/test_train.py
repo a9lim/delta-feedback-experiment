@@ -251,8 +251,8 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
     )
     trainer = SimpleNamespace(
         states={
-            GraphSpec(1, False, False): None,
-            GraphSpec(1, True, False): None,
+            GraphSpec(1, False): None,
+            GraphSpec(2, False): None,
         }
     )
     evaluator = SimpleNamespace(states={4: None})
@@ -394,12 +394,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [8, 9])
+@pytest.mark.parametrize("version", [8, 9, 10])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[10\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[11\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

@@ -22,7 +22,7 @@ from delta_feedback_experiment.model import (
     multipass_loss,
     shift_right,
 )
-from delta_feedback_experiment.pkda import PreconditionedKDA
+from delta_feedback_experiment.pkda import PreconditionedKDA, _PackedControlSplit
 
 TINY = {
     "vocab_size": 97,
@@ -150,6 +150,23 @@ def test_pkda_preconditioner_initialization_and_bound():
     )
     assert preconditioner.min() >= 1 / pkda.squash_x
     assert preconditioner.max() <= pkda.squash_x
+
+
+def test_packed_control_split_preserves_forward_and_backward():
+    splits = (5, 2, 2, 2, 5)
+    actual = torch.randn(3, 7, sum(splits), requires_grad=True)
+    expected = actual.detach().clone().requires_grad_()
+    cotangents = tuple(torch.randn(3, 7, size) for size in splits)
+
+    actual_parts = _PackedControlSplit.apply(actual, splits)
+    expected_parts = expected.split(splits, dim=-1)
+    assert all(
+        torch.equal(got, want)
+        for got, want in zip(actual_parts, expected_parts, strict=True)
+    )
+    torch.autograd.backward(actual_parts, cotangents)
+    torch.autograd.backward(expected_parts, cotangents)
+    assert torch.equal(actual.grad, expected.grad)
 
 
 def test_factorial_initialization_is_paired_by_semantic_factor():
@@ -387,6 +404,16 @@ def test_multipass_loss_shape():
     assert len(losses) == 3
     expected = losses[0] + (losses[1] + losses[2]) / 2
     assert torch.allclose(total, expected)
+
+
+def test_multipass_loss_accepts_a_device_side_z_coefficient():
+    model = tiny("df")
+    toks = tokens()
+    prefix = torch.ones((1, toks.shape[0]), dtype=torch.long)
+    outs = multipass(model, toks, 2, prefix_lens=prefix)
+    float_total, _ = multipass_loss(model, toks, outs, z_coef=1e-5)
+    tensor_total, _ = multipass_loss(model, toks, outs, z_coef=torch.tensor(1e-5))
+    assert torch.equal(float_total, tensor_total)
 
 
 def test_multipass_rejects_feedback_free_arms():

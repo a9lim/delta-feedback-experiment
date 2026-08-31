@@ -1039,7 +1039,9 @@ def _fixed_cce(embeddings: Tensor, classifier: Tensor, targets: Tensor) -> Tenso
         shift=False,
         batch_shape=batch_shape,
     )
-    return linear_cross_entropy_apply(embeddings, classifier, params)
+    return linear_cross_entropy_apply(
+        embeddings, classifier.to(embeddings.dtype), params
+    )
 
 
 class _LinearCrossEntropyZFunction(torch.autograd.Function):
@@ -1125,7 +1127,9 @@ def _fixed_cce_z(
     """Dense capture-safe CCE and z-loss for the packed training stream."""
     embeddings = embeddings.contiguous().flatten(0, -2)
     targets = targets.contiguous().flatten()
-    return _LinearCrossEntropyZFunction.apply(embeddings, classifier, targets)
+    return _LinearCrossEntropyZFunction.apply(
+        embeddings, classifier.to(embeddings.dtype), targets
+    )
 
 
 def sequence_ce(
@@ -1133,7 +1137,6 @@ def sequence_ce(
     h_top: Tensor,
     targets: Tensor,
     *,
-    want_z: bool = False,
     chunk: int = 1024,
 ) -> tuple[Tensor, Tensor]:
     """(mean CE, mean z²) over [B, T] targets, chunked along the sequence.
@@ -1149,10 +1152,7 @@ def sequence_ce(
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
         normalized = model.final_norm(h_top)
-        if want_z:
-            return _fixed_cce_z(normalized, model.embed_tokens.weight, targets)
-        ce = _fixed_cce(normalized, model.embed_tokens.weight, targets)
-        return ce, ce.new_zeros((), dtype=torch.float32)
+        return _fixed_cce_z(normalized, model.embed_tokens.weight, targets)
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)
@@ -1186,7 +1186,11 @@ def sequence_ce(
 
 
 def multipass_loss(
-    model: DFModel, tokens: Tensor, outs: list[ColumnOutput], *, z_coef: float = 0.0
+    model: DFModel,
+    tokens: Tensor,
+    outs: list[ColumnOutput],
+    *,
+    z_coef: float | Tensor = 0.0,
 ) -> tuple[Tensor, list[Tensor]]:
     """FBT Eq. 12 with λ=1: pass-1 NTP plus the mean over feedback passes,
     plus (in cooldown) the z-loss under the same per-pass weighting.
@@ -1197,7 +1201,7 @@ def multipass_loss(
     targets = tokens[:, 1:]
     losses, z_terms = [], []
     for out in outs:
-        ce, z = sequence_ce(model, out.h_top[:, :-1], targets, want_z=z_coef > 0)
+        ce, z = sequence_ce(model, out.h_top[:, :-1], targets)
         losses.append(ce)
         z_terms.append(z)
 
@@ -1207,8 +1211,7 @@ def multipass_loss(
         return values[0] + torch.stack(values[1:]).mean()
 
     total = combine(losses)
-    if z_coef:
-        total = total + z_coef * combine(z_terms)
+    total = total + z_coef * combine(z_terms)
     return total, losses
 
 

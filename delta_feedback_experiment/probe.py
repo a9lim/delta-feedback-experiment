@@ -33,7 +33,12 @@ def cuda_gate() -> None:
         linear_cross_entropy_apply,
     )
     from .optim import OptimizerPair, build_optimizers
-    from .pkda import PreconditionedKDA, pkda_cuda_available, rms_norm_gated
+    from .pkda import (
+        PreconditionedKDA,
+        _PackedControlSplit,
+        pkda_cuda_available,
+        rms_norm_gated,
+    )
     from .train import (
         CONTRACT,
         CudaEvalRunner,
@@ -287,6 +292,30 @@ def cuda_gate() -> None:
     del cce_e, cce_c, cce_t, cce_de, cce_dc, ref_e, ref_c, ref_logits
     del cce_ce, cce_z, ref_ce, ref_z
 
+    # The packed control projection exposes five semantic slices, but its
+    # backward writes their gradients directly into one GEMM-ready buffer.
+    control_splits = (128, 8, 8, 8, 128)
+    control = torch.randn(
+        3,
+        65,
+        sum(control_splits),
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    control_ref = control.detach().clone().requires_grad_()
+    cotangents = tuple(
+        torch.randn(3, 65, size, device="cuda", dtype=torch.bfloat16)
+        for size in control_splits
+    )
+    control_parts = _PackedControlSplit.apply(control, control_splits)
+    reference_parts = control_ref.split(control_splits, dim=-1)
+    torch.autograd.backward(control_parts, cotangents)
+    torch.autograd.backward(reference_parts, cotangents)
+    if not torch.equal(control.grad, control_ref.grad):
+        raise AssertionError("packed-control gradient assembly drift")
+    del control, control_ref, cotangents, control_parts, reference_parts
+
     # Exercise both FlashAttention entry points: full causal attention and the
     # in-place native GQA KV cache. BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
@@ -379,7 +408,7 @@ def cuda_gate() -> None:
     runner = CudaGraphTrainer(model, optimizers, args, schedule)
     eval_runner = CudaEvalRunner(model, args, runner.pool)
     backend = execution_fields(model, runner, eval_runner)
-    if backend["flash"] != 1 or backend["cuda_graphs"] != 7:
+    if backend["flash"] != 1 or backend["cuda_graphs"] != 4:
         raise AssertionError(f"invalid production execution telemetry: {backend}")
     torch.cuda.synchronize()
     prepared = time.monotonic() - started
@@ -442,9 +471,9 @@ def cuda_gate() -> None:
             generator=generator,
         )
         samples = []
-        for _ in range(7):
+        for replay_index in range(7):
             runner.zero_grad()
-            runner.begin(spec)
+            runner.begin(spec, args.zloss if replay_index % 2 else 0.0)
             torch.cuda.synchronize()
             started = time.monotonic()
             runner.replay(state, rows, index + 1, index * args.micro_rows)
@@ -471,8 +500,7 @@ def cuda_gate() -> None:
             optimizer.step()
         runner.zero_grad()
         records.append(
-            f"k={spec.n_passes}/z={int(spec.want_z)}/ckpt={int(spec.checkpoint)}:"
-            f"{elapsed * 1000:.1f}ms"
+            f"k={spec.n_passes}/ckpt={int(spec.checkpoint)}:{elapsed * 1000:.1f}ms"
         )
 
     # Freeze the full model, optimizer, and RNG surface into pinned host memory.

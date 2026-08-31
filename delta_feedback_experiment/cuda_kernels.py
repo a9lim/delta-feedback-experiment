@@ -671,6 +671,145 @@ def _route_backward_impl(
 
 if triton is not None:
 
+    @triton.jit
+    def _pack_control_gradients_kernel(
+        grad0,
+        grad1,
+        grad2,
+        grad3,
+        grad4,
+        packed,
+        n_elements,
+        size0: tl.constexpr,
+        size1: tl.constexpr,
+        size2: tl.constexpr,
+        size3: tl.constexpr,
+        size4: tl.constexpr,
+        total: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        valid = offsets < n_elements
+        column = offsets % total
+        row = offsets // total
+
+        edge1 = size0
+        edge2 = edge1 + size1
+        edge3 = edge2 + size2
+        edge4 = edge3 + size3
+
+        value0 = tl.load(
+            grad0 + row * size0 + column,
+            mask=valid & (column < edge1),
+            other=0.0,
+        )
+        value1 = tl.load(
+            grad1 + row * size1 + column - edge1,
+            mask=valid & (column >= edge1) & (column < edge2),
+            other=0.0,
+        )
+        value2 = tl.load(
+            grad2 + row * size2 + column - edge2,
+            mask=valid & (column >= edge2) & (column < edge3),
+            other=0.0,
+        )
+        value3 = tl.load(
+            grad3 + row * size3 + column - edge3,
+            mask=valid & (column >= edge3) & (column < edge4),
+            other=0.0,
+        )
+        value4 = tl.load(
+            grad4 + row * size4 + column - edge4,
+            mask=valid & (column >= edge4),
+            other=0.0,
+        )
+        value = tl.where(
+            column < edge1,
+            value0,
+            tl.where(
+                column < edge2,
+                value1,
+                tl.where(
+                    column < edge3, value2, tl.where(column < edge4, value3, value4)
+                ),
+            ),
+        )
+        tl.store(packed + offsets, value, mask=valid)
+
+
+def _pack_control_gradients_impl(
+    grad0: Tensor,
+    grad1: Tensor,
+    grad2: Tensor,
+    grad3: Tensor,
+    grad4: Tensor,
+) -> Tensor:
+    gradients = (grad0, grad1, grad2, grad3, grad4)
+    prefix = grad0.shape[:-1]
+    if any(gradient.shape[:-1] != prefix for gradient in gradients[1:]):
+        raise ValueError("control gradients must share their leading shape")
+    if any(not gradient.is_contiguous() for gradient in gradients):
+        raise ValueError("control gradients must be contiguous")
+    total = sum(gradient.shape[-1] for gradient in gradients)
+    packed = torch.empty((*prefix, total), device=grad0.device, dtype=grad0.dtype)
+    sizes = tuple(gradient.shape[-1] for gradient in gradients)
+    _pack_control_gradients_kernel[(triton.cdiv(packed.numel(), 256),)](
+        *gradients,
+        packed,
+        packed.numel(),
+        *sizes,
+        total,
+        BLOCK=256,
+        num_warps=4,
+    )
+    return packed
+
+
+if triton is not None:
+
+    @torch.library.custom_op(
+        "delta_feedback::pack_control_gradients",
+        mutates_args=(),
+        device_types="cuda",
+    )
+    def _pack_control_gradients_op(
+        grad0: Tensor,
+        grad1: Tensor,
+        grad2: Tensor,
+        grad3: Tensor,
+        grad4: Tensor,
+    ) -> Tensor:
+        return _pack_control_gradients_impl(grad0, grad1, grad2, grad3, grad4)
+
+    @_pack_control_gradients_op.register_fake
+    def _pack_control_gradients_fake(
+        grad0: Tensor,
+        grad1: Tensor,
+        grad2: Tensor,
+        grad3: Tensor,
+        grad4: Tensor,
+    ) -> Tensor:
+        total = sum(
+            gradient.shape[-1] for gradient in (grad0, grad1, grad2, grad3, grad4)
+        )
+        return torch.empty(
+            (*grad0.shape[:-1], total), device=grad0.device, dtype=grad0.dtype
+        )
+else:  # pragma: no cover - the Mac never enters the CUDA packer.
+    _pack_control_gradients_op = None
+
+
+def pack_control_gradients(gradients: tuple[Tensor, ...]) -> Tensor:
+    """Assemble the five control gradients without split backward's cat."""
+    if len(gradients) != 5:
+        raise ValueError("PKDA has exactly five packed control gradients")
+    if triton is None or not gradients[0].is_cuda:
+        return torch.cat(gradients, dim=-1)
+    return _pack_control_gradients_op(*gradients)
+
+
+if triton is not None:
+
     @torch.library.custom_op(
         "delta_feedback::route_forward", mutates_args=(), device_types="cuda"
     )
@@ -798,4 +937,9 @@ def bespoke_route(
     return routed, weights
 
 
-__all__ = ["MAX_ROUTE_SOURCES", "bespoke_route", "triton"]
+__all__ = [
+    "MAX_ROUTE_SOURCES",
+    "bespoke_route",
+    "pack_control_gradients",
+    "triton",
+]

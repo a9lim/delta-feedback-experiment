@@ -41,7 +41,7 @@ from .model import (
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=10, resumable=frozenset({10}), surface_version=10
+    version=11, resumable=frozenset({11}), surface_version=11
 )
 
 EXACT_FIELDS = (
@@ -257,7 +257,6 @@ def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
 @dataclass(frozen=True)
 class GraphSpec:
     n_passes: int
-    want_z: bool
     checkpoint: bool
 
 
@@ -267,6 +266,7 @@ class CapturedMicro:
     rows: torch.Tensor
     prefix: torch.Tensor | None
     jitter: torch.Tensor | None
+    z_coef: torch.Tensor
     loss_sum: torch.Tensor
     pass1_sum: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
@@ -333,7 +333,6 @@ class CudaGraphTrainer:
     def _reachable_specs(self, schedule: Schedule) -> list[GraphSpec]:
         specs = set()
         for step in range(1, schedule.total + 1):
-            want_z = schedule.phase(step)[0] == "cooldown" and self.args.zloss > 0
             n_passes = (
                 draw_passes(self.args, step, schedule.total)
                 if self.model.cfg.feedback_active
@@ -342,11 +341,10 @@ class CudaGraphTrainer:
             specs.add(
                 GraphSpec(
                     n_passes,
-                    want_z,
                     automatic_checkpoint(self.model, n_passes, self.args, self.device),
                 )
             )
-        return sorted(specs, key=lambda spec: (spec.n_passes, spec.want_z))
+        return sorted(specs, key=lambda spec: spec.n_passes)
 
     def _allocate(self, spec: GraphSpec) -> CapturedMicro:
         rows = torch.zeros(
@@ -378,6 +376,7 @@ class CudaGraphTrainer:
             jitter,
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
         )
 
     def _body(self, state: CapturedMicro) -> None:
@@ -390,8 +389,9 @@ class CudaGraphTrainer:
                 prefix_lens=state.prefix,
                 jitter=state.jitter,
             )
-            z_coef = self.args.zloss if state.spec.want_z else 0.0
-            loss, losses = multipass_loss(self.model, state.rows, outs, z_coef=z_coef)
+            loss, losses = multipass_loss(
+                self.model, state.rows, outs, z_coef=state.z_coef
+            )
         (loss / self.micros).backward()
         state.loss_sum.add_(loss.detach() / self.micros)
         state.pass1_sum.add_(losses[0].detach() / self.micros)
@@ -449,8 +449,9 @@ class CudaGraphTrainer:
         ):
             group["lr"] = rate
 
-    def begin(self, spec: GraphSpec) -> CapturedMicro:
+    def begin(self, spec: GraphSpec, z_coef: float = 0.0) -> CapturedMicro:
         state = self.states[spec]
+        state.z_coef.fill_(z_coef)
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
         return state
@@ -921,8 +922,8 @@ def train(argv: list[str] | None = None) -> dict:
 
             micros = args.batch_rows // args.micro_rows
             if graph_runner is not None:
-                spec = GraphSpec(n_passes, z_coef > 0, checkpointing)
-                graph_state = graph_runner.begin(spec)
+                spec = GraphSpec(n_passes, checkpointing)
+                graph_state = graph_runner.begin(spec, z_coef)
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
                     rows = data_train.batch(first_row, args.micro_rows)
