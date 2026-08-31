@@ -29,7 +29,15 @@ from transformer_experiments import checkpoints, runs, telemetry
 from transformer_experiments.schedule import Schedule
 
 from .data import TokenData, read_meta
-from .model import ARMS, DFModel, arm_config, iterate_fused, multipass, multipass_loss
+from .model import (
+    ARMS,
+    DFModel,
+    arm_config,
+    flash_attn_func,
+    iterate_fused,
+    multipass,
+    multipass_loss,
+)
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
@@ -583,6 +591,18 @@ class CudaEvalRunner:
         return result
 
 
+def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
+    """Production CUDA telemetry without assuming a packed mixer layout."""
+    has_global_attention = any(not block.is_pkda for block in model.blocks)
+    return {
+        "flash": int(flash_attn_func is not None and has_global_attention),
+        "cce": 1,
+        "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
+        "eval_graphs": len(eval_graph_runner.states),
+        "checkpoint_modes": sum(spec.checkpoint for spec in graph_runner.states),
+    }
+
+
 @torch.no_grad()
 def evaluate(
     model: DFModel,
@@ -892,11 +912,7 @@ def train(argv: list[str] | None = None) -> dict:
         torch.cuda.reset_peak_memory_stats()
         telemetry.log(
             "execution",
-            flash=int(model.blocks[0].attn.qkv_proj.weight.is_cuda),
-            cce=1,
-            cuda_graphs=len(graph_runner.states) + len(eval_graph_runner.states),
-            eval_graphs=len(eval_graph_runner.states),
-            checkpoint_modes=sum(spec.checkpoint for spec in graph_runner.states),
+            **execution_fields(model, graph_runner, eval_graph_runner),
         )
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0

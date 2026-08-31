@@ -224,6 +224,48 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
         assert all("seed" in record for record in records)
 
 
+def test_execution_telemetry_supports_a_pkda_first_layer():
+    from types import SimpleNamespace
+
+    from delta_feedback_experiment.model import (
+        DFModel,
+        arm_config,
+        flash_attn_func,
+    )
+    from delta_feedback_experiment.train import GraphSpec, execution_fields
+
+    model = DFModel(
+        arm_config(
+            "base",
+            vocab_size=97,
+            dim=32,
+            layers=4,
+            heads=2,
+            kv_heads=2,
+            head_dim=16,
+            intermediate=64,
+            pkda_heads=2,
+            pkda_head_dim=16,
+            max_seq_len=17,
+        )
+    )
+    trainer = SimpleNamespace(
+        states={
+            GraphSpec(1, False, False): None,
+            GraphSpec(1, True, False): None,
+        }
+    )
+    evaluator = SimpleNamespace(states={4: None})
+    fields = execution_fields(model, trainer, evaluator)
+    assert fields == {
+        "flash": int(flash_attn_func is not None),
+        "cce": 1,
+        "cuda_graphs": 3,
+        "eval_graphs": 1,
+        "checkpoint_modes": 0,
+    }
+
+
 # -- schedule and derived randomness -------------------------------------------
 
 

@@ -40,6 +40,7 @@ def cuda_gate() -> None:
         build_parser,
         build_schedule,
         evaluate,
+        execution_fields,
         route_summary,
     )
 
@@ -330,6 +331,9 @@ def cuda_gate() -> None:
     started = time.monotonic()
     runner = CudaGraphTrainer(model, optimizers, args, schedule)
     eval_runner = CudaEvalRunner(model, args, runner.pool)
+    backend = execution_fields(model, runner, eval_runner)
+    if backend["flash"] != 1 or backend["cuda_graphs"] != 7:
+        raise AssertionError(f"invalid production execution telemetry: {backend}")
     torch.cuda.synchronize()
     prepared = time.monotonic() - started
     capture_peak = torch.cuda.max_memory_allocated() / 2**30
