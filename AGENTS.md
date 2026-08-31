@@ -100,10 +100,10 @@ contract changes.
 - The screen and same-geometry continuation surfaces are implemented. The
   2B→8B→32B WSD ladder still requires an explicit tested branch-from-heat-end
   continuation path. The 24-layer flagship is the exact
-  `[KDA, KDA, KDA, gated global GQA] x 6` hard-DF design in the scale plan; it
-  also requires KDA kernels and cache semantics, gated GQA, block-delta
-  routing, and distributed execution. Do not describe either path as runnable
-  until those contracts land in code and tests.
+  `[PKDA, PKDA, PKDA, gated global GQA] x 6` hard-DF design in the scale plan;
+  it also requires PKDA kernels and recurrent/preconditioner cache semantics,
+  gated GQA, block-delta routing, and distributed execution. Do not describe
+  either path as runnable until those contracts land in code and tests.
 - Flagship promotion requires the registered ladder trend, the matched
   factorial evidence, a clean contraction gate, the exact implementation gate,
   and explicit spend confirmation from a9.

@@ -26,8 +26,25 @@ references:
       Defines Kimi Delta Attention, its chunkwise and recurrent forms,
       channel-wise decay, causal short convolutions, sigmoid output gate, NoPE
       global-attention layers, and the empirically selected 3:1 KDA-to-global
-      MLA cadence. The flagship keeps those KDA and cadence choices but uses
-      dense global GQA instead of MLA.
+      MLA cadence. The flagship keeps the KDA substrate and cadence inside
+      PKDA but uses dense global GQA instead of MLA.
+
+  - arxiv: "2604.21100"
+    slug: tumma2026-preconditioned-deltanet
+    note: >
+      Defines Preconditioned KDA: an apply-to-key diagonal approximation to the
+      inverse key Gram, with independent preconditioner decay and gain, a
+      stable log-space squash onto [1/x, x], chunkwise and recurrent forms, and
+      language-model evidence at 340M and 1B. The flagship uses the registered
+      x=1.5 PKDA parameterization rather than unpreconditioned KDA.
+
+  - url: https://github.com/fla-org/flash-linear-attention/blob/main/fla/layers/precond_kda.py
+    slug: fla2026-preconditioned-kda
+    note: >
+      The upstream PrecondKDA reference layer defines the independent ATK gate
+      projections and initialization, bounded preconditioner, auxiliary A-state
+      cache, chunkwise training kernel, and fused-recurrent decoding kernel that
+      the flagship implementation must reproduce and qualify.
 
   - url: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json
     slug: qwen2025-qwen3-next-config
@@ -35,7 +52,7 @@ references:
       The official released Qwen3-Next configuration sets the full-attention
       interval to four and uses fewer KV than query heads in those global
       layers. This is interval-four and GQA precedent only; Qwen3-Next uses
-      Gated DeltaNet where the flagship uses KDA.
+      Gated DeltaNet where the flagship uses PKDA.
 
   - url: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py
     slug: qwen2025-qwen3-next-attention

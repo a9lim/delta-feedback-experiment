@@ -357,14 +357,16 @@ Every arm uses the same recipe.
 ### Parameter groups
 
 - **NorMuon:** every trainable two-dimensional weight except the tied
-  embedding/unembedding and sigmoid attention-gate projections. This includes
-  the FBT value and token-gate fusion matrices. Defaults: learning rate `1e-2`,
-  momentum `0.95`, row second-moment beta `0.95`, five Newton-Schulz steps,
-  epsilon `1e-8`, decoupled weight decay `0.01`.
-- **Adam:** sigmoid attention-gate projections, tied embeddings, RMSNorm
-  weights, routing queries, null vectors, and all other non-matrix parameters.
-  Defaults: learning rate `5e-4`, betas `(0.9, 0.95)`, epsilon `1e-8`, no
-  weight decay.
+  embedding/unembedding and scale-sensitive gate-producing projections. This
+  includes the FBT value and token-gate fusion matrices. Defaults: learning
+  rate `1e-2`, momentum `0.95`, row second-moment beta `0.95`, five
+  Newton-Schulz steps, epsilon `1e-8`, decoupled weight decay `0.01`.
+- **Adam:** scale-sensitive gate-producing projections, tied embeddings,
+  RMSNorm weights, routing queries, null vectors, and all other non-matrix
+  parameters. At screen scale the exception is the sigmoid GGQA output gate.
+  In the flagship it also covers PKDA's main decay, delta-update, output-gate,
+  preconditioner-decay, and preconditioner-gain projections. Defaults: learning
+  rate `5e-4`, betas `(0.9, 0.95)`, epsilon `1e-8`, no weight decay.
 
 NorMuon orthogonalizes the momentum, normalizes rows by their second moments,
 and globally rescales the update to Frobenius norm `0.2 * sqrt(m*n)` before
@@ -574,27 +576,52 @@ context 8,192, and six identical four-layer cells. Its token-mixing schedule is
 exactly:
 
 ```text
-[KDA, KDA, KDA, gated global GQA] x 6
+[PKDA, PKDA, PKDA, gated global GQA] x 6
 ```
 
-There is no sliding-window attention. Each KDA layer uses 12 heads with
-`d_k = d_v = 128`, so its concatenated head width is 1,536. It follows the
-released Kimi Linear parameterization: bias-free Q/K/V projections; separate
-causal depthwise convolutions of width 4 followed by SiLU; L2-normalized Q and
-K; a rank-128 channel-wise decay projection; one sigmoid delta-update gate per
-head; the KDA recurrent update; head-wise RMSNorm; a rank-128 sigmoid output
-gate; and a bias-free output projection. Training uses the chunkwise-parallel
-form and cached decoding uses the mathematically equivalent recurrent form.
-For each KDA head, with zero initial state, the semantic recurrence is:
+There is no sliding-window attention. Each PKDA layer uses 12 heads with
+`d_k = d_v = 128`, so its concatenated head width is 1,536. Its base recurrence
+keeps the released Kimi Linear parameterization: bias-free Q/K/V projections;
+separate causal depthwise convolutions of width 4 followed by SiLU;
+L2-normalized Q and K; a rank-128 channel-wise decay projection; one sigmoid
+delta-update gate per head; head-wise RMSNorm; a rank-128 sigmoid output gate;
+and a bias-free output projection.
+
+PKDA applies the stable diagonal apply-to-key preconditioner from
+Preconditioned DeltaNet. Each head maintains an auxiliary nonnegative diagonal
+state `A_t` with its own scalar decay `alpha_P_t` and gain `beta_P_t`. Their
+input projections and learned gate parameters are independent of the main KDA
+decay and update gate; they are not tied. The per-head positive center is
+parameterized as `mu = exp(log_mu)` with `log_mu` initialized to `-0.2`.
+The preconditioner decay rate is initialized with `exp(A_P)` sampled uniformly
+on `[1, 16]`; its softplus time constant is initialized log-uniformly on
+`[0.001, 0.1]`. The squash uses `x = 1.5`, `eps = 1e-6`, disables the optional
+negative-eigenvalue and safe-gate modes, and bounds every coordinate of the
+write-key preconditioner to `[2/3, 3/2]`. For each head, with zero initial
+matrix and preconditioner states, the semantic recurrence in the project's
+key-first state convention is:
 
 ```text
 log_alpha_t = -exp(A) * softplus(W_f_up W_f_down x_t + b_f)
 alpha_t     = exp(log_alpha_t)
 beta_t      = sigmoid(W_beta x_t)
+log_alpha_P_t = -exp(A_P) * softplus(W_alpha_P x_t + b_alpha_P)
+alpha_P_t     = exp(log_alpha_P_t)
+beta_P_t      = sigmoid(W_beta_P x_t)
+A_t           = alpha_P_t A_(t-1) + beta_P_t (k_t ⊙ k_t)
+mu             = exp(log_mu)
+r_t            = log(A_t + eps) - mu
+s_t            = r_t / (1 + abs(r_t))
+B_t            = exp(-log(1.5) * s_t)
+k_write_t      = B_t ⊙ k_t
 S_tilde_t   = Diag(alpha_t) S_(t-1)
-S_t         = (I - beta_t k_t k_t^T) S_tilde_t + beta_t k_t v_t^T
+S_t         = (I - beta_t k_write_t k_t^T) S_tilde_t
+              + beta_t k_write_t v_t^T
 o_t         = S_t^T q_t
 ```
+
+Training uses the chunkwise-parallel PKDA form. Cached decoding uses the
+mathematically equivalent recurrent form and advances both `S_t` and `A_t`.
 
 The fourth layer of each cell uses dense causal, sigmoid-output-gated GQA: 16
 query heads, 8 KV heads, head width 96, per-head Q/K RMSNorm, and a full 8,192-
@@ -610,23 +637,28 @@ o_t      = W_o(sigmoid(g_t) * z_t)
 
 The gate acts elementwise on the concatenated attention output before the
 output projection and before the branch's `1/sqrt(2L)` scaling. It does not
-modify attention logits or softmax weights, and it is distinct from KDA's
-delta-update and output gates and from the FBT entry gate. Because the gated
-`o_t` is still the single attention branch delta, the seed-plus-deltas residual
-identity is unchanged.
+modify attention logits or softmax weights, and it is distinct from PKDA's
+main delta-update, preconditioner, and output gates and from the FBT entry gate.
+Because the gated `o_t` is still the single attention branch delta, the
+seed-plus-deltas residual identity is unchanged.
 
-The flagship has no explicit positional embedding in either mixer: KDA's
+The flagship has no explicit positional embedding in either mixer: PKDA's
 causal convolution and data-dependent recurrent transition carry order and
 recency, and the global GQA layers use NoPE. This is a deliberate synthesis.
-Kimi Linear supplies KDA, NoPE global attention, and the empirically selected
-3:1 cadence, but uses global MLA; Qwen3-Next supplies independent interval-four
-Gated DeltaNet/gated-global-GQA precedent, but does not use KDA.
+Kimi Linear supplies PKDA's KDA substrate, NoPE global attention, and the
+empirically selected 3:1 cadence, but uses unpreconditioned KDA with global MLA.
+Preconditioned DeltaNet supplies the PKDA recurrence and stable preconditioner
+parameterization, but evaluates pure PKDA rather than this hybrid. Qwen3-Next
+supplies independent interval-four Gated DeltaNet/gated-global-GQA precedent,
+but does not use PKDA.
 
-The approximately 1.22B count assumes the geometry and dense KDA projections
+The approximately 1.22B count assumes the geometry and dense PKDA projections
 above, tied embeddings, hard-DF modules, and six width-1,536 GQA gate
-projections. Those gates add 14,155,776 weights to the ungated hybrid. The
-implementation gate must record the exact instantiated count before spend
-approval.
+projections. Relative to KDA, the two width-to-head preconditioner projections
+and three learned per-head vectors add 36,900 parameters per PKDA layer and
+664,200 across the 18 PKDA layers. The GQA gates add 14,155,776 weights to the
+ungated hybrid. The implementation gate must record the exact instantiated
+count before spend approval.
 
 #### Flagship block-delta routing
 
@@ -660,23 +692,24 @@ payload is present. This is the block form described by the Delta Attention
 Residuals and Attention Residuals papers, rather than an ad hoc bank of
 individual attention and MLP outputs.
 
-KDA state is local to one transformer evaluation. A Jacobi or fused-prefill
-pass starts every KDA recurrent and convolution state from zero and advances it
-once across that pass's causal token order. Autoregressive decoding retains one
-KDA state and convolution history per KDA layer alongside the GQA KV caches and
-advances both once per generated token. Recurrent state is never carried from
-one repeated pass over the same token positions into the next; the DF payload
-is the only cross-pass state. After the final prefill pass, the KDA and GQA
-caches advance normally over newly generated positions.
+PKDA state is local to one transformer evaluation. A Jacobi or fused-prefill
+pass starts every PKDA matrix state, diagonal preconditioner state, and
+convolution state from zero and advances them once across that pass's causal
+token order. Autoregressive decoding retains all three states per PKDA layer
+alongside the GQA KV caches and advances them once per generated token. No PKDA
+state is carried from one repeated pass over the same token positions into the
+next; the DF payload is the only cross-pass state. After the final prefill pass,
+the PKDA and GQA caches advance normally over newly generated positions.
 
 #### Flagship implementation gate
 
-The exact flagship implementation must pass portable/chunkwise/recurrent KDA
-value and gradient parity, convolution- and recurrent-cache continuation
-parity, gated-GQA value and gradient parity against an explicit
-sigmoid-times-attention reference, block-source and payload-source identity
-tests, exact compute and parameter accounting, optimizer partition tests, the
-width-1,536/H=8 router gate, distributed execution, checkpoint portability,
+The exact flagship implementation must pass portable/chunkwise/recurrent PKDA
+value and gradient parity; bounded-preconditioner and independent-gate tests;
+matrix-state, diagonal-preconditioner-state, and convolution-cache continuation
+parity; gated-GQA value and gradient parity against an explicit
+sigmoid-times-attention reference; block-source and payload-source identity
+tests; exact compute and parameter accounting; optimizer partition tests; the
+width-1,536/H=8 router gate; distributed execution; checkpoint portability;
 and restart behavior on the selected hardware. Until those contracts land in
 code and tests, the flagship is specified but not runnable.
 
@@ -743,12 +776,14 @@ introduced into the registered factorial.
 - `df_soft` non-adoption can reflect optimization path dependence. Compare it
   with hard DF before interpreting null mass as lack of utility.
 - The flagship hybrid is a synthesis rather than a reproduced architecture:
-  Kimi's 3:1 evidence used KDA with MLA at a different scale, while Qwen3-Next
-  used Gated DeltaNet with gated global GQA. Those deployed precedents motivate
-  the mixer and gate choices but do not establish their interaction with DF;
-  realized stability, throughput, and quality remain empirical.
-- KDA's asymptotic cache advantage does not guarantee a realized speedup at an
-  8,192-token context. Promotion uses measured end-to-end training, prefill,
+  Kimi's 3:1 evidence used unpreconditioned KDA with MLA, Preconditioned
+  DeltaNet evaluated pure PKDA at different context and training budgets, and
+  Qwen3-Next used Gated DeltaNet with gated global GQA. Those precedents
+  motivate the mixer and gate choices but do not establish their interaction
+  with DF; realized stability, throughput, and quality remain empirical.
+- PKDA's asymptotic cache advantage does not guarantee a realized speedup at
+  an 8,192-token context, and its diagonal preconditioner adds work to every
+  recurrent layer. Promotion uses measured end-to-end training, prefill,
   decode, memory, and pass-token costs on the selected hardware.
 - Parameter counts differ because architecture gates, feedback fusion, and
   routers add parameters. Always report exact arm parameter counts alongside
