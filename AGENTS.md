@@ -34,7 +34,7 @@ contract changes.
 
 - The model family is one plain-PyTorch `DFModel` configured by the five exact
   arm names in `ARMS`; do not add parallel model implementations or aliases.
-- Both screen trials' `base`, `mhdb`, `fbt`, and `df` use exact
+- Every hybrid arm in either screen uses an exact
   `[PKDA, PKDA, PKDA, gated global GQA] x 3` trunks: 8 PKDA heads at
   `d_k = d_v = 128`, causal convolution width 4, NoPE global attention, and
   8/4-by-96 GQA. `vanilla` remains the exact twelve-layer RoPE GQA trunk. Every
@@ -82,8 +82,10 @@ contract changes.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.
-- The primary factorial is `{base, mhdb, fbt, df}`. Report `vanilla` versus
-  `base` separately as the whole-trunk contrast.
+- The Jobe primary factorial is `{base, mhdb, fbt, df}`. Prime runs only the
+  bare-minimum `{base,df}` contrast. Report `vanilla` versus `base` separately
+  as the Jobe whole-trunk contrast, and never attribute a Prime `base`/`df`
+  difference to either package individually.
 - Pass-1 validation is the common Standard-mode metric. Feedback arms also
   report the fully fused second-pass metric. Routing observables and
   contraction traces are diagnostics, not architecture wins by themselves.
@@ -116,8 +118,8 @@ contract changes.
   and runs that job's probe from the current checkout.
 - The Jobe 25x screen and a fresh single-process 400x schedule are implemented;
   there is no continuation ladder or 100x run. After an admissible two-seed,
-  five-arm Jobe screen, Prime receives a fresh one-seed `{base,mhdb,fbt,df}`
-  factorial at 400x: 153,819 steps and 50,403,409,920 predicted tokens per arm,
+  five-arm Jobe screen, Prime receives a fresh one-seed `{base,df}` comparison
+  at 400x: 153,819 steps and 50,403,409,920 predicted tokens per arm,
   initialized from global row zero rather than a Jobe checkpoint. The target is
   one Prime 8xH100-80GB node at the shared 327,680-token global batch. Exact DDP
   row sharding, synchronized norm-1 clipping, durable artifacts, parity,
@@ -131,6 +133,6 @@ contract changes.
   exist, but the flagship still requires exact-geometry distributed execution,
   memory/throughput qualification, checkpoint portability, and restart tests.
   Do not describe it as runnable until those contracts land.
-- Flagship promotion requires coherent Jobe and fresh Prime factorial evidence,
-  a clean contraction gate, the exact implementation gate, and explicit spend
-  confirmation from a9.
+- Flagship promotion requires coherent Jobe factorial and fresh Prime
+  `base`/`df` evidence, a clean contraction gate, the exact implementation gate,
+  and explicit spend confirmation from a9.

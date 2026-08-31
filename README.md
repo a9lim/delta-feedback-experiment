@@ -91,14 +91,16 @@ microbatch accumulation, the global FP32 gradient norm is clipped to 1.0 before
 the shared NorMuonH/Adam step.
 
 There is no continuation ladder or 100x run. If the Jobe screen passes its
-entry gate, `{base, mhdb, fbt, df}` receives a fresh one-seed 400x pretraining
-trial on Prime: every arm starts from initialization and global row zero, runs
+entry gate, `{base, df}` receives the bare-minimum fresh one-seed 400x
+comparison on Prime: both arms start from initialization and global row zero, run
 153,819 optimizer steps, and predicts exactly 50,403,409,920 tokens. Feedback
 begins after step 76,910, halfway through the fresh schedule. The registered
 Prime target is one 8xH100-80GB node with the same 320-row global batch; its DDP,
 durable-storage, parity, restart, and throughput gates are not yet implemented.
 The canonical tokenizer target is 51B stored training tokens so this trial's
-49,222,080 rows are available.
+49,222,080 rows are available. This pair measures the complete DF package
+against its shared hybrid baseline; component attribution remains a Jobe-only
+factorial claim.
 
 New snapshots are immutable checkpoint-contract v13 files under `runs/`.
 Only v13 is resumable. `--max-steps` limits only the current invocation; it

@@ -592,26 +592,25 @@ The Jobe screen runs at 25.00–29.67 predicted tokens per active non-embedding
 parameter across its arms. It is a sensitivity and interaction screen, not a
 decisive test of FBT formation at the high token-per-parameter regime.
 
-### Fresh Prime 400x confirmation screen
+### Fresh Prime 400x minimum comparison
 
 There is no continued-pretraining ladder and no 100x run. After an admissible
-Jobe result, the primary hybrid factorial `{base, mhdb, fbt, df}` is pretrained
-from fresh initialization on rented Prime Intellect GPUs for 153,819 optimizer
-steps and 50,403,409,920 predicted tokens per arm. Every Prime arm uses paired
-seed 1, data seed 0, and the same stream prefix beginning at global row zero;
-none loads a Jobe model or optimizer checkpoint. `vanilla` remains the Jobe-only
-external trunk control because the Prime trial tests the package factorial at
-the high-token regime rather than repeating the already gated trunk decision.
+Jobe result, the bare-minimum `{base, df}` contrast is pretrained from fresh
+initialization on rented Prime Intellect GPUs for 153,819 optimizer steps and
+50,403,409,920 predicted tokens per arm. Both Prime arms use paired seed 1,
+data seed 0, and the same stream prefix beginning at global row zero; neither
+loads a Jobe model or optimizer checkpoint. `vanilla`, `mhdb`, and `fbt` remain
+Jobe-only arms. The Prime pair tests the complete DF package against its shared
+hybrid baseline at the high-token regime; it cannot attribute the difference
+to MHDB, FBT, or their interaction.
 
-The largest arm, `df`, has 126,008,544 active non-embedding parameters and
-realizes 399.999939 predicted tokens per active parameter. Equal data gives the
-other hybrid arms slightly larger ratios:
+`df` has 126,008,544 active non-embedding parameters and realizes 399.999939
+predicted tokens per active parameter. Equal data gives `base` a slightly
+larger ratio:
 
 | Arm | Optimizer steps | Exact predicted tokens | Realized active ratio |
 |---|---:|---:|---:|
 | `base` | 153,819 | 50,403,409,920 | 403.973849 |
-| `mhdb` | 153,819 | 50,403,409,920 | 403.794892 |
-| `fbt` | 153,819 | 50,403,409,920 | 400.182867 |
 | `df` | 153,819 | 50,403,409,920 | 399.999939 |
 
 This is one fresh WSD schedule rather than a branch or concatenation:
@@ -625,9 +624,10 @@ This is one fresh WSD schedule rather than a branch or concatenation:
 
 Feedback therefore begins halfway through this run and preserves the
 flagship's expected whole-run 75%/22%/3% pass mixture and 1.28 pass-token
-multiplier. The 51B-token canonical training stream covers the 49,222,080
-rows required by this schedule; 1,025 stored tokens per row correspond to
-1,024 predicted tokens.
+multiplier. The pair consumes 100.807B predicted tokens and approximately
+114.920B expected pass-tokens in total. The 51B-token canonical training stream
+covers the 49,222,080 rows required by this schedule; 1,025 stored tokens per
+row correspond to 1,024 predicted tokens.
 
 The registered Prime execution target is one eight-H100-80GB node under
 replicated DDP: 8 ranks x 4 rows per microbatch x 10 accumulation microsteps =
@@ -933,23 +933,24 @@ screen to justify replacing the old trunk. Within the hybrid factorial, MHDB
 must produce a resolvable paired effect for the screen to serve as a
 sensitivity gate. A stable FBT null at 25x does not by itself exclude the Prime
 trial because the Jobe screen is far below the registered token-per-parameter
-regime. The Prime spend proceeds only if DF's paired effect is credible enough
-that a fresh high-token factorial can resolve the interaction between the two
-packages and every feedback arm remains stable under self-composition.
+regime. The Prime spend proceeds only if the complete DF package is credible
+enough to justify a fresh high-token comparison and every Jobe feedback arm
+remains stable under self-composition.
 
-The Prime comparison is admissible only when all four arms start from fresh
+The Prime comparison is admissible only when `base` and `df` start from fresh
 paired initialization, consume the same row-zero stream prefix under the
 153,819-step schedule, and complete on the same qualified distributed recipe.
 Jobe checkpoints are cross-hardware diagnostics only and cannot initialize a
-Prime arm.
+Prime arm. Prime can establish only the full-package `df - base` contrast;
+Jobe's factorial remains the sole component-attribution surface.
 
 ### Flagship promotion
 
 Promote only if:
 
-1. the fresh Prime 400x factorial shows DF's advantage over both parent arms at
-   matched token-equivalent compute, with an interaction direction coherent
-   with the two-seed Jobe screen rather than a single-arm improvement;
+1. the fresh Prime 400x comparison shows DF's advantage over `base` at matched
+   token-equivalent compute, while the two-seed Jobe factorial supplies a
+   coherent package-attribution result;
 2. the Prime feedback map remains stable for at least 30 fused
    self-compositions;
 3. routing and same-checkpoint ablations do not reveal a trivial unused or
@@ -975,8 +976,9 @@ introduced into the registered factorial.
   measures that trunk directly, and `mhdb` measures routing conditional on it;
   neither is a numerical reproduction target for its source paper.
 - A low-token FBT null is compatible with missing formation conditions. A null
-  in the fresh 400x Prime factorial is stronger evidence against the current
-  feedback recipe at this model scale.
+  `df - base` result in the fresh 400x Prime pair is stronger evidence against
+  the complete package at this model scale, but cannot identify which package
+  or interaction caused it.
 - The flagship hybrid is a synthesis rather than a reproduced architecture:
   Kimi's 3:1 evidence used unpreconditioned KDA with MLA, Preconditioned
   DeltaNet evaluated pure PKDA at different context and training budgets, and
