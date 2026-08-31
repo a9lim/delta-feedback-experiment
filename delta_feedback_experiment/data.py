@@ -62,7 +62,7 @@ def tokenize(
     assert eos is not None
     if revision is None:
         # Pin the dataset commit so the stream is reproducible: the full
-        # 51B tokenization and any smoke-sized one must be byte-prefixes
+        # 54B tokenization and any smoke-sized one must be byte-prefixes
         # of the same stream.
         from huggingface_hub import HfApi
 

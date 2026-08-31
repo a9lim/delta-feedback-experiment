@@ -35,7 +35,7 @@ separate whole-trunk control.
 No run under the current screen contract is complete, no screen job is active,
 and there are no accepted experiment findings.
 
-The 223–243M screen model, deterministic single-process trainer, portable
+The 223–250M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
 runs remain serial because the full DF graph pool reserves 22.76 GiB on its
 24 GiB RTX 4090.
@@ -92,14 +92,14 @@ The queue records exact arguments, not Git state. A source change never stops
 an active child; the worker refreshes before the next queued job and runs its
 probe from the current checkout.
 
-The default Jobe run uses 9,614 steps, 320 rows per step, and 1,024 predictions
-per row: 3,150,315,520 predicted tokens. Feedback starts halfway through the
+The default Jobe run uses 10,205 steps, 320 rows per step, and 1,024 predictions
+per row: 3,343,974,400 predicted tokens. Feedback starts halfway through the
 schedule and draws one, two, or three passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 1.0 before the shared
 NorMuonH/Adam update.
 
-Snapshots use checkpoint contract v13, and only v13 is resumable.
+Snapshots use checkpoint contract v14, and only v14 is resumable.
 `--max-steps` limits the current invocation without changing the registered
 schedule.
 

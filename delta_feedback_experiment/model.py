@@ -93,7 +93,7 @@ class ModelConfig:
     kv_heads: int = 4
     head_dim: int = 96
     intermediate: int = 3072
-    pkda_heads: int = 8
+    pkda_heads: int = 10
     pkda_head_dim: int = 128
     pkda_conv_size: int = 4
     max_seq_len: int = 1024

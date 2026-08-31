@@ -81,6 +81,11 @@ def test_arm_flags():
     assert df.routing_active
     assert df.gated_attention
 
+    screen = arm_config("base")
+    assert screen.pkda_heads == 10
+    assert screen.pkda_heads * screen.pkda_head_dim * 3 == screen.dim * 5
+    assert screen.routing_heads == 4
+
 
 def test_parents_are_deletions():
     """Every parent's parameter set is a strict subset of DF's."""
@@ -101,10 +106,10 @@ def test_parents_are_deletions():
 def test_screen_param_count():
     expected = {
         "vanilla": (222_876_672, 106_189_824),
-        "base": (241_455_840, 124_768_992),
-        "mhdb": (241_511_136, 124_824_288),
-        "fbt": (242_637_792, 125_950_944),
-        "df": (242_695_392, 126_008_544),
+        "base": (249_197_352, 132_510_504),
+        "mhdb": (249_252_648, 132_565_800),
+        "fbt": (250_379_304, 133_692_456),
+        "df": (250_436_904, 133_750_056),
     }
     with torch.device("meta"):
         for arm, (total, active_non_embedding) in expected.items():

@@ -22,10 +22,10 @@ two factorial on one byte-identical hybrid trunk:
 
 | Arm | Hybrid trunk | MHDB | FBT | Parameters | Active non-embedding |
 |---|---:|---:|---:|---:|---:|
-| `base` | yes | no | no | 241,455,840 | 124,768,992 |
-| `mhdb` | yes | yes | no | 241,511,136 | 124,824,288 |
-| `fbt` | yes | no | yes | 242,637,792 | 125,950,944 |
-| `df` | yes | yes | yes | 242,695,392 | 126,008,544 |
+| `base` | yes | no | no | 249,197,352 | 132,510,504 |
+| `mhdb` | yes | yes | no | 249,252,648 | 132,565,800 |
+| `fbt` | yes | no | yes | 250,379,304 | 133,692,456 |
+| `df` | yes | yes | yes | 250,436,904 | 133,750,056 |
 
 `base` deletes both packages. `mhdb` routes within a plain-embedding column
 but emits no recurrent payload. `fbt` uses the asymmetric entry fusion and a
@@ -61,16 +61,20 @@ factorial arms are a scale-adapted projection of the flagship architecture:
 | Context / predictions per row | 1,024 |
 | Vanilla RoPE theta | 1,000,000 |
 | GQA query / KV heads / head width | 8 / 4 / 96 |
-| PKDA heads / key-value width | 8 / 128 |
-| PKDA Q/K/V projection width | 1,024 |
+| PKDA Q/K/V heads / head width | 10 / 128 |
+| PKDA Q/K/V projection width | 1,280 |
 | PKDA convolution width | 4 |
 | Routing groups | 4, exactly the KV-head count |
 | RMSNorm epsilon | `1e-6` |
 
-The screen's 8-by-128 PKDA geometry reproduces the 340M Preconditioned
-DeltaNet recurrence geometry at a different outer width. Hybrid global layers
-are dense causal NoPE GGQA. `vanilla` instead retains twelve bias-free RoPE
-GQA layers with packed QKV, per-head Q/K RMSNorm, and no attention-output gate.
+The screen's 10-by-128 PKDA geometry preserves the flagship's `5/3`
+recurrent-projection-to-residual-width ratio at exactly half its residual
+width. This is the Kimi scaling prior; Preconditioned DeltaNet supplies the
+preconditioner rather than an independently validated head-count optimum.
+Hybrid global layers are dense causal NoPE GGQA. `vanilla` instead retains
+twelve bias-free RoPE GQA layers with packed QKV, per-head Q/K RMSNorm, and no
+attention-output gate. MHDB remains four-headed because its groups follow the
+global KV-head count, not the PKDA head count.
 
 The complete hybrid trunk initializes byte-identically across `base`, `mhdb`,
 `fbt`, and `df`. MHDB parameters are paired across `mhdb` and `df`; FBT
@@ -104,8 +108,8 @@ prefix lengths and jitter are additionally keyed by the microbatch's first
 global row. They do not depend on ambient RNG state. Resume returns to the same
 row and the same keyed feedback draws.
 
-The canonical training target contains 51B stored training tokens, enough for
-the fresh Prime schedule's 49,222,080 rows.
+The canonical stream target is 54B stored tokens including the held-out
+prefix, enough for the fresh Prime schedule's 52,246,080 training rows.
 
 ## Training protocol
 
@@ -157,16 +161,16 @@ penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 ### WSD schedule
 
 Both optimizer learning rates use one warmup-stable-cooldown multiplier. The
-default 9,614-step Jobe schedule is:
+default 10,205-step Jobe schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–4,807 | one pass |
-| Stable heat | 4,808–7,210 | feedback arms draw 1, 2, or 3 passes |
-| Cooldown | 7,211–9,614 | feedback arms draw 1, 2, or 3 passes |
+| Stable heat | 201–5,102 | one pass |
+| Stable heat | 5,103–7,654 | feedback arms draw 1, 2, or 3 passes |
+| Cooldown | 7,655–10,205 | feedback arms draw 1, 2, or 3 passes |
 
-After step 4,807, the draw is 50% / 44% / 6% for one / two / three passes.
+After step 5,102, the draw is 50% / 44% / 6% for one / two / three passes.
 Across the full run this targets 75% / 22% / 3% and an expected feedback-arm
 compute multiplier of 1.28 pass-tokens per predicted token. Exact realized
 pass-tokens are recorded.
@@ -217,7 +221,7 @@ on Jobe; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v13, and only v13 is resumable. A
+New snapshots use checkpoint contract v14, and only v14 is resumable. A
 snapshot contains the model, both optimizer states, fixed NorMuonH radii,
 state-defining arguments, cumulative step, and Python/Torch/CUDA RNG state. A
 resume inherits every state-defining field and rejects explicit conflicts.
@@ -304,10 +308,10 @@ and the separately implemented flagship.
 
 ### Stage 1: Jobe 25x discovery
 
-Each Jobe arm trains for 9,614 steps, 3,150,315,520 predicted tokens, and a
-320-row global batch on the RTX 4090. The arms receive 25.00–29.67 predicted
-tokens per active non-embedding parameter. Two paired initialization seeds are
-registered.
+Each Jobe arm trains for 10,205 steps, 3,343,974,400 predicted tokens, and a
+320-row global batch on the RTX 4090. The four factorial cells receive
+25.00–25.24 predicted tokens per active non-embedding parameter; the smaller
+pure-GQA control receives 31.49. Two paired initialization seeds are registered.
 
 The stage asks:
 
@@ -324,24 +328,24 @@ token-per-parameter ratio.
 
 After an admissible Jobe result, only `{base, df}` is pretrained from fresh
 paired initialization on one 8xH100-80GB Prime node. Both arms use seed 1,
-data seed 0, global row zero, 153,819 steps, and 50,403,409,920 predicted tokens.
+data seed 0, global row zero, 163,269 steps, and 53,499,985,920 predicted tokens.
 Neither loads a Jobe model or optimizer checkpoint.
 
 | Arm | Exact predicted tokens | Active-token ratio |
 |---|---:|---:|
-| `base` | 50,403,409,920 | 403.973849 |
-| `df` | 50,403,409,920 | 399.999939 |
+| `base` | 53,499,985,920 | 403.741472 |
+| `df` | 53,499,985,920 | 399.999727 |
 
 The fresh WSD schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–76,910 | one pass |
-| Stable heat | 76,911–115,364 | feedback draw active |
-| Cooldown | 115,365–153,819 | feedback draw active |
+| Stable heat | 201–81,634 | one pass |
+| Stable heat | 81,635–122,452 | feedback draw active |
+| Cooldown | 122,453–163,269 | feedback draw active |
 
-The pair consumes 100.807B predicted tokens and approximately 114.920B
+The pair consumes 107.000B predicted tokens and approximately 121.980B
 expected pass-tokens. It tests only the complete DF package against its shared
 hybrid baseline; component attribution remains a Jobe factorial claim.
 

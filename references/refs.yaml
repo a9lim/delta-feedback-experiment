@@ -47,10 +47,11 @@ references:
       Defines Preconditioned KDA: an apply-to-key diagonal approximation to the
       inverse key Gram, with independent preconditioner decay and gain, a
       stable log-space squash onto [1/x, x], chunkwise and recurrent forms, and
-      language-model evidence at 340M and 1B. The screen reproduces the 340M
-      model's 8-by-128 recurrence geometry at a different outer width, and both
-      scales use the registered x=1.5 PKDA parameterization rather than
-      unpreconditioned KDA.
+      language-model evidence at 340M and 1B. It supplies the preconditioner,
+      not the screen's head-count rule: the screen uses 10-by-128 to preserve
+      the flagship Kimi prior's 5/3 recurrent projection ratio. Both scales use
+      the registered x=1.5 PKDA parameterization rather than unpreconditioned
+      KDA.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/layers/precond_kda.py
     slug: fla2026-preconditioned-kda
