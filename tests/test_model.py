@@ -210,6 +210,17 @@ def test_routing_heads_can_select_different_sources():
     assert routed[..., 16:].mean() > 0.99
 
 
+def test_null_value_follows_activation_dtype_with_fp32_gradient():
+    model = tiny("mhdb").train()
+    router = model.blocks[0].attn_router
+    source = torch.randn(1, 3, TINY["dim"], dtype=torch.bfloat16)
+    routed, _ = router([source], [None], False)
+    assert routed.dtype == torch.bfloat16
+    routed.float().sum().backward()
+    assert router.null.grad is not None
+    assert router.null.grad.dtype == torch.float32
+
+
 def test_single_head_routing_and_unknown_arm_are_rejected():
     with pytest.raises(ValueError, match="unknown arm"):
         arm_config("dar", **TINY)

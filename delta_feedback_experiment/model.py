@@ -437,7 +437,8 @@ class Router(nn.Module):
         want_weights: bool,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Return a routed addition and weights shaped ``[N,B,T,H]``."""
-        sources = [self.null.expand_as(sources[0])] + sources
+        null = self.null.to(sources[0].dtype).expand_as(sources[0])
+        sources = [null] + sources
         masks = [None] + masks
         if len(sources) < 2:
             return None, None
