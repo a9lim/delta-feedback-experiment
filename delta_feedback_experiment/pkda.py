@@ -16,17 +16,23 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
+    from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.precond_kda import (
         chunk_precond_kda,
         fused_recurrent_precond_kda,
     )
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
+    rms_norm_gated = None
     chunk_precond_kda = None
     fused_recurrent_precond_kda = None
 
 
 def pkda_cuda_available() -> bool:
-    return chunk_precond_kda is not None and fused_recurrent_precond_kda is not None
+    return (
+        chunk_precond_kda is not None
+        and fused_recurrent_precond_kda is not None
+        and rms_norm_gated is not None
+    )
 
 
 class PreconditionedKDA(nn.Module):
@@ -89,25 +95,32 @@ class PreconditionedKDA(nn.Module):
             bias=False,
         )
 
+        # These five small hidden-width projections share one Adam-side GEMM.
+        # Their non-overlapping row slices retain independent parameters and
+        # exactly the unpacked parameter count.
+        self.control_splits = (
+            head_dim,
+            num_heads,
+            num_heads,
+            num_heads,
+            head_dim,
+        )
+        self.control_proj = nn.Linear(hidden_size, sum(self.control_splits), bias=False)
+
         # KDA's channel-wise decay is rank-head_dim, as in the released layer.
-        self.decay_down = nn.Linear(hidden_size, head_dim, bias=False)
         self.decay_up = nn.Linear(head_dim, self.projection_size, bias=False)
-        self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
         self.A_log = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
         self.dt_bias = nn.Parameter(
             torch.zeros(self.projection_size, dtype=torch.float32)
         )
 
         # Independent scalar decay and gain for the diagonal preconditioner.
-        self.precond_decay_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.precond_beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
         self.A_log_precond = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
         self.dt_bias_precond = nn.Parameter(torch.empty(num_heads, dtype=torch.float32))
         self.log_precond_center = nn.Parameter(
             torch.full((num_heads,), -0.2, dtype=torch.float32)
         )
 
-        self.output_gate_down = nn.Linear(hidden_size, head_dim, bias=False)
         self.output_gate_up = nn.Linear(head_dim, self.projection_size, bias=True)
         self.output_norm = nn.Parameter(torch.ones(head_dim))
         self.o_proj = nn.Linear(self.projection_size, hidden_size, bias=False)
@@ -171,16 +184,29 @@ class PreconditionedKDA(nn.Module):
         final = (q_state, k_state, v_state) if output_final_state else None
         return q.reshape(shape), k.reshape(shape), v.reshape(shape), final
 
-    def _gates(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-        raw_decay = self.decay_up(self.decay_down(x)).reshape(
+    def _controls(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        (
+            decay_hidden,
+            beta_logits,
+            precond_decay_logits,
+            precond_beta_logits,
+            output_gate_hidden,
+        ) = self.control_proj(x).split(self.control_splits, dim=-1)
+        raw_decay = self.decay_up(decay_hidden).reshape(
             *x.shape[:2], self.num_heads, self.head_dim
         )
-        beta = torch.sigmoid(self.beta_proj(x))
+        beta = torch.sigmoid(beta_logits)
         precond_decay = -self.A_log_precond.float().exp() * F.softplus(
-            self.precond_decay_proj(x).float() + self.dt_bias_precond
+            precond_decay_logits.float() + self.dt_bias_precond
         )
-        precond_beta = torch.sigmoid(self.precond_beta_proj(x))
-        return raw_decay, beta, precond_decay, precond_beta
+        precond_beta = torch.sigmoid(precond_beta_logits)
+        return (
+            raw_decay,
+            beta,
+            precond_decay,
+            precond_beta,
+            output_gate_hidden,
+        )
 
     def _portable_recurrence(
         self,
@@ -296,7 +322,13 @@ class PreconditionedKDA(nn.Module):
         tuple[Tensor, Tensor, Tensor] | None,
     ]:
         q, k, v, final_conv = self._project(x, conv_state, output_final_state)
-        raw_decay, beta, precond_decay, precond_beta = self._gates(x)
+        (
+            raw_decay,
+            beta,
+            precond_decay,
+            precond_beta,
+            output_gate_hidden,
+        ) = self._controls(x)
         if x.is_cuda:
             output, state, a_state = self._cuda_recurrence(
                 q,
@@ -323,14 +355,28 @@ class PreconditionedKDA(nn.Module):
                 a_state,
                 output_final_state,
             )
-        normalized = output.float() * torch.rsqrt(
-            output.float().square().mean(-1, keepdim=True) + self.norm_eps
-        )
-        normalized = normalized * self.output_norm.float()
-        gate = torch.sigmoid(self.output_gate_up(self.output_gate_down(x))).reshape(
+        gate_logits = self.output_gate_up(output_gate_hidden).reshape(
             *x.shape[:2], self.num_heads, self.head_dim
         )
-        mixed = normalized.to(output.dtype) * gate
+        if output.is_cuda:
+            if rms_norm_gated is None:
+                raise RuntimeError(
+                    "CUDA PKDA output requires FLA's fused RMSNorm-gate operator"
+                )
+            mixed = rms_norm_gated(
+                output,
+                gate_logits,
+                self.output_norm,
+                None,
+                "sigmoid",
+                eps=self.norm_eps,
+            )
+        else:
+            normalized = output.float() * torch.rsqrt(
+                output.float().square().mean(-1, keepdim=True) + self.norm_eps
+            )
+            normalized = normalized * self.output_norm.float()
+            mixed = normalized.to(output.dtype) * torch.sigmoid(gate_logits)
         return (
             self.o_proj(mixed.flatten(-2)),
             state,

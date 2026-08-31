@@ -132,10 +132,16 @@ def test_pkda_preconditioner_initialization_and_bound():
     assert torch.all((pkda.A_log.exp() >= 1) & (pkda.A_log.exp() <= 16))
     assert torch.all((pkda.A_log_precond.exp() >= 1) & (pkda.A_log_precond.exp() <= 16))
     assert torch.equal(pkda.log_precond_center, torch.full((2,), -0.2))
-    assert (
-        pkda.precond_decay_proj.weight.data_ptr() != pkda.decay_down.weight.data_ptr()
-    )
-    assert pkda.precond_beta_proj.weight.data_ptr() != pkda.beta_proj.weight.data_ptr()
+    assert pkda.control_splits == (16, 2, 2, 2, 16)
+    controls = pkda.control_proj.weight.split(pkda.control_splits)
+    assert [part.shape for part in controls] == [
+        (16, 32),
+        (2, 32),
+        (2, 32),
+        (2, 32),
+        (16, 32),
+    ]
+    assert [part.storage_offset() for part in controls] == [0, 512, 576, 640, 704]
 
     diagonal_state = torch.logspace(-12, 12, 100).reshape(1, 1, -1)
     deviation = torch.log(diagonal_state + pkda.squash_eps) + 0.2

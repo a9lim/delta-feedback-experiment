@@ -663,6 +663,16 @@ _compiled_block = torch.compile(
     mode="default",
 )
 
+_compiled_pkda_block = torch.compile(
+    _block_for_checkpoint,
+    # FLA's opaque recurrence remains its own kernel boundary. Inductor graph
+    # breaks around it and fuses the projections, controls, norm/gate, MLP,
+    # residual updates, and routing on either side.
+    fullgraph=False,
+    dynamic=True,
+    mode="default",
+)
+
 
 # -- the model -----------------------------------------------------------------
 
@@ -834,7 +844,7 @@ class DFModel(nn.Module):
                 if block.global_gate_index is not None
                 else None
             )
-            block_fn = _block_for_checkpoint if block.is_pkda else _compiled_block
+            block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
             if checkpointing:
                 h, _a, _m = torch.utils.checkpoint.checkpoint(
                     block_fn if h.is_cuda else _block_for_checkpoint,

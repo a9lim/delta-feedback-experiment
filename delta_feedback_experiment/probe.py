@@ -32,7 +32,7 @@ def cuda_gate() -> None:
         linear_cross_entropy_apply,
     )
     from .optim import OptimizerPair, build_optimizers
-    from .pkda import PreconditionedKDA, pkda_cuda_available
+    from .pkda import PreconditionedKDA, pkda_cuda_available, rms_norm_gated
     from .train import (
         CONTRACT,
         CudaEvalRunner,
@@ -211,8 +211,54 @@ def cuda_gate() -> None:
         grad_rel = relative_error(actual, expected)
         if grad_rel >= 0.15:
             raise AssertionError(f"PKDA chunk {name} gradient drift: {grad_rel:.4f}")
+    pkda_norm_eps = pkda_cuda.norm_eps
     del pkda_ref, pkda_cuda, pkda_inputs, pkda_cuda_inputs
     del pkda_expected, pkda_actual, pkda_cotangent
+
+    # FLA's fused RMSNorm/sigmoid gate must preserve the portable PKDA
+    # epilogue in both values and gradients at production dtypes.
+    torch.manual_seed(10)
+    norm_output = torch.randn(
+        2, 65, 2, 16, device="cuda", dtype=torch.bfloat16
+    ).requires_grad_()
+    norm_gate = torch.randn_like(norm_output).requires_grad_()
+    norm_weight = torch.randn(16, device="cuda", dtype=torch.float32).requires_grad_()
+    norm_actual = rms_norm_gated(
+        norm_output,
+        norm_gate,
+        norm_weight,
+        None,
+        "sigmoid",
+        eps=pkda_norm_eps,
+    )
+    norm_ref_output = norm_output.detach().clone().requires_grad_()
+    norm_ref_gate = norm_gate.detach().clone().requires_grad_()
+    norm_ref_weight = norm_weight.detach().clone().requires_grad_()
+    norm_reference = norm_ref_output.float() * torch.rsqrt(
+        norm_ref_output.float().square().mean(-1, keepdim=True) + pkda_norm_eps
+    )
+    norm_reference = norm_reference * norm_ref_weight
+    norm_reference = norm_reference.to(norm_ref_output.dtype) * torch.sigmoid(
+        norm_ref_gate
+    )
+    norm_cotangent = torch.randn_like(norm_actual)
+    (norm_actual.float() * norm_cotangent.float()).mean().backward()
+    (norm_reference.float() * norm_cotangent.float()).mean().backward()
+    norm_gate_rel = relative_error(norm_actual, norm_reference)
+    if norm_gate_rel >= 0.01:
+        raise AssertionError(f"PKDA fused norm/gate value drift: {norm_gate_rel:.4f}")
+    for name, actual, expected in (
+        ("output", norm_output.grad, norm_ref_output.grad),
+        ("gate", norm_gate.grad, norm_ref_gate.grad),
+        ("weight", norm_weight.grad, norm_ref_weight.grad),
+    ):
+        grad_rel = relative_error(actual, expected)
+        if grad_rel >= 0.05:
+            raise AssertionError(
+                f"PKDA fused norm/gate {name} gradient drift: {grad_rel:.4f}"
+            )
+    del norm_output, norm_gate, norm_weight, norm_actual
+    del norm_ref_output, norm_ref_gate, norm_ref_weight, norm_reference, norm_cotangent
 
     # CCE-native z-loss must retain the full-logit scalar and gradient semantics
     # while never constructing the classifier-wide activation in the real path.
@@ -444,6 +490,7 @@ def cuda_gate() -> None:
         f"prepare={prepared:.1f}s | allocated={capture_peak:.2f}GiB | "
         f"reserved={capture_reserved:.2f}GiB | "
         f"pkda_rel={pkda_value_rel:.4f} | "
+        f"norm_gate_rel={norm_gate_rel:.4f} | "
         f"decode_rel={vanilla_decode_rel:.4f}/{hybrid_decode_rel:.4f} | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)

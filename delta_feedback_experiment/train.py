@@ -41,7 +41,7 @@ from .model import (
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=9, resumable=frozenset({8, 9}), surface_version=8
+    version=10, resumable=frozenset({10}), surface_version=10
 )
 
 EXACT_FIELDS = (
@@ -799,18 +799,6 @@ def train(argv: list[str] | None = None) -> dict:
         payload = checkpoints.read(path, CONTRACT, map_location="cpu")
         CONTRACT.check_resumable(path, payload["version"])
         saved = payload["args"]
-        if payload["version"] == 8:
-            if saved.get("arm") != "vanilla":
-                raise ValueError(
-                    f"{path}: checkpoint-v8 is resumable only for the preserved "
-                    "vanilla trunk"
-                )
-            # These fields did not exist in v8 and do not participate in the
-            # vanilla graph. Carry the current invocation's inert values into
-            # the first v9 continuation snapshot.
-            saved.setdefault("pkda_heads", args.pkda_heads)
-            saved.setdefault("pkda_head_dim", args.pkda_head_dim)
-            saved.setdefault("pkda_conv_size", args.pkda_conv_size)
         missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
         if missing:
             raise ValueError(f"{path}: checkpoint lacks settings {missing}")

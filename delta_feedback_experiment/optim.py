@@ -205,17 +205,16 @@ def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
     """(NorMuon matrices, Adam rest) per the FBT/NorMuon convention.
 
     Ordinary hidden 2D weights get NorMuon.  The tied
-    embedding/unembedding, global-attention gates, and PKDA's decay, update,
-    preconditioner, and output-gate projections are explicit matrix exceptions;
+    embedding/unembedding, global-attention gates, and PKDA's packed controls,
+    decay expansion, and output-gate expansion are explicit matrix exceptions;
     they join norms, depthwise convolutions, routing parameters, and vectors in
     Adam. PKDA Q/K/V/output projections and FBT fusion retain NorMuon.
     """
     matrices, rest = [], []
     pkda_adam = (
-        ".attn.decay_",
-        ".attn.beta_proj.",
-        ".attn.precond_",
-        ".attn.output_gate_",
+        ".attn.control_proj.",
+        ".attn.decay_up.",
+        ".attn.output_gate_up.",
     )
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:

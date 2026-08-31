@@ -86,10 +86,9 @@ token stream. Pass counts are keyed by data seed and step; prefix lengths and
 jitter additionally use the global row, so paired arms see identical examples
 and feedback draws.
 
-New snapshots are immutable checkpoint-contract v9 files under `runs/`.
-Completed v8 vanilla snapshots remain exactly resumable; other v8 arms are
-rejected. `--max-steps` limits only the current invocation; it never rescales
-the state-defining schedule.
+New snapshots are immutable checkpoint-contract v10 files under `runs/`.
+Only v10 is resumable. `--max-steps` limits only the current invocation; it
+never rescales the state-defining schedule.
 
 ## Analysis
 

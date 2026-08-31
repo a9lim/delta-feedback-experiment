@@ -180,8 +180,8 @@ def test_attention_gates_use_adam_while_fbt_fusion_uses_normuon():
     assert "fuse_gate.weight" in normuon_names
     assert "blocks.0.attn.q_proj.weight" in normuon_names
     assert "blocks.3.attn.qkv_proj.weight" in normuon_names
-    assert "blocks.0.attn.decay_down.weight" in adam_names
-    assert "blocks.0.attn.precond_decay_proj.weight" in adam_names
+    assert "blocks.0.attn.control_proj.weight" in adam_names
+    assert "blocks.0.attn.decay_up.weight" in adam_names
     assert "blocks.0.attn.output_gate_up.weight" in adam_names
     assert "blocks.0.attn.q_conv.weight" in adam_names
     assert "blocks.0.mlp.gate_up_proj.weight" in normuon_names
@@ -386,26 +386,21 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
         run(tmp_path, "conf", ["--arm", "df", "--resume", "--dim", "64"])
 
 
-def rewrite_latest_as_v8(tmp_path, tag):
+def rewrite_latest_version(tmp_path, tag, version):
     snapshots = list((tmp_path / "runs").glob(f"{tag}.pt.*"))
     path = max(snapshots, key=lambda item: int(item.name.rsplit(".", 1)[1]))
     payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["version"] = 8
-    for field in ("pkda_heads", "pkda_head_dim", "pkda_conv_size"):
-        payload["args"].pop(field)
+    payload["version"] = version
     torch.save(payload, path)
 
 
-def test_checkpoint_v8_resume_is_vanilla_only(tmp_path, capsys):
-    run(tmp_path, "old-vanilla", ["--arm", "vanilla", "--max-steps", "5"])
-    rewrite_latest_as_v8(tmp_path, "old-vanilla")
-    resumed = run(tmp_path, "old-vanilla", ["--arm", "vanilla", "--resume"])
-    assert resumed["step"] == 8
-
-    run(tmp_path, "old-df", ["--arm", "df", "--max-steps", "2"])
-    rewrite_latest_as_v8(tmp_path, "old-df")
-    with pytest.raises(ValueError, match="only for the preserved vanilla"):
-        run(tmp_path, "old-df", ["--arm", "df", "--resume"])
+@pytest.mark.parametrize("version", [8, 9])
+def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
+    tag = f"legacy-v{version}"
+    run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
+    rewrite_latest_version(tmp_path, tag, version)
+    with pytest.raises(ValueError, match="resumable versions \\[10\\]"):
+        run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 
 def test_multipass_checkpoint_parity():

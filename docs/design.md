@@ -96,7 +96,10 @@ hybrid cadence. Its base parameterization is bias-free Q/K/V projection;
 separate causal depthwise convolutions followed by SiLU; L2-normalized Q/K;
 rank-128 channel-wise decay; one sigmoid delta-update gate per head; head-wise
 RMSNorm at epsilon `1e-5`; a rank-128 sigmoid output gate; and a bias-free
-output projection.
+output projection. One packed Adam-side hidden-width projection supplies five
+non-overlapping control slices: the main-decay bottleneck, delta-update logits,
+preconditioner-decay logits, preconditioner-gain logits, and output-gate
+bottleneck. Packing changes neither parameter count nor optimizer semantics.
 
 The diagonal apply-to-key preconditioner has independent scalar decay and gain
 projections, `x = 1.5`, `eps = 1e-6`, a learned log-space center initialized to
@@ -361,9 +364,9 @@ Every arm uses the same recipe.
 - **Adam:** scale-sensitive gate-producing projections, tied embeddings,
   RMSNorm weights, routing queries, null vectors, depthwise convolution
   weights, and all other non-matrix parameters. This includes every GGQA gate
-  and PKDA's main decay, delta-update, output-gate, preconditioner-decay, and
-  preconditioner-gain projection. Defaults: learning rate `5e-4`, betas
-  `(0.9, 0.95)`, epsilon `1e-8`, no weight decay.
+  and PKDA's packed control projection, main-decay expansion, and output-gate
+  expansion. Defaults: learning rate `5e-4`, betas `(0.9, 0.95)`, epsilon
+  `1e-8`, no weight decay.
 
 NorMuon orthogonalizes the momentum, normalizes rows by their second moments,
 and globally rescales the update to Frobenius norm `0.2 * sqrt(m*n)` before
@@ -412,14 +415,18 @@ The authoritative Jobe screen path uses:
 - BF16 trunk activations with FP32 weights and optimizer state;
 - the pinned upstream FLA PKDA chunk kernel with chunk size 64, FP32 boundary
   states, and recomputed backward intermediates;
+- FLA's fused head-wise RMSNorm-plus-sigmoid-output-gate operator after every
+  PKDA recurrence;
 - FlashAttention for full-sequence, prefill, GQA, and cached decoding;
 - a fixed-capacity Triton MHDB router over source pointers, with full-width RMS
   scores, per-head masked softmaxes, FP32 value accumulation, and an analytic
   backward that retains cross-head RMS coupling;
 - cut cross-entropy for the tied head, including the exact squared
   log-partition gradient without materializing vocabulary-wide logits;
-- full-block compilation around global-attention kernels and eager optimized
-  PKDA kernel boundaries;
+- full-block compilation around global-attention kernels and segmented PKDA
+  block compilation that graph-breaks at the opaque FLA recurrence while
+  compiling the projections, controls, routing, MLP, and residual work around
+  it;
 - fixed-address forward/backward CUDA graphs for every schedule-reachable train
   mode and shared-pool no-grad validation graphs;
 - BF16 keyed jitter drawn directly into graph input buffers;
@@ -447,14 +454,11 @@ three-pass DF modes fit, but do not justify a concurrent-run mode.
 
 ### Checkpoint contract
 
-New snapshots use checkpoint contract v9 and resume v9. The completed
-checkpoint-v8 `vanilla` state is also exactly resumable because its module,
-optimizer, and initialization surfaces are unchanged; every other v8 arm is
-rejected. Snapshots contain model, both optimizer states, exact state-defining
-arguments, step, and Python/Torch/CUDA RNG state. A resume inherits all
-state-defining fields and rejects an explicit conflict. Runtime paths, device,
-evaluation cadence, snapshot cadence, and evaluation-row count may change per
-invocation.
+New snapshots use checkpoint contract v10, and only v10 is resumable.
+Snapshots contain model, both optimizer states, exact state-defining arguments,
+step, and Python/Torch/CUDA RNG state. A resume inherits all state-defining
+fields and rejects an explicit conflict. Runtime paths, device, evaluation
+cadence, snapshot cadence, and evaluation-row count may change per invocation.
 
 The run retains the latest two snapshots plus the protected end-of-heat and
 end-of-run snapshots. `df queue` records exact arguments and runs the probe
@@ -555,7 +559,7 @@ training an alternative payload rule from scratch.
 The screen uses the geometry above, 6,700 steps, 2.003B predicted tokens per
 run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX 4090. The
 completed `vanilla` run is retained; the four hybrid factorial arms are new
-runs under checkpoint-v9.
+runs under checkpoint-v10.
 
 The screen is designed to establish:
 
@@ -577,7 +581,7 @@ continuing the next rung from that rung's protected pre-cooldown checkpoint.
 Finalist arms share the stream prefix and use one paired seed, with the screen's
 two-seed spread retained as the noise estimate.
 
-This ladder is not currently runnable through exact resume: `steps` is a v9
+This ladder is not currently runnable through exact resume: `steps` is a v10
 state-defining field, and no tested branch-from-heat-end continuation command
 exists. Before ladder launch, code and tests must define a new run address,
 preserve model/optimizer/RNG and row continuity, extend the stable phase without
@@ -759,11 +763,11 @@ expectation.
 Learning rates, decay, and the z-loss follow the shared NorMuon/Adam WSD recipe
 above. The flagship additionally clips the accumulated global FP32 gradient
 norm to 1.0 immediately before the optimizer step, matching the 1B PKDA
-training precedent. All PKDA decay, update, output-gate, preconditioner-decay,
-and preconditioner-gain projections remain in Adam; Q/K/V/output projections
-remain in NorMuon. The three-dimensional depthwise convolution weights are
-non-matrix parameters and remain in Adam with no weight decay. All learned KDA
-and preconditioner rate parameters are also exempt from weight decay.
+training precedent. The packed PKDA control projection, main-decay expansion,
+and output-gate expansion remain in Adam; Q/K/V/output projections remain in
+NorMuon. The three-dimensional depthwise convolution weights are non-matrix
+parameters and remain in Adam with no weight decay. All learned KDA and
+preconditioner rate parameters are also exempt from weight decay.
 
 The registered distributed target is eight H100 80GB GPUs under replicated
 DDP, BF16 autocast, FP32 parameters, FP32 gradients at the optimizer boundary,
@@ -772,8 +776,9 @@ sharding. Every transformer block is activation-checkpointed on every pass;
 feedback payloads and source banks remain differentiable, and checkpoint
 recomputation does not preserve RNG state because all stochastic feedback
 choices arrive as keyed tensor inputs. Global GQA uses BF16 FlashAttention.
-PKDA uses the upstream-equivalent Triton chunk kernel for training/prefill and
-the fused recurrent kernel for single-token decode. This target remains
+PKDA uses the upstream-equivalent Triton chunk kernel for training/prefill, the
+fused recurrent kernel for single-token decode, and FLA's fused head-wise
+RMSNorm-plus-sigmoid-gate operator. This target remains
 non-runnable until its per-rank memory, graph behavior, parity, and throughput
 pass the implementation gate.
 
