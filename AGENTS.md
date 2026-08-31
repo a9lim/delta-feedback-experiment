@@ -71,6 +71,9 @@ contract changes.
   are paired across `mhdb`/`df`, and FBT weights across `fbt`/`df`. The
   structurally distinct `vanilla` control retains its exact initialization
   recipe and state layout.
+- The screen global batch is 320 rows x 1,024 predictions = 327,680 predicted
+  tokens, accumulated as 80 four-row microbatches. This exactly matches the
+  flagship's predicted tokens per optimizer update.
 - Report both predicted tokens and token-equivalent compute. A `k`-pass batch
   costs `k` transformer passes; equal steps are matched-data, not matched-FLOP,
   comparisons.

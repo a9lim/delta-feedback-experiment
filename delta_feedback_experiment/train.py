@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     schedule = parser.add_argument_group("schedule (state-defining)")
-    schedule.add_argument("--steps", type=runs.parse_step_count, default=10536)
+    schedule.add_argument("--steps", type=runs.parse_step_count, default=9614)
     schedule.add_argument("--warmup-steps", type=int, default=200)
     schedule.add_argument("--cooldown-frac", type=float, default=0.25)
     schedule.add_argument(
@@ -146,8 +146,8 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--batch-rows",
         type=int,
-        default=292,
-        help="global batch in rows (292 x 1025 tokens ~ FBT's 300K)",
+        default=320,
+        help="global batch in rows (320 x 1024 predictions = 327,680 tokens)",
     )
     recipe.add_argument("--micro-rows", type=int, default=4)
     recipe.add_argument("--seq-len", type=int, default=1024)

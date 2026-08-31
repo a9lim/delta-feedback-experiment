@@ -386,16 +386,16 @@ decay; matrix norm control is the explicit Hyperball constraint.
 
 ### Default screen schedule
 
-The default 10,536-step WSD schedule is:
+The default 9,614-step WSD schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–5,268 | one pass |
-| Stable heat | 5,269–7,902 | feedback arms draw 1, 2, or 3 passes |
-| Cooldown | 7,903–10,536 | feedback arms draw 1, 2, or 3 passes |
+| Stable heat | 201–4,807 | one pass |
+| Stable heat | 4,808–7,210 | feedback arms draw 1, 2, or 3 passes |
+| Cooldown | 7,211–9,614 | feedback arms draw 1, 2, or 3 passes |
 
-After step 5,268, `P(k>1) = 0.50` and `P(k=3 | k>1) = 0.12`, giving the
+After step 4,807, `P(k>1) = 0.50` and `P(k=3 | k>1) = 0.12`, giving the
 50%/44%/6% one-/two-/three-pass mixture through the second half of the run.
 Across the full run this targets the 75%/22%/3% mixture. The exact draws are
 deterministic for the registered data seed. The expected compute multiplier for
@@ -568,11 +568,12 @@ training an alternative payload rule from scratch.
 
 ### 223–243M screen
 
-The screen uses the geometry above, 10,536 steps, 3,150,348,288 predicted
-tokens per run, FineWeb-Edu, two paired initialization seeds, and Jobe's RTX
-4090. No registered screen run is complete. `vanilla` is the external trunk
-control and the four hybrid arms form the primary factorial under
-checkpoint-v12.
+The screen uses the geometry above, a 320-row global batch, 9,614 steps,
+3,150,315,520 predicted tokens per run, FineWeb-Edu, two paired initialization
+seeds, and Jobe's RTX 4090. The 327,680 predicted tokens per optimizer update
+exactly match the registered flagship batch. No registered screen run is
+complete. `vanilla` is the external trunk control and the four hybrid arms
+form the primary factorial under checkpoint-v12.
 
 The screen is designed to establish:
 
@@ -595,15 +596,15 @@ rungs as:
 
 | Rung | Optimizer steps | Exact predicted tokens | Realized `df` ratio |
 |---:|---:|---:|---:|
-| 25x | 10,536 | 3,150,348,288 | 25.001069 |
-| 100x | 42,143 | 12,601,094,144 | 100.001903 |
-| 400x | 168,569 | 50,403,479,552 | 400.000492 |
+| 25x | 9,614 | 3,150,315,520 | 25.000809 |
+| 100x | 38,455 | 12,600,934,400 | 100.000635 |
+| 400x | 153,819 | 50,403,409,920 | 399.999939 |
 
 Every arm at a rung receives the same exact stream prefix; its realized ratio
 therefore differs only with active parameter count. At the top rung the four
 hybrid factorial arms span 400.000–403.974 predicted tokens per active
 non-embedding parameter, while the structurally smaller `vanilla` control is
-at 474.655. Do not shorten `vanilla` to force its ratio to 400, because that
+at 474.654. Do not shorten `vanilla` to force its ratio to 400, because that
 would break the matched-data whole-trunk contrast.
 
 The first rung is the two-seed all-arm screen. Selected finalist arms continue
@@ -611,7 +612,7 @@ through the 100x and 400x rungs with one paired seed, taking a WSD cooldown
 branch at each rung and continuing the next rung from that rung's protected
 pre-cooldown checkpoint. The screen's two-seed spread remains the noise
 estimate. Continuation preserves the first rung's absolute feedback boundary
-after step 5,268 rather than recomputing it as half of each later endpoint.
+after step 4,807 rather than recomputing it as half of each later endpoint.
 The ladder therefore matches the flagship's final data ratio, not its
 relative-time feedback curriculum; predicted tokens and token-equivalent
 compute remain separate reported quantities.

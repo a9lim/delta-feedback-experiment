@@ -78,17 +78,18 @@ Changing the checkout never stops an active child; the worker refreshes before
 starting the next queued job, and every job runs its probe on the then-current
 source.
 
-The default screen run is 10,536 steps, 292 rows per step, and sequence length
-1,024: 3,150,348,288 predicted training tokens. This is the batch-aligned 25x
-rung for the 126,008,544 active non-embedding parameters in `df`, the largest
-hybrid arm. Feedback arms use one pass through step 5,268, then draw one, two,
+The default screen run is 9,614 steps, 320 rows per step, and sequence length
+1,024: 3,150,315,520 predicted training tokens. Its 327,680-token optimizer
+batch exactly matches the flagship, and this is the batch-aligned 25x rung for
+the 126,008,544 active non-embedding parameters in `df`, the largest hybrid
+arm. Feedback arms use one pass through step 4,807, then draw one, two,
 or three passes at a 50%/44%/6% mixture through the rest of heat and cooldown.
 Every step is addressed directly into one fixed token stream. Pass counts are
 keyed by data seed and step; prefix lengths and jitter additionally use the
 global row, so paired arms see identical examples and feedback draws.
 
-The same-geometry ladder uses exact 25x, 100x, and 400x rungs at 10,536,
-42,143, and 168,569 optimizer steps. Its branch-from-heat-end continuation path
+The same-geometry ladder uses exact 25x, 100x, and 400x rungs at 9,614,
+38,455, and 153,819 optimizer steps. Its branch-from-heat-end continuation path
 remains an implementation gate; only the first rung is currently runnable.
 
 New snapshots are immutable checkpoint-contract v12 files under `runs/`.
