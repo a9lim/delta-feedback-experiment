@@ -209,14 +209,19 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 
 - BF16 trunk activations with FP32 parameters, accumulated gradients, and
   optimizer state;
-- the pinned FLA recomputing PKDA chunk kernel and fused PKDA output norm/gate;
+- the pinned FLA recomputing PKDA chunk kernel, one fused Q/K/V causal
+  convolution launch per PKDA layer, and fused PKDA output norm/gate;
 - FlashAttention for full-sequence, prefill, GQA, and cached decode;
 - a fixed-capacity Triton MHDB router with analytic backward and cross-group
   full-width RMS coupling;
-- BF16-operand cut cross-entropy with the exact squared-log-partition gradient;
+- an address-stable, non-checkpoint BF16 classifier shadow refreshed from its
+  FP32 tied-embedding master once per optimizer update;
+- pinned current cut cross-entropy with BF16 operands, capture-safe fixed-shape
+  no-ignore preprocessing, and its native differentiable log-partition output
+  for the exact squared-log-partition gradient;
 - the Triton PKDA control-gradient packer;
-- compiled global-attention blocks and segmented PKDA blocks around the opaque
-  FLA recurrence;
+- fixed-shape, exhaustive Inductor autotuning for compiled global-attention
+  blocks and segmented PKDA blocks around the opaque FLA recurrence;
 - one fixed-address train CUDA graph per reachable pass count and shared-pool
   no-grad validation graphs;
 - BF16 keyed jitter written directly into graph input buffers;
@@ -228,13 +233,16 @@ default capture is:
 
 | Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 53.8 s | 14.10 GiB | 23.00 GiB | 4 |
+| `df` | 61.4 s | 13.31 GiB | 22.89 GiB | 4 |
 
-Median graph replay is 84.0 ms, 166.9 ms, and 250.0 ms for one, two, and three
+Median graph replay is 75.5 ms, 149.9 ms, and 224.9 ms for one, two, and three
 passes. The same probe measures PKDA chunk parity at relative error 0.0040,
-fused output norm-gate parity at 0.0032, and cached decode parity at
-0.0077/0.0139. The reserved graph pool is the concurrency boundary. Screen
-runs remain serial; concurrent execution is outside the qualified
+fused Q/K/V convolution parity at 0.0033, fused output norm-gate parity at
+0.0032, and cached decode parity at 0.0069/0.0145. Inductor artifacts live in
+`~/.cache/delta-feedback/torchinductor` by default; the probe performed the
+one-time search and a second process reused the resulting 1.1 GiB cache with
+no autotuning work. The reserved graph pool is the concurrency boundary.
+Screen runs remain serial; concurrent execution is outside the qualified
 deterministic path.
 
 ### Checkpoints and queue

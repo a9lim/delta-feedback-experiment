@@ -37,7 +37,7 @@ and there are no accepted experiment findings.
 
 The 230–258M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
-runs remain serial because the full v15 DF graph pool reserves 23.00 GiB on
+runs remain serial because the full v15 DF graph pool reserves 22.89 GiB on
 its 24 GiB RTX 4090.
 
 The realized Jobe token store is a 35.000B-token prefix of the pinned stream.
@@ -68,6 +68,14 @@ the pinned Torch/FlashAttention pair:
 ```bash
 uv pip install -e '.[cuda]'
 ```
+
+The CUDA extra is the single project-owned pin surface for both CCE and FLA;
+their exact Git commits and the compatible FlashAttention version live in
+`pyproject.toml`. Machine-wide constraints continue to own Torch itself. The
+first `df probe` performs the fixed-shape Inductor search and preserves its
+generated artifacts at `~/.cache/delta-feedback/torchinductor`; later probes
+and training processes reuse that cache. Set `DF_INDUCTOR_CACHE_DIR` only when
+the durable cache belongs elsewhere.
 
 Install the exact data-build stack on any staging host that materializes the
 canonical token stream:

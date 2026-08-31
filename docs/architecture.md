@@ -356,9 +356,10 @@ centers, and output-gate bias use the special initializations stated above.
 
 Embedding parameters and optimizer state are FP32. On CUDA, the residual
 stream, routed values, payloads, mixer activations, and caches are BF16 except
-for the PKDA matrix and diagonal boundary states. The tied classifier is cast
-to BF16 only at the cut-cross-entropy operand boundary; its authoritative
-parameter and accumulated gradient remain FP32.
+for the PKDA matrix and diagonal boundary states. Cut cross-entropy reads an
+address-stable BF16 classifier shadow that is refreshed from the tied embedding
+once after every optimizer update and is neither a parameter nor checkpoint
+state. Its authoritative tied parameter and accumulated gradient remain FP32.
 
 ## NorMuonH and Adam
 

@@ -76,7 +76,7 @@ a contract changes.
 - Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
   monitor serving, and spool orchestration from the workspace root package.
 - Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified v15 DF graph pool reserves 23.00 GiB. New snapshots are v15
+  the qualified v15 DF graph pool reserves 22.89 GiB. New snapshots are v15
   and every older version is rejected.
 - Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
   The queue stores arguments rather than Git state; a worker refreshes before
