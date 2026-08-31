@@ -40,6 +40,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from . import INDUCTOR_MODE
 from .pkda import PreconditionedKDA
 
 try:  # Triton is deliberately a CUDA-only optimization dependency.
@@ -57,20 +58,10 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 
 try:
     from cut_cross_entropy import linear_cross_entropy
-    from cut_cross_entropy.cce import (
-        sort_logit_avg,
-    )
-    from cut_cross_entropy.cce_backward import cce_backward_kernel
-    from cut_cross_entropy.cce_lse_forward import cce_lse_forward_kernel
-    from cut_cross_entropy.indexed_dot import indexed_neg_dot_forward_kernel
-    from cut_cross_entropy.utils import _handle_eps
+    from cut_cross_entropy.utils import compute_z_loss
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     linear_cross_entropy = None
-    sort_logit_avg = None
-    cce_backward_kernel = None
-    cce_lse_forward_kernel = None
-    indexed_neg_dot_forward_kernel = None
-    _handle_eps = None
+    compute_z_loss = None
 
 ARMS = ("vanilla", "base", "mhdb", "fbt", "df")
 
@@ -652,12 +643,11 @@ def _block_for_checkpoint(block, h, cos, sin, gate_weight, *sources):
 _compiled_block = torch.compile(
     _block_for_checkpoint,
     fullgraph=True,
-    dynamic=True,
-    # The complete block has many lifted GEMMs and source-count variants.
-    # Default Inductor still fuses every surrounding pointwise epilogue while
-    # avoiding a >10 minute exhaustive GEMM search already covered well by
-    # cuBLAS/FlashAttention on Ada. The outer trainer owns CUDA capture.
-    mode="default",
+    dynamic=False,
+    # The graph shapes are fixed by the registered screen. The probe performs
+    # the expensive search once and later processes reuse its durable cache;
+    # the outer trainer, rather than Inductor, owns CUDA capture.
+    mode=INDUCTOR_MODE,
 )
 
 _compiled_pkda_block = torch.compile(
@@ -666,8 +656,8 @@ _compiled_pkda_block = torch.compile(
     # breaks around it and fuses the projections, controls, norm/gate, MLP,
     # residual updates, and routing on either side.
     fullgraph=False,
-    dynamic=True,
-    mode="default",
+    dynamic=False,
+    mode=INDUCTOR_MODE,
 )
 
 
@@ -701,6 +691,18 @@ class ColumnOutput:
     """How many leading entries of ``sources`` are seeds, not deltas."""
 
 
+class _ClassifierShadow(torch.autograd.Function):
+    """Read a stable BF16 shadow while accumulating into its FP32 master."""
+
+    @staticmethod
+    def forward(ctx, master: Tensor, shadow: Tensor) -> Tensor:
+        return shadow
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None]:
+        return gradient.float(), None
+
+
 class DFModel(nn.Module):
     """The full model; parents are deletions per the config flags."""
 
@@ -709,6 +711,7 @@ class DFModel(nn.Module):
         self.cfg = cfg
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
+        self.register_buffer("_classifier_shadow", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         # Capture the exact common-trunk initialization boundary before
@@ -783,6 +786,37 @@ class DFModel(nn.Module):
 
     def logits(self, h_top: Tensor) -> Tensor:
         return F.linear(self.final_norm(h_top), self.embed_tokens.weight)
+
+    @torch.no_grad()
+    def refresh_classifier_shadow(self) -> None:
+        """Refresh the CUDA-only BF16 readout derived from the FP32 embedding.
+
+        The buffer is deliberately absent from ``state_dict``. Its address is
+        allocated once before graph capture and remains stable across optimizer
+        updates; only its contents change.
+        """
+        master = self.embed_tokens.weight
+        if not master.is_cuda:
+            self._classifier_shadow = None
+            return
+        shadow = self._classifier_shadow
+        if (
+            shadow is None
+            or shadow.shape != master.shape
+            or shadow.device != master.device
+        ):
+            shadow = torch.empty_like(master, dtype=torch.bfloat16)
+            self._classifier_shadow = shadow
+        shadow.copy_(master)
+
+    def classifier_for_loss(self) -> Tensor:
+        """Return the graph-stable BF16 CCE operand linked to the FP32 master."""
+        master = self.embed_tokens.weight
+        if not master.is_cuda:
+            return master
+        if self._classifier_shadow is None:
+            raise RuntimeError("CUDA classifier shadow was not prepared")
+        return _ClassifierShadow.apply(master, self._classifier_shadow)
 
     # -- one column pass -------------------------------------------------------
 
@@ -1017,92 +1051,22 @@ _compiled_head_losses = torch.compile(
 )
 
 
-class _LinearCrossEntropyZFunction(torch.autograd.Function):
-    """CCE's tiled linear CE plus exact mean-square log-partition loss.
-
-    The pinned CCE forward already computes one FP32 log-sum-exp per token.
-    Preserve it for the scalar z-loss and reuse CCE's probability-tile backward
-    for ``2 * z * lse * softmax(logits)``.  The classifier-sized logits are
-    never materialized.  CE retains the authoritative high-threshold gradient
-    filter; the z term is deliberately unfiltered so its derivative is exact.
-    """
-
-    @staticmethod
-    def forward(ctx, embeddings: Tensor, classifier: Tensor, targets: Tensor):
-        filter_eps = _handle_eps("high", embeddings.dtype)
-        return_logit_avg = (
-            embeddings.requires_grad or classifier.requires_grad
-        ) and filter_eps is not None
-        result = cce_lse_forward_kernel(
-            embeddings,
-            classifier,
-            None,
-            softcap=None,
-            return_logit_avg=return_logit_avg,
-        )
-        if return_logit_avg:
-            lse, logit_avg = result
-        else:
-            lse, logit_avg = result, None
-        neg_dot = indexed_neg_dot_forward_kernel(
-            embeddings,
-            classifier,
-            targets,
-            False,
-            None,
-            None,
-            lse.dtype,
-        )
-        ce = neg_dot.add_(lse).mean()
-        z = lse.square().mean()
-        ctx.save_for_backward(embeddings, classifier, lse, targets, logit_avg)
-        ctx.filter_eps = filter_eps
-        return ce, z
-
-    @staticmethod
-    def backward(ctx, grad_ce: Tensor, grad_z: Tensor):
-        embeddings, classifier, lse, targets, logit_avg = ctx.saved_tensors
-        ordering = sort_logit_avg(logit_avg) if logit_avg is not None else None
-        scale = 1.0 / lse.numel()
-        # One vocabulary sweep: scaling (p-y) by ce + 2*z*lse gives the
-        # desired probability gradient but over-scales the target subtraction.
-        # Repair that single indexed classifier column below.
-        z_scale = grad_z * (2.0 * lse)
-        de, dc = cce_backward_kernel(
-            grad_ce + z_scale,
-            embeddings,
-            classifier,
-            lse,
-            None,
-            None,
-            ctx.filter_eps,
-            targets=targets,
-            shift=False,
-            vocab_ordering=ordering,
-            grad_scale=scale,
-        )
-        correction = z_scale * scale
-        de.add_(
-            classifier.index_select(0, targets).to(de.dtype)
-            * correction.to(de.dtype).unsqueeze(1)
-        )
-        dc.index_add_(
-            0,
-            targets,
-            embeddings.to(dc.dtype) * correction.to(dc.dtype).unsqueeze(1),
-        )
-        return de, dc, None
-
-
 def _fixed_cce_z(
     embeddings: Tensor, classifier: Tensor, targets: Tensor
 ) -> tuple[Tensor, Tensor]:
-    """Dense capture-safe CCE and z-loss with a BF16 tied classifier operand."""
+    """Current CCE's fused CE and differentiable log-partition loss."""
+    if linear_cross_entropy is None or compute_z_loss is None:
+        raise RuntimeError("cut-cross-entropy is unavailable")
     embeddings = embeddings.contiguous().flatten(0, -2)
     targets = targets.contiguous().flatten()
-    return _LinearCrossEntropyZFunction.apply(
-        embeddings, classifier.to(embeddings.dtype), targets
+    ce, lse = linear_cross_entropy(
+        embeddings,
+        classifier,
+        targets,
+        return_lse=True,
+        filter_eps="auto",
     )
+    return ce, compute_z_loss(lse)
 
 
 def sequence_ce(
@@ -1125,7 +1089,7 @@ def sequence_ce(
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
         normalized = model.final_norm(h_top)
-        return _fixed_cce_z(normalized, model.embed_tokens.weight, targets)
+        return _fixed_cce_z(normalized, model.classifier_for_loss(), targets)
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)

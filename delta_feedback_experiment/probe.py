@@ -25,6 +25,7 @@ def cuda_gate() -> None:
     from .model import (
         DFModel,
         KVCache,
+        _ClassifierShadow,
         _fixed_cce_z,
         _route_sources,
         arm_config,
@@ -222,6 +223,65 @@ def cuda_gate() -> None:
     del pkda_ref, pkda_cuda, pkda_inputs, pkda_cuda_inputs
     del pkda_expected, pkda_actual, pkda_cotangent
 
+    # Dense no-cache PKDA projects Q/K/V separately but executes their equal-
+    # width short convolutions in one FLA Triton kernel. Compare that fused path
+    # to the literal three-convolution implementation in values and gradients.
+    torch.manual_seed(12)
+    conv_ref = PreconditionedKDA(32, num_heads=2, head_dim=16).cuda().train()
+    conv_fused = copy.deepcopy(conv_ref).train()
+    conv_x_ref = torch.randn(
+        2, 65, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    conv_x_fused = conv_x_ref.detach().clone().requires_grad_()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        ref_q, _ = conv_ref._causal_conv(
+            conv_ref.q_proj(conv_x_ref), conv_ref.q_conv, None, False
+        )
+        ref_k, _ = conv_ref._causal_conv(
+            conv_ref.k_proj(conv_x_ref), conv_ref.k_conv, None, False
+        )
+        ref_v, _ = conv_ref._causal_conv(
+            conv_ref.v_proj(conv_x_ref), conv_ref.v_conv, None, False
+        )
+        reference_qkv = tuple(
+            value.reshape(2, 65, 2, 16) for value in (ref_q, ref_k, ref_v)
+        )
+        fused_qkv = conv_fused._project(conv_x_fused, None, False)[:3]
+    conv_cotangents = tuple(torch.randn_like(value) for value in reference_qkv)
+    torch.autograd.backward(reference_qkv, conv_cotangents)
+    torch.autograd.backward(fused_qkv, conv_cotangents)
+    conv_rel = max(
+        relative_error(actual, expected)
+        for actual, expected in zip(fused_qkv, reference_qkv, strict=True)
+    )
+    if conv_rel >= 0.01:
+        raise AssertionError(f"fused QKV convolution value drift: {conv_rel:.4f}")
+    conv_grad_names = (
+        "q_proj.weight",
+        "k_proj.weight",
+        "v_proj.weight",
+        "q_conv.weight",
+        "k_conv.weight",
+        "v_conv.weight",
+    )
+    ref_parameters = dict(conv_ref.named_parameters())
+    fused_parameters = dict(conv_fused.named_parameters())
+    for name in conv_grad_names:
+        grad_rel = relative_error(
+            fused_parameters[name].grad, ref_parameters[name].grad
+        )
+        if grad_rel >= 0.05:
+            raise AssertionError(
+                f"fused QKV convolution {name} gradient drift: {grad_rel:.4f}"
+            )
+    conv_input_grad_rel = relative_error(conv_x_fused.grad, conv_x_ref.grad)
+    if conv_input_grad_rel >= 0.05:
+        raise AssertionError(
+            f"fused QKV convolution input gradient drift: {conv_input_grad_rel:.4f}"
+        )
+    del conv_ref, conv_fused, conv_x_ref, conv_x_fused
+    del reference_qkv, fused_qkv, conv_cotangents
+
     # FLA's fused RMSNorm/sigmoid gate must preserve the portable PKDA
     # epilogue in both values and gradients at production dtypes.
     torch.manual_seed(10)
@@ -272,8 +332,11 @@ def cuda_gate() -> None:
     torch.manual_seed(11)
     cce_e = torch.randn(41, 32, device="cuda", dtype=torch.bfloat16).requires_grad_()
     cce_c = torch.randn(127, 32, device="cuda", dtype=torch.float32).requires_grad_()
+    cce_shadow = cce_c.detach().to(torch.bfloat16)
     cce_t = torch.randint(0, 127, (41,), device="cuda")
-    cce_ce, cce_z = _fixed_cce_z(cce_e, cce_c, cce_t)
+    cce_ce, cce_z = _fixed_cce_z(
+        cce_e, _ClassifierShadow.apply(cce_c, cce_shadow), cce_t
+    )
     (cce_ce + 1e-2 * cce_z).backward()
     cce_de, cce_dc = cce_e.grad.float().clone(), cce_c.grad.clone()
     ref_e = cce_e.detach().clone().requires_grad_()
@@ -290,7 +353,7 @@ def cuda_gate() -> None:
         raise AssertionError("CCE-native z embedding gradient drift")
     if not torch.allclose(cce_dc, ref_c.grad, rtol=3e-2, atol=3e-3):
         raise AssertionError("CCE-native z classifier gradient drift")
-    del cce_e, cce_c, cce_t, cce_de, cce_dc, ref_e, ref_c, ref_logits
+    del cce_e, cce_c, cce_shadow, cce_t, cce_de, cce_dc, ref_e, ref_c, ref_logits
     del cce_ce, cce_z, ref_ce, ref_z
 
     # The packed control projection exposes five semantic slices, but its
@@ -394,6 +457,13 @@ def cuda_gate() -> None:
         lr_h=args.lr_h,
         lr_adam=args.lr_adam,
     )
+    model.refresh_classifier_shadow()
+    classifier_shadow = model._classifier_shadow
+    if classifier_shadow is None or classifier_shadow.dtype != torch.bfloat16:
+        raise AssertionError("CUDA BF16 classifier shadow was not prepared")
+    if any("classifier_shadow" in name for name in model.state_dict()):
+        raise AssertionError("derived classifier shadow entered the checkpoint state")
+    classifier_shadow_ptr = classifier_shadow.data_ptr()
     with torch.autocast("cuda", dtype=torch.bfloat16):
         embedded = model.embed_tokens(
             torch.zeros(1, 1, dtype=torch.long, device="cuda")
@@ -497,6 +567,9 @@ def cuda_gate() -> None:
             )
         for optimizer in optimizers:
             optimizer.step()
+        model.refresh_classifier_shadow()
+        if model._classifier_shadow.data_ptr() != classifier_shadow_ptr:
+            raise AssertionError("classifier shadow address changed after optimizer step")
         runner.zero_grad()
         records.append(
             f"k={spec.n_passes}/ckpt={int(spec.checkpoint)}:{elapsed * 1000:.1f}ms"
@@ -531,6 +604,7 @@ def cuda_gate() -> None:
         f"prepare={prepared:.1f}s | allocated={capture_peak:.2f}GiB | "
         f"reserved={capture_reserved:.2f}GiB | "
         f"pkda_rel={pkda_value_rel:.4f} | "
+        f"conv_rel={conv_rel:.4f} | "
         f"norm_gate_rel={norm_gate_rel:.4f} | "
         f"decode_rel={vanilla_decode_rel:.4f}/{hybrid_decode_rel:.4f} | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "

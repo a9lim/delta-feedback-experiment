@@ -18,12 +18,14 @@ from torch import Tensor, nn
 from .cuda_kernels import pack_control_gradients
 
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
+    from fla.modules.convolution import causal_conv1d
     from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.precond_kda import (
         chunk_precond_kda,
         fused_recurrent_precond_kda,
     )
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
+    causal_conv1d = None
     rms_norm_gated = None
     chunk_precond_kda = None
     fused_recurrent_precond_kda = None
@@ -33,6 +35,7 @@ def pkda_cuda_available() -> bool:
     return (
         chunk_precond_kda is not None
         and fused_recurrent_precond_kda is not None
+        and causal_conv1d is not None
         and rms_norm_gated is not None
     )
 
@@ -193,6 +196,38 @@ class PreconditionedKDA(nn.Module):
         conv_state: tuple[Tensor, Tensor, Tensor] | None,
         output_final_state: bool,
     ) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor, Tensor, Tensor] | None]:
+        if (
+            x.is_cuda
+            and conv_state is None
+            and not output_final_state
+            and causal_conv1d is not None
+        ):
+            # Dense training/prefill has no per-projection cache state. Collapse
+            # all three identical short convolutions into one Triton launch;
+            # parameters stay separate so initialization, optimizer ownership,
+            # checkpoint names, and cached decoding remain unchanged.
+            qkv = torch.cat(
+                (self.q_proj(x), self.k_proj(x), self.v_proj(x)), dim=-1
+            )
+            weight = torch.cat(
+                (
+                    self.q_conv.weight.squeeze(1),
+                    self.k_conv.weight.squeeze(1),
+                    self.v_conv.weight.squeeze(1),
+                ),
+                dim=0,
+            )
+            qkv, _ = causal_conv1d(
+                x=qkv,
+                weight=weight,
+                bias=None,
+                activation="silu",
+                backend="triton",
+            )
+            q, k, v = qkv.split(self.projection_size, dim=-1)
+            shape = (*x.shape[:2], self.num_heads, self.head_dim)
+            return q.reshape(shape), k.reshape(shape), v.reshape(shape), None
+
         states = conv_state or (None, None, None)
         q, q_state = self._causal_conv(
             self.q_proj(x), self.q_conv, states[0], output_final_state

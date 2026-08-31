@@ -198,6 +198,23 @@ def test_factorial_initialization_is_paired_by_semantic_factor():
         assert torch.equal(states["fbt"][name], states["df"][name])
 
 
+def test_classifier_shadow_is_derived_and_preserves_master_gradients():
+    from delta_feedback_experiment.model import _ClassifierShadow
+
+    model = tiny("df")
+    assert model._classifier_shadow is None
+    assert model.classifier_for_loss() is model.embed_tokens.weight
+    assert not any("classifier_shadow" in name for name in model.state_dict())
+
+    master = torch.randn(11, 7, dtype=torch.float32, requires_grad=True)
+    shadow = master.detach().to(torch.bfloat16)
+    operand = _ClassifierShadow.apply(master, shadow)
+    operand.float().sum().backward()
+    assert master.grad.dtype == torch.float32
+    assert torch.equal(master.grad, torch.ones_like(master))
+    assert shadow.grad is None
+
+
 def test_zero_gqa_gate_halves_the_ungated_attention_branch():
     model = tiny("base")
     attention = model.blocks[3].attn
