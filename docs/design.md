@@ -571,10 +571,11 @@ re-warming, and create a new cooldown branch without weakening exact resume.
 ### Flagship
 
 The registered flagship is hard DF with an analytical parameter count of
-1,335,420,192 and a 400B-predicted-token budget. It has width 1,536, 24 decoder
-layers, SwiGLU width 6,656, the project's tied 151,936-token vocabulary,
-context 8,192, and six identical four-layer cells. Its token-mixing schedule is
-exactly:
+1,335,420,192 and a 441B-predicted-token budget, defined as 400 predicted
+tokens per active non-embedding parameter before batch alignment. It has width
+1,536, 24 decoder layers, SwiGLU width 6,656, the project's tied 151,936-token
+vocabulary, context 8,192, and six identical four-layer cells. Its token-mixing
+schedule is exactly:
 
 ```text
 [PKDA, PKDA, PKDA, gated global GQA] x 6
@@ -584,11 +585,11 @@ The operating point has four explicit authority classes:
 
 | Surface | Authority |
 |---|---|
-| Width 1,536, 24 layers, SwiGLU 6,656, GQA 16/8-by-96, context 8,192, 400B tokens, WSD/NorMuon recipe, and latent-feedback schedule | Full-Bandwidth Transformer, inherited directly except for the project's tokenizer and vocabulary |
+| Width 1,536, 24 layers, SwiGLU 6,656, GQA 16/8-by-96, context 8,192, nominal 1B/400B-token scale, WSD/NorMuon recipe, and latent-feedback schedule | Full-Bandwidth Transformer, inherited directly except for the project's tokenizer and vocabulary |
 | PKDA 20-by-128 geometry, convolution width 4, Q/K L2 normalization, sigmoid output gate, NoPE, and 3:1 hybrid cadence | Kimi Linear paper and released configuration |
 | Apply-to-key recurrence, independent preconditioner gates, `x = 1.5`, bounded squash, initialization, chunk/recurrent forms, FP32 boundary states, and global gradient clip 1.0 | Preconditioned DeltaNet paper and upstream FLA implementation |
 | Sigmoid-gated global GQA | Released Qwen3-Next configuration and implementation |
-| PKDA replacing KDA inside the 3:1 cadence, global GQA replacing MLA, hard DF plus block-delta routing, 151,936-token vocabulary, exact mid-run feedback boundary, 327,680-token batch rounding, and replicated eight-rank execution | Registered project synthesis; these interactions require the promotion and implementation gates |
+| PKDA replacing KDA inside the 3:1 cadence, global GQA replacing MLA, hard DF plus block-delta routing, 151,936-token vocabulary, 400 predicted tokens per active non-embedding parameter, exact mid-run feedback boundary, 441B batch-aligned budget, and replicated eight-rank execution | Registered project synthesis; these interactions require the promotion and implementation gates |
 
 There is no sliding-window attention. Each PKDA layer uses 20 query/key heads,
 20 value heads, `expand_v = 1`, and `d_k = d_v = 128`, so its key and value
@@ -692,6 +693,10 @@ The analytical count is:
 | 48 within-column routers and one payload router | 225,792 |
 | **Total** | **1,335,420,192** |
 
+The total includes the 233,373,696-parameter tied embedding/readout. Removing
+that term leaves 1,102,046,496 active non-embedding parameters, which is the
+registered denominator for the flagship data budget.
+
 Relative to unpreconditioned KDA, the two width-to-head preconditioner
 projections and three learned per-head vectors add 61,500 parameters per PKDA
 layer and 1,107,000 across the 18 PKDA layers. Relative to the discarded
@@ -711,14 +716,22 @@ partition. Its exact operating schedule is:
 | Sequence length | 8,192 predictions |
 | Global batch | 40 sequences = 327,680 predicted tokens |
 | Distributed batch | 8 ranks x microbatch 1 x accumulation 5 |
-| Optimizer steps | 1,220,703 |
-| Exact predicted tokens | 399,999,959,040 |
+| Active non-embedding parameters | 1,102,046,496 |
+| Budget rule | 400 predicted tokens per active non-embedding parameter |
+| Unrounded token target | 440,818,598,400 |
+| Optimizer steps | 1,345,272 |
+| Exact predicted tokens | 440,818,728,960 |
 | Warmup | steps 1-200 |
-| Stable heat | steps 201-915,527 |
-| Cooldown | steps 915,528-1,220,703 |
-| Feedback boundary | after step 610,351 |
+| Stable heat | steps 201-1,008,954 |
+| Cooldown | steps 1,008,955-1,345,272 |
+| Feedback boundary | after step 672,636 |
 | Whole-run pass mixture | expected 75% / 22% / 3% for 1 / 2 / 3 passes |
-| Expected token-equivalent compute | approximately 512B pass-tokens |
+| Expected token-equivalent compute | approximately 564.248B pass-tokens |
+
+The mathematical 400-token target is 440,818,598,400 predicted tokens. The
+nearest whole-step schedule at the registered global batch exceeds it by only
+130,560 tokens, less than one optimizer batch, and realizes 400.000118
+predicted tokens per active non-embedding parameter.
 
 The 327,680-token batch is the clean eight-rank realization nearest the FBT
 paper's approximately 300K-token batch: every rank processes one full sequence

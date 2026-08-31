@@ -27,8 +27,10 @@ references:
       channel-wise decay, causal short convolutions, sigmoid output gate, NoPE
       global-attention layers, the empirically selected 3:1 KDA-to-global MLA
       cadence, and the width-1,536 scaling-law point with 20 heads and
-      128-dimensional key/value heads. The flagship keeps the KDA substrate
-      and cadence inside PKDA but uses dense global GQA instead of MLA.
+      128-dimensional key/value heads. Its scaling convention reports active
+      parameters without embedding parameters. The flagship keeps the KDA
+      substrate and cadence inside PKDA but uses dense global GQA instead of
+      MLA.
 
   - url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json
     slug: kimi2025-kimi-linear-config
