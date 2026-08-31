@@ -80,19 +80,31 @@ STOP_PHASE = "train run"
 
 
 def tokenize_command(argv: list[str]) -> None:
+    from .data import (
+        CANONICAL_CONFIG,
+        CANONICAL_DATASET_REVISION,
+        CANONICAL_TARGET_TOKENS,
+        CANONICAL_TOKENIZER_REVISION,
+        CANONICAL_VAL_TOKENS,
+    )
+
     parser = argparse.ArgumentParser("df tokenize")
     parser.add_argument("--out", default="data/tokens")
     parser.add_argument(
         "--target",
         type=float,
-        default=57e9,
+        default=CANONICAL_TARGET_TOKENS,
         help="total tokenization target, including the held-out prefix",
     )
     parser.add_argument(
-        "--val", type=float, default=30e6, help="held-out tokens from the stream head"
+        "--val",
+        type=float,
+        default=CANONICAL_VAL_TOKENS,
+        help="held-out tokens from the stream head",
     )
-    parser.add_argument("--config", default="sample-100BT")
-    parser.add_argument("--revision", default=None)
+    parser.add_argument("--config", default=CANONICAL_CONFIG)
+    parser.add_argument("--revision", default=CANONICAL_DATASET_REVISION)
+    parser.add_argument("--tokenizer-revision", default=CANONICAL_TOKENIZER_REVISION)
     args = parser.parse_args(argv)
     from .data import tokenize
 
@@ -102,6 +114,7 @@ def tokenize_command(argv: list[str]) -> None:
         val_tokens=int(args.val),
         config=args.config,
         revision=args.revision,
+        tokenizer_revision=args.tokenizer_revision,
     )
 
 

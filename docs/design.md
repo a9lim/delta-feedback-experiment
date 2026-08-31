@@ -91,9 +91,19 @@ geometry and cell count, not those semantics.
 
 ## Data and pairing
 
-The corpus is FineWeb-Edu in canonical streaming order, tokenized with
-`Qwen/Qwen3-0.6B`. Tokenization resolves and records the dataset commit when no
-revision is supplied. Every non-empty document is followed by EOS.
+Hugging Face's `HuggingFaceFW/fineweb-edu` `sample-100BT` configuration is the
+corpus authority. The registered input is its canonical streaming order at
+dataset commit `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`, tokenized with
+`Qwen/Qwen3-0.6B` at commit
+`c1899de289a04d12100db370d81485cdf75e47ca`. The `data-build` extra pins the
+four packages that compile this stream, and `meta.json` records those realized
+versions. Every non-empty document is followed by EOS.
+
+Training never consumes the live iterable directly. Each execution surface
+materializes a local contiguous uint32 representation from those pinned Hugging
+Face sources so that step-addressed rows, rank sharding, validation, and resume
+do not depend on network or iterator state. This store is a compiled training
+representation, not a separately curated or re-hosted corpus.
 
 The held-out validation slice is the stream head. Training follows in
 contiguous uint32 shards. One row is a non-overlapping `seq_len + 1` window, so
@@ -112,7 +122,9 @@ global row. They do not depend on ambient RNG state. Resume returns to the same
 row and the same keyed feedback draws.
 
 The canonical stream target is 57B stored tokens including the held-out
-prefix, enough for the fresh Prime schedule's 55,010,880 training rows.
+prefix. The fresh Prime schedule needs exactly 55,010,880 training rows, or
+56,386,152,000 stored training tokens, leaving about 584M tokens of headroom
+after the held-out prefix.
 
 ## Training protocol
 
@@ -355,12 +367,23 @@ The pair consumes 112.662B predicted tokens and approximately 128.435B
 expected pass-tokens. It tests only the complete DF package against its shared
 hybrid baseline; component attribution remains a Jobe factorial claim.
 
+Prime data staging occurs only after selecting an 8xH100 provider and location,
+but before provisioning the H100 node. Create a provider-local persistent disk
+sized for the compiled stream and run artifacts, attach it to an inexpensive
+compatible staging instance, install the exact `data-build` stack, and run
+`df tokenize` directly from the pinned Hugging Face dataset and tokenizer into
+the mounted data path. The resulting metadata and byte-checksum manifest must
+match the canonical Jobe prefix before the disk is detached and attached to
+the H100 node. The registered path requires neither live training reads from
+Hugging Face nor a separately hosted copy of the compiled store.
+
 The schedule is expressible by the current single-process trainer, but Prime
 distributed execution is not runnable. Its gate must add exact row sharding,
 DDP accumulation and synchronized global clipping, rank-safe telemetry and
 snapshots, persistent artifact staging, cross-rank optimizer parity, restart
-tests, and H100 memory/throughput qualification. The qualified configuration
-and projected rental cost are reviewed before provisioning.
+tests, persistent-disk read qualification, and H100 memory/throughput
+qualification. The qualified configuration and projected rental cost are
+reviewed before provisioning.
 
 ### Stage 3: flagship
 

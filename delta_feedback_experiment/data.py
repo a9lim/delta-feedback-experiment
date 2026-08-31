@@ -2,7 +2,7 @@
 
 Layout under a data directory (default ``data/tokens``):
 
-    meta.json            tokenizer, dataset revision, counts, eos id
+    meta.json            tokenizer/dataset revisions, build versions, counts
     val.bin              the held-out slice — the stream's first tokens
     train.0000.bin ...   uint32 shards, one contiguous stream
 
@@ -16,6 +16,7 @@ data order contract — and a resumed run addresses the identical rows.
 from __future__ import annotations
 
 import json
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,48 @@ META = "meta.json"
 SHARD_TOKENS = 1 << 28
 """Tokens per train shard (~1 GiB as uint32)."""
 
+CANONICAL_TARGET_TOKENS = 57_000_000_000
+CANONICAL_VAL_TOKENS = 30_000_000
+CANONICAL_DATASET = "HuggingFaceFW/fineweb-edu"
+CANONICAL_CONFIG = "sample-100BT"
+CANONICAL_DATASET_REVISION = "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9"
+CANONICAL_TOKENIZER = "Qwen/Qwen3-0.6B"
+CANONICAL_TOKENIZER_REVISION = "c1899de289a04d12100db370d81485cdf75e47ca"
+CANONICAL_DATA_PACKAGES = {
+    "datasets": "5.0.1",
+    "transformers": "5.16.1",
+    "tokenizers": "0.23.1",
+    "huggingface-hub": "1.29.0",
+}
+
+
+def data_package_versions() -> dict[str, str]:
+    """Return and validate the exact packages that compile the token stream."""
+    installed = {}
+    for package, expected in CANONICAL_DATA_PACKAGES.items():
+        try:
+            installed[package] = version(package)
+        except PackageNotFoundError as exc:
+            raise RuntimeError(
+                f"canonical data build requires {package}=={expected}; "
+                "install the data-build extra"
+            ) from exc
+    mismatches = {
+        package: (CANONICAL_DATA_PACKAGES[package], actual)
+        for package, actual in installed.items()
+        if actual != CANONICAL_DATA_PACKAGES[package]
+    }
+    if mismatches:
+        detail = ", ".join(
+            f"{package}=={expected} (found {actual})"
+            for package, (expected, actual) in mismatches.items()
+        )
+        raise RuntimeError(
+            f"canonical data build package mismatch: {detail}; "
+            "install the data-build extra"
+        )
+    return installed
+
 
 # -- tokenization --------------------------------------------------------------
 
@@ -35,19 +78,20 @@ def tokenize(
     *,
     target_tokens: int,
     val_tokens: int,
-    tokenizer_name: str = "Qwen/Qwen3-0.6B",
-    dataset: str = "HuggingFaceFW/fineweb-edu",
-    config: str = "sample-100BT",
-    revision: str | None = None,
+    tokenizer_name: str = CANONICAL_TOKENIZER,
+    tokenizer_revision: str = CANONICAL_TOKENIZER_REVISION,
+    dataset: str = CANONICAL_DATASET,
+    config: str = CANONICAL_CONFIG,
+    revision: str = CANONICAL_DATASET_REVISION,
     batch_docs: int = 256,
 ) -> dict:
     """Stream, tokenize, and shard the corpus until the target is reached.
 
-    Deterministic given (dataset, config, revision): documents are taken
-    in the dataset's canonical streaming order, each followed by the
-    tokenizer's EOS.  Writes val.bin from the head of the stream, then
-    train shards.  Idempotent completion: refuses to run if meta.json
-    already exists.
+    Deterministic given the pinned dataset, tokenizer, and build packages:
+    documents are taken in the dataset's canonical streaming order, each
+    followed by the tokenizer's EOS.  Writes val.bin from the head of the
+    stream, then train shards.  Idempotent completion: refuses to run if
+    meta.json already exists.
     """
     from datasets import load_dataset
     from transformers import AutoTokenizer
@@ -57,16 +101,12 @@ def tokenize(
     if (out / META).exists():
         raise FileExistsError(f"{out / META} exists; delete the directory to redo")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    packages = data_package_versions()
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name, revision=tokenizer_revision
+    )
     eos = tokenizer.eos_token_id
     assert eos is not None
-    if revision is None:
-        # Pin the dataset commit so the stream is reproducible: the full
-        # 57B tokenization and any smoke-sized one must be byte-prefixes
-        # of the same stream.
-        from huggingface_hub import HfApi
-
-        revision = HfApi().dataset_info(dataset).sha
     stream = load_dataset(
         dataset, name=config, split="train", streaming=True, revision=revision
     )
@@ -75,7 +115,9 @@ def tokenize(
         "tokenize",
         dataset=dataset,
         config=config,
+        revision=revision,
         tokenizer=tokenizer_name,
+        tokenizer_revision=tokenizer_revision,
         target=target_tokens,
         val=val_tokens,
     )
@@ -135,10 +177,12 @@ def tokenize(
 
     meta = {
         "tokenizer": tokenizer_name,
+        "tokenizer_revision": tokenizer_revision,
         "eos_id": int(eos),
         "dataset": dataset,
         "config": config,
         "revision": revision,
+        "packages": packages,
         "val_tokens": int(val_count),
         "train_tokens": int(written - val_count),
         "vocab_size": 151936,
@@ -231,10 +275,12 @@ def write_synthetic(
         json.dumps(
             {
                 "tokenizer": "synthetic",
+                "tokenizer_revision": None,
                 "eos_id": 0,
                 "dataset": "synthetic",
                 "config": None,
                 "revision": None,
+                "packages": {},
                 "val_tokens": val_tokens,
                 "train_tokens": train_tokens,
                 "vocab_size": vocab,

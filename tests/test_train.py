@@ -5,11 +5,29 @@ resumed must be bit-identical to an uninterrupted one — the property the
 whole paired-comparison design leans on for multi-day jobe runs.
 """
 
+import sys
+from types import ModuleType
+
 import numpy as np
 import pytest
 import torch
 
-from delta_feedback_experiment.data import TokenData, write_synthetic
+from delta_feedback_experiment import data as data_module
+from delta_feedback_experiment.cli import tokenize_command
+from delta_feedback_experiment.data import (
+    CANONICAL_CONFIG,
+    CANONICAL_DATA_PACKAGES,
+    CANONICAL_DATASET,
+    CANONICAL_DATASET_REVISION,
+    CANONICAL_TARGET_TOKENS,
+    CANONICAL_TOKENIZER,
+    CANONICAL_TOKENIZER_REVISION,
+    CANONICAL_VAL_TOKENS,
+    TokenData,
+    data_package_versions,
+    tokenize,
+    write_synthetic,
+)
 from delta_feedback_experiment.optim import (
     NorMuonH,
     build_optimizers,
@@ -100,6 +118,83 @@ def test_token_data_stitches_shards(tmp_path):
     )
     with pytest.raises(IndexError):
         data.batch(data.rows, 1)
+
+
+def test_data_build_versions_are_exact(monkeypatch):
+    installed = dict(CANONICAL_DATA_PACKAGES)
+    monkeypatch.setattr(data_module, "version", installed.__getitem__)
+    assert data_package_versions() == installed
+
+    installed["datasets"] = "0.0.0"
+    with pytest.raises(RuntimeError, match="datasets==5.0.1"):
+        data_package_versions()
+
+
+def test_tokenize_materializes_pinned_hf_stream(tmp_path, monkeypatch):
+    calls = {}
+    datasets = ModuleType("datasets")
+    transformers = ModuleType("transformers")
+
+    def load_dataset(dataset, *, name, split, streaming, revision):
+        calls["dataset"] = (dataset, name, split, streaming, revision)
+        return iter([{"text": "a"}, {"text": "b"}, {"text": "c"}])
+
+    class FakeTokenizer:
+        eos_token_id = 3
+
+        def __call__(self, texts, *, add_special_tokens):
+            assert not add_special_tokens
+            return {"input_ids": [[1, 2] for _ in texts]}
+
+    class FakeAutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, name, *, revision):
+            calls["tokenizer"] = (name, revision)
+            return FakeTokenizer()
+
+    datasets.load_dataset = load_dataset
+    transformers.AutoTokenizer = FakeAutoTokenizer
+    monkeypatch.setitem(sys.modules, "datasets", datasets)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setattr(
+        data_module, "data_package_versions", lambda: dict(CANONICAL_DATA_PACKAGES)
+    )
+
+    meta = tokenize(tmp_path / "tokens", target_tokens=9, val_tokens=3, batch_docs=1)
+
+    assert calls["dataset"] == (
+        CANONICAL_DATASET,
+        CANONICAL_CONFIG,
+        "train",
+        True,
+        CANONICAL_DATASET_REVISION,
+    )
+    assert calls["tokenizer"] == (
+        CANONICAL_TOKENIZER,
+        CANONICAL_TOKENIZER_REVISION,
+    )
+    assert meta["revision"] == CANONICAL_DATASET_REVISION
+    assert meta["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION
+    assert meta["packages"] == CANONICAL_DATA_PACKAGES
+    assert meta["val_tokens"] == 3
+    assert meta["train_tokens"] == 6
+
+
+def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_tokenize(out_dir, **kwargs):
+        captured["out_dir"] = out_dir
+        captured.update(kwargs)
+
+    monkeypatch.setattr(data_module, "tokenize", fake_tokenize)
+    tokenize_command(["--out", str(tmp_path / "tokens")])
+
+    assert captured["target_tokens"] == CANONICAL_TARGET_TOKENS
+    assert captured["val_tokens"] == CANONICAL_VAL_TOKENS
+    assert captured["config"] == CANONICAL_CONFIG
+    assert captured["revision"] == CANONICAL_DATASET_REVISION
+    assert captured["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION
 
 
 # -- optimizer -----------------------------------------------------------------

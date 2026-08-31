@@ -40,6 +40,9 @@ semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
 runs remain serial because the full v15 DF graph pool reserves 23.00 GiB on
 its 24 GiB RTX 4090.
 
+The realized Jobe token store is a 35.000B-token prefix of the pinned stream.
+The canonical 57B store has not yet been materialized.
+
 The next stages are specified but not runnable: a fresh `{base, df}` 400x
 comparison on one 8xH100-80GB Prime node, followed—only after the evidence and
 implementation gates—by the 1.335B-parameter, 441B-token flagship. See
@@ -66,13 +69,20 @@ the pinned Torch/FlashAttention pair:
 uv pip install -e '.[cuda]'
 ```
 
+Install the exact data-build stack on any staging host that materializes the
+canonical token stream:
+
+```bash
+uv pip install -e '.[data-build]'
+```
+
 ## Operate
 
 ```bash
 # Portable invariant suite; includes the full CUDA gate on a CUDA host.
 df probe
 
-# Build the canonical FineWeb-Edu/Qwen3 stream.
+# Materialize the canonical 57B stream from pinned HF dataset/tokenizer commits.
 df tokenize --out /data/df/tokens
 
 # Run or queue one arm.

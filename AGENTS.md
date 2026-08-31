@@ -83,7 +83,8 @@ a contract changes.
   the next job and runs the current checkout's probe.
 - The implemented local program is the two-seed 25x Jobe screen plus a fresh
   single-process 400x schedule. Prime DDP and the exact flagship remain gated
-  on distributed parity, durable artifacts, memory/throughput, checkpoint
+  on pinned direct-HF data materialization with byte-checksum parity,
+  distributed parity, durable artifacts, memory/throughput, checkpoint
   portability, and restart tests.
 - Flagship promotion requires an admissible Jobe factorial, a fresh Prime
   `{base, df}` result, stable long-horizon contraction, the exact implementation
