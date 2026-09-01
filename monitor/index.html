@@ -14,7 +14,7 @@
   <h1><span class="brand">df</span><select id="run" title="run"></select></h1>
   <div class="controls">
     <label><input type="checkbox" id="logy" checked> log y</label>
-    <label>every <select id="every"><option value="5" selected>5 s</option><option value="10">10 s</option><option value="30">30 s</option></select></label>
+    <label>every <output id="every">–</output></label>
     <button id="refresh" title="refresh now">↻</button>
     <span class="hint zoom">drag to zoom · double-click resets</span>
   </div>
@@ -144,13 +144,18 @@ const CONFIG_GROUPS = [
   ['trunk', ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
   ['optimizer', ['lr_h', 'lr_adam', 'zloss']],
   ['feedback', ['feedback_start', 'feedback_batch_prob', 'three_pass', 'jitter']],
-  ['batch', ['batch_rows', 'micro_rows', 'steps', 'warmup_steps', 'cooldown_frac']],
+  ['batch', ['batch_rows', 'micro_rows']],
 ];
 function renderConfig(run) {
   const setup = run.meta.run;
   const cards = [];
   if (setup) {
     const used = new Set(['event', 'tag']);
+    // Once the resolved schedule is present, its address and phase lengths
+    // supersede the raw step/warmup/cooldown inputs below.
+    if (run.meta.schedule) {
+      for (const key of ['steps', 'warmup_steps', 'cooldown_frac']) used.add(key);
+    }
     for (const [title, keys] of CONFIG_GROUPS) {
       const fields = {};
       for (const key of keys) if (setup[key] != null) { fields[key] = setup[key]; used.add(key); }
@@ -291,6 +296,11 @@ function render(view) {
 
 M.configure({
   primaryKind: 'train',
+  pollSeconds: (view) => {
+    const p = pace(view);
+    const stepSeconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
+    return Number.isFinite(stepSeconds) ? Math.ceil(stepSeconds + 1) : 5;
+  },
   metaEvents: ['run', 'schedule', 'resume', 'fork'],
   title: (run) => `df · ${run.tag}`,
   meta: (view) => {

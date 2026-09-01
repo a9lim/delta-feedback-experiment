@@ -257,7 +257,9 @@ count may change between invocations.
 Each run retains the latest two snapshots plus protected end-of-heat and
 end-of-run snapshots. The durable queue stores exact arguments, not Git state.
 Source changes do not stop an active child; the worker refreshes before the
-next job and runs that job's probe from the current checkout.
+next job and runs that job's probe from the current checkout. `df stop queue`
+atomically removes every pending job without touching the active child or
+worker; `df stop live` does the converse.
 
 ## Evaluation
 

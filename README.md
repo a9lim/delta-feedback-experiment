@@ -102,13 +102,17 @@ df queue example-df-s1 --arm df --seed 1 --data-seed 0 \
 # Inspect and control the detached queue.
 df status
 df watch
-df stop TAG|live|all [--at STEP]
+df stop TAG|live [--at STEP]
+df stop queue
+df stop all
 df clear TAG|all
 ```
 
 The queue records exact arguments, not Git state. A source change never stops
 an active child; the worker refreshes before the next queued job and runs its
-probe from the current checkout.
+probe from the current checkout. `df stop queue` removes every pending job but
+leaves the active run and worker untouched; it is the complement of `df stop
+live`, which stops only the active run and preserves the pending queue.
 
 The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024 predictions
 per row: 3,520,921,600 predicted tokens. Feedback starts halfway through the

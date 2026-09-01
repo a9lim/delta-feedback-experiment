@@ -27,7 +27,8 @@ df — delta-feedback experiment operator
   df queue FILE             append jobs from a file (TAG FLAGS per line)
   df status                 print queue and recent-run state
   df watch                  follow milestones until the queue is idle
-  df stop TAG|live|all [--at STEP]
+  df stop TAG|live [--at STEP]
+  df stop queue|all
   df clear TAG|all          move an idle tag's artifacts to recovery
 """
 
