@@ -233,6 +233,38 @@ def test_normuonh_descends_on_its_initial_frobenius_sphere():
     assert torch.equal(optimizer.state[weight]["radius"], initial_radius)
 
 
+def test_normuonh_applies_nesterov_before_orthogonalization():
+    torch.manual_seed(3)
+    weight = torch.nn.Parameter(torch.randn(8, 6))
+    expected = weight.detach().clone()
+    radius = expected.norm()
+    momentum = torch.zeros_like(expected)
+    row_moment = torch.zeros(expected.shape[0], 1)
+    beta1, beta2, lr, eps = 0.8, 0.7, 0.03, 1e-8
+    optimizer = NorMuonH(
+        [weight], lr=lr, momentum=beta1, beta2=beta2, eps=eps
+    )
+
+    for gradient in (torch.randn_like(weight), torch.randn_like(weight)):
+        weight.grad = gradient.clone()
+        optimizer.step()
+
+        momentum = torch.lerp(momentum, gradient, 1 - beta1)
+        direction = torch.lerp(gradient, momentum, beta1)
+        update = orthogonalize(direction)
+        row_moment = torch.lerp(
+            row_moment, update.square().mean(dim=-1, keepdim=True), 1 - beta2
+        )
+        update = update / (row_moment.sqrt() + eps)
+        update = update / update.norm().clamp_min(eps)
+        trial = expected - lr * radius * update
+        expected = radius * trial / trial.norm().clamp_min(eps)
+
+    assert torch.allclose(weight, expected, rtol=2e-5, atol=2e-6)
+    assert torch.allclose(optimizer.state[weight]["momentum"], momentum)
+    assert torch.allclose(optimizer.state[weight]["row_moment"], row_moment)
+
+
 def test_normuonh_rejects_vectors_and_zero_radius():
     with pytest.raises(ValueError):
         NorMuonH([torch.nn.Parameter(torch.zeros(8))])
@@ -267,8 +299,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 1.0
-    assert CONTRACT.version == 17
-    assert CONTRACT.resumable == frozenset({17})
+    assert CONTRACT.version == 18
+    assert CONTRACT.resumable == frozenset({18})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -567,12 +599,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15, 16])
+@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15, 16, 17])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[17\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[18\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

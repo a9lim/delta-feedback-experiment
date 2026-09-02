@@ -306,14 +306,14 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v17, and only v17 is resumable; v16
-snapshots, whose state has the same meaning, remain readable for evaluation
-and forks but cannot be continued because their feedback prefix draws differ. A
-snapshot contains the model, both optimizer states, fixed NorMuonH radii,
-state-defining arguments, cumulative step, and Python/Torch/CUDA RNG state. A
-resume inherits every state-defining field and rejects explicit conflicts.
-Runtime paths, device, evaluation cadence, snapshot cadence, and evaluation-row
-count may change between invocations.
+New snapshots use checkpoint contract v18, and only v18 is resumable. V16 and
+v17 snapshots remain readable for evaluation and forks but cannot be continued:
+v16 used different feedback-prefix draws, and both predate the Nesterov
+NorMuonH update. A snapshot contains the model, both optimizer states, fixed
+NorMuonH radii, state-defining arguments, cumulative step, and
+Python/Torch/CUDA RNG state. A resume inherits every state-defining field and
+rejects explicit conflicts. Runtime paths, device, evaluation cadence, snapshot
+cadence, and evaluation-row count may change between invocations.
 
 Each run retains the latest two snapshots plus protected snapshots at the
 cooldown boundary, the feedback boundary (the last one-pass state), and the

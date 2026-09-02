@@ -114,6 +114,15 @@ references:
       the base matrix direction inside NorMuonH; Hyperball normalization replaces
       its global rescaling before the parameter update.
 
+  - url: https://github.com/zichongli5/NorMuon/blob/c6989a8354730695d9f5a9faa6c55eeb24865209/normuon.py#L35-L42
+    slug: li2025-normuon-implementation
+    note: >
+      The released NorMuon implementation updates the EMA momentum, forms the
+      default Nesterov direction by blending the current gradient with that
+      updated momentum, and only then applies Newton-Schulz orthogonalization.
+      NorMuonH preserves this ordering before its row normalization and
+      Hyperball projection.
+
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
     note: >

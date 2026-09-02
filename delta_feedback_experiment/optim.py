@@ -2,12 +2,12 @@
 Adam for parameters whose norm carries semantic information, under one WSD
 learning-rate multiplier.
 
-NorMuonH combines NorMuon's EMA momentum, Newton-Schulz orthogonalization,
-and neuron-wise second-moment normalization with the Hyperball constraint
-(arXiv:2606.16899). Each constrained matrix keeps its initial FP32 Frobenius
-radius, the NorMuon direction is normalized to unit Frobenius norm, and every
-trial step is projected exactly back to the initial-radius sphere. No optimizer
-group uses weight decay.
+NorMuonH combines NorMuon's Nesterov momentum, Newton-Schulz
+orthogonalization, and neuron-wise second-moment normalization with the
+Hyperball constraint (arXiv:2606.16899). Each constrained matrix keeps its
+initial FP32 Frobenius radius, the NorMuon direction is normalized to unit
+Frobenius norm, and every trial step is projected exactly back to the
+initial-radius sphere. No optimizer group uses weight decay.
 """
 
 from __future__ import annotations
@@ -57,11 +57,12 @@ def _normuonh_batch(
     eps: float,
     ns_steps: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Batched NorMuon direction followed by the exact Hyperball update."""
+    """Batched Nesterov NorMuon direction and exact Hyperball update."""
     a, b, c = NS_COEFFS
     momentum = torch.lerp(momentum, gradient, 1 - momentum_beta)
-    transposed = momentum.shape[-2] > momentum.shape[-1]
-    x = momentum.mT if transposed else momentum
+    direction = torch.lerp(gradient, momentum, momentum_beta)
+    transposed = direction.shape[-2] > direction.shape[-1]
+    x = direction.mT if transposed else direction
     x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     for _ in range(ns_steps):
         gram = x @ x.mT
@@ -88,7 +89,7 @@ _compiled_normuonh_batch = torch.compile(
 
 
 class NorMuonH(torch.optim.Optimizer):
-    """NorMuon directions constrained to each matrix's initial Frobenius sphere."""
+    """Nesterov NorMuon directions on each initial Frobenius sphere."""
 
     def __init__(
         self,

@@ -378,10 +378,22 @@ For matrix `W`, its initial FP32 Frobenius radius `R = ||W_0||_F` is fixed for
 the life of the run. NorMuonH forms an update direction by:
 
 1. EMA momentum with coefficient `0.95`;
-2. five Newton-Schulz orthogonalization steps;
-3. row-wise second-moment normalization with beta `0.95` and epsilon `1e-8`;
-4. unit-Frobenius normalization;
-5. a Hyperball trial step and exact radial projection.
+2. the released NorMuon Nesterov blend of `0.05` times the current gradient
+   and `0.95` times the updated momentum;
+3. five Newton-Schulz orthogonalization steps;
+4. row-wise second-moment normalization with beta `0.95` and epsilon `1e-8`;
+5. unit-Frobenius normalization;
+6. a Hyperball trial step and exact radial projection.
+
+For current gradient `G_t` and stored momentum `M_t`:
+
+```text
+M_t = 0.95 M_{t-1} + 0.05 G_t
+N_t = 0.05 G_t + 0.95 M_t
+```
+
+Newton-Schulz and the NorMuon row normalization act on `N_t`. Adam remains the
+ordinary non-Nesterov optimizer specified below.
 
 With dimensionless learning rate `lr_h = 2e-2` and normalized direction `U`:
 

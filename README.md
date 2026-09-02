@@ -126,11 +126,13 @@ the schedule, with the cooldown, and every later step draws two or three
 passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 1.0 before the shared
-NorMuonH/Adam update.
+NorMuonH/Adam update; NorMuonH applies its Nesterov blend before
+orthogonalization, while Adam remains ordinary Adam.
 
-Snapshots use checkpoint contract v17, and only v17 is resumable. Protected
-snapshots persist at the cooldown boundary, the feedback boundary, and the end
-of the run.
+Snapshots use checkpoint contract v18, and only v18 is resumable. V16 and v17
+remain readable for evaluation and forks but predate the current Nesterov
+NorMuonH update. Protected snapshots persist at the cooldown boundary, the
+feedback boundary, and the end of the run.
 `--max-steps` limits the current invocation without changing the registered
 schedule.
 
