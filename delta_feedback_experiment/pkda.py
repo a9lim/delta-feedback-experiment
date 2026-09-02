@@ -165,6 +165,8 @@ class PreconditionedKDA(nn.Module):
         self.k_sink: Tensor | None = None
         self.v_sink: Tensor | None = None
         self.o_sink: Tensor | None = None
+        self.qkv_shadow: Tensor | None = None
+        self.o_shadow: Tensor | None = None
         self.reset_recurrence_parameters()
 
     @torch.no_grad()
@@ -226,6 +228,7 @@ class PreconditionedKDA(nn.Module):
                 x,
                 (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
                 (self.q_sink, self.k_sink, self.v_sink),
+                self.qkv_shadow,
             )
             weight = torch.cat(
                 (
@@ -477,7 +480,9 @@ class PreconditionedKDA(nn.Module):
             normalized = normalized * self.output_norm.float()
             mixed = normalized.to(output.dtype) * torch.sigmoid(gate_logits)
         return (
-            sink_linear(mixed.flatten(-2), (self.o_proj.weight,), (self.o_sink,)),
+            sink_linear(
+                mixed.flatten(-2), (self.o_proj.weight,), (self.o_sink,), self.o_shadow
+            ),
             state,
             a_state,
             final_conv,

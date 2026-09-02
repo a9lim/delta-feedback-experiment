@@ -463,7 +463,7 @@ def cuda_gate() -> None:
         lr_h=args.lr_h,
         lr_adam=args.lr_adam,
     )
-    model.refresh_classifier_shadow()
+    model.refresh_shadows()
     classifier_shadow = model._classifier_shadow
     if classifier_shadow is None or classifier_shadow.dtype != torch.bfloat16:
         raise AssertionError("CUDA BF16 classifier shadow was not prepared")
@@ -573,7 +573,7 @@ def cuda_gate() -> None:
             )
         for optimizer in optimizers:
             optimizer.step()
-        model.refresh_classifier_shadow()
+        model.refresh_shadows()
         if model._classifier_shadow.data_ptr() != classifier_shadow_ptr:
             raise AssertionError(
                 "classifier shadow address changed after optimizer step"

@@ -214,8 +214,12 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   the stored-row width so the draws do not depend on the executed length;
 - persistent FP32 gradient buffers that the tied embedding (lookup scatter and
   CCE classifier gradient) and every large projection accumulate into directly
-  from backward, so no weight gradient is materialized apart from its
+  from backward through cuBLAS, with the FP32 sink as both the unit-beta
+  addend and the output, so no weight gradient is materialized apart from its
   accumulator and those parameters hand autograd no gradient at all;
+- address-stable BF16 shadows of every sink-fed projection's concatenated
+  weights, refreshed together with the classifier shadow once per optimizer
+  update, so no replay casts or concatenates FP32 parameters;
 - the workspace FLA fork's PKDA chunk kernel retaining its WY and chunk-state
   intermediates for backward and recomputing only the gated query, one GEMM
   over the concatenated Q/K/V weights per PKDA layer feeding one causal
@@ -248,15 +252,15 @@ default capture is:
 
 | Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 66.7 s | 14.04 GiB | 22.97 GiB | 4 |
+| `df` | 59.5 s | 13.52 GiB | 22.99 GiB | 4 |
 
-Median graph replay is 65.6 ms, 132.4 ms, and 199.4 ms for one, two, and three
+Median graph replay is 63.1 ms, 127.5 ms, and 192.0 ms for one, two, and three
 passes. The same probe measures PKDA chunk parity at relative error 0.0039,
 fused Q/K/V convolution parity at 0.0035, fused output norm-gate parity at
 0.0032, and cached decode parity at 0.0069/0.0128. Resumed from the completed
 `screen-df-s1` step-10,500 snapshot, this path reproduces that run's logged
 per-step losses to four decimals over 100 mixed-pass steps, its step-10,600
-validation losses within 0.001, and runs at 58.0k one-pass tokens per second
+validation losses within 0.001, and runs at 60.0k one-pass tokens per second
 against the run's 50.9k. Inductor artifacts live in
 `~/.cache/delta-feedback/torchinductor` by default; the probe performs the
 fixed-shape search once and later processes reuse the cache with no autotuning

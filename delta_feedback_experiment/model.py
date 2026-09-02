@@ -353,6 +353,8 @@ class Attention(nn.Module):
         self.qkv_sink: Tensor | None = None
         self.gate_sink: Tensor | None = None
         self.o_sink: Tensor | None = None
+        self.qkv_shadow: Tensor | None = None
+        self.o_shadow: Tensor | None = None
 
     def forward(
         self,
@@ -372,12 +374,13 @@ class Attention(nn.Module):
                 x,
                 (self.qkv_proj.weight, gate_weight),
                 (self.qkv_sink, self.gate_sink),
+                self.qkv_shadow,
             ).split((self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1)
         else:
             gate_logits = None
-            q, k, v = sink_linear(x, (self.qkv_proj.weight,), (self.qkv_sink,)).split(
-                (self.q_size, self.kv_size, self.kv_size), dim=-1
-            )
+            q, k, v = sink_linear(
+                x, (self.qkv_proj.weight,), (self.qkv_sink,), self.qkv_shadow
+            ).split((self.q_size, self.kv_size, self.kv_size), dim=-1)
         q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
         k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
@@ -424,7 +427,7 @@ class Attention(nn.Module):
         out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
         if gate_logits is not None:
             out = out * torch.sigmoid(gate_logits)
-        return sink_linear(out, (self.o_proj.weight,), (self.o_sink,))
+        return sink_linear(out, (self.o_proj.weight,), (self.o_sink,), self.o_shadow)
 
 
 class SwiGLU(nn.Module):
@@ -434,13 +437,18 @@ class SwiGLU(nn.Module):
         self.down_proj = nn.Linear(cfg.intermediate, cfg.dim, bias=False)
         self.gate_up_sink: Tensor | None = None
         self.down_sink: Tensor | None = None
+        self.gate_up_shadow: Tensor | None = None
+        self.down_shadow: Tensor | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         gate, up = sink_linear(
-            x, (self.gate_up_proj.weight,), (self.gate_up_sink,)
+            x, (self.gate_up_proj.weight,), (self.gate_up_sink,), self.gate_up_shadow
         ).chunk(2, dim=-1)
         return sink_linear(
-            F.silu(gate) * up, (self.down_proj.weight,), (self.down_sink,)
+            F.silu(gate) * up,
+            (self.down_proj.weight,),
+            (self.down_sink,),
+            self.down_shadow,
         )
 
 
@@ -796,6 +804,9 @@ class DFModel(nn.Module):
         )
         self.fuse_value_sink: Tensor | None = None
         self.fuse_gate_sink: Tensor | None = None
+        self.fuse_value_shadow: Tensor | None = None
+        self.fuse_gate_shadow: Tensor | None = None
+        self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
         if cfg.gated_entry:
             self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
@@ -855,10 +866,18 @@ class DFModel(nn.Module):
         """FBT entry: u = rmsnorm(W_U p ⊙ σ(W_G rmsnorm(e))) (Appendix C)."""
         gate = torch.sigmoid(
             sink_linear(
-                self.gate_norm(e), (self.fuse_gate.weight,), (self.fuse_gate_sink,)
+                self.gate_norm(e),
+                (self.fuse_gate.weight,),
+                (self.fuse_gate_sink,),
+                self.fuse_gate_shadow,
             )
         )
-        value = sink_linear(payload, (self.fuse_value.weight,), (self.fuse_value_sink,))
+        value = sink_linear(
+            payload,
+            (self.fuse_value.weight,),
+            (self.fuse_value_sink,),
+            self.fuse_value_shadow,
+        )
         return self.entry_norm(value * gate)
 
     # -- persistent gradient sinks -------------------------------------------
@@ -873,15 +892,49 @@ class DFModel(nn.Module):
         gradient; ``None`` restores ordinary autograd accumulation.  Returns
         the parameters that were bound, so the trainer can treat a touched
         buffer as that parameter's activity for the captured mode.
+
+        On CUDA every bound site also receives an address-stable BF16 shadow of
+        its (concatenated) weights.  ``refresh_shadows`` rewrites the shadows
+        from the FP32 masters once per optimizer update, so no replay casts or
+        concatenates parameters; the shadows are neither parameters nor
+        checkpoint state.
         """
         lookup = sinks or {}
         bound: set[nn.Parameter] = set()
+        refresh: list[tuple[Tensor, Tensor]] = []
 
         def sink(parameter: nn.Parameter) -> Tensor | None:
             buffer = lookup.get(parameter)
             if buffer is not None:
                 bound.add(parameter)
             return buffer
+
+        def shadow(current: Tensor | None, *weights: Tensor) -> Tensor | None:
+            # Rebinding keeps an existing shadow: the compiled blocks were
+            # traced against these exact tensors, and an address must not
+            # change between warm-up and capture.
+            if sinks is None or not weights[0].is_cuda:
+                return None
+            rows = sum(weight.shape[0] for weight in weights)
+            shape = (rows, weights[0].shape[1])
+            fresh = current is None or current.shape != shape
+            if fresh:
+                current = torch.empty(
+                    shape, device=weights[0].device, dtype=torch.bfloat16
+                )
+            start = 0
+            for weight in weights:
+                segment = current[start : start + weight.shape[0]]
+                if fresh:
+                    # A shadow is valid from the moment it exists; warm-up may
+                    # trace the blocks before the trainer's first refresh. The
+                    # copy must leave no autograd history on the shadow: a
+                    # recorded CopySlices node lives on this (uncaptured)
+                    # stream and would break the captured backward.
+                    segment.copy_(weight.detach())
+                refresh.append((segment, weight.detach()))
+                start += weight.shape[0]
+            return current
 
         # The portable head reads the tied weight through autograd, so only the
         # CUDA path (CCE plus the bespoke lookup) owns an embedding sink.
@@ -891,35 +944,59 @@ class DFModel(nn.Module):
         for block in self.blocks:
             block.mlp.gate_up_sink = sink(block.mlp.gate_up_proj.weight)
             block.mlp.down_sink = sink(block.mlp.down_proj.weight)
+            block.mlp.gate_up_shadow = shadow(
+                block.mlp.gate_up_shadow, block.mlp.gate_up_proj.weight
+            )
+            block.mlp.down_shadow = shadow(
+                block.mlp.down_shadow, block.mlp.down_proj.weight
+            )
             attn = block.attn
             if block.is_pkda:
                 attn.q_sink = sink(attn.q_proj.weight)
                 attn.k_sink = sink(attn.k_proj.weight)
                 attn.v_sink = sink(attn.v_proj.weight)
                 attn.o_sink = sink(attn.o_proj.weight)
+                attn.qkv_shadow = shadow(
+                    attn.qkv_shadow,
+                    attn.q_proj.weight,
+                    attn.k_proj.weight,
+                    attn.v_proj.weight,
+                )
+                attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
             else:
                 attn.qkv_sink = sink(attn.qkv_proj.weight)
                 attn.o_sink = sink(attn.o_proj.weight)
-                attn.gate_sink = (
-                    sink(self.attention_gates[block.global_gate_index].weight)
-                    if block.global_gate_index is not None
-                    else None
-                )
+                attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
+                if block.global_gate_index is not None:
+                    gate = self.attention_gates[block.global_gate_index].weight
+                    attn.gate_sink = sink(gate)
+                    attn.qkv_shadow = shadow(
+                        attn.qkv_shadow, attn.qkv_proj.weight, gate
+                    )
+                else:
+                    attn.gate_sink = None
+                    attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight)
         if self.cfg.gated_entry:
             self.fuse_value_sink = sink(self.fuse_value.weight)
             self.fuse_gate_sink = sink(self.fuse_gate.weight)
+            self.fuse_value_shadow = shadow(
+                self.fuse_value_shadow, self.fuse_value.weight
+            )
+            self.fuse_gate_shadow = shadow(self.fuse_gate_shadow, self.fuse_gate.weight)
+        self._shadow_refresh = refresh
         return bound
 
     def logits(self, h_top: Tensor) -> Tensor:
         return F.linear(self.final_norm(h_top), self.embed_tokens.weight)
 
     @torch.no_grad()
-    def refresh_classifier_shadow(self) -> None:
-        """Refresh the CUDA-only BF16 readout derived from the FP32 embedding.
+    def refresh_shadows(self) -> None:
+        """Refresh every CUDA-only BF16 operand copy from its FP32 master.
 
-        The buffer is deliberately absent from ``state_dict``. Its address is
-        allocated once before graph capture and remains stable across optimizer
-        updates; only its contents change.
+        That is the classifier readout of the tied embedding plus the trunk
+        shadows bound with the gradient sinks. None of them is ``state_dict``
+        content. Their addresses are allocated once before graph capture and
+        remain stable across optimizer updates; only their contents change.
         """
         master = self.embed_tokens.weight
         if not master.is_cuda:
@@ -934,6 +1011,11 @@ class DFModel(nn.Module):
             shadow = torch.empty_like(master, dtype=torch.bfloat16)
             self._classifier_shadow = shadow
         shadow.copy_(master)
+        if self._shadow_refresh:
+            torch._foreach_copy_(
+                [copy for copy, _ in self._shadow_refresh],
+                [weight for _, weight in self._shadow_refresh],
+            )
 
     def classifier_for_loss(self) -> Tensor:
         """Return the graph-stable BF16 CCE operand linked to the FP32 master."""

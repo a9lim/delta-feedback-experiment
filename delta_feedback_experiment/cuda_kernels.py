@@ -722,64 +722,6 @@ def _pack_control_gradients_impl(
 # -- in-place weight-gradient accumulation -------------------------------------
 
 
-if triton is not None:
-
-    @triton.autotune(
-        configs=[
-            triton.Config({"BM": 128, "BN": 128, "BK": 32}, num_warps=8, num_stages=3),
-            triton.Config({"BM": 128, "BN": 128, "BK": 64}, num_warps=8, num_stages=3),
-            triton.Config({"BM": 128, "BN": 64, "BK": 32}, num_warps=4, num_stages=4),
-            triton.Config({"BM": 128, "BN": 64, "BK": 64}, num_warps=4, num_stages=3),
-            triton.Config({"BM": 64, "BN": 128, "BK": 32}, num_warps=4, num_stages=4),
-            triton.Config({"BM": 64, "BN": 128, "BK": 64}, num_warps=4, num_stages=3),
-            triton.Config({"BM": 64, "BN": 64, "BK": 64}, num_warps=4, num_stages=4),
-            triton.Config({"BM": 64, "BN": 64, "BK": 32}, num_warps=4, num_stages=4),
-        ],
-        key=["rows", "cols", "tokens"],
-        restore_value=["sink"],
-    )
-    @triton.jit
-    def _dw_accum_kernel(
-        grad_output,
-        activations,
-        sink,
-        rows,
-        cols,
-        tokens,
-        stride_gt,
-        stride_gr,
-        stride_at,
-        stride_ac,
-        stride_sr,
-        stride_sc,
-        BM: tl.constexpr,
-        BN: tl.constexpr,
-        BK: tl.constexpr,
-    ):
-        """sink[rows, cols] += grad_output[tokens, rows]^T @ activations[tokens, cols]."""
-        pid_r = tl.program_id(0)
-        pid_c = tl.program_id(1)
-        r = pid_r * BM + tl.arange(0, BM)
-        c = pid_c * BN + tl.arange(0, BN)
-        acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for t0 in range(0, tokens, BK):
-            t = t0 + tl.arange(0, BK)
-            g = tl.load(
-                grad_output + t[None, :] * stride_gt + r[:, None] * stride_gr,
-                mask=(r[:, None] < rows) & (t[None, :] < tokens),
-                other=0.0,
-            )
-            a = tl.load(
-                activations + t[:, None] * stride_at + c[None, :] * stride_ac,
-                mask=(t[:, None] < tokens) & (c[None, :] < cols),
-                other=0.0,
-            )
-            acc += tl.dot(g, a)
-        pointers = sink + r[:, None] * stride_sr + c[None, :] * stride_sc
-        mask = (r[:, None] < rows) & (c[None, :] < cols)
-        tl.store(pointers, tl.load(pointers, mask=mask, other=0.0) + acc, mask=mask)
-
-
 @torch.library.custom_op(
     "delta_feedback::dw_accum", mutates_args=(), device_types="cpu"
 )
@@ -788,9 +730,12 @@ def dw_accum(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Tensor:
 
     ``grad_output`` is ``[tokens, rows]`` and ``activations`` ``[tokens, cols]``;
     ``sink`` is the persistent FP32 ``[rows, cols]`` weight gradient.  The CPU
-    kernel is the literal reference; CUDA owns the tensor-core reduction and
-    the read-modify-write epilogue, so a weight gradient is never materialized
-    separately from its accumulator.
+    kernel is the literal reference; CUDA hands cuBLAS the BF16 operands with
+    the FP32 sink as both the ``beta=1`` addend and the output, so a weight
+    gradient is never materialized separately from its accumulator.  Measured
+    on the 4090 against a Triton tensor-core kernel with the same
+    read-modify-write epilogue, cuBLAS was 18% faster over the trunk shapes
+    with equal or lower error, and it captures into CUDA graphs.
 
     The op deliberately declares no mutation.  Inside a compiled block the sink
     is a saved tensor of the compiled autograd node, and a declared mutation
@@ -808,35 +753,27 @@ def _dw_accum_fake(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Te
     return sink.new_zeros(())
 
 
-if triton is not None:
-
-    @dw_accum.register_kernel("cuda")
-    def _dw_accum_cuda(
-        grad_output: Tensor, activations: Tensor, sink: Tensor
-    ) -> Tensor:
-        if sink.dtype != torch.float32:
-            raise TypeError("dw_accum sinks are FP32 gradient buffers")
-        tokens, rows = grad_output.shape
-        cols = activations.shape[1]
-
-        def grid(meta):
-            return (triton.cdiv(rows, meta["BM"]), triton.cdiv(cols, meta["BN"]))
-
-        _dw_accum_kernel[grid](
-            grad_output,
-            activations,
-            sink,
-            rows,
-            cols,
-            tokens,
-            grad_output.stride(0),
-            grad_output.stride(1),
-            activations.stride(0),
-            activations.stride(1),
-            sink.stride(0),
-            sink.stride(1),
-        )
-        return sink.new_zeros(())
+@dw_accum.register_kernel("cuda")
+def _dw_accum_cuda(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Tensor:
+    if sink.dtype != torch.float32:
+        raise TypeError("dw_accum sinks are FP32 gradient buffers")
+    # Accumulate through a transient alias of the sink's memory: an in-place
+    # ``out=`` on the sink itself would bump the version counter that the
+    # compiled blocks' saved-tensor checks read between the passes sharing it.
+    target = torch.empty(0, dtype=sink.dtype, device=sink.device)
+    target.set_(
+        sink.untyped_storage(), sink.storage_offset(), sink.shape, sink.stride()
+    )
+    torch.addmm(
+        target,
+        grad_output.mT,
+        activations,
+        beta=1.0,
+        alpha=1.0,
+        out_dtype=torch.float32,
+        out=target,
+    )
+    return sink.new_zeros(())
 
 
 class _SinkLinear(torch.autograd.Function):
@@ -849,20 +786,24 @@ class _SinkLinear(torch.autograd.Function):
     so the only weight-gradient traffic is the accumulator itself, and the
     parameters receive no autograd gradient at all.  Row segments keep
     separate parameters (Q/K/V, or QKV plus the attention gate) behind one GEMM.
+
+    ``operand`` is the activation-dtype copy of the concatenated weights that
+    the GEMM actually reads: the trainer's persistent shadow when one is bound,
+    otherwise a fresh cast.  The FP32 parameters stay inputs so the output's
+    autograd requirement follows them exactly as it would through ``F.linear``.
     """
 
     @staticmethod
-    def forward(ctx, x: Tensor, splits: tuple[int, ...], *tensors: Tensor) -> Tensor:
+    def forward(
+        ctx, x: Tensor, splits: tuple[int, ...], operand: Tensor, *tensors: Tensor
+    ) -> Tensor:
         count = len(splits)
-        weights, sinks = tensors[:count], tensors[count:]
-        weight = weights[0] if count == 1 else torch.cat(weights, dim=0)
-        weight = weight.to(x.dtype)
-        ctx.save_for_backward(x, weight)
+        ctx.save_for_backward(x, operand)
         # Sinks are mutated by every backward that reaches them, so they are
         # held as plain attributes rather than version-checked saved tensors.
-        ctx.sinks = sinks
+        ctx.sinks = tensors[count:]
         ctx.splits = splits
-        return F.linear(x, weight)
+        return F.linear(x, operand)
 
     @staticmethod
     def backward(ctx, gradient: Tensor):
@@ -879,17 +820,33 @@ class _SinkLinear(torch.autograd.Function):
             start += size
         # The fence is zero; the dependency keeps every accumulation alive.
         grad_x = grad_x + fence.to(grad_x.dtype)
-        return (grad_x, None) + (None,) * (2 * len(ctx.splits))
+        return (grad_x, None, None) + (None,) * (2 * len(ctx.splits))
 
 
 def sink_linear(
-    x: Tensor, weights: tuple[Tensor, ...], sinks: tuple[Tensor | None, ...]
+    x: Tensor,
+    weights: tuple[Tensor, ...],
+    sinks: tuple[Tensor | None, ...],
+    shadow: Tensor | None = None,
 ) -> Tensor:
-    """Linear over concatenated weights; bound sinks accumulate dW in place."""
+    """Linear over concatenated weights; bound sinks accumulate dW in place.
+
+    ``shadow`` is the trainer-owned activation-dtype copy of the concatenated
+    weights, refreshed once per optimizer step, so no replay re-casts or
+    re-concatenates FP32 parameters.  Without one (portable paths, analysis,
+    cached decoding) the operand is cast per call.
+    """
+    if shadow is not None and shadow.dtype == x.dtype:
+        operand = shadow
+    else:
+        operand = (weights[0] if len(weights) == 1 else torch.cat(weights, dim=0)).to(
+            x.dtype
+        )
     if not torch.is_grad_enabled() or any(sink is None for sink in sinks):
-        weight = weights[0] if len(weights) == 1 else torch.cat(weights, dim=0)
-        return F.linear(x, weight)
-    return _SinkLinear.apply(x, tuple(w.shape[0] for w in weights), *weights, *sinks)
+        return F.linear(x, operand)
+    return _SinkLinear.apply(
+        x, tuple(w.shape[0] for w in weights), operand, *weights, *sinks
+    )
 
 
 if triton is not None:

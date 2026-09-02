@@ -184,7 +184,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="cap this invocation's additional steps; never rescales the schedule",
     )
     runtime.add_argument("--device", default=None)
-    runtime.add_argument("--eval-every", type=int, default=100)
+    runtime.add_argument("--eval-every", type=int, default=250)
     runtime.add_argument("--snapshot-every", type=int, default=500)
     runtime.add_argument("--eval-rows", type=int, default=32)
     return parser
@@ -304,7 +304,7 @@ class CudaGraphTrainer:
         self.generator = torch.Generator(device=self.device)
         self.parameters = [p for p in model.parameters() if p.requires_grad]
         self.states: dict[GraphSpec, CapturedMicro] = {}
-        self.model.refresh_classifier_shadow()
+        self.model.refresh_shadows()
         specs = self._reachable_specs(schedule)
         for spec in specs:
             self.states[spec] = self._allocate(spec)
@@ -333,7 +333,7 @@ class CudaGraphTrainer:
             parameter.grad = gradient
 
         self._initialize_optimizers()
-        self.model.refresh_classifier_shadow()
+        self.model.refresh_shadows()
         for active in active_by_spec.values():
             for optimizer in self.optimizers:
                 warmup = getattr(optimizer, "warmup", None)
@@ -998,7 +998,7 @@ def train(argv: list[str] | None = None) -> dict:
             grad_norm = clip_gradients(model.parameters())
             for optimizer in optimizers:
                 optimizer.step()
-            model.refresh_classifier_shadow()
+            model.refresh_shadows()
             if graph_runner is not None:
                 graph_runner.zero_grad()
             else:
