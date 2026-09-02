@@ -221,7 +221,7 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   over the concatenated Q/K/V weights per PKDA layer feeding one causal
   convolution launch that also applies the SiLU and the per-head Q/K L2
   normalization and recomputes its own pre-activation in backward, Ada-tuned
-  intra-chunk and preconditioner backward kernels, and fused PKDA output
+  intra-chunk backward and inter/solve forward kernels, and fused PKDA output
   norm/gate;
 - FlashAttention for full-sequence, prefill, GQA, and cached decode, with each
   gated global layer projecting Q/K/V and its gate in one GEMM;
@@ -248,15 +248,15 @@ default capture is:
 
 | Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 60.5 s | 14.04 GiB | 22.97 GiB | 4 |
+| `df` | 66.7 s | 14.04 GiB | 22.97 GiB | 4 |
 
-Median graph replay is 65.8 ms, 132.8 ms, and 199.7 ms for one, two, and three
+Median graph replay is 65.6 ms, 132.4 ms, and 199.4 ms for one, two, and three
 passes. The same probe measures PKDA chunk parity at relative error 0.0039,
 fused Q/K/V convolution parity at 0.0035, fused output norm-gate parity at
 0.0032, and cached decode parity at 0.0069/0.0128. Resumed from the completed
 `screen-df-s1` step-10,500 snapshot, this path reproduces that run's logged
 per-step losses to four decimals over 100 mixed-pass steps, its step-10,600
-validation losses within 0.001, and runs at 57.9k one-pass tokens per second
+validation losses within 0.001, and runs at 58.0k one-pass tokens per second
 against the run's 50.9k. Inductor artifacts live in
 `~/.cache/delta-feedback/torchinductor` by default; the probe performs the
 fixed-shape search once and later processes reuse the cache with no autotuning
