@@ -222,15 +222,24 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   addend and the output, so no weight gradient is materialized apart from its
   accumulator and those parameters hand autograd no gradient at all;
 - address-stable BF16 shadows of every sink-fed projection's concatenated
-  weights, refreshed together with the classifier shadow once per optimizer
-  update, so no replay casts or concatenates FP32 parameters;
+  weights and of PKDA's three Adam-owned control matrices, refreshed together
+  with the classifier shadow once per optimizer update, so no replay casts or
+  concatenates FP32 parameters;
 - the workspace FLA fork's PKDA chunk kernel retaining its WY and chunk-state
   intermediates for backward and recomputing only the gated query, one GEMM
   over the concatenated Q/K/V weights per PKDA layer feeding one causal
   convolution launch that also applies the SiLU and the per-head Q/K L2
-  normalization and recomputes its own pre-activation in backward, Ada-tuned
-  intra-chunk backward and inter/solve forward kernels, and fused PKDA output
-  norm/gate;
+  normalization, recomputes its own pre-activation in backward, and writes Q,
+  K, and V as three contiguous slabs whose gradients return separately, so the
+  recurrence reads them without contiguity copies and the backward never
+  concatenates them, Ada-tuned intra-chunk backward and inter/solve forward
+  kernels, a WY/inter backward that keeps its value-side tiles across its
+  key loop at 128-wide value tiles, a gate backward that folds the decay
+  gradient's reverse cumulative sum and narrowing into its own kernel, a
+  preconditioner whose forward products are kept for backward instead of
+  recomputed, whose chunk kernels run without register spills, and whose
+  summary kernel folds in the intra-chunk key gradient, and fused PKDA
+  output norm/gate;
 - FlashAttention for full-sequence, prefill, GQA, and cached decode, with each
   gated global layer projecting Q/K/V and its gate in one GEMM;
 - a fixed-capacity Triton MHDB router that reads every source once per token
@@ -241,8 +250,17 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   FP32 tied-embedding master once per optimizer update;
 - the workspace cut-cross-entropy fork with BF16 operands, capture-safe
   fixed-shape no-ignore preprocessing, and its native differentiable
-  log-partition output for the exact squared-log-partition gradient;
+  log-partition output for the exact squared-log-partition gradient, tiling
+  the classifier in both halves through one fixed vocabulary permutation
+  (ids by descending frequency in the held-out slice, ties by id, derived at
+  startup from the registered stream and never checkpointed), storing each
+  tile's per-row maximum logit in the forward, and skipping every backward
+  tile the gradient filter would drop before recomputing its logits, a
+  decision identical to the late filter's;
 - the Triton PKDA control-gradient packer;
+- each compiled block also emitting the residual's distance from its cell
+  entry, so partial and completed block deltas are never formed eagerly
+  between blocks;
 - fixed-shape, exhaustive Inductor autotuning for compiled global-attention
   blocks and segmented PKDA blocks around the opaque FLA recurrence, with one
   process-wide Dynamo recompile budget covering every block, source-count,
@@ -258,17 +276,26 @@ default capture is:
 
 | Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 59.5 s | 13.52 GiB | 22.99 GiB | 4 |
+| `df` | 149.2 s | 13.84 GiB | 21.76 GiB | 4 |
 
-Median graph replay is 63.1 ms, 127.5 ms, and 192.0 ms for one, two, and three
-passes. The same probe measures PKDA chunk parity at relative error 0.0039,
-fused Q/K/V convolution parity at 0.0035, fused output norm-gate parity at
-0.0032, and cached decode parity at 0.0069/0.0128. Resumed from the completed
-`screen-df-s1` step-10,500 snapshot (a v15 snapshot from the superseded
-mixed-heat recipe), this path reproduces that run's logged
-per-step losses to four decimals over 100 mixed-pass steps, its step-10,600
-validation losses within 0.001, and runs at 60.0k one-pass tokens per second
-against the run's 50.9k. Inductor artifacts live in
+Median graph replay is 55.4 ms, 111.9 ms, and 168.4 ms for one, two, and three
+passes at random initialization; at a trained checkpoint the cut
+cross-entropy backward keeps more tiles and the one-pass replay is about
+five milliseconds longer. The same probe measures PKDA chunk parity at
+relative error 0.0039, fused Q/K/V convolution parity at 0.0035, fused output
+norm-gate parity at 0.0032, cached decode parity at 0.0069/0.0128, and that
+the head's early tile skip computes exactly the late filter's tile set. The
+fork kernels are additionally gated on the workspace PKDA layer benchmark,
+whose gradient drift against its stored reference is unchanged across the
+kernel rounds (7.44e-3 at the largest row). The head's fixed vocabulary
+ordering keeps about 3% fewer gradient tiles than upstream's per-batch
+ordering, so the embedding gradient sits about twice as far from an FP32
+reference (2.2e-2 against 1.2e-2 relative) at trained checkpoints; the
+filter threshold itself is unchanged. Resumed from the `screen-df-s1`
+step-10,500 snapshot under the current recipe, this path matches the
+previous execution path's per-step losses to four decimals for three
+two-pass steps and drifts to 1e-3 relative by the twenty-fourth. Inductor
+artifacts live in
 `~/.cache/delta-feedback/torchinductor` by default; the probe performs the
 fixed-shape search once and later processes reuse the cache with no autotuning
 work. The reserved graph pool is the concurrency boundary. Screen runs remain

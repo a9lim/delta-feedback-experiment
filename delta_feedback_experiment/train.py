@@ -28,7 +28,7 @@ import torch
 from transformer_experiments import checkpoints, runs, telemetry
 from transformer_experiments.schedule import Schedule
 
-from .data import TokenData, read_meta
+from .data import TokenData, read_meta, vocab_order_from_counts
 from .model import (
     ARMS,
     DFModel,
@@ -875,6 +875,13 @@ def train(argv: list[str] | None = None) -> dict:
             max_seq_len=args.seq_len + 1,
         )
     ).to(device)
+    if device.type == "cuda":
+        # The head tiles the vocabulary by held-out frequency (a function of
+        # the registered stream, so every arm and every resume derive the
+        # same permutation) and skips filtered gradient tiles early.
+        model.set_vocab_order(
+            vocab_order_from_counts(data_val.unigram_counts(args.vocab_size))
+        )
     optimizers = build_optimizers(model, lr_h=args.lr_h, lr_adam=args.lr_adam)
     pair = OptimizerPair(optimizers)
 

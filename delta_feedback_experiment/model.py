@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
-from .cuda_kernels import sink_linear
+from .cuda_kernels import ShadowOperand, sink_linear
 from .pkda import PreconditionedKDA
 
 try:  # Triton is deliberately a CUDA-only optimization dependency.
@@ -665,14 +665,23 @@ class Block(nn.Module):
     def forward(
         self,
         h: Tensor,
+        block_start: Tensor | None,
         cos: Tensor | None,
         sin: Tensor | None,
         cache: KVCache | None,
         gate_weight: Tensor | None,
         want_weights: bool,
         *sources: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
-        """Returns (h, attn delta, mlp delta, attn weights, mlp weights)."""
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
+        """Returns (h, attn delta, mlp delta, cell delta, attn weights, mlp
+        weights). ``block_start`` is the residual at the cell's entry, or None
+        when this block is that entry; the returned cell delta is the next
+        sublayer's partial source or, at the cell boundary, the completed
+        block delta, computed here so it lands inside the compiled block
+        instead of as an eager subtraction. (Passing ``h`` twice would make
+        Dynamo guard the inputs against aliasing, and its recompile-reason
+        logging then evaluates those guards across block instances.)"""
+        start = h if block_start is None else block_start
         x, w_attn = self._read(h, self.attn_router, sources, want_weights)
         normalized = self.attn_norm(x)
         if self.is_pkda:
@@ -699,18 +708,32 @@ class Block(nn.Module):
         x, w_mlp = self._read(h, self.mlp_router, mlp_sources, want_weights)
         m = self.branch_scale * self.mlp(self.mlp_norm(x))
         h = h + m
-        return h, a, m, w_attn, w_mlp
+        return h, a, m, h - start, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, cos, sin, gate_weight, *sources):
+def _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources):
     """Tensor-only wrapper for activation checkpointing (no cache, no
     weights) — the recomputation must be free of side effects."""
-    h, a, m, _, _ = block(h, cos, sin, None, gate_weight, False, *sources)
-    return h, a, m
+    h, a, m, delta, _, _ = block(
+        h, block_start, cos, sin, None, gate_weight, False, *sources
+    )
+    return h, a, m, delta
+
+
+# Each block family compiles through its own code object. Dynamo keys its
+# cache on the code object and, when it recompiles, evaluates every earlier
+# entry's guards against the current call to log the reason; one family's
+# guards name attributes the other family's mixer does not have.
+def _attention_block(block, h, block_start, cos, sin, gate_weight, *sources):
+    return _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources)
+
+
+def _pkda_block(block, h, block_start, cos, sin, gate_weight, *sources):
+    return _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources)
 
 
 _compiled_block = torch.compile(
-    _block_for_checkpoint,
+    _attention_block,
     fullgraph=True,
     dynamic=False,
     # The graph shapes are fixed by the registered screen. The probe performs
@@ -720,7 +743,7 @@ _compiled_block = torch.compile(
 )
 
 _compiled_pkda_block = torch.compile(
-    _block_for_checkpoint,
+    _pkda_block,
     # FLA's opaque recurrence remains its own kernel boundary. Inductor graph
     # breaks around it and fuses the projections, controls, norm/gate, MLP,
     # residual updates, and routing on either side.
@@ -760,25 +783,13 @@ class ColumnOutput:
     """How many leading entries of ``sources`` are seeds, not deltas."""
 
 
-class _ClassifierShadow(torch.autograd.Function):
-    """Read a stable BF16 shadow while accumulating into its FP32 master.
+_ClassifierShadow = ShadowOperand
+"""The tied classifier reads its BF16 shadow through the shared operand.
 
-    With a persistent sink the BF16 classifier gradient is added into it in one
-    fused pass instead of being widened to a 467 MB FP32 temporary that autograd
-    then adds a second time.
-    """
-
-    @staticmethod
-    def forward(ctx, master: Tensor, shadow: Tensor, sink: Tensor | None) -> Tensor:
-        ctx.sink = sink
-        return shadow
-
-    @staticmethod
-    def backward(ctx, gradient: Tensor) -> tuple[Tensor | None, None, None]:
-        if ctx.sink is not None:
-            ctx.sink.add_(gradient)
-            return None, None, None
-        return gradient.float(), None, None
+With a persistent sink the BF16 classifier gradient is added into it in one
+fused pass instead of being widened to a 467 MB FP32 temporary that autograd
+then adds a second time.
+"""
 
 
 class DFModel(nn.Module):
@@ -790,6 +801,7 @@ class DFModel(nn.Module):
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.register_buffer("_classifier_shadow", None, persistent=False)
+        self.register_buffer("_vocab_order", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         # Capture the exact common-trunk initialization boundary before
@@ -963,6 +975,17 @@ class DFModel(nn.Module):
                     attn.v_proj.weight,
                 )
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
+                # The Adam-owned control matrices keep ordinary autograd
+                # gradients but read shadows too, so no replay casts them.
+                attn.control_shadow = shadow(
+                    attn.control_shadow, attn.control_proj.weight
+                )
+                attn.decay_up_shadow = shadow(
+                    attn.decay_up_shadow, attn.decay_up.weight
+                )
+                attn.output_gate_shadow = shadow(
+                    attn.output_gate_shadow, attn.output_gate_up.weight
+                )
             else:
                 attn.qkv_sink = sink(attn.qkv_proj.weight)
                 attn.o_sink = sink(attn.o_proj.weight)
@@ -1017,6 +1040,28 @@ class DFModel(nn.Module):
                 [weight for _, weight in self._shadow_refresh],
             )
 
+    def set_vocab_order(self, order: Tensor | None) -> None:
+        """Bind the fixed vocabulary permutation the CUDA head tiles by.
+
+        Cut cross-entropy filters gradient tiles whose probabilities all fall
+        below its epsilon, and it skips a tile before recomputing its logits
+        only when the forward and backward tile the vocabulary the same way.
+        Ordering ids by descending frequency in the held-out slice clusters the
+        negligible tiles; the permutation is a function of the registered data,
+        so it is neither a parameter nor checkpoint state.
+        """
+        if order is None:
+            self._vocab_order = None
+            return
+        if order.shape != (self.cfg.vocab_size,):
+            raise ValueError(
+                f"vocabulary order must have {self.cfg.vocab_size} entries, "
+                f"got {tuple(order.shape)}"
+            )
+        self._vocab_order = order.to(
+            device=self.embed_tokens.weight.device, dtype=torch.int32
+        ).contiguous()
+
     def classifier_for_loss(self) -> Tensor:
         """Return the graph-stable BF16 CCE operand linked to the FP32 master."""
         master = self.embed_tokens.weight
@@ -1069,15 +1114,20 @@ class DFModel(nn.Module):
             and not want_weights
         )
         block_start = h
+        # The residual's distance from the cell entry, produced by each block
+        # for the next sublayer's partial source and the cell's completed delta.
+        delta: Tensor | None = None
         for block in self.blocks:
             block_index = block.layer // cfg.routing_block_size
             block_offset = block.layer % cfg.routing_block_size
             if block_offset == 0:
                 block_start = h
+            # A cell-entry block measures its delta from its own input.
+            entry = None if block_offset == 0 else block_start
             passed_sources = list(sources) if sources is not None else []
             passed_names = list(source_names)
             if sources is not None and block_offset:
-                passed_sources.append(h - block_start)
+                passed_sources.append(delta)
                 passed_names.append(f"partial{block_index}")
             passed = tuple(passed_sources)
             gate_weight = (
@@ -1087,10 +1137,11 @@ class DFModel(nn.Module):
             )
             block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
             if checkpointing:
-                h, _a, _m = torch.utils.checkpoint.checkpoint(
+                h, _a, _m, delta = torch.utils.checkpoint.checkpoint(
                     block_fn if h.is_cuda else _block_for_checkpoint,
                     block,
                     h,
+                    entry,
                     cos,
                     sin,
                     gate_weight,
@@ -1099,10 +1150,13 @@ class DFModel(nn.Module):
                     preserve_rng_state=False,
                 )
             elif h.is_cuda and cache is None and not want_weights:
-                h, _a, _m = block_fn(block, h, cos, sin, gate_weight, *passed)
+                h, _a, _m, delta = block_fn(
+                    block, h, entry, cos, sin, gate_weight, *passed
+                )
             else:
-                h, _a, _m, w_attn, w_mlp = block(
+                h, _a, _m, delta, w_attn, w_mlp = block(
                     h,
+                    entry,
                     cos,
                     sin,
                     cache,
@@ -1127,7 +1181,7 @@ class DFModel(nn.Module):
                 block_offset == cfg.routing_block_size - 1
                 or block.layer == cfg.layers - 1
             ):
-                sources.append(h - block_start)
+                sources.append(delta)
                 source_names.append(f"block{block_index}")
         if cache is not None:
             cache.advance(x.shape[1])
@@ -1267,7 +1321,13 @@ _compiled_head_losses = torch.compile(
 
 
 def _fixed_cce_z(
-    embeddings: Tensor, classifier: Tensor, targets: Tensor
+    embeddings: Tensor,
+    classifier: Tensor,
+    targets: Tensor,
+    vocab_ordering: Tensor | None = None,
+    *,
+    skip_early: bool = True,
+    tile_flags: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Current CCE with capture-safe preprocessing and differentiable LSE.
 
@@ -1276,6 +1336,12 @@ def _fixed_cce_z(
     that exact pinned-C CCE request directly: its data-dependent ``nonzero`` is
     illegal inside CUDA graph capture, while its forward and new differentiable
     LSE backward are otherwise the authoritative implementation.
+
+    With ``vocab_ordering`` both halves tile the classifier through that fixed
+    permutation and the backward skips every tile the gradient filter would
+    drop before recomputing its logits. ``skip_early`` and ``tile_flags`` are
+    the fork's diagnostics: the probe forces the late filter alone and checks
+    that both paths compute the identical tile set.
     """
     if (
         CCEParams is None
@@ -1302,6 +1368,9 @@ def _fixed_cce_z(
         filter_c_grad=True,
         vocab_parallel_options=None,
         return_lse=True,
+        vocab_ordering=vocab_ordering,
+        skip_early=skip_early,
+        tile_flags=tile_flags,
     )
     ce, lse = linear_cross_entropy_apply(
         embeddings,
@@ -1333,7 +1402,9 @@ def sequence_ce(
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
         normalized = model.final_norm(h_top)
-        return _fixed_cce_z(normalized, model.classifier_for_loss(), targets)
+        return _fixed_cce_z(
+            normalized, model.classifier_for_loss(), targets, model._vocab_order
+        )
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)

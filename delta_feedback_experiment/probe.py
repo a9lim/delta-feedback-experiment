@@ -22,6 +22,7 @@ def cuda_gate() -> None:
 
     from .cuda_kernels import bespoke_route
     from .cuda_kernels import triton as route_triton
+    from .data import vocab_order_from_counts
     from .model import (
         DFModel,
         KVCache,
@@ -362,6 +363,50 @@ def cuda_gate() -> None:
     del cce_e, cce_c, cce_shadow, cce_t, cce_de, cce_dc, ref_e, ref_c, ref_logits
     del cce_ce, cce_z, ref_ce, ref_z
 
+    # Under a vocabulary ordering the backward skips a tile before recomputing
+    # its logits exactly when the late gradient filter would drop it. Compare
+    # the computed-tile sets of both paths on logits spread enough that the
+    # filter keeps some tiles and drops others.
+    # A hot vocabulary region carries all the probability mass and every
+    # target, and the ordering packs it into the leading tiles, as the
+    # frequency ordering does in production; the cold tiles must be filtered.
+    torch.manual_seed(13)
+    flag_e = (torch.randn(1024, 64, device="cuda") * 3).to(torch.bfloat16)
+    flag_e.requires_grad_()
+    flag_c = torch.randn(4096, 64, device="cuda", dtype=torch.float32)
+    flag_c[512:] *= 0.05
+    flag_c.requires_grad_()
+    flag_shadow = flag_c.detach().to(torch.bfloat16)
+    flag_t = torch.randint(0, 512, (1024,), device="cuda")
+    flag_order = torch.cat(
+        (torch.randperm(512, device="cuda"), 512 + torch.randperm(3584, device="cuda"))
+    ).to(torch.int32)
+    tile_sets = {}
+    for skip_early in (False, True):
+        tile_flags = torch.full((8, 32), -1, dtype=torch.int32, device="cuda")
+        flag_e.grad = None
+        flag_c.grad = None
+        flag_ce, flag_z = _fixed_cce_z(
+            flag_e,
+            _ClassifierShadow.apply(flag_c, flag_shadow, None),
+            flag_t,
+            flag_order,
+            skip_early=skip_early,
+            tile_flags=tile_flags,
+        )
+        (flag_ce + 1e-2 * flag_z).backward()
+        tile_sets[skip_early] = tile_flags.clone()
+    if (tile_sets[True] < 0).any() or (tile_sets[False] < 0).any():
+        raise AssertionError("CCE tile flags were not written for every tile")
+    if not torch.equal(tile_sets[False] == 1, tile_sets[True] == 1):
+        raise AssertionError("CCE early skip and late filter compute different tiles")
+    if not (tile_sets[True] == 0).any() or not (tile_sets[False] == 2).any():
+        raise AssertionError("CCE tile identity check exercised no filtered tile")
+    if (tile_sets[True] == 2).any():
+        raise AssertionError("a tile reached the late filter despite the early skip")
+    del flag_e, flag_c, flag_shadow, flag_t, flag_order, tile_sets, tile_flags
+    del flag_ce, flag_z
+
     # The packed control projection exposes five semantic slices, but its
     # backward writes their gradients directly into one GEMM-ready buffer.
     control_splits = (128, 8, 8, 8, 128)
@@ -440,6 +485,21 @@ def cuda_gate() -> None:
     args = build_parser().parse_args(["cuda-probe", "--arm", "df"])
     schedule = build_schedule(args)
     torch.set_float32_matmul_precision("high")
+
+    class _ProbeValidation:
+        def __init__(self):
+            self.rows = torch.randint(
+                0,
+                args.vocab_size,
+                (args.eval_rows, args.seq_len + 1),
+                generator=torch.Generator().manual_seed(19),
+            )
+
+        def batch(self, first, count, device=None):
+            rows = self.rows[first : first + count]
+            return rows.to(device) if device is not None else rows
+
+    probe_validation = _ProbeValidation()
     torch.manual_seed(args.seed)
     model = (
         DFModel(
@@ -458,6 +518,19 @@ def cuda_gate() -> None:
         .cuda()
         .train()
     )
+    # The trainer orders the vocabulary by held-out frequency; the probe's
+    # synthetic rows stand in for the held-out slice.
+    model.set_vocab_order(
+        vocab_order_from_counts(
+            torch.bincount(
+                probe_validation.rows.flatten(), minlength=args.vocab_size
+            ).numpy()
+        )
+    )
+    if model._vocab_order is None or model._vocab_order.dtype != torch.int32:
+        raise AssertionError("CUDA vocabulary order was not bound")
+    if any("vocab_order" in name for name in model.state_dict()):
+        raise AssertionError("derived vocabulary order entered the checkpoint state")
     optimizers = build_optimizers(
         model,
         lr_h=args.lr_h,
@@ -495,20 +568,6 @@ def cuda_gate() -> None:
             f"capture peak leaves unsafe headroom: {capture_peak:.2f} GiB"
         )
 
-    class _ProbeValidation:
-        def __init__(self):
-            self.rows = torch.randint(
-                0,
-                args.vocab_size,
-                (args.eval_rows, args.seq_len + 1),
-                generator=torch.Generator().manual_seed(19),
-            )
-
-        def batch(self, first, count, device=None):
-            rows = self.rows[first : first + count]
-            return rows.to(device) if device is not None else rows
-
-    probe_validation = _ProbeValidation()
     eval_scores = eval_runner.run(probe_validation)
     if any(not math.isfinite(value) for value in eval_scores.values()):
         raise AssertionError(f"nonfinite captured evaluation: {eval_scores}")

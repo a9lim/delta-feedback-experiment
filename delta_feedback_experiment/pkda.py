@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .cuda_kernels import pack_control_gradients, sink_linear
+from .cuda_kernels import pack_control_gradients, shadowed_weight, sink_linear
 
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
     from fla.modules.convolution import causal_conv1d
@@ -167,6 +167,9 @@ class PreconditionedKDA(nn.Module):
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
+        self.control_shadow: Tensor | None = None
+        self.decay_up_shadow: Tensor | None = None
+        self.output_gate_shadow: Tensor | None = None
         self.reset_recurrence_parameters()
 
     @torch.no_grad()
@@ -240,8 +243,11 @@ class PreconditionedKDA(nn.Module):
             )
             # The SiLU and the per-head Q/K L2 normalization are fused into the
             # convolution kernel, whose backward recomputes its pre-activation
-            # in place instead of relaunching the forward.
-            qkv, _ = causal_conv1d(
+            # in place instead of relaunching the forward. The kernel writes Q,
+            # K, and V as three contiguous slabs and takes their three gradients
+            # back, so the recurrence reads them without contiguity copies and
+            # the backward never concatenates them.
+            (q, k, v), _ = causal_conv1d(
                 x=qkv,
                 weight=weight,
                 bias=None,
@@ -250,10 +256,10 @@ class PreconditionedKDA(nn.Module):
                 l2norm_head_dim=self.head_dim,
                 l2norm_channels=2 * self.projection_size,
                 l2norm_eps=QK_NORM_EPS,
+                split_outputs=(self.projection_size,) * 3,
             )
-            q, k, v = qkv.split(self.projection_size, dim=-1)
             shape = (*x.shape[:2], self.num_heads, self.head_dim)
-            return q.reshape(shape), k.reshape(shape), v.reshape(shape), None
+            return q.view(shape), k.view(shape), v.view(shape), None
 
         states = conv_state or (None, None, None)
         q, q_state = self._causal_conv(
@@ -284,16 +290,22 @@ class PreconditionedKDA(nn.Module):
         )
 
     def _controls(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        packed = F.linear(
+            x, shadowed_weight(self.control_proj.weight, self.control_shadow, x.dtype)
+        )
         (
             decay_hidden,
             beta_logits,
             precond_decay_logits,
             precond_beta_logits,
             output_gate_hidden,
-        ) = _PackedControlSplit.apply(self.control_proj(x), self.control_splits)
-        raw_decay = self.decay_up(decay_hidden).reshape(
-            *x.shape[:2], self.num_heads, self.head_dim
-        )
+        ) = _PackedControlSplit.apply(packed, self.control_splits)
+        raw_decay = F.linear(
+            decay_hidden,
+            shadowed_weight(
+                self.decay_up.weight, self.decay_up_shadow, decay_hidden.dtype
+            ),
+        ).reshape(*x.shape[:2], self.num_heads, self.head_dim)
         beta = torch.sigmoid(beta_logits)
         precond_decay = -self.A_log_precond.float().exp() * F.softplus(
             precond_decay_logits.float() + self.dt_bias_precond
@@ -457,9 +469,15 @@ class PreconditionedKDA(nn.Module):
                 a_state,
                 output_final_state,
             )
-        gate_logits = self.output_gate_up(output_gate_hidden).reshape(
-            *x.shape[:2], self.num_heads, self.head_dim
-        )
+        gate_logits = F.linear(
+            output_gate_hidden,
+            shadowed_weight(
+                self.output_gate_up.weight,
+                self.output_gate_shadow,
+                output_gate_hidden.dtype,
+            ),
+            self.output_gate_up.bias,
+        ).reshape(*x.shape[:2], self.num_heads, self.head_dim)
         if output.is_cuda:
             if rms_norm_gated is None:
                 raise RuntimeError(

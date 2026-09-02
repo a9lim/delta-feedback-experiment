@@ -618,3 +618,29 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--grad-checkpoint"])
+
+
+def test_vocab_order_ranks_by_frequency_with_stable_ties(tmp_path):
+    """The head's vocabulary permutation is a pure function of the split: ids
+    by descending count, ties by ascending id, every id exactly once."""
+    import numpy as np
+
+    from delta_feedback_experiment.data import (
+        TokenData,
+        vocab_order_from_counts,
+        write_synthetic,
+    )
+
+    write_synthetic(tmp_path, train_tokens=2_000, val_tokens=600, vocab=13, seed=5)
+    val = TokenData.load(tmp_path, "val", seq_len=7)
+    counts = val.unigram_counts(13)
+    assert counts.sum() == 600
+    expected = np.bincount(np.fromfile(tmp_path / "val.bin", dtype=np.uint32), minlength=13)
+    assert np.array_equal(counts, expected)
+
+    order = vocab_order_from_counts(np.array([3, 9, 9, 0, 9, 1], dtype=np.int64))
+    assert order.dtype == torch.int32
+    assert order.tolist() == [1, 2, 4, 0, 5, 3]
+    full = vocab_order_from_counts(counts)
+    assert sorted(full.tolist()) == list(range(13))
+    assert all(counts[a] >= counts[b] for a, b in zip(full[:-1], full[1:]))

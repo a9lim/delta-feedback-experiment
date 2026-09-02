@@ -776,6 +776,38 @@ def _dw_accum_cuda(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Te
     return sink.new_zeros(())
 
 
+class ShadowOperand(torch.autograd.Function):
+    """Read an address-stable activation-dtype shadow of an FP32 master.
+
+    The forward hands the caller the shadow as the GEMM operand; the backward
+    either adds the operand gradient into a persistent FP32 ``sink`` and hands
+    autograd nothing (the tied classifier), or returns it widened to FP32 as
+    the master's ordinary autograd gradient (the small Adam-owned matrices).
+    Either way no replay casts the master.
+    """
+
+    @staticmethod
+    def forward(ctx, master: Tensor, shadow: Tensor, sink: Tensor | None) -> Tensor:
+        ctx.sink = sink
+        return shadow
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor | None, None, None]:
+        if ctx.sink is not None:
+            ctx.sink.add_(gradient)
+            return None, None, None
+        return gradient.float(), None, None
+
+
+def shadowed_weight(master: Tensor, shadow: Tensor | None, dtype: torch.dtype) -> Tensor:
+    """The GEMM operand for ``master``: its bound shadow when one matches
+    ``dtype`` and autograd is live, otherwise the master itself (autocast or the
+    caller then casts as before)."""
+    if shadow is not None and shadow.dtype == dtype and torch.is_grad_enabled():
+        return ShadowOperand.apply(master, shadow, None)
+    return master
+
+
 class _SinkLinear(torch.autograd.Function):
     """``F.linear`` over concatenated weights whose weight gradients accumulate
     straight into persistent FP32 buffers.
@@ -1019,9 +1051,11 @@ def bespoke_route(
 __all__ = [
     "MAX_ROUTE_SOURCES",
     "ROUTE_TOKENS_PER_PROGRAM",
+    "ShadowOperand",
     "bespoke_route",
     "dw_accum",
     "pack_control_gradients",
+    "shadowed_weight",
     "sink_linear",
     "triton",
 ]

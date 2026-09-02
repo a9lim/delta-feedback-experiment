@@ -24,7 +24,7 @@ from pathlib import Path
 import torch
 from transformer_experiments import checkpoints
 
-from delta_feedback_experiment.data import TokenData
+from delta_feedback_experiment.data import TokenData, vocab_order_from_counts
 from delta_feedback_experiment.model import (
     DFModel,
     arm_config,
@@ -80,6 +80,11 @@ def main() -> None:
     # refreshes after every update; analysis must prepare it once itself.
     model.refresh_shadows()
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
+    if next(model.parameters()).is_cuda:
+        # The trainer's head tiles the vocabulary by held-out frequency.
+        model.set_vocab_order(
+            vocab_order_from_counts(data_val.unigram_counts(saved["vocab_size"]))
+        )
 
     # The CUDA loss path reads BF16 operands, exactly like the trainer's
     # captured evaluation; portable devices stay in FP32.
