@@ -364,9 +364,8 @@ The stage asks:
 4. whether null, seed, block, and payload paths are actually used.
 
 Only `screen-df-s1` is complete under the current screen contract. This is a
-sensitivity
-and interaction screen, not a decisive test of FBT formation at high
-token-per-parameter ratio.
+sensitivity and interaction screen, not a decisive test of FBT formation at
+high token-per-parameter ratio.
 
 ### Stage 2: fresh Prime 400x minimum contrast
 
