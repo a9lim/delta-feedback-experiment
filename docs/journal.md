@@ -5,9 +5,11 @@
 Same-checkpoint examination of the completed `df` run (step 10,745). Nothing
 here is an arm comparison; every number is an intervention or a diagnostic on
 one checkpoint and belongs to this scratch page until a matched comparison
-exists. Scripts and raw outputs: `jobe:~/tmp/df-fused/` (`fused_diag.py`,
-`gate_ensemble.py`, `dense_feedback_continue.py`, their JSON/logs); figures
-under `figures/fused-screen-df-s1/` (ignored).
+exists. Scripts and raw outputs: `jobe:~/tmp/df-fused/` and a local copy in
+`tmp/df-fused/` (`fused_diag.py`, `gate_ensemble.py`, `entry_sweeps.py`,
+`followups.py`, `dense_feedback_continue.py`, `plot_fused.py`, their
+JSON/logs, and the Codex read); figures under `figures/fused-screen-df-s1/`;
+the run's full log copied to `logs/screen-df-s1.jobe-final.log`. All ignored.
 
 ### The gap
 
@@ -19,16 +21,18 @@ under `figures/fused-screen-df-s1/` (ignored).
 
 The 256-row pass reproduces the logged 32-row numbers to the fourth decimal
 on its first 32 rows; top-1 accuracy also falls, 42.4% to 42.1%. The gap
-fell monotonically from +0.56 at step 5,600 to +0.042 at the end of heat and
-+0.024 at the end of the run; against cumulative feedback passes it follows
-`n^-1.04` from step 7,000 on. That fit does not identify exposure as the
-cause: feedback passes, optimizer step, plain-token training, and the
-cooldown are collinear over that range, and a floor of 0.008–0.015 fits
-almost as well. The train-time pass-2 minus pass-1 penalty on random-prefix
-rows ended at +0.015, consistent with +0.024 once all positions are fused.
-Gradient-weighted, the fusion parameters were updated on 2,996 of 10,745
-steps and the payload/gate path received its loss at unit weight only on
-those steps.
+fell from +0.56 at step 5,600 to a noisy plateau near +0.045 over steps
+7,200–8,059 at constant learning rate, then to +0.024 during the first 60%
+of the cooldown, and stayed at +0.024 ± 0.001 for the last 1,100 steps. A
+`n^-1.04` power law in cumulative feedback passes fits the decline from step
+7,000 but conflates two regimes (see the erosion result under the
+continuation below): the constant-LR plateau is an equilibrium between
+one-pass erosion and two-pass repair, the cooldown removes that excess, and
+the final +0.024 is the floor of the fused mode as trained. The train-time
+pass-2 minus pass-1 penalty on random-prefix rows ended at +0.015,
+consistent with +0.024 once all positions are fused. Gradient-weighted, the
+fusion parameters were updated on 2,996 of 10,745 steps and the
+payload/gate path received its loss at unit weight only on those steps.
 
 ### What the penalty is made of
 
@@ -169,41 +173,134 @@ which is where its 24% growth and flat logits come from.
   of the plain one. Single-position penalties in this test have a standard
   error near 0.06 at 64 rows and are not individually interpretable.
 
+### Cost term versus benefit term: end of heat (8,059) against the end (10,745)
+
+A gap that decays as `1/n` only approaches zero from above, so the fit alone
+describes a fused pathway becoming a lossless substitute for the plain route,
+never a better one. Split the gap as `decode_cost − payload_benefit`: the
+cost is what the trunk pays to recover the token through the multiplicative
+gate; the benefit is what the previous column's full-depth state adds beyond
+what a plain column computes. FBT's reverse gap needs a large benefit term
+(their 100B two-pass model matching the 200B baseline is on the order of
+0.05 nats at 1B). Comparing the protected end-of-heat snapshot with the final
+one (128 versus 256 rows, so row sets differ; the logged 32-row gaps are
++0.042 and +0.024):
+
+| | step 8,059 | step 10,745 |
+|---|---:|---:|
+| gap, fused − pass 1 | +0.035 | +0.025 |
+| KL(pass 1 ‖ fused) | 0.107 | 0.057 |
+| argmax agreement | 82.1% | 87.5% |
+| tokens where fused wins | 48.7% | 47.6% |
+| easiest 20% of tokens (own CE) | +0.046 | +0.025 |
+| hardest 5% of tokens | +0.03 / −0.07 | −0.00 / −0.03 / −0.07 |
+| rarest 10% / most frequent 10% input tokens | +0.068 / +0.019 | +0.047 / +0.011 |
+| best probability-mixture gain | −0.014 | −0.006 |
+| gate token share of fused input (median) | 11.0% | 8.3% |
+| first-cell delta change, pass 2 vs pass 1 | 3.8× | 3.6× |
+
+Across the cooldown the fused predictor converged toward the plain one (KL
+halved, agreement up, ensemble diversity down), the easy-token and
+rare-token costs fell by about 40%, and the region where fused wins widened
+from the hardest 1% of tokens to the hardest 5%. The gate did not sharpen;
+its token share fell. The dominant dynamic is cost decay, with a small
+benefit forming only at the hard tail. On this trajectory the asymptote is a
+marginal overtake of a few thousandths, not FBT's. Forming a large benefit
+term is what FBT's heavier low-ratio recipes buy, and whether this hybrid
+trunk can form one at all is the open structural question the screen has
+not yet posed.
+
 ### Dense-feedback continuation (same checkpoint, not an arm)
 
-Pending: `dense_feedback_continue.py` restores the final snapshot with both
-optimizer states and trains every step with two passes on fresh rows past the
-schedule at 10% of the stable learning rates (10-step warmup), first with
-every parameter trainable (150 steps), then with only the fusion parameters
-(`fuse_value`, `fuse_gate`, entry/gate/payload norms, payload router; 100
-steps). Eval every 25 steps under the run's convention.
+`dense_feedback_continue.py` restores the final snapshot with both optimizer
+states and trains on fresh rows past the schedule at 10% of the stable
+learning rates (10-step warmup), 320-row batches, the run's loss and jitter
+and random-prefix draws, eval every 25 steps on the run's 32 rows. Three
+branches, each restored independently from the same snapshot:
+
+| branch | steps | pass 1 | fused | gap |
+|---|---:|---:|---:|---:|
+| snapshot | 0 | 3.098 | 3.121 | +0.024 |
+| two-pass, all parameters | 150 | 3.102 | 3.124 | +0.023 |
+| two-pass, fusion parameters only | 100 | 3.098 | 3.121 | +0.023 |
+| one-pass control, all parameters | 150 | 3.101 | 3.261 | +0.160 |
+
+Both dense branches move the gap by 0.001, inside the eval noise; the
+all-parameter branch also lifts pass 1 by 0.004 from the learning-rate
+restart and holds it there. The dose is small (150 feedback passes on top of
+2,996, a 5% increase, at one-tenth learning rate), so the checkpoint is not
+cheaply repairable at the end of the schedule, in neither the trunk nor the
+interface.
+
+**The one-pass control is the result.** With pass 1 tracking the two-pass
+branch exactly (3.1005 / 3.1026 / 3.1010 against 3.1007 / 3.1025 / 3.1018 at
+steps 25 / 50 / 150), plain-only training erodes the fused mode
+monotonically: gap +0.024 → +0.032 → +0.056 → +0.087 → +0.126 → +0.152 →
++0.160 over 150 steps, 0.14 nats lost over 48M plain tokens at one-tenth
+learning rate while dense two-pass training holds it flat. The two losses'
+gradients are 75–98% aligned, so this is not conflict; it is drift. With
+NorMuonH's normalized updates the trunk moves at a fixed relative rate on
+every step, the fusion and payload parameters receive no gradient on a
+one-pass step, and the co-adaptation that the fused mode consists of
+(rescaling the seed by 2 costs a nat) decays in whatever directions `ell_1`
+does not pin. The run's 50% one-pass draw therefore alternated erosion and
+repair for the whole feedback phase; at constant learning rate that
+equilibrium sat near +0.045, the cooldown shrank both terms and the gap
+settled at +0.024, and the last 1,100 steps froze it there. The
+`n^-1` fit read that shape as exposure decay.
 
 ### Reading
 
-Partly an exposure artifact, partly not. The exposure signature is real: the
-gap decays as `n^-1` in feedback passes with no floor in sight, the penalty
-is largest exactly where fused exposure is smallest (early positions, rare
-tokens), and the entry gate has barely moved off its initialization. But the
-penalty at well-exposed positions on frequent tokens is still +0.011–0.024,
-the fused pass changes the first cell's computation by 3.6× and the trunk
-spends its depth undoing that rather than using it, the extra information in
-the fused pass is worth 0.006 in ensemble, and iterating makes it worse.
-The FBT mechanism (a shallow layer reading full-depth past states through
-dense attention) enters a PKDA recurrence here, at 14× the plain seed scale
-and 92% previous-state content, and this checkpoint has learned to tolerate
-that input, not to profit from it. The continuation says how much of the
-remaining gap more feedback exposure alone can buy.
+Three layers, answered separately.
+
+1. **The training-time deficit is a recipe artifact, mechanistically.** The
+   fused mode is a tight co-adaptation that plain-only steps erode at
+   0.14 nats per 150 steps even at one-tenth learning rate, and the run's
+   50% one-pass draw eroded it on half of every feedback-phase step. That
+   is why the gap plateaued near +0.045 through the constant-LR heat and
+   only settled during the cooldown. The specific lever is the one-pass
+   fraction after feedback starts, not the three-pass share: FBT's 100%
+   three-pass recipe at 10 tokens per parameter has no erosion at all.
+2. **The final +0.024 is the floor of the fused mode as trained, and it
+   carries an exposure signature without an exposure attribution.** It is
+   flat over well-exposed positions, three times larger at the rarely fused
+   early positions, four times larger on rare input tokens than on frequent
+   ones, and grows with the surprise of the fused-in token; it fell 40%
+   across the cooldown as the fused predictor converged toward the plain
+   one. It is the residual cost of decoding the token identity through the
+   mandatory multiplicative gate, and a 5% exposure top-up at low learning
+   rate does not move it, so its size cannot be assigned to the recipe
+   from this run alone.
+3. **The FBT benefit term has not formed.** Fused wins only on the hardest
+   5% of tokens, the split-validated complementary information is 0.006
+   nats, and iterating the fused map makes it worse; the asymptote on this
+   trajectory is a marginal overtake, not FBT's 0.05-nat-class reverse gap.
+   Whether this PKDA-heavy trunk (dense reads every fourth layer, the
+   fused seed entering a compressive recurrence) can form that benefit is
+   untested, because the run never trained the fused mode under stable
+   conditions with enough exposure to find out.
+
+So: yes, the recipe is the proximate cause of the training-time gap and a
+plausible cause of the final gap's size, but the run cannot separate
+"under-exposed" from "cannot form the benefit at this scale and trunk". A
+25x fused metric under 75/22/3 is not comparable to FBT's numbers, and the
+pass-1 factorial stands on its own.
 
 ### Options (decisions for a9, not taken)
 
 1. **Match FBT's recipe to the token-per-parameter regime.** FBT chose its
    mixture per scale; at 25x the closest precedents are 75/0/25 (100 tok/param)
-   and 100% three-pass (10 tok/param). A screen-wide change to
-   `feedback_batch_prob`/`three_pass` (and possibly `feedback_start`) is
-   contract-neutral for the factorial because only `df-s1` is complete, but
-   it changes the pass-token cost of every feedback arm and the design's
-   whole-run 75/22/3 statement, and the flagship at 400x keeps 75/22/3
-   either way.
+   and 100% three-pass (10 tok/param). The erosion result says the lever
+   that matters is the one-pass fraction once feedback starts
+   (`feedback_batch_prob` → 1.0), with the three-pass share a secondary
+   stability knob. A screen-wide change is contract-neutral for the
+   factorial because only `df-s1` is complete, but it changes the
+   pass-token cost of every feedback arm and the design's whole-run
+   75/22/3 statement, and the flagship at 400x keeps 75/22/3 either way.
+   Speculation, not measured: the same erosion applies under 75/22/3 at
+   Prime and flagship scale, and FBT's own success with it at ≥200B may
+   rest on a lower equilibrium excess there; the cooldown settles it in
+   any case, as it did here.
 2. **Leave the recipe and accept a fused deficit at 25x.** The design already
    states a stable FBT null at 25x does not exclude Prime; the factorial's
    pass-1 effects (MHDB, FBT, interaction) are unaffected by which fused
