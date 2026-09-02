@@ -267,8 +267,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 1.0
-    assert CONTRACT.version == 16
-    assert CONTRACT.resumable == frozenset({16})
+    assert CONTRACT.version == 17
+    assert CONTRACT.resumable == frozenset({17})
+    assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(1.0)
@@ -566,12 +567,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15])
+@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15, 16])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[16\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[17\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 
@@ -631,3 +632,25 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--grad-checkpoint"])
+
+
+def test_prefix_draw_leaves_every_row_one_fused_position():
+    """Plain-prefix lengths are drawn in 1..seq_len-1: position 0 is always
+    plain, the last executed position is always fused."""
+    from types import SimpleNamespace
+
+    from delta_feedback_experiment.train import micro_draws
+
+    args = SimpleNamespace(data_seed=0, seq_len=16, jitter=0.02)
+    seen = set()
+    for step in range(64):
+        prefix, jitter = micro_draws(
+            args, step, step * 7, 3, 8, 4, torch.device("cpu")
+        )
+        assert prefix.shape == (2, 8)
+        assert jitter.shape == (2, 8, args.seq_len + 1, 4)
+        assert int(prefix.min()) >= 1
+        assert int(prefix.max()) <= args.seq_len - 1
+        seen.update(prefix.flatten().tolist())
+    assert args.seq_len - 1 in seen and 1 in seen
+    assert args.seq_len not in seen

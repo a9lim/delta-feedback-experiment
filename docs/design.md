@@ -153,12 +153,13 @@ is ordinary teacher forcing with plain embeddings. For every later pass:
 1. take the preceding pass's payload without detaching it;
 2. add keyed uniform jitter, `[-0.02, 0.02]` by default;
 3. shift the payload one position right and insert zero at position 0;
-4. draw a per-row plain-prefix length uniformly from `1..seq_len`;
+4. draw a per-row plain-prefix length uniformly from `1..seq_len-1`;
 5. use plain embeddings on that prefix and FBT-fused inputs on the suffix;
 6. run the complete stack again.
 
-The shift and prefix preserve token causality. Position 0 is always plain and
-every row has at least one feedback position. A `k`-pass batch trains a
+The shift and prefix preserve token causality. Position 0 is always plain,
+the last executed position is always fused, and every row therefore has at
+least one feedback position. A `k`-pass batch trains a
 feedback horizon of `k-1` transitions and costs `k` transformer evaluations.
 Non-feedback arms always use one pass; feedback arms use one pass before the
 feedback boundary and two or three passes on every step after it.
@@ -305,7 +306,9 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v16, and only v16 is resumable. A
+New snapshots use checkpoint contract v17, and only v17 is resumable; v16
+snapshots, whose state has the same meaning, remain readable for evaluation
+and forks but cannot be continued because their feedback prefix draws differ. A
 snapshot contains the model, both optimizer states, fixed NorMuonH radii,
 state-defining arguments, cumulative step, and Python/Torch/CUDA RNG state. A
 resume inherits every state-defining field and rejects explicit conflicts.

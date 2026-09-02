@@ -47,7 +47,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=16, resumable=frozenset({16}), surface_version=16
+    version=17, resumable=frozenset({17}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 1.0
@@ -252,7 +252,9 @@ def micro_draws(
     shape = (n_passes - 1, n_rows)
     if prefix_out is None:
         prefix_out = torch.empty(shape, dtype=torch.long, device=device)
-    torch.randint(1, columns, shape, generator=generator, out=prefix_out)
+    # Plain-prefix lengths in 1..seq_len-1: position 0 is always plain and
+    # every row keeps at least one fused position.
+    torch.randint(1, args.seq_len, shape, generator=generator, out=prefix_out)
     jitter_shape = (n_passes - 1, n_rows, columns, dim)
     if jitter_out is None:
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32

@@ -486,7 +486,7 @@ Registering `df-loop` changes the following together:
   and `r_max`; `ColumnOutput` gains the write bank and `forward_column` takes
   a per-position plain mask and a previous bank; `AGENTS.md` and `README.md`
   state six arms.
-- Checkpoint contract v17 with `r_mean`, `r_max`, and the `r` sub-stream as
+- Checkpoint contract v18 with `r_mean`, `r_max`, and the `r` sub-stream as
   state-defining fields; realized `r` and cell-tokens in the run log.
 - The workspace FLA fork gains the fused-position PKDA operator, forward and
   backward; the gated GQA layer gains the two-piece merge; the router gains
@@ -502,7 +502,3 @@ Registering `df-loop` changes the following together:
   evaluation contract, the two-channel sequence trace in place of the
   payload-only iteration for loop arms, and the flagship-width loop run to
   the scale plan.
-- `design.md` resolves, independently of this arm, that its prefix draw over
-  `1..seq_len` can leave a row with no fused position, against its own
-  statement that every row has at least one; the loop arm inherits whichever
-  contract results.

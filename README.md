@@ -128,7 +128,7 @@ token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 1.0 before the shared
 NorMuonH/Adam update.
 
-Snapshots use checkpoint contract v16, and only v16 is resumable. Protected
+Snapshots use checkpoint contract v17, and only v17 is resumable. Protected
 snapshots persist at the cooldown boundary, the feedback boundary, and the end
 of the run.
 `--max-steps` limits the current invocation without changing the registered

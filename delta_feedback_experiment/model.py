@@ -1234,8 +1234,8 @@ def multipass(
     positions, which are exactly the positions that predict tokens 1..T.
     The final stored token is only ever a target; computing a column for
     it would be causally dead work.  prefix_lens [n_passes-1, B] holds
-    values in 1..T (the plain-embedding prefix per feedback pass; position
-    0 is always plain); jitter [n_passes-1, B, T+1, D] is drawn at the
+    values in 1..T-1 (the plain-embedding prefix per feedback pass; position
+    0 is always plain and position T-1 is always fused); jitter [n_passes-1, B, T+1, D] is drawn at the
     stored-row width and its first T columns are added to the carried
     payload before shifting, so the keyed draw is independent of how many
     positions execute.  Both are pre-drawn by the caller — the shared
