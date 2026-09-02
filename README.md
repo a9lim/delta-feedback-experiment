@@ -151,6 +151,9 @@ not a separately trained arm.
   state, parameter accounting, and optimizer contract.
 - [docs/design.md](docs/design.md): comparisons, data, schedules, execution,
   evaluation, scale plan, and promotion gates.
+- [docs/depth-architecture.md](docs/depth-architecture.md): specified,
+  unimplemented `df-loop` arm: tied recurrent core, shared core cache,
+  and its contract deltas.
 - [docs/findings.md](docs/findings.md): accepted experiment findings only.
 - [docs/journal.md](docs/journal.md): disposable active notes.
 - [references/refs.yaml](references/refs.yaml): primary references and their

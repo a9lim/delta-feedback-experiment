@@ -15,6 +15,9 @@ until a matched comparison is admissible.
   state, parameter, and optimizer contract.
 - [docs/design.md](docs/design.md) owns comparisons, data, schedules,
   execution, evaluation, scaling, and gates.
+- [docs/depth-architecture.md](docs/depth-architecture.md) specifies the
+  unimplemented depth-recurrent `df-loop` arm; nothing in it is registered
+  until its adoption list lands.
 - [docs/findings.md](docs/findings.md) contains accepted scientific findings
   only; engineering tests, throughput, isolated checkpoints, and plans do not
   belong there.

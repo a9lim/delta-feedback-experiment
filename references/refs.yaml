@@ -129,3 +129,15 @@ references:
       Defines the cumulative-state Attention Residuals substrate needed to
       distinguish replacement routing from the additive delta routing used in
       this experiment.
+
+  - arxiv: "2502.05171"
+    slug: geiping2025-recurrent-depth
+    note: >
+      Defines the prelude/recurrent-core/coda decoder, the log-normal Poisson
+      draw of the iteration count, truncated backpropagation through the last
+      iterations, a KV cache budget shared across iterations, and the
+      zero-shot warm start of the next token's state. The depth-recurrent arm
+      takes the tied core, the iteration draw, and the shared-cache idea; it
+      replaces the adapter with MHDB reads, the random initial state with the
+      prelude output, the residual sandwich norm with branch-output norms, and
+      the untrained warm start with the trained FBT payload.
