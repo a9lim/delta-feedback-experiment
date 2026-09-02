@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .cuda_kernels import pack_control_gradients
+from .cuda_kernels import pack_control_gradients, sink_linear
 
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
     from fla.modules.convolution import causal_conv1d
@@ -150,6 +150,10 @@ class PreconditionedKDA(nn.Module):
         self.output_gate_up = nn.Linear(head_dim, self.projection_size, bias=True)
         self.output_norm = nn.Parameter(torch.ones(head_dim))
         self.o_proj = nn.Linear(self.projection_size, hidden_size, bias=False)
+        self.q_sink: Tensor | None = None
+        self.k_sink: Tensor | None = None
+        self.v_sink: Tensor | None = None
+        self.o_sink: Tensor | None = None
         self.reset_recurrence_parameters()
 
     @torch.no_grad()
@@ -203,11 +207,14 @@ class PreconditionedKDA(nn.Module):
             and causal_conv1d is not None
         ):
             # Dense training/prefill has no per-projection cache state. Collapse
-            # all three identical short convolutions into one Triton launch;
+            # the three projections into one GEMM over the concatenated weights
+            # and all three identical short convolutions into one Triton launch;
             # parameters stay separate so initialization, optimizer ownership,
             # checkpoint names, and cached decoding remain unchanged.
-            qkv = torch.cat(
-                (self.q_proj(x), self.k_proj(x), self.v_proj(x)), dim=-1
+            qkv = sink_linear(
+                x,
+                (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
+                (self.q_sink, self.k_sink, self.v_sink),
             )
             weight = torch.cat(
                 (
@@ -230,13 +237,22 @@ class PreconditionedKDA(nn.Module):
 
         states = conv_state or (None, None, None)
         q, q_state = self._causal_conv(
-            self.q_proj(x), self.q_conv, states[0], output_final_state
+            sink_linear(x, (self.q_proj.weight,), (self.q_sink,)),
+            self.q_conv,
+            states[0],
+            output_final_state,
         )
         k, k_state = self._causal_conv(
-            self.k_proj(x), self.k_conv, states[1], output_final_state
+            sink_linear(x, (self.k_proj.weight,), (self.k_sink,)),
+            self.k_conv,
+            states[1],
+            output_final_state,
         )
         v, v_state = self._causal_conv(
-            self.v_proj(x), self.v_conv, states[2], output_final_state
+            sink_linear(x, (self.v_proj.weight,), (self.v_sink,)),
+            self.v_conv,
+            states[2],
+            output_final_state,
         )
         shape = (*x.shape[:2], self.num_heads, self.head_dim)
         final = (q_state, k_state, v_state) if output_final_state else None
@@ -357,6 +373,10 @@ class PreconditionedKDA(nn.Module):
             "initial_A_state": a_state,
             "output_final_state": output_final_state,
             "use_gate_in_kernel": True,
+            # Training keeps the WY and chunk-state intermediates for backward
+            # instead of recomputing them; measured on Jobe as a small,
+            # memory-cheap win at the screen geometry.
+            "disable_recompute": torch.is_grad_enabled(),
             "x": self.squash_x,
             "eps": self.squash_eps,
             "log_atk_scale": self.log_precond_center,
@@ -436,7 +456,7 @@ class PreconditionedKDA(nn.Module):
             normalized = normalized * self.output_norm.float()
             mixed = normalized.to(output.dtype) * torch.sigmoid(gate_logits)
         return (
-            self.o_proj(mixed.flatten(-2)),
+            sink_linear(mixed.flatten(-2), (self.o_proj.weight,), (self.o_sink,)),
             state,
             a_state,
             final_conv,

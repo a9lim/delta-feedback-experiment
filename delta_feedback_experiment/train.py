@@ -253,8 +253,8 @@ def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
     if device.type != "cuda":
         return False
     cfg = model.cfg
-    screen_work = 4 * 1025 * 768 * 12 * 3
-    work = args.micro_rows * (args.seq_len + 1) * cfg.dim * cfg.layers * n_passes
+    screen_work = 4 * 1024 * 768 * 12 * 3
+    work = args.micro_rows * args.seq_len * cfg.dim * cfg.layers * n_passes
     # PKDA's kernel recomputes its chunk intermediates internally. The exact
     # screen k=3 graph is admitted raw; larger geometries remain guarded.
     return work > screen_work
@@ -286,6 +286,12 @@ class CudaGraphTrainer:
     Data and keyed CUDA randomness are copied/drawn into those addresses before
     replay.  Graphs share a private pool and never overlap; each captured body
     ends after backward, so no saved activation survives between replays.
+
+    Every persistent FP32 gradient buffer exists before the first forward.  The
+    tied embedding and the large projections accumulate into their buffers in
+    place from inside backward and hand autograd no gradient, so a buffer that
+    warm-up touched marks its parameter active for that mode exactly as an
+    autograd gradient marks the remaining vectors and small matrices.
     """
 
     def __init__(self, model: DFModel, optimizers, args, schedule: Schedule):
@@ -302,6 +308,8 @@ class CudaGraphTrainer:
         specs = self._reachable_specs(schedule)
         for spec in specs:
             self.states[spec] = self._allocate(spec)
+        self._buffers = {p: torch.zeros_like(p) for p in self.parameters}
+        self.sink_fed = model.bind_gradient_sinks(self._buffers)
 
         # The pointer-list router intentionally specializes on source count
         # (up to 27), while retaining dynamic B/T. Raise Dynamo's frame-local
@@ -317,7 +325,10 @@ class CudaGraphTrainer:
             torch._dynamo.config.recompile_limit = prior_recompile_limit
         model.zero_grad(set_to_none=True)
         union = set().union(*active_by_spec.values())
-        self.grad_buffers = {p: torch.zeros_like(p) for p in union}
+        self.grad_buffers = {p: self._buffers[p] for p in self.parameters if p in union}
+        del self._buffers
+        # Rebinding drops the sinks of parameters no reachable mode ever touches.
+        self.sink_fed = model.bind_gradient_sinks(self.grad_buffers)
         for parameter, gradient in self.grad_buffers.items():
             parameter.grad = gradient
 
@@ -405,6 +416,8 @@ class CudaGraphTrainer:
         state.pass1_sum.add_(losses[0].detach() / self.micros)
 
     def _warm(self, state: CapturedMicro) -> set[torch.nn.Parameter]:
+        for parameter in self.sink_fed:
+            self._buffers[parameter].zero_()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
@@ -413,7 +426,9 @@ class CudaGraphTrainer:
                 self._body(state)
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
-        return {p for p in self.parameters if p.grad is not None}
+        active = {p for p in self.parameters if p.grad is not None}
+        active |= {p for p in self.sink_fed if bool(self._buffers[p].any())}
+        return active
 
     def _capture(self, state: CapturedMicro, pool) -> None:
         for gradient in self.grad_buffers.values():

@@ -8,6 +8,7 @@ benefits materially from owning the reduction and memory traffic directly.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 try:  # Triton is part of Jobe's pinned torch stack, not the Mac test runtime.
@@ -110,7 +111,7 @@ if triton is not None:
         return s26
 
     @triton.jit
-    def _route_logits_kernel(
+    def _route_forward_kernel(
         s0,
         s1,
         s2,
@@ -142,6 +143,7 @@ if triton is not None:
         present,
         logits,
         inv_rms,
+        routed,
         bt: tl.constexpr,
         dim: tl.constexpr,
         num_heads: tl.constexpr,
@@ -149,10 +151,13 @@ if triton is not None:
         eps: tl.constexpr,
         n_sources: tl.constexpr,
         has_present: tl.constexpr,
-        null_first: tl.constexpr,
         block_h: tl.constexpr,
         block_k: tl.constexpr,
     ):
+        """Full-width RMS keys, per-group source softmax, and the value mix in
+        one pass over the bank: every source tile is read exactly once per
+        token, with the softmax folded in online.  Source 0 is the site's
+        width-``dim`` null and is read at a fixed address."""
         token = tl.program_id(0)
         h_offsets = tl.arange(0, block_h)
         k_offsets = tl.arange(0, block_k)
@@ -160,7 +165,10 @@ if triton is not None:
         mask = head_mask[:, None] & (k_offsets[None, :] < head_dim)
         offsets = h_offsets[:, None] * head_dim + k_offsets[None, :]
         p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
-        for index in range(n_sources):
+        running_max = tl.full((block_h,), -float("inf"), tl.float32)
+        running_sum = tl.zeros((block_h,), tl.float32)
+        mixed = tl.zeros((block_h, block_k), tl.float32)
+        for index in tl.static_range(n_sources):
             source = _route_pointer(
                 index,
                 s0,
@@ -191,7 +199,7 @@ if triton is not None:
                 s25,
                 s26,
             )
-            base = 0 if null_first and index == 0 else token * dim
+            base = 0 if index == 0 else token * dim
             value = tl.load(source + base + offsets, mask=mask, other=0.0).to(
                 tl.float32
             )
@@ -208,6 +216,20 @@ if triton is not None:
                 mask=head_mask,
             )
             tl.store(inv_rms + index * bt + token, inverse)
+            new_max = tl.maximum(running_max, score)
+            rescale = tl.where(
+                new_max == -float("inf"), 1.0, tl.exp(running_max - new_max)
+            )
+            term = tl.where(score == -float("inf"), 0.0, tl.exp(score - new_max))
+            running_sum = running_sum * rescale + term
+            mixed = mixed * rescale[:, None] + term[:, None] * value
+            running_max = new_max
+        mixed = mixed / running_sum[:, None]
+        tl.store(
+            routed + token * dim + offsets,
+            mixed.to(routed.dtype.element_ty),
+            mask=mask,
+        )
 
     @triton.jit
     def _route_softmax_kernel(
@@ -228,90 +250,6 @@ if triton is not None:
         numerators = tl.exp(values)
         result = numerators / tl.sum(numerators, axis=0)
         tl.store(weights + addresses, result, mask=mask)
-
-    @triton.jit
-    def _route_mix_kernel(
-        s0,
-        s1,
-        s2,
-        s3,
-        s4,
-        s5,
-        s6,
-        s7,
-        s8,
-        s9,
-        s10,
-        s11,
-        s12,
-        s13,
-        s14,
-        s15,
-        s16,
-        s17,
-        s18,
-        s19,
-        s20,
-        s21,
-        s22,
-        s23,
-        s24,
-        s25,
-        s26,
-        weights,
-        routed,
-        bt: tl.constexpr,
-        dim: tl.constexpr,
-        num_heads: tl.constexpr,
-        head_dim: tl.constexpr,
-        n_sources: tl.constexpr,
-        null_first: tl.constexpr,
-        block_k: tl.constexpr,
-    ):
-        token = tl.program_id(0)
-        head = tl.program_id(1)
-        k_offsets = tl.arange(0, block_k)
-        offsets = head * head_dim + k_offsets
-        mask = k_offsets < head_dim
-        total = tl.zeros((block_k,), tl.float32)
-        for index in range(n_sources):
-            source = _route_pointer(
-                index,
-                s0,
-                s1,
-                s2,
-                s3,
-                s4,
-                s5,
-                s6,
-                s7,
-                s8,
-                s9,
-                s10,
-                s11,
-                s12,
-                s13,
-                s14,
-                s15,
-                s16,
-                s17,
-                s18,
-                s19,
-                s20,
-                s21,
-                s22,
-                s23,
-                s24,
-                s25,
-                s26,
-            )
-            base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(source + base + offsets, mask=mask, other=0.0)
-            weight = tl.load(
-                weights + index * bt * num_heads + token * num_heads + head
-            )
-            total += value * weight
-        tl.store(routed + token * dim + offsets, total, mask=mask)
 
     @triton.jit
     def _route_backward_kernel(
@@ -373,154 +311,180 @@ if triton is not None:
         grad_routed,
         weights,
         inv_rms,
-        grad_projected,
+        partials,
         bt: tl.constexpr,
         dim: tl.constexpr,
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         n_sources: tl.constexpr,
-        null_first: tl.constexpr,
+        tokens_per_program: tl.constexpr,
         block_h: tl.constexpr,
         block_k: tl.constexpr,
     ):
-        token = tl.program_id(0)
+        """Analytic MHDB backward over ``tokens_per_program`` tokens.
+
+        Per-token source gradients are stored directly; the query and null
+        gradients, which are sums over every token, stay in FP32 registers and
+        leave as one ``[dim]`` partial per program.
+        """
+        pid = tl.program_id(0)
         h_offsets = tl.arange(0, block_h)
         k_offsets = tl.arange(0, block_k)
         head_mask = h_offsets < num_heads
         mask = head_mask[:, None] & (k_offsets[None, :] < head_dim)
         offsets = h_offsets[:, None] * head_dim + k_offsets[None, :]
         p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
-        upstream = tl.load(
-            grad_routed + token * dim + offsets, mask=mask, other=0.0
-        ).to(tl.float32)
-        centered = tl.zeros((block_h,), tl.float32)
-        for index in range(n_sources):
-            source = _route_pointer(
-                index,
-                s0,
-                s1,
-                s2,
-                s3,
-                s4,
-                s5,
-                s6,
-                s7,
-                s8,
-                s9,
-                s10,
-                s11,
-                s12,
-                s13,
-                s14,
-                s15,
-                s16,
-                s17,
-                s18,
-                s19,
-                s20,
-                s21,
-                s22,
-                s23,
-                s24,
-                s25,
-                s26,
-            )
-            source_base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(source + source_base + offsets, mask=mask, other=0.0).to(
-                tl.float32
-            )
-            weight = tl.load(
-                weights + index * bt * num_heads + token * num_heads + h_offsets,
-                mask=head_mask,
-                other=0.0,
-            )
-            centered += weight * tl.sum(upstream * value, axis=1)
-
         grad_p = tl.zeros((block_h, block_k), tl.float32)
-        for index in range(n_sources):
-            source = _route_pointer(
-                index,
-                s0,
-                s1,
-                s2,
-                s3,
-                s4,
-                s5,
-                s6,
-                s7,
-                s8,
-                s9,
-                s10,
-                s11,
-                s12,
-                s13,
-                s14,
-                s15,
-                s16,
-                s17,
-                s18,
-                s19,
-                s20,
-                s21,
-                s22,
-                s23,
-                s24,
-                s25,
-                s26,
-            )
-            grad_source = _route_pointer(
-                index,
-                g0,
-                g1,
-                g2,
-                g3,
-                g4,
-                g5,
-                g6,
-                g7,
-                g8,
-                g9,
-                g10,
-                g11,
-                g12,
-                g13,
-                g14,
-                g15,
-                g16,
-                g17,
-                g18,
-                g19,
-                g20,
-                g21,
-                g22,
-                g23,
-                g24,
-                g25,
-                g26,
-            )
-            source_base = 0 if null_first and index == 0 else token * dim
-            value = tl.load(source + source_base + offsets, mask=mask, other=0.0).to(
-                tl.float32
-            )
-            weight = tl.load(
-                weights + index * bt * num_heads + token * num_heads + h_offsets,
-                mask=head_mask,
-                other=0.0,
-            )
-            inverse = tl.load(inv_rms + index * bt + token)
-            route_beta = weight * (tl.sum(upstream * value, axis=1) - centered)
-            dkp = route_beta[:, None] * p
-            # RMS statistics are shared across the full hidden width, so the
-            # norm-backward correction couples all routing heads.
-            norm_dot = tl.sum(tl.sum(dkp * value, axis=1), axis=0)
-            source_grad = (
-                weight[:, None] * upstream
-                + inverse * dkp
-                - (inverse * inverse * inverse / dim) * norm_dot * value
-            )
-            tl.store(grad_source + token * dim + offsets, source_grad, mask=mask)
-            grad_p += route_beta[:, None] * value * inverse
-        tl.store(grad_projected + token * dim + offsets, grad_p, mask=mask)
+        grad_null = tl.zeros((block_h, block_k), tl.float32)
+        for step in range(tokens_per_program):
+            token = pid * tokens_per_program + step
+            valid = token < bt
+            token_mask = mask & valid
+            head_valid = head_mask & valid
+            upstream = tl.load(
+                grad_routed + token * dim + offsets, mask=token_mask, other=0.0
+            ).to(tl.float32)
+            centered = tl.zeros((block_h,), tl.float32)
+            for index in tl.static_range(n_sources):
+                source = _route_pointer(
+                    index,
+                    s0,
+                    s1,
+                    s2,
+                    s3,
+                    s4,
+                    s5,
+                    s6,
+                    s7,
+                    s8,
+                    s9,
+                    s10,
+                    s11,
+                    s12,
+                    s13,
+                    s14,
+                    s15,
+                    s16,
+                    s17,
+                    s18,
+                    s19,
+                    s20,
+                    s21,
+                    s22,
+                    s23,
+                    s24,
+                    s25,
+                    s26,
+                )
+                base = 0 if index == 0 else token * dim
+                value = tl.load(source + base + offsets, mask=token_mask, other=0.0).to(
+                    tl.float32
+                )
+                weight = tl.load(
+                    weights + index * bt * num_heads + token * num_heads + h_offsets,
+                    mask=head_valid,
+                    other=0.0,
+                )
+                centered += weight * tl.sum(upstream * value, axis=1)
+
+            for index in tl.static_range(n_sources):
+                source = _route_pointer(
+                    index,
+                    s0,
+                    s1,
+                    s2,
+                    s3,
+                    s4,
+                    s5,
+                    s6,
+                    s7,
+                    s8,
+                    s9,
+                    s10,
+                    s11,
+                    s12,
+                    s13,
+                    s14,
+                    s15,
+                    s16,
+                    s17,
+                    s18,
+                    s19,
+                    s20,
+                    s21,
+                    s22,
+                    s23,
+                    s24,
+                    s25,
+                    s26,
+                )
+                base = 0 if index == 0 else token * dim
+                value = tl.load(source + base + offsets, mask=token_mask, other=0.0).to(
+                    tl.float32
+                )
+                weight = tl.load(
+                    weights + index * bt * num_heads + token * num_heads + h_offsets,
+                    mask=head_valid,
+                    other=0.0,
+                )
+                inverse = tl.load(inv_rms + index * bt + tl.minimum(token, bt - 1))
+                route_beta = weight * (tl.sum(upstream * value, axis=1) - centered)
+                dkp = route_beta[:, None] * p
+                # RMS statistics are shared across the full hidden width, so the
+                # norm-backward correction couples all routing heads.
+                norm_dot = tl.sum(tl.sum(dkp * value, axis=1), axis=0)
+                source_grad = (
+                    weight[:, None] * upstream
+                    + inverse * dkp
+                    - (inverse * inverse * inverse / dim) * norm_dot * value
+                )
+                if index == 0:
+                    grad_null += source_grad
+                else:
+                    grad_source = _route_pointer(
+                        index - 1,
+                        g0,
+                        g1,
+                        g2,
+                        g3,
+                        g4,
+                        g5,
+                        g6,
+                        g7,
+                        g8,
+                        g9,
+                        g10,
+                        g11,
+                        g12,
+                        g13,
+                        g14,
+                        g15,
+                        g16,
+                        g17,
+                        g18,
+                        g19,
+                        g20,
+                        g21,
+                        g22,
+                        g23,
+                        g24,
+                        g25,
+                        g26,
+                    )
+                    tl.store(
+                        grad_source + token * dim + offsets,
+                        source_grad.to(grad_source.dtype.element_ty),
+                        mask=token_mask,
+                    )
+                grad_p += route_beta[:, None] * value * inverse
+        tl.store(partials + pid * dim + offsets, grad_p, mask=mask)
+        tl.store(
+            partials + (tl.num_programs(0) + pid) * dim + offsets, grad_null, mask=mask
+        )
+
+
+ROUTE_TOKENS_PER_PROGRAM = 4
+"""Tokens folded into one backward program; sets the query/null partial count."""
 
 
 def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
@@ -554,17 +518,18 @@ def _check_route_dims(dim: int, num_heads: int) -> int:
 def _route_forward_impl(
     projected: Tensor,
     present: Tensor,
+    null: Tensor,
     sources: list[Tensor],
-    null_first: bool,
     eps: float,
     num_heads: int,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    n_sources = len(sources)
+    bank = (null, *sources)
+    n_sources = len(bank)
     batch, length, dim = sources[0].shape
     bt = batch * length
     head_dim = _check_route_dims(dim, num_heads)
     block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
-    padded = _padded_sources(tuple(sources))
+    padded = _padded_sources(bank)
     logits = torch.empty(
         (n_sources, bt, num_heads), device=projected.device, dtype=torch.float32
     )
@@ -573,12 +538,13 @@ def _route_forward_impl(
     routed = torch.empty_like(sources[0], memory_format=torch.contiguous_format)
     has_present = present.numel() > 0
     present_arg = present if has_present else sources[0]
-    _route_logits_kernel[(bt,)](
+    _route_forward_kernel[(bt,)](
         *padded,
         projected,
         present_arg,
         logits,
         inv_rms,
+        routed,
         bt=bt,
         dim=dim,
         num_heads=num_heads,
@@ -586,7 +552,6 @@ def _route_forward_impl(
         eps=eps,
         n_sources=n_sources,
         has_present=has_present,
-        null_first=null_first,
         block_h=block_h,
         block_k=block_k,
         num_warps=num_warps,
@@ -600,19 +565,6 @@ def _route_forward_impl(
         block_n=triton.next_power_of_2(n_sources),
         num_warps=1,
     )
-    _route_mix_kernel[(bt, num_heads)](
-        *padded,
-        weights,
-        routed,
-        bt=bt,
-        dim=dim,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        n_sources=n_sources,
-        null_first=null_first,
-        block_k=block_k,
-        num_warps=max(1, num_warps // 2),
-    )
     return (
         routed,
         weights.view(n_sources, batch, length, num_heads),
@@ -625,48 +577,50 @@ def _route_backward_impl(
     grad_routed: Tensor,
     weights: Tensor,
     inv_rms: Tensor,
+    null: Tensor,
     sources: list[Tensor],
-    null_first: bool,
     num_heads: int,
-) -> tuple[Tensor, list[Tensor]]:
+) -> tuple[Tensor, Tensor, list[Tensor]]:
     grad_routed = grad_routed.contiguous()
+    bank = (null, *sources)
+    n_sources = len(bank)
     batch, length, dim = sources[0].shape
     bt = batch * length
-    n_sources = len(sources)
     head_dim = _check_route_dims(dim, num_heads)
     block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
     flat_weights = weights.view(n_sources, bt, num_heads)
-    padded = _padded_sources(tuple(sources))
+    padded = _padded_sources(bank)
     source_grads = [
         torch.empty(source.shape, device=source.device, dtype=source.dtype)
         for source in sources
     ]
     padded_grads = tuple(source_grads) + (source_grads[-1],) * (
-        MAX_ROUTE_SOURCES - n_sources
+        MAX_ROUTE_SOURCES - len(source_grads)
     )
-    grad_projected_tokens = torch.empty_like(
-        sources[0], memory_format=torch.contiguous_format
+    programs = triton.cdiv(bt, ROUTE_TOKENS_PER_PROGRAM)
+    partials = torch.empty(
+        (2, programs, dim), device=projected.device, dtype=torch.float32
     )
-    _route_backward_kernel[(bt,)](
+    _route_backward_kernel[(programs,)](
         *padded,
         *padded_grads,
         projected,
         grad_routed,
         flat_weights,
         inv_rms,
-        grad_projected_tokens,
+        partials,
         bt=bt,
         dim=dim,
         num_heads=num_heads,
         head_dim=head_dim,
         n_sources=n_sources,
-        null_first=null_first,
+        tokens_per_program=ROUTE_TOKENS_PER_PROGRAM,
         block_h=block_h,
         block_k=block_k,
         num_warps=num_warps,
     )
-    grad_projected = grad_projected_tokens.sum(dim=(0, 1)).to(projected.dtype)
-    return grad_projected, source_grads
+    summed = partials.sum(dim=1)
+    return summed[0].to(projected.dtype), summed[1].to(null.dtype), source_grads
 
 
 if triton is not None:
@@ -765,6 +719,179 @@ def _pack_control_gradients_impl(
     return packed
 
 
+# -- in-place weight-gradient accumulation -------------------------------------
+
+
+if triton is not None:
+
+    @triton.autotune(
+        configs=[
+            triton.Config({"BM": 128, "BN": 128, "BK": 32}, num_warps=8, num_stages=3),
+            triton.Config({"BM": 128, "BN": 128, "BK": 64}, num_warps=8, num_stages=3),
+            triton.Config({"BM": 128, "BN": 64, "BK": 32}, num_warps=4, num_stages=4),
+            triton.Config({"BM": 128, "BN": 64, "BK": 64}, num_warps=4, num_stages=3),
+            triton.Config({"BM": 64, "BN": 128, "BK": 32}, num_warps=4, num_stages=4),
+            triton.Config({"BM": 64, "BN": 128, "BK": 64}, num_warps=4, num_stages=3),
+            triton.Config({"BM": 64, "BN": 64, "BK": 64}, num_warps=4, num_stages=4),
+            triton.Config({"BM": 64, "BN": 64, "BK": 32}, num_warps=4, num_stages=4),
+        ],
+        key=["rows", "cols", "tokens"],
+        restore_value=["sink"],
+    )
+    @triton.jit
+    def _dw_accum_kernel(
+        grad_output,
+        activations,
+        sink,
+        rows,
+        cols,
+        tokens,
+        stride_gt,
+        stride_gr,
+        stride_at,
+        stride_ac,
+        stride_sr,
+        stride_sc,
+        BM: tl.constexpr,
+        BN: tl.constexpr,
+        BK: tl.constexpr,
+    ):
+        """sink[rows, cols] += grad_output[tokens, rows]^T @ activations[tokens, cols]."""
+        pid_r = tl.program_id(0)
+        pid_c = tl.program_id(1)
+        r = pid_r * BM + tl.arange(0, BM)
+        c = pid_c * BN + tl.arange(0, BN)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for t0 in range(0, tokens, BK):
+            t = t0 + tl.arange(0, BK)
+            g = tl.load(
+                grad_output + t[None, :] * stride_gt + r[:, None] * stride_gr,
+                mask=(r[:, None] < rows) & (t[None, :] < tokens),
+                other=0.0,
+            )
+            a = tl.load(
+                activations + t[:, None] * stride_at + c[None, :] * stride_ac,
+                mask=(t[:, None] < tokens) & (c[None, :] < cols),
+                other=0.0,
+            )
+            acc += tl.dot(g, a)
+        pointers = sink + r[:, None] * stride_sr + c[None, :] * stride_sc
+        mask = (r[:, None] < rows) & (c[None, :] < cols)
+        tl.store(pointers, tl.load(pointers, mask=mask, other=0.0) + acc, mask=mask)
+
+
+@torch.library.custom_op(
+    "delta_feedback::dw_accum", mutates_args=(), device_types="cpu"
+)
+def dw_accum(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Tensor:
+    """sink += grad_output^T @ activations, accumulated in FP32 in place.
+
+    ``grad_output`` is ``[tokens, rows]`` and ``activations`` ``[tokens, cols]``;
+    ``sink`` is the persistent FP32 ``[rows, cols]`` weight gradient.  The CPU
+    kernel is the literal reference; CUDA owns the tensor-core reduction and
+    the read-modify-write epilogue, so a weight gradient is never materialized
+    separately from its accumulator.
+
+    The op deliberately declares no mutation.  Inside a compiled block the sink
+    is a saved tensor of the compiled autograd node, and a declared mutation
+    would bump its version between the backward passes that share it; nothing
+    in any graph reads a sink, so the accumulation is invisible to autograd
+    by design.  The returned zero scalar is a fence: callers fold it into the
+    input gradient so the accumulation can never be dead-code-eliminated.
+    """
+    sink.addmm_(grad_output.float().mT, activations.float())
+    return sink.new_zeros(())
+
+
+@dw_accum.register_fake
+def _dw_accum_fake(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Tensor:
+    return sink.new_zeros(())
+
+
+if triton is not None:
+
+    @dw_accum.register_kernel("cuda")
+    def _dw_accum_cuda(
+        grad_output: Tensor, activations: Tensor, sink: Tensor
+    ) -> Tensor:
+        if sink.dtype != torch.float32:
+            raise TypeError("dw_accum sinks are FP32 gradient buffers")
+        tokens, rows = grad_output.shape
+        cols = activations.shape[1]
+
+        def grid(meta):
+            return (triton.cdiv(rows, meta["BM"]), triton.cdiv(cols, meta["BN"]))
+
+        _dw_accum_kernel[grid](
+            grad_output,
+            activations,
+            sink,
+            rows,
+            cols,
+            tokens,
+            grad_output.stride(0),
+            grad_output.stride(1),
+            activations.stride(0),
+            activations.stride(1),
+            sink.stride(0),
+            sink.stride(1),
+        )
+        return sink.new_zeros(())
+
+
+class _SinkLinear(torch.autograd.Function):
+    """``F.linear`` over concatenated weights whose weight gradients accumulate
+    straight into persistent FP32 buffers.
+
+    Autograd's default path materializes each microbatch's weight gradient,
+    widens it, and adds it into ``.grad`` as separate kernels.  Here the
+    backward's tensor-core reduction ends in a read-modify-write of the sink,
+    so the only weight-gradient traffic is the accumulator itself, and the
+    parameters receive no autograd gradient at all.  Row segments keep
+    separate parameters (Q/K/V, or QKV plus the attention gate) behind one GEMM.
+    """
+
+    @staticmethod
+    def forward(ctx, x: Tensor, splits: tuple[int, ...], *tensors: Tensor) -> Tensor:
+        count = len(splits)
+        weights, sinks = tensors[:count], tensors[count:]
+        weight = weights[0] if count == 1 else torch.cat(weights, dim=0)
+        weight = weight.to(x.dtype)
+        ctx.save_for_backward(x, weight)
+        # Sinks are mutated by every backward that reaches them, so they are
+        # held as plain attributes rather than version-checked saved tensors.
+        ctx.sinks = sinks
+        ctx.splits = splits
+        return F.linear(x, weight)
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor):
+        x, weight = ctx.saved_tensors
+        sinks = ctx.sinks
+        grad_x = gradient @ weight
+        flat_gradient = gradient.reshape(-1, gradient.shape[-1])
+        flat_x = x.reshape(-1, x.shape[-1])
+        start = 0
+        fence = None
+        for size, sink in zip(ctx.splits, sinks, strict=True):
+            token = dw_accum(flat_gradient[:, start : start + size], flat_x, sink)
+            fence = token if fence is None else fence + token
+            start += size
+        # The fence is zero; the dependency keeps every accumulation alive.
+        grad_x = grad_x + fence.to(grad_x.dtype)
+        return (grad_x, None) + (None,) * (2 * len(ctx.splits))
+
+
+def sink_linear(
+    x: Tensor, weights: tuple[Tensor, ...], sinks: tuple[Tensor | None, ...]
+) -> Tensor:
+    """Linear over concatenated weights; bound sinks accumulate dW in place."""
+    if not torch.is_grad_enabled() or any(sink is None for sink in sinks):
+        weight = weights[0] if len(weights) == 1 else torch.cat(weights, dim=0)
+        return F.linear(x, weight)
+    return _SinkLinear.apply(x, tuple(w.shape[0] for w in weights), *weights, *sinks)
+
+
 if triton is not None:
 
     @torch.library.custom_op(
@@ -816,36 +943,33 @@ if triton is not None:
     def _route_forward_op(
         projected: Tensor,
         present: Tensor,
+        null: Tensor,
         sources: list[Tensor],
-        null_first: bool,
         eps: float,
         num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        return _route_forward_impl(
-            projected, present, sources, null_first, eps, num_heads
-        )
+        return _route_forward_impl(projected, present, null, sources, eps, num_heads)
 
     @_route_forward_op.register_fake
     def _route_forward_fake(
         projected: Tensor,
         present: Tensor,
+        null: Tensor,
         sources: list[Tensor],
-        null_first: bool,
         eps: float,
         num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        del present, null_first, eps
+        del present, null, eps
         batch, length, _ = sources[0].shape
+        n_sources = len(sources) + 1
         routed = torch.empty_like(sources[0])
         weights = torch.empty(
-            (len(sources), batch, length, num_heads),
+            (n_sources, batch, length, num_heads),
             device=projected.device,
             dtype=torch.float32,
         )
         inv_rms = torch.empty(
-            (len(sources), batch, length),
-            device=projected.device,
-            dtype=torch.float32,
+            (n_sources, batch, length), device=projected.device, dtype=torch.float32
         )
         return routed, weights, inv_rms
 
@@ -857,18 +981,12 @@ if triton is not None:
         grad_routed: Tensor,
         weights: Tensor,
         inv_rms: Tensor,
+        null: Tensor,
         sources: list[Tensor],
-        null_first: bool,
         num_heads: int,
-    ) -> tuple[Tensor, list[Tensor]]:
+    ) -> tuple[Tensor, Tensor, list[Tensor]]:
         return _route_backward_impl(
-            projected,
-            grad_routed,
-            weights,
-            inv_rms,
-            sources,
-            null_first,
-            num_heads,
+            projected, grad_routed, weights, inv_rms, null, sources, num_heads
         )
 
     @_route_backward_op.register_fake
@@ -877,36 +995,36 @@ if triton is not None:
         grad_routed: Tensor,
         weights: Tensor,
         inv_rms: Tensor,
+        null: Tensor,
         sources: list[Tensor],
-        null_first: bool,
         num_heads: int,
-    ) -> tuple[Tensor, list[Tensor]]:
-        del grad_routed, weights, inv_rms, null_first, num_heads
-        return torch.empty_like(projected), [
-            torch.empty_like(source) for source in sources
-        ]
+    ) -> tuple[Tensor, Tensor, list[Tensor]]:
+        del grad_routed, weights, inv_rms, num_heads
+        return (
+            torch.empty_like(projected),
+            torch.empty_like(null),
+            [torch.empty_like(source) for source in sources],
+        )
 
     def _route_setup_context(ctx, inputs, output) -> None:
-        projected, _present, sources, null_first, _eps, num_heads = inputs
+        projected, _present, null, sources, _eps, num_heads = inputs
         _routed, weights, inv_rms = output
-        ctx.save_for_backward(projected, weights, inv_rms, *sources)
-        ctx.n_sources = len(sources)
-        ctx.null_first = null_first
+        ctx.save_for_backward(projected, null, weights, inv_rms, *sources)
         ctx.num_heads = num_heads
         ctx.mark_non_differentiable(weights, inv_rms)
 
     def _route_autograd_backward(ctx, grad_routed, _grad_weights, _grad_inv_rms):
-        projected, weights, inv_rms, *sources = ctx.saved_tensors
-        grad_projected, source_grads = _route_backward_op(
+        projected, null, weights, inv_rms, *sources = ctx.saved_tensors
+        grad_projected, grad_null, source_grads = _route_backward_op(
             projected,
             grad_routed,
             weights,
             inv_rms,
+            null,
             list(sources),
-            ctx.null_first,
             ctx.num_heads,
         )
-        return grad_projected, None, source_grads, None, None, None
+        return grad_projected, None, grad_null, source_grads, None, None
 
     _route_forward_op.register_autograd(
         _route_autograd_backward, setup_context=_route_setup_context
@@ -918,12 +1036,16 @@ else:  # pragma: no cover - the Mac never enters the CUDA route.
 def bespoke_route(
     projected: Tensor,
     present: Tensor | None,
-    null_first: bool,
+    null: Tensor,
     eps: float,
     num_heads: int,
     sources: tuple[Tensor, ...],
 ) -> tuple[Tensor, Tensor]:
-    """Full-width RMS keys plus per-head depth softmaxes in fused Triton."""
+    """Full-width RMS keys plus per-head depth softmaxes in fused Triton.
+
+    ``null`` is the site's width-``dim`` null value; it is source 0 of the
+    returned weights and never materialized per token.
+    """
     if triton is None or not projected.is_cuda:
         raise RuntimeError("bespoke_route requires Triton CUDA")
     present_arg = (
@@ -932,14 +1054,17 @@ def bespoke_route(
         else torch.empty(0, device=projected.device, dtype=torch.bool)
     )
     routed, weights, _inv_rms = _route_forward_op(
-        projected, present_arg, list(sources), null_first, eps, num_heads
+        projected, present_arg, null.contiguous(), list(sources), eps, num_heads
     )
     return routed, weights
 
 
 __all__ = [
     "MAX_ROUTE_SOURCES",
+    "ROUTE_TOKENS_PER_PROGRAM",
     "bespoke_route",
+    "dw_accum",
     "pack_control_gradients",
+    "sink_linear",
     "triton",
 ]

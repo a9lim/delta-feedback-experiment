@@ -209,11 +209,23 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 
 - BF16 trunk activations with FP32 parameters, accumulated gradients, and
   optimizer state;
-- the pinned FLA recomputing PKDA chunk kernel, one fused Q/K/V causal
-  convolution launch per PKDA layer, and fused PKDA output norm/gate;
-- FlashAttention for full-sequence, prefill, GQA, and cached decode;
-- a fixed-capacity Triton MHDB router with analytic backward and cross-group
-  full-width RMS coupling;
+- execution of exactly the `seq_len` input positions of every stored row; the
+  final stored token is only ever a target, and keyed jitter is still drawn at
+  the stored-row width so the draws do not depend on the executed length;
+- persistent FP32 gradient buffers that the tied embedding (lookup scatter and
+  CCE classifier gradient) and every large projection accumulate into directly
+  from backward, so no weight gradient is materialized apart from its
+  accumulator and those parameters hand autograd no gradient at all;
+- the pinned FLA PKDA chunk kernel retaining its WY and chunk-state
+  intermediates for backward, one GEMM over the concatenated Q/K/V weights and
+  one fused causal-convolution launch per PKDA layer, and fused PKDA output
+  norm/gate;
+- FlashAttention for full-sequence, prefill, GQA, and cached decode, with each
+  gated global layer projecting Q/K/V and its gate in one GEMM;
+- a fixed-capacity Triton MHDB router that reads every source once per token
+  with the source softmax folded in online, holds each site's width-`D` null in
+  place, keeps full-width RMS coupling in its analytic backward, and reduces the
+  query and null gradients from FP32 per-program partials;
 - an address-stable, non-checkpoint BF16 classifier shadow refreshed from its
   FP32 tied-embedding master once per optimizer update;
 - pinned current cut cross-entropy with BF16 operands, capture-safe fixed-shape
@@ -233,17 +245,20 @@ default capture is:
 
 | Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 61.4 s | 13.31 GiB | 22.89 GiB | 4 |
+| `df` | 96.5 s | 14.05 GiB | 22.99 GiB | 4 |
 
-Median graph replay is 75.5 ms, 149.9 ms, and 224.9 ms for one, two, and three
+Median graph replay is 67.7 ms, 136.8 ms, and 205.7 ms for one, two, and three
 passes. The same probe measures PKDA chunk parity at relative error 0.0040,
 fused Q/K/V convolution parity at 0.0033, fused output norm-gate parity at
-0.0032, and cached decode parity at 0.0069/0.0145. Inductor artifacts live in
-`~/.cache/delta-feedback/torchinductor` by default; the probe performed the
-one-time search and a second process reused the resulting 1.1 GiB cache with
-no autotuning work. The reserved graph pool is the concurrency boundary.
-Screen runs remain serial; concurrent execution is outside the qualified
-deterministic path.
+0.0032, and cached decode parity at 0.0069/0.0146. Resumed from the completed
+`screen-df-s1` step-10,500 snapshot, this path reproduces that run's logged
+per-step losses to four decimals over 100 mixed-pass steps, its step-10,600
+validation losses within 0.001, and runs at 56.2k one-pass tokens per second
+against the run's 50.9k. Inductor artifacts live in
+`~/.cache/delta-feedback/torchinductor` by default; the probe performs the
+fixed-shape search once and later processes reuse the cache with no autotuning
+work. The reserved graph pool is the concurrency boundary. Screen runs remain
+serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
@@ -348,7 +363,8 @@ The stage asks:
 3. whether every feedback arm remains stable under self-composition;
 4. whether null, seed, block, and payload paths are actually used.
 
-No run under the current screen contract is complete. This is a sensitivity
+Only `screen-df-s1` is complete under the current screen contract. This is a
+sensitivity
 and interaction screen, not a decisive test of FBT formation at high
 token-per-parameter ratio.
 

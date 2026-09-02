@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
+from .cuda_kernels import sink_linear
 from .pkda import PreconditionedKDA
 
 try:  # Triton is deliberately a CUDA-only optimization dependency.
@@ -183,6 +184,31 @@ class RMSNorm(nn.Module):
         return (x * self.weight.float()).to(dtype)
 
 
+class _EmbeddingSink(torch.autograd.Function):
+    """Token lookup whose backward scatters into a persistent FP32 gradient.
+
+    ``nn.Embedding``'s backward builds a dense zero ``[V, D]`` gradient, scatters
+    the row gradients into it, and leaves autograd to add the whole tensor into
+    the accumulated gradient: three passes over 467 MB at screen scale for
+    4,096 touched rows.  Given the trainer's persistent buffer, the same
+    contribution is one ``index_add_`` of the touched rows.
+    """
+
+    @staticmethod
+    def forward(ctx, tokens: Tensor, weight: Tensor, sink: Tensor) -> Tensor:
+        ctx.save_for_backward(tokens)
+        ctx.sink = sink
+        return F.embedding(tokens, weight)
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[None, None, None]:
+        (tokens,) = ctx.saved_tensors
+        ctx.sink.index_add_(
+            0, tokens.reshape(-1), gradient.reshape(-1, gradient.shape[-1]).float()
+        )
+        return None, None, None
+
+
 class ResidualEmbedding(nn.Embedding):
     """FP32 tied weights, BF16 CUDA activations inside the training autocast.
 
@@ -190,10 +216,22 @@ class ResidualEmbedding(nn.Embedding):
     FP32 output silently promotes every residual, payload, and routed source.
     Outside CUDA autocast (CPU tests and explicit FP32 analysis) it remains an
     ordinary embedding.
+
+    ``grad_sink`` is the trainer-owned persistent FP32 gradient buffer of the
+    tied weight.  When it is set, both the lookup and the tied classifier
+    accumulate straight into it and return no autograd gradient; the buffer is
+    the ``.grad`` the clip and optimizer read.  It is never a parameter or a
+    checkpoint entry.
     """
 
+    grad_sink: Tensor | None = None
+
     def forward(self, tokens: Tensor) -> Tensor:
-        out = super().forward(tokens)
+        sink = self.grad_sink
+        if sink is not None and self.weight.is_cuda and torch.is_grad_enabled():
+            out = _EmbeddingSink.apply(tokens, self.weight, sink)
+        else:
+            out = super().forward(tokens)
         if out.is_cuda and torch.is_autocast_enabled("cuda"):
             return out.to(torch.bfloat16)
         return out
@@ -312,6 +350,9 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(cfg.heads * cfg.head_dim, cfg.dim, bias=False)
         self.q_norm = RMSNorm(cfg.head_dim, cfg.norm_eps)
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps)
+        self.qkv_sink: Tensor | None = None
+        self.gate_sink: Tensor | None = None
+        self.o_sink: Tensor | None = None
 
     def forward(
         self,
@@ -324,9 +365,19 @@ class Attention(nn.Module):
     ) -> Tensor:
         batch, length, _ = x.shape
         cfg = self.cfg
-        q, k, v = self.qkv_proj(x).split(
-            (self.q_size, self.kv_size, self.kv_size), dim=-1
-        )
+        if gate_weight is not None:
+            # One GEMM produces Q/K/V and the gate logits; the gate keeps its
+            # own parameter, optimizer group, and checkpoint name.
+            q, k, v, gate_logits = sink_linear(
+                x,
+                (self.qkv_proj.weight, gate_weight),
+                (self.qkv_sink, self.gate_sink),
+            ).split((self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1)
+        else:
+            gate_logits = None
+            q, k, v = sink_linear(x, (self.qkv_proj.weight,), (self.qkv_sink,)).split(
+                (self.q_size, self.kv_size, self.kv_size), dim=-1
+            )
         q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
         k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
@@ -371,9 +422,9 @@ class Attention(nn.Module):
                 enable_gqa=cfg.heads != cfg.kv_heads,
             ).transpose(1, 2)
         out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
-        if gate_weight is not None:
-            out = out * torch.sigmoid(F.linear(x, gate_weight))
-        return self.o_proj(out)
+        if gate_logits is not None:
+            out = out * torch.sigmoid(gate_logits)
+        return sink_linear(out, (self.o_proj.weight,), (self.o_sink,))
 
 
 class SwiGLU(nn.Module):
@@ -381,10 +432,16 @@ class SwiGLU(nn.Module):
         super().__init__()
         self.gate_up_proj = nn.Linear(cfg.dim, 2 * cfg.intermediate, bias=False)
         self.down_proj = nn.Linear(cfg.intermediate, cfg.dim, bias=False)
+        self.gate_up_sink: Tensor | None = None
+        self.down_sink: Tensor | None = None
 
     def forward(self, x: Tensor) -> Tensor:
-        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        gate, up = sink_linear(
+            x, (self.gate_up_proj.weight,), (self.gate_up_sink,)
+        ).chunk(2, dim=-1)
+        return sink_linear(
+            F.silu(gate) * up, (self.down_proj.weight,), (self.down_sink,)
+        )
 
 
 def _check_route_geometry(dim: int, num_heads: int) -> int:
@@ -498,11 +555,10 @@ class Router(nn.Module):
         want_weights: bool,
     ) -> tuple[Tensor | None, Tensor | None]:
         """Return a routed addition and weights shaped ``[N,B,T,H]``."""
-        null = self.null.to(sources[0].dtype).expand_as(sources[0])
-        sources = [null] + sources
-        masks = [None] + masks
-        if len(sources) < 2:
+        if not sources:
             return None, None
+        null = self.null.to(sources[0].dtype)
+        masks = [None] + masks
         present = None
         if any(mask is not None for mask in masks):
             present = torch.stack(
@@ -520,7 +576,7 @@ class Router(nn.Module):
             routed, weights = bespoke_route(
                 projected,
                 present,
-                True,
+                null,
                 self.key_norm.eps,
                 self.num_heads,
                 tuple(sources),
@@ -532,11 +588,12 @@ class Router(nn.Module):
                 self.key_norm.eps,
                 present,
                 self.num_heads,
+                null.expand_as(sources[0]),
                 *sources,
             )
         else:
             routed, weights = _route_algebra(
-                torch.stack(sources),
+                torch.stack([null.expand_as(sources[0]), *sources]),
                 self.query,
                 self.key_norm.weight,
                 self.key_norm.eps,
@@ -696,15 +753,24 @@ class ColumnOutput:
 
 
 class _ClassifierShadow(torch.autograd.Function):
-    """Read a stable BF16 shadow while accumulating into its FP32 master."""
+    """Read a stable BF16 shadow while accumulating into its FP32 master.
+
+    With a persistent sink the BF16 classifier gradient is added into it in one
+    fused pass instead of being widened to a 467 MB FP32 temporary that autograd
+    then adds a second time.
+    """
 
     @staticmethod
-    def forward(ctx, master: Tensor, shadow: Tensor) -> Tensor:
+    def forward(ctx, master: Tensor, shadow: Tensor, sink: Tensor | None) -> Tensor:
+        ctx.sink = sink
         return shadow
 
     @staticmethod
-    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None]:
-        return gradient.float(), None
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor | None, None, None]:
+        if ctx.sink is not None:
+            ctx.sink.add_(gradient)
+            return None, None, None
+        return gradient.float(), None, None
 
 
 class DFModel(nn.Module):
@@ -728,6 +794,8 @@ class DFModel(nn.Module):
                 len(cfg.global_attention_layers) if cfg.gated_attention else 0
             )
         )
+        self.fuse_value_sink: Tensor | None = None
+        self.fuse_gate_sink: Tensor | None = None
         if cfg.gated_entry:
             self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
@@ -785,8 +853,62 @@ class DFModel(nn.Module):
 
     def fuse(self, payload: Tensor, e: Tensor) -> Tensor:
         """FBT entry: u = rmsnorm(W_U p ⊙ σ(W_G rmsnorm(e))) (Appendix C)."""
-        gate = torch.sigmoid(self.fuse_gate(self.gate_norm(e)))
-        return self.entry_norm(self.fuse_value(payload) * gate)
+        gate = torch.sigmoid(
+            sink_linear(
+                self.gate_norm(e), (self.fuse_gate.weight,), (self.fuse_gate_sink,)
+            )
+        )
+        value = sink_linear(payload, (self.fuse_value.weight,), (self.fuse_value_sink,))
+        return self.entry_norm(value * gate)
+
+    # -- persistent gradient sinks -------------------------------------------
+
+    def bind_gradient_sinks(
+        self, sinks: dict[nn.Parameter, Tensor] | None
+    ) -> set[nn.Parameter]:
+        """Attach trainer-owned FP32 gradient buffers to every sink-capable site.
+
+        The tied embedding, every large projection, and the fusion matrices
+        then accumulate their gradients in place and return no autograd
+        gradient; ``None`` restores ordinary autograd accumulation.  Returns
+        the parameters that were bound, so the trainer can treat a touched
+        buffer as that parameter's activity for the captured mode.
+        """
+        lookup = sinks or {}
+        bound: set[nn.Parameter] = set()
+
+        def sink(parameter: nn.Parameter) -> Tensor | None:
+            buffer = lookup.get(parameter)
+            if buffer is not None:
+                bound.add(parameter)
+            return buffer
+
+        # The portable head reads the tied weight through autograd, so only the
+        # CUDA path (CCE plus the bespoke lookup) owns an embedding sink.
+        self.embed_tokens.grad_sink = (
+            sink(self.embed_tokens.weight) if self.embed_tokens.weight.is_cuda else None
+        )
+        for block in self.blocks:
+            block.mlp.gate_up_sink = sink(block.mlp.gate_up_proj.weight)
+            block.mlp.down_sink = sink(block.mlp.down_proj.weight)
+            attn = block.attn
+            if block.is_pkda:
+                attn.q_sink = sink(attn.q_proj.weight)
+                attn.k_sink = sink(attn.k_proj.weight)
+                attn.v_sink = sink(attn.v_proj.weight)
+                attn.o_sink = sink(attn.o_proj.weight)
+            else:
+                attn.qkv_sink = sink(attn.qkv_proj.weight)
+                attn.o_sink = sink(attn.o_proj.weight)
+                attn.gate_sink = (
+                    sink(self.attention_gates[block.global_gate_index].weight)
+                    if block.global_gate_index is not None
+                    else None
+                )
+        if self.cfg.gated_entry:
+            self.fuse_value_sink = sink(self.fuse_value.weight)
+            self.fuse_gate_sink = sink(self.fuse_gate.weight)
+        return bound
 
     def logits(self, h_top: Tensor) -> Tensor:
         return F.linear(self.final_norm(h_top), self.embed_tokens.weight)
@@ -820,7 +942,9 @@ class DFModel(nn.Module):
             return master
         if self._classifier_shadow is None:
             raise RuntimeError("CUDA classifier shadow was not prepared")
-        return _ClassifierShadow.apply(master, self._classifier_shadow)
+        return _ClassifierShadow.apply(
+            master, self._classifier_shadow, self.embed_tokens.grad_sink
+        )
 
     # -- one column pass -------------------------------------------------------
 
@@ -993,17 +1117,22 @@ def multipass(
 ) -> list[ColumnOutput]:
     """The arm-agnostic Jacobi multi-pass forward.
 
-    tokens [B, T]; prefix_lens [n_passes-1, B] with values in 1..T (the
-    plain-embedding prefix per feedback pass; position 0 is always
-    plain); jitter [n_passes-1, B, T, D] added to the carried payload
-    before shifting.  Both are pre-drawn by the caller — the shared
+    tokens [B, T+1] is one stored row: the model executes its first T
+    positions, which are exactly the positions that predict tokens 1..T.
+    The final stored token is only ever a target; computing a column for
+    it would be causally dead work.  prefix_lens [n_passes-1, B] holds
+    values in 1..T (the plain-embedding prefix per feedback pass; position
+    0 is always plain); jitter [n_passes-1, B, T+1, D] is drawn at the
+    stored-row width and its first T columns are added to the carried
+    payload before shifting, so the keyed draw is independent of how many
+    positions execute.  Both are pre-drawn by the caller — the shared
     randomness contract lives in the trainer, not here.  Non-feedback
     arms simply take n_passes=1.
     """
     cfg = model.cfg
     if n_passes > 1 and not cfg.feedback_active:
         raise ValueError("multi-pass batches require a feedback-bearing arm")
-    e = model.embed_tokens(tokens)
+    e = model.embed_tokens(tokens[:, :-1])
     out = model.forward_column(
         e, want_weights=want_weights, need_payload=n_passes > 1 or want_weights
     )
@@ -1011,12 +1140,12 @@ def multipass(
     if n_passes == 1:
         return outs
 
-    length = tokens.shape[1]
+    length = e.shape[1]
     positions = torch.arange(length, device=tokens.device)
     for i in range(n_passes - 1):
         p = outs[-1].payload
         if jitter is not None:
-            p = p + jitter[i]
+            p = p + jitter[i][:, :length]
         p_shifted = shift_right(p)
         plain = positions[None, :] < prefix_lens[i][:, None]  # [B, T]
         fused = model.fuse(p_shifted, e)
@@ -1171,7 +1300,7 @@ def multipass_loss(
     targets = tokens[:, 1:]
     losses, z_terms = [], []
     for out in outs:
-        ce, z = sequence_ce(model, out.h_top[:, :-1], targets)
+        ce, z = sequence_ce(model, out.h_top, targets)
         losses.append(ce)
         z_terms.append(z)
 
@@ -1211,8 +1340,8 @@ def iterate_fused(
         else contextlib.nullcontext()
     )
     with autocast:
-        batch, length = tokens.shape
-        e = model.embed_tokens(tokens)
+        e = model.embed_tokens(tokens[:, :-1])
+        batch, length = e.shape[:2]
         positions = torch.arange(length, device=tokens.device)
         plain = (positions[None, :] < 1).expand(batch, -1)
 
@@ -1223,7 +1352,7 @@ def iterate_fused(
             p_shifted = shift_right(out.payload)
             fused = model.fuse(p_shifted, e)
             out = model.forward_column(torch.where(plain[..., None], e, fused))
-            loss, _ = sequence_ce(model, out.h_top[:, :-1], tokens[:, 1:])
+            loss, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
             delta = (out.h_top - previous).float().norm(dim=-1).mean()
             records.append({"loss": loss.item(), "update_norm": delta.item()})
     return records

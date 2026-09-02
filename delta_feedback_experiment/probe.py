@@ -61,14 +61,14 @@ def cuda_gate() -> None:
 
     # The fixed-capacity router must match the semantic implementation in both
     # values and gradients. H=4/N=5 covers the largest screen bank; H=8/N=8
-    # covers the corresponding six-cell flagship payload bank.
+    # covers the corresponding six-cell flagship payload bank. ``n_sources``
+    # counts the width-``dim`` null that the bespoke kernel reads in place.
     def route_parity(
         dim,
         heads,
         batch,
         length,
         n_sources,
-        null_first,
         seed,
         route_max_bound=0.05,
         weight_max_bound=0.015,
@@ -76,45 +76,45 @@ def cuda_gate() -> None:
         torch.manual_seed(seed)
         query = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
         key = torch.randn(dim, device="cuda", dtype=torch.float32).requires_grad_()
-        sources = [
+        null = torch.randn(dim, device="cuda", dtype=torch.bfloat16).requires_grad_()
+        sources = tuple(
             torch.randn(
                 batch, length, dim, device="cuda", dtype=torch.bfloat16
             ).requires_grad_()
-            for _ in range(n_sources)
-        ]
-        if null_first:
-            sources[0] = (
-                torch.randn(1, 1, dim, device="cuda", dtype=torch.bfloat16)
-                .expand(batch, length, dim)
-                .clone()
-                .requires_grad_()
-            )
-        sources = tuple(sources)
+            for _ in range(n_sources - 1)
+        )
         present = torch.rand(n_sources, batch, length, device="cuda") > 0.2
         present[0] = True
         projected = (query * key).to(torch.bfloat16)
-        routed, weights = bespoke_route(
-            projected, present, null_first, 1e-6, heads, sources
-        )
+        routed, weights = bespoke_route(projected, present, null, 1e-6, heads, sources)
         routed.float().square().mean().backward()
         grads = (
             query.grad.clone(),
             key.grad.clone(),
+            null.grad.clone(),
             *(source.grad.clone() for source in sources),
         )
 
         ref_query = query.detach().clone().requires_grad_()
         ref_key = key.detach().clone().requires_grad_()
+        ref_null = null.detach().clone().requires_grad_()
         ref_sources = tuple(
             source.detach().clone().requires_grad_() for source in sources
         )
         ref_routed, ref_weights = _route_sources(
-            ref_query, ref_key, 1e-6, present, heads, *ref_sources
+            ref_query,
+            ref_key,
+            1e-6,
+            present,
+            heads,
+            ref_null.expand(batch, length, dim),
+            *ref_sources,
         )
         ref_routed.float().square().mean().backward()
         ref_grads = (
             ref_query.grad,
             ref_key.grad,
+            ref_null.grad,
             *(source.grad for source in ref_sources),
         )
 
@@ -142,18 +142,19 @@ def cuda_gate() -> None:
             if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
                 raise AssertionError(f"H={heads} bespoke router gradient drift")
 
-    route_parity(48, 4, 3, 11, 5, True, 7)
+    route_parity(48, 4, 3, 11, 5, 7)
     route_parity(
         1536,
         8,
         2,
         3,
         8,
-        True,
         8,
         route_max_bound=0.10,
         weight_max_bound=0.025,
     )
+    # Ragged token counts must not disturb the multi-token backward programs.
+    route_parity(48, 4, 5, 7, 3, 11)
 
     # Compare the exact chunk operator against the literal recurrent equations
     # across a chunk boundary. Inputs use the production dtypes, and the loss
@@ -335,7 +336,7 @@ def cuda_gate() -> None:
     cce_shadow = cce_c.detach().to(torch.bfloat16)
     cce_t = torch.randint(0, 127, (41,), device="cuda")
     cce_ce, cce_z = _fixed_cce_z(
-        cce_e, _ClassifierShadow.apply(cce_c, cce_shadow), cce_t
+        cce_e, _ClassifierShadow.apply(cce_c, cce_shadow, None), cce_t
     )
     (cce_ce + 1e-2 * cce_z).backward()
     cce_de, cce_dc = cce_e.grad.float().clone(), cce_c.grad.clone()
@@ -569,7 +570,9 @@ def cuda_gate() -> None:
             optimizer.step()
         model.refresh_classifier_shadow()
         if model._classifier_shadow.data_ptr() != classifier_shadow_ptr:
-            raise AssertionError("classifier shadow address changed after optimizer step")
+            raise AssertionError(
+                "classifier shadow address changed after optimizer step"
+            )
         runner.zero_grad()
         records.append(
             f"k={spec.n_passes}/ckpt={int(spec.checkpoint)}:{elapsed * 1000:.1f}ms"

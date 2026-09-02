@@ -208,11 +208,95 @@ def test_classifier_shadow_is_derived_and_preserves_master_gradients():
 
     master = torch.randn(11, 7, dtype=torch.float32, requires_grad=True)
     shadow = master.detach().to(torch.bfloat16)
-    operand = _ClassifierShadow.apply(master, shadow)
+    operand = _ClassifierShadow.apply(master, shadow, None)
     operand.float().sum().backward()
     assert master.grad.dtype == torch.float32
     assert torch.equal(master.grad, torch.ones_like(master))
     assert shadow.grad is None
+
+
+def test_sink_linear_accumulates_segment_gradients_in_place():
+    """One GEMM over concatenated weights; each segment's dW lands in its own
+    persistent FP32 buffer and the parameters see no autograd gradient."""
+    from delta_feedback_experiment.cuda_kernels import sink_linear
+
+    torch.manual_seed(3)
+    x = torch.randn(2, 5, 8, requires_grad=True)
+    weights = tuple(torch.nn.Parameter(torch.randn(rows, 8)) for rows in (6, 3))
+    sinks = tuple(torch.full_like(w, 0.25) for w in weights)
+    reference = torch.nn.functional.linear(x, torch.cat(weights))
+    out = sink_linear(x, weights, sinks)
+    assert torch.equal(out, reference)
+    cotangent = torch.randn_like(out)
+    out.backward(cotangent)
+    x_ref = x.detach().clone().requires_grad_()
+    w_ref = tuple(w.detach().clone().requires_grad_() for w in weights)
+    torch.nn.functional.linear(x_ref, torch.cat(w_ref)).backward(cotangent)
+    assert torch.allclose(x.grad, x_ref.grad, atol=1e-6)
+    for weight, sink, ref in zip(weights, sinks, w_ref, strict=True):
+        assert weight.grad is None
+        assert torch.allclose(sink, 0.25 + ref.grad, atol=1e-5)
+    # An unbound sink or disabled autograd falls back to the plain linear.
+    assert torch.equal(sink_linear(x, weights, (sinks[0], None)), reference)
+    with torch.no_grad():
+        assert torch.equal(sink_linear(x, weights, sinks), reference)
+
+
+def test_gradient_sinks_bind_every_large_projection_and_unbind_cleanly():
+    model = tiny("df").train()
+    buffers = {p: torch.zeros_like(p) for p in model.parameters()}
+    bound = model.bind_gradient_sinks(buffers)
+    names = {name for name, p in model.named_parameters() if p in bound}
+    assert "embed_tokens.weight" not in names  # CUDA-only: CCE owns that path
+    assert "blocks.0.attn.q_proj.weight" in names
+    assert "blocks.3.attn.qkv_proj.weight" in names
+    assert "attention_gates.0.weight" in names
+    assert "blocks.1.mlp.down_proj.weight" in names
+    assert "fuse_value.weight" in names and "fuse_gate.weight" in names
+    assert not any(".norm" in name or "router" in name for name in names)
+    toks = tokens()
+    prefix = torch.ones((1, toks.shape[0]), dtype=torch.long)
+    outs = multipass(model, toks, 2, prefix_lens=prefix)
+    total, _ = multipass_loss(model, toks, outs)
+    total.backward()
+    for name, p in model.named_parameters():
+        if p in bound:
+            assert p.grad is None, name
+            assert buffers[p].abs().sum() > 0, name
+        else:
+            assert p.grad is not None, name
+    assert model.bind_gradient_sinks(None) == set()
+    model.zero_grad(set_to_none=True)
+    outs = multipass(model, toks, 2, prefix_lens=prefix)
+    multipass_loss(model, toks, outs)[0].backward()
+    assert model.blocks[0].attn.q_proj.weight.grad is not None
+
+
+def test_tied_embedding_sink_accumulates_both_gradient_paths_in_place():
+    """With a trainer-owned FP32 buffer, the lookup scatters rows and the
+    classifier adds its BF16 gradient directly; autograd sees no gradient."""
+    from delta_feedback_experiment.model import _ClassifierShadow, _EmbeddingSink
+
+    model = tiny("df").train()
+    weight = model.embed_tokens.weight
+    toks = tokens()
+    sink = torch.zeros_like(weight)
+
+    e = _EmbeddingSink.apply(toks, weight, sink)
+    (e * 0.5).sum().backward()
+    assert weight.grad is None
+    reference = torch.zeros_like(weight).index_add_(
+        0, toks.reshape(-1), torch.full((toks.numel(), weight.shape[1]), 0.5)
+    )
+    assert torch.equal(sink, reference)
+
+    shadow = weight.detach().to(torch.bfloat16)
+    _ClassifierShadow.apply(weight, shadow, sink).float().sum().backward()
+    assert weight.grad is None
+    assert torch.equal(sink, reference + 1)
+
+    model.embed_tokens(toks).sum().backward()
+    assert weight.grad is not None
 
 
 def test_zero_gqa_gate_halves_the_ungated_attention_branch():
@@ -385,9 +469,51 @@ def test_multipass_k1_is_plain_forward():
     model = tiny("df")
     toks = tokens()
     single = multipass(model, toks, 1)
-    plain = forward(model, toks)
+    plain = forward(model, toks[:, :-1])
     assert torch.equal(single[0].h_top, plain.h_top)
+    assert single[0].h_top.shape[1] == toks.shape[1] - 1
     assert single[0].payload is None  # no consumer exists after the final pass
+
+
+def test_multipass_matches_the_causally_equivalent_full_row_forward():
+    """Executing only the T input positions of a T+1 row is the same
+    function: the dropped final column never fed a loss or a payload."""
+    for arm in ("df", "fbt", "base"):
+        model = tiny(arm)
+        toks = tokens()
+        prefix = torch.ones((2, toks.shape[0]), dtype=torch.long) * 3
+        jitter = torch.randn((2, *toks.shape, TINY["dim"])) * 0.02
+        n_passes = 3 if model.cfg.feedback_active else 1
+        outs = multipass(
+            model,
+            toks,
+            n_passes,
+            prefix_lens=prefix if n_passes > 1 else None,
+            jitter=jitter if n_passes > 1 else None,
+        )
+        total, losses = multipass_loss(model, toks, outs)
+        assert len(losses) == n_passes and torch.isfinite(total)
+
+        # Literal full-row reference: run every stored token and drop the last.
+        e = model.embed_tokens(toks)
+        ref = [model.forward_column(e, need_payload=n_passes > 1)]
+        length = toks.shape[1]
+        positions = torch.arange(length)
+        for i in range(n_passes - 1):
+            p = shift_right(ref[-1].payload + jitter[i])
+            plain = positions[None, :] < prefix[i][:, None]
+            ref.append(
+                model.forward_column(
+                    torch.where(plain[..., None], e, model.fuse(p, e)),
+                    need_payload=i < n_passes - 2,
+                )
+            )
+        for out, full in zip(outs, ref, strict=True):
+            assert torch.allclose(out.h_top, full.h_top[:, :-1], atol=1e-5), arm
+        ref_total, _ = multipass_loss(
+            model, toks, [type(o)(**{**vars(o), "h_top": o.h_top[:, :-1]}) for o in ref]
+        )
+        assert torch.allclose(total, ref_total, atol=1e-5), arm
 
 
 def test_all_plain_prefix_degenerates_to_pass1():
