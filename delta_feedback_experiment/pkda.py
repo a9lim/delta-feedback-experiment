@@ -1,10 +1,11 @@
-"""Preconditioned KDA with a portable recurrence and the upstream CUDA kernel.
+"""Preconditioned KDA with a portable recurrence and the FLA fork's CUDA kernels.
 
 The parameterization follows FLA's ``PrecondKDA`` layer, while the module
 boundary stays native to this project so initialization, optimizer partition,
-cache ownership, and activation checkpointing remain explicit. CPU and MPS use
-the literal recurrent equations. CUDA requires FLA's chunk/fused-recurrent
-operators; it never substitutes the quadratic Python recurrence for training.
+cache ownership, activation checkpointing, and the Q/K normalization remain
+explicit. CPU and MPS use the literal recurrent equations. CUDA requires the
+workspace fork's chunk/fused-recurrent operators; it never substitutes the
+quadratic Python recurrence for training.
 """
 
 from __future__ import annotations
@@ -29,6 +30,16 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     rms_norm_gated = None
     chunk_precond_kda = None
     fused_recurrent_precond_kda = None
+
+
+QK_NORM_EPS = 1e-6
+"""Epsilon of the per-head Q/K L2 normalization, x / sqrt(sum(x^2) + eps)."""
+
+
+def _l2norm(t: Tensor) -> Tensor:
+    """FP32 per-head L2 normalization returned in the input dtype."""
+    f = t.float()
+    return (f * torch.rsqrt(f.square().sum(-1, keepdim=True) + QK_NORM_EPS)).to(t.dtype)
 
 
 def pkda_cuda_available() -> bool:
@@ -224,12 +235,18 @@ class PreconditionedKDA(nn.Module):
                 ),
                 dim=0,
             )
+            # The SiLU and the per-head Q/K L2 normalization are fused into the
+            # convolution kernel, whose backward recomputes its pre-activation
+            # in place instead of relaunching the forward.
             qkv, _ = causal_conv1d(
                 x=qkv,
                 weight=weight,
                 bias=None,
                 activation="silu",
                 backend="triton",
+                l2norm_head_dim=self.head_dim,
+                l2norm_channels=2 * self.projection_size,
+                l2norm_eps=QK_NORM_EPS,
             )
             q, k, v = qkv.split(self.projection_size, dim=-1)
             shape = (*x.shape[:2], self.num_heads, self.head_dim)
@@ -256,7 +273,12 @@ class PreconditionedKDA(nn.Module):
         )
         shape = (*x.shape[:2], self.num_heads, self.head_dim)
         final = (q_state, k_state, v_state) if output_final_state else None
-        return q.reshape(shape), k.reshape(shape), v.reshape(shape), final
+        return (
+            _l2norm(q.reshape(shape)),
+            _l2norm(k.reshape(shape)),
+            v.reshape(shape),
+            final,
+        )
 
     def _controls(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         (
@@ -296,14 +318,11 @@ class PreconditionedKDA(nn.Module):
         output_final_state: bool,
     ) -> tuple[Tensor, Tensor | None, Tensor | None]:
         dtype = v.dtype
-        # FLA's in-kernel l2norm is x / sqrt(sum(x^2) + 1e-6), followed by
-        # the operator's 1/sqrt(K) query scale. Keep the portable recurrence
-        # literal so the CUDA gate can compare both values and gradients.
-        q = q.float()
+        # q and k arrive L2-normalized from ``_project``; the operator's
+        # 1/sqrt(K) query scale follows. Keep the recurrence literal so the CUDA
+        # gate can compare both values and gradients.
+        q = q.float() * self.head_dim**-0.5
         k = k.float()
-        q = q * torch.rsqrt(q.square().sum(-1, keepdim=True) + 1e-6)
-        k = k * torch.rsqrt(k.square().sum(-1, keepdim=True) + 1e-6)
-        q = q * self.head_dim**-0.5
         v = v.float()
         decay = -self.A_log.float().exp()[None, None, :, None] * F.softplus(
             raw_decay.float() + self.dt_bias.view(1, 1, self.num_heads, self.head_dim)
@@ -373,6 +392,8 @@ class PreconditionedKDA(nn.Module):
             "initial_A_state": a_state,
             "output_final_state": output_final_state,
             "use_gate_in_kernel": True,
+            # ``_project`` already normalized q and k.
+            "use_qk_l2norm_in_kernel": False,
             # Training keeps the WY and chunk-state intermediates for backward
             # instead of recomputing them; measured on Jobe as a small,
             # memory-cheap win at the screen geometry.

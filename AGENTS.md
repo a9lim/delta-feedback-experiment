@@ -35,9 +35,10 @@ a contract changes.
   `[PKDA, PKDA, PKDA, gated global GQA] x 3`; `vanilla` is twelve-layer RoPE
   GQA. The flagship is the corresponding six-cell hard-DF architecture in
   `architecture.md`.
-- PKDA uses the literal portable recurrence off CUDA and pinned FLA chunk and
-  recurrent kernels on CUDA. Recurrent matrix and preconditioner boundaries
-  are FP32. Never silently use the sequential fallback for CUDA training.
+- PKDA uses the literal portable recurrence off CUDA and the workspace FLA
+  fork's chunk and recurrent kernels on CUDA. Recurrent matrix and
+  preconditioner boundaries are FP32. Never silently use the sequential
+  fallback for CUDA training.
 - MHDB sources are the actual column seed, completed four-layer block deltas,
   and at most one current-cell partial. Individual branch deltas are not
   sources. Every site prepends its own learned zero-initialized null.
@@ -76,7 +77,7 @@ a contract changes.
 - Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
   monitor serving, and spool orchestration from the workspace root package.
 - Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified v15 DF graph pool reserves 22.99 GiB. New snapshots are v15
+  the qualified v15 DF graph pool reserves 22.97 GiB. New snapshots are v15
   and every older version is rejected.
 - Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
   The queue stores arguments rather than Git state; a worker refreshes before

@@ -36,6 +36,7 @@ def cuda_gate() -> None:
     from .optim import OptimizerPair, build_optimizers
     from .pkda import (
         PreconditionedKDA,
+        _l2norm,
         _PackedControlSplit,
         pkda_cuda_available,
         rms_norm_gated,
@@ -225,8 +226,10 @@ def cuda_gate() -> None:
     del pkda_expected, pkda_actual, pkda_cotangent
 
     # Dense no-cache PKDA projects Q/K/V separately but executes their equal-
-    # width short convolutions in one FLA Triton kernel. Compare that fused path
-    # to the literal three-convolution implementation in values and gradients.
+    # width short convolutions, the SiLU, and the per-head Q/K L2 normalization
+    # in one FLA Triton kernel. Compare that fused path to the literal
+    # three-convolution implementation plus the explicit normalization in
+    # values and gradients.
     torch.manual_seed(12)
     conv_ref = PreconditionedKDA(32, num_heads=2, head_dim=16).cuda().train()
     conv_fused = copy.deepcopy(conv_ref).train()
@@ -244,8 +247,10 @@ def cuda_gate() -> None:
         ref_v, _ = conv_ref._causal_conv(
             conv_ref.v_proj(conv_x_ref), conv_ref.v_conv, None, False
         )
-        reference_qkv = tuple(
-            value.reshape(2, 65, 2, 16) for value in (ref_q, ref_k, ref_v)
+        reference_qkv = (
+            _l2norm(ref_q.reshape(2, 65, 2, 16)),
+            _l2norm(ref_k.reshape(2, 65, 2, 16)),
+            ref_v.reshape(2, 65, 2, 16),
         )
         fused_qkv = conv_fused._project(conv_x_fused, None, False)[:3]
     conv_cotangents = tuple(torch.randn_like(value) for value in reference_qkv)
