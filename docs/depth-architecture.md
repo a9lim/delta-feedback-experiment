@@ -34,8 +34,10 @@ three cells:
 
 Every cell is `[PKDA, PKDA, PKDA, gated global GQA]` with the mixer, gate,
 routing-group, and precision contracts of `architecture.md`. At `r = 1` the
-column executes the same twelve layers as `df` with the same parameters, and
-`df-loop` at `r = 1` is `df`.
+column executes the same twelve layers as `df` with the same parameters and
+the same source banks; pass 1 and Standard decoding then coincide with `df`
+exactly, and later passes differ from `df` only by the shared mixing mode
+defined below.
 
 A `k`-pass batch at iteration count `r` costs `k (2 + r)` cell evaluations
 per predicted token. Results report **cell-tokens** beside pass-tokens: `df`
