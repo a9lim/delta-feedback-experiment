@@ -235,17 +235,6 @@ class TokenData:
             length -= take
         return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
-    def unigram_counts(self, vocab_size: int) -> np.ndarray:
-        """Token counts over the whole split, int64 ``[vocab_size]``."""
-        counts = np.zeros(vocab_size, dtype=np.int64)
-        chunk = 1 << 26
-        for shard in self.maps:
-            for start in range(0, shard.size, chunk):
-                counts += np.bincount(shard[start : start + chunk], minlength=vocab_size)[
-                    :vocab_size
-                ]
-        return counts
-
     def batch(self, first_row: int, n_rows: int, device=None) -> torch.Tensor:
         """Rows [first_row, first_row+n_rows) as int64 [n, seq_len+1]."""
         width = self.seq_len + 1
@@ -258,18 +247,6 @@ class TokenData:
         array = np.asarray(flat, dtype=np.int64).reshape(n_rows, width)
         tensor = torch.from_numpy(array)
         return tensor.to(device) if device is not None else tensor
-
-
-def vocab_order_from_counts(counts: np.ndarray) -> torch.Tensor:
-    """Vocabulary ids by descending count, ties by ascending id, as int32.
-
-    The CUDA head tiles the classifier through this permutation so that the
-    ids whose probabilities are negligible together sit in the same gradient
-    tiles; it is a pure function of the registered stream, never state.
-    """
-    ids = np.arange(counts.shape[0])
-    order = np.lexsort((ids, -counts.astype(np.int64)))
-    return torch.from_numpy(order.astype(np.int32))
 
 
 def write_synthetic(

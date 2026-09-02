@@ -22,7 +22,6 @@ def cuda_gate() -> None:
 
     from .cuda_kernels import bespoke_route
     from .cuda_kernels import triton as route_triton
-    from .data import vocab_order_from_counts
     from .model import (
         DFModel,
         KVCache,
@@ -30,6 +29,7 @@ def cuda_gate() -> None:
         _fixed_cce_z,
         _route_sources,
         arm_config,
+        batch_vocab_order,
         flash_attn_func,
         iterate_fused,
         linear_cross_entropy,
@@ -518,19 +518,6 @@ def cuda_gate() -> None:
         .cuda()
         .train()
     )
-    # The trainer orders the vocabulary by held-out frequency; the probe's
-    # synthetic rows stand in for the held-out slice.
-    model.set_vocab_order(
-        vocab_order_from_counts(
-            torch.bincount(
-                probe_validation.rows.flatten(), minlength=args.vocab_size
-            ).numpy()
-        )
-    )
-    if model._vocab_order is None or model._vocab_order.dtype != torch.int32:
-        raise AssertionError("CUDA vocabulary order was not bound")
-    if any("vocab_order" in name for name in model.state_dict()):
-        raise AssertionError("derived vocabulary order entered the checkpoint state")
     optimizers = build_optimizers(
         model,
         lr_h=args.lr_h,
@@ -540,6 +527,18 @@ def cuda_gate() -> None:
     classifier_shadow = model._classifier_shadow
     if classifier_shadow is None or classifier_shadow.dtype != torch.bfloat16:
         raise AssertionError("CUDA BF16 classifier shadow was not prepared")
+    # The head tiles the classifier by the batch's own mean-logit ordering,
+    # computed before the forward; it must be a permutation of the vocabulary.
+    probe_order = batch_vocab_order(
+        torch.randn(8, args.dim, device="cuda", dtype=torch.bfloat16),
+        classifier_shadow,
+    )
+    if probe_order.dtype != torch.int32 or not torch.equal(
+        probe_order.sort().values,
+        torch.arange(args.vocab_size, device="cuda", dtype=torch.int32),
+    ):
+        raise AssertionError("the head's batch ordering is not a vocabulary permutation")
+    del probe_order
     if any("classifier_shadow" in name for name in model.state_dict()):
         raise AssertionError("derived classifier shadow entered the checkpoint state")
     classifier_shadow_ptr = classifier_shadow.data_ptr()

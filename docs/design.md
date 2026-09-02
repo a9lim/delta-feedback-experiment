@@ -251,12 +251,15 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 - the workspace cut-cross-entropy fork with BF16 operands, capture-safe
   fixed-shape no-ignore preprocessing, and its native differentiable
   log-partition output for the exact squared-log-partition gradient, tiling
-  the classifier in both halves through one fixed vocabulary permutation
-  (ids by descending frequency in the held-out slice, ties by id, derived at
-  startup from the registered stream and never checkpointed), storing each
-  tile's per-row maximum logit in the forward, and skipping every backward
-  tile the gradient filter would drop before recomputing its logits, a
-  decision identical to the late filter's;
+  the classifier in both halves through the microbatch's own ascending
+  mean-logit ordering of the vocabulary (the mean logit is linear in the
+  embeddings, so one classifier product with the mean embedding yields it
+  before the forward, inside the graph and without state; ascending because
+  the backward accumulates each row's embedding gradient across vocabulary
+  tiles in BF16 through locks and the smallest contributions must arrive
+  first), storing each tile's per-row maximum logit in the forward, and
+  skipping every backward tile the gradient filter would drop before
+  recomputing its logits, a decision identical to the late filter's;
 - the Triton PKDA control-gradient packer;
 - each compiled block also emitting the residual's distance from its cell
   entry, so partial and completed block deltas are never formed eagerly
@@ -276,9 +279,9 @@ default capture is:
 
 | Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 149.2 s | 13.84 GiB | 21.76 GiB | 4 |
+| `df` | 149.2 s | 13.85 GiB | 22.98 GiB | 4 |
 
-Median graph replay is 55.4 ms, 111.9 ms, and 168.4 ms for one, two, and three
+Median graph replay is 55.9 ms, 113.1 ms, and 170.2 ms for one, two, and three
 passes at random initialization; at a trained checkpoint the cut
 cross-entropy backward keeps more tiles and the one-pass replay is about
 five milliseconds longer. The same probe measures PKDA chunk parity at
@@ -287,14 +290,13 @@ norm-gate parity at 0.0032, cached decode parity at 0.0069/0.0128, and that
 the head's early tile skip computes exactly the late filter's tile set. The
 fork kernels are additionally gated on the workspace PKDA layer benchmark,
 whose gradient drift against its stored reference is unchanged across the
-kernel rounds (7.44e-3 at the largest row). The head's fixed vocabulary
-ordering keeps about 3% fewer gradient tiles than upstream's per-batch
-ordering, so the embedding gradient sits about twice as far from an FP32
-reference (2.2e-2 against 1.2e-2 relative) at trained checkpoints; the
-filter threshold itself is unchanged. Resumed from the `screen-df-s1`
-step-10,500 snapshot under the current recipe, this path matches the
-previous execution path's per-step losses to four decimals for three
-two-pass steps and drifts to 1e-3 relative by the twenty-fourth. Inductor
+kernel rounds (7.44e-3 at the largest row). The head's ordering direction was
+qualified against an exact FP32 dense head on one full 80-microbatch step of
+the `screen-df-s1` step-10,500 snapshot: upstream's per-batch ascending
+order and this path give the same trunk gradient norm (0.3211) within 1.4%
+of the exact head's (0.3256), whereas a descending, a held-out-frequency,
+and a per-step average ordering each dropped the same probability mass but
+rounded the BF16-locked tail away first and came out 20 to 25% too large. Inductor
 artifacts live in
 `~/.cache/delta-feedback/torchinductor` by default; the probe performs the
 fixed-shape search once and later processes reuse the cache with no autotuning

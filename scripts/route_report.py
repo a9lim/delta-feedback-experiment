@@ -30,7 +30,7 @@ import torch
 from matplotlib import colors
 from transformer_experiments import checkpoints
 
-from delta_feedback_experiment.data import TokenData, vocab_order_from_counts
+from delta_feedback_experiment.data import TokenData
 from delta_feedback_experiment.model import DFModel, arm_config, multipass
 from delta_feedback_experiment.train import CONTRACT, pick_device
 
@@ -207,11 +207,6 @@ def main() -> None:
 
     # -- empirical: routing distributions --------------------------------------
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
-    if next(model.parameters()).is_cuda:
-        # The trainer's head tiles the vocabulary by held-out frequency.
-        model.set_vocab_order(
-            vocab_order_from_counts(data_val.unigram_counts(saved["vocab_size"]))
-        )
     (
         means,
         stats,

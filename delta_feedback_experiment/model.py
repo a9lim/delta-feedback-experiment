@@ -801,7 +801,6 @@ class DFModel(nn.Module):
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.register_buffer("_classifier_shadow", None, persistent=False)
-        self.register_buffer("_vocab_order", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         # Capture the exact common-trunk initialization boundary before
@@ -1039,28 +1038,6 @@ class DFModel(nn.Module):
                 [copy for copy, _ in self._shadow_refresh],
                 [weight for _, weight in self._shadow_refresh],
             )
-
-    def set_vocab_order(self, order: Tensor | None) -> None:
-        """Bind the fixed vocabulary permutation the CUDA head tiles by.
-
-        Cut cross-entropy filters gradient tiles whose probabilities all fall
-        below its epsilon, and it skips a tile before recomputing its logits
-        only when the forward and backward tile the vocabulary the same way.
-        Ordering ids by descending frequency in the held-out slice clusters the
-        negligible tiles; the permutation is a function of the registered data,
-        so it is neither a parameter nor checkpoint state.
-        """
-        if order is None:
-            self._vocab_order = None
-            return
-        if order.shape != (self.cfg.vocab_size,):
-            raise ValueError(
-                f"vocabulary order must have {self.cfg.vocab_size} entries, "
-                f"got {tuple(order.shape)}"
-            )
-        self._vocab_order = order.to(
-            device=self.embed_tokens.weight.device, dtype=torch.int32
-        ).contiguous()
 
     def classifier_for_loss(self) -> Tensor:
         """Return the graph-stable BF16 CCE operand linked to the FP32 master."""
@@ -1320,6 +1297,38 @@ _compiled_head_losses = torch.compile(
 )
 
 
+@torch.no_grad()
+def batch_vocab_order(embeddings: Tensor, classifier: Tensor) -> Tensor:
+    """This batch's mean-logit ordering of the vocabulary, an int32 permutation.
+
+    Cut cross-entropy drops gradient tiles whose probabilities all fall below
+    its epsilon and, when both halves tile the vocabulary the same way, skips
+    them before recomputing their logits. Upstream orders the vocabulary by
+    the batch's mean logit, measured inside its forward; the mean logit is
+    linear in the embeddings, so one classifier product with the mean
+    embedding gives it before the forward runs, inside the captured graph,
+    with no state.
+
+    The order is ascending, as upstream's ``argsort`` is, and that direction
+    is load-bearing: the backward accumulates each row's embedding gradient
+    across the vocabulary tiles in BF16 through locks, roughly in tile order,
+    so the tiles with the smallest contributions have to arrive first. Every
+    other order that was tried (descending mean logit, held-out frequency, a
+    per-step average) dropped or computed the same tiles yet rounded the
+    tail away against an already large running sum, a coherent error that
+    the step's microbatch averaging did not cancel: the step gradient came
+    out 20 to 25% too large.
+    """
+    mean = embeddings.reshape(-1, embeddings.shape[-1]).float().mean(0, keepdim=True)
+    logit_avg = torch.addmm(
+        torch.zeros(1, classifier.shape[0], device=classifier.device),
+        mean.to(classifier.dtype),
+        classifier.mT,
+        out_dtype=torch.float32,
+    )
+    return torch.argsort(logit_avg[0], stable=True).to(torch.int32)
+
+
 def _fixed_cce_z(
     embeddings: Tensor,
     classifier: Tensor,
@@ -1337,7 +1346,7 @@ def _fixed_cce_z(
     illegal inside CUDA graph capture, while its forward and new differentiable
     LSE backward are otherwise the authoritative implementation.
 
-    With ``vocab_ordering`` both halves tile the classifier through that fixed
+    With ``vocab_ordering`` both halves tile the classifier through that
     permutation and the backward skips every tile the gradient filter would
     drop before recomputing its logits. ``skip_early`` and ``tile_flags`` are
     the fork's diagnostics: the probe forces the late filter alone and checks
@@ -1402,9 +1411,14 @@ def sequence_ce(
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
         normalized = model.final_norm(h_top)
-        return _fixed_cce_z(
-            normalized, model.classifier_for_loss(), targets, model._vocab_order
+        # The ordering is a scheduling hint for the backward, so evaluation
+        # (no backward) tiles the classifier in place.
+        ordering = (
+            batch_vocab_order(normalized, model._classifier_shadow)
+            if torch.is_grad_enabled()
+            else None
         )
+        return _fixed_cce_z(normalized, model.classifier_for_loss(), targets, ordering)
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)
