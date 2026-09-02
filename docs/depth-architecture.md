@@ -27,15 +27,15 @@ three cells:
 | Prelude `P` | one cell, layers 0–3 |
 | Recurrent core `R` | one cell, layers 4–7, weight-tied across iterations |
 | Coda `C` | one cell, layers 8–11 |
-| Iterations per column `r` | drawn per step, `1 ≤ r ≤ 16` |
-| Mean iteration rate `r_mean` | 8 |
+| Iterations per column `r` | drawn per step, `1 ≤ r ≤ 8` |
+| Mean iteration rate `r_mean` | 4 |
 | Compute depth per pass | `4 + 4r + 4` layers, `2 + r` cells |
-| Unique parameters | those of `df` plus eight core branch-output norms |
+| Unique parameters | identical to `df` |
 
 Every cell is `[PKDA, PKDA, PKDA, gated global GQA]` with the mixer, gate,
 routing-group, and precision contracts of `architecture.md`. At `r = 1` the
-column executes the same twelve layers as `df`; the only difference is the
-core's branch-output norms defined below.
+column executes the same twelve layers as `df` with the same parameters, and
+`df-loop` at `r = 1` is `df`.
 
 A `k`-pass batch at iteration count `r` costs `k (2 + r)` cell evaluations
 per predicted token. Results report **cell-tokens** beside pass-tokens: `df`
@@ -96,33 +96,25 @@ and prelude delta are re-readable at every iteration through the routers.
 
 ## Residual shell in the core
 
-Prelude and coda sublayers keep the pre-norm shell of `architecture.md`. Each
-core sublayer adds an RMSNorm on the branch output before the residual add:
-
-```text
-a = branch_norm_attn(mixer(rmsnorm(routed_read(h)))) / sqrt(2L)
-h = h + a
-m = branch_norm_mlp(swiglu(rmsnorm(routed_read(h)))) / sqrt(2L)
-h = h + m
-```
-
-`L = 12` is the unique layer count, so the branch scale is the same
-`1/sqrt(24)` as every other arm. The eight branch-output norms have width 768,
-epsilon `1e-6`, weights initialized to one, and are Adam-owned like every
-norm. They are the loop arm's only parameters beyond `df`: `8 x 768 = 6,144`.
-
-This is the residual bound that recurrent-depth models call the sandwich
-format, applied to the branch rather than to the residual sum: normalizing
-the sum would break the telescoping identity, and the branch form keeps it:
+Every cell, the core included, keeps the pre-norm shell of `architecture.md`
+with branch scale `1/sqrt(2L)` at `L = 12`, the unique layer count. No
+branch-output or residual-state norm is added. The bound that recurrent-depth
+models obtain from their sandwich norms is already present here: Hyperball
+pins every matrix at its initial Frobenius radius, PKDA and gated GQA carry
+sigmoid output gates, and every branch reads a unit-RMS pre-normalized input,
+so branch outputs are bounded a priori. Because those gates and the SwiGLU
+can drive a branch toward zero input-dependently, the depth iteration can
+reach a fixed point in the state; a branch-output norm would pin the update
+size and forbid that. The telescoping identity holds in every cell:
 
 ```text
 h_top = seed + Delta_P + sum_i Delta_R^(i) + Delta_C
 ```
 
-At initialization a core branch output has RMS near one, so each core branch
-contributes about `0.2` RMS to the residual, larger than a freshly
-initialized prelude or coda branch. The per-iteration residual RMS is a
-registered diagnostic.
+Per-iteration residual RMS and the depth-contraction trace are the registered
+guards. If a run shows the iteration diverging, the fallback is a residual
+state norm in the core, which caps the state but makes each delta carry a
+rescaling of everything before it; a branch-output norm is not a fallback.
 
 ## Iteration count
 
@@ -130,7 +122,7 @@ registered diagnostic.
 
 ```text
 tau ~ Normal(log(r_mean - 1) - sigma^2 / 2, sigma),   sigma = 1/2
-r   = min(1 + Poisson(exp(tau)), r_max),               r_mean = 8, r_max = 16
+r   = min(1 + Poisson(exp(tau)), r_max),               r_mean = 4, r_max = 8
 ```
 
 This is the recurrent-depth log-normal Poisson draw with the rate shifted by
@@ -138,19 +130,19 @@ one so that the uncapped mean of `r` is `r_mean`. Under the cap:
 
 | Statistic | Value |
 |---|---:|
-| `E[r]` | 7.77 |
-| median `r` | 7 |
-| `P(r = 1)` | 1.3% |
-| `P(r = 16)` | 6.6% |
-| expected layers per pass | 39.1 |
-| expected cells per pass | 9.77 |
+| `E[r]` | 3.88 |
+| median `r` | 4 |
+| `P(r = 1)` | 10.2% |
+| `P(r = 8)` | 8.0% |
+| expected layers per pass | 23.5 |
+| expected cells per pass | 5.88 |
 
 The draw comes from its own keyed sub-stream of the data seed and step, so
 `df` and `df-loop` share byte-identical pass-count and jitter draws. Realized
 `r` is logged per step and enters the cell-token total.
 
-Evaluation uses fixed `r = 8` in every mode. A fixed-`r` sweep over
-`{1, 2, 4, 8, 16}` is a diagnostic, not a metric.
+Evaluation uses fixed `r = r_mean` in every mode. A fixed-`r` sweep over
+`{1, 2, 4, 8}` at the screen is a diagnostic, not a metric.
 
 ## MHDB source banks
 
@@ -269,32 +261,31 @@ log-partition penalty applies unchanged.
 
 Backpropagation is complete: every iteration of every pass is in the graph,
 with block-level activation checkpointing at every pass. Truncated
-backpropagation through the last iterations is excluded at the screen; if a
-larger scale ever adopts it, the seed and `Delta_P` reads inside the retained
-iterations are the prelude's only gradient path, so an unrouted core could
-not truncate.
+backpropagation through the last iterations is excluded at both scales below;
+if it were ever adopted, the seed and `Delta_P` reads inside the retained
+iterations would be the prelude's only gradient path, so an unrouted core
+could not truncate.
 
 Optimizer ownership follows `architecture.md`: the tied core's matrices are
 NorMuonH parameters receiving summed gradients across iterations, with one
-fixed Hyperball radius each; the branch-output norms are Adam parameters. The
-global FP32 gradient is clipped to norm 1.0 before both steps.
+fixed Hyperball radius each. The global FP32 gradient is clipped to norm 1.0
+before both steps.
 
 `df-loop` pairs with `df`: byte-identical initialization of every shared
-parameter, the same stream, row order, schedule, pass-count and jitter draws,
-and deterministic unit initialization of the eight new norms. The `r` draw is
-the only additional randomness.
+parameter, the same stream, row order, schedule, and pass-count and jitter
+draws. The `r` draw is the only additional randomness.
 
 ## Evaluation and diagnostics
 
-`val` is pass-1 held-out cross-entropy at `r = 8` in same-depth mode.
-`val_fused` is a second pass with plain-prefix length 1 at `r = 8` in shared
-mode with the payload. Both report cell-tokens.
+`val` is pass-1 held-out cross-entropy at `r = r_mean` in same-depth mode.
+`val_fused` is a second pass with plain-prefix length 1 at `r = r_mean` in
+shared mode with the payload. Both report cell-tokens.
 
 A loop result is uninterpretable without two stability traces:
 
 - **Depth contraction.** At fixed neighbours, per-position
   `||h^(i) - h^(i-1)||_2` across core iterations for `i` up to `r_max`, with
-  loss at each fixed `r` in `{1, 2, 4, 8, 16}` in both modes.
+  loss at each fixed power-of-two `r` up to `r_max` in both modes.
 - **Sequence contraction.** Repeated fully fused prefill in shared mode with
   the payload, as in `design.md`: eight iterations in the monitor, at least
   thirty for promotion.
@@ -308,10 +299,8 @@ part of any metric.
 
 ## Parameter, cache, and cost accounting
 
-| Component | `df` | `df-loop` |
-|---|---:|---:|
-| Total parameters | 257,514,792 | 257,520,936 |
-| Active non-embedding | 140,827,944 | 140,834,088 |
+`df-loop` has exactly the parameters of `df`: 257,514,792 total and
+140,827,944 active non-embedding.
 
 Per sequence at 1,024 context, one cell's registered mixer cache is
 3.456 MiB (three FP32 PKDA matrix and diagonal states plus BF16 convolution
@@ -319,37 +308,95 @@ histories, 1.956 MiB; one BF16 KV cache, 1.500 MiB):
 
 | Decode mode | Cells cached | Cache |
 |---|---:|---:|
-| Standard | `1 + 16 + 1` | 62.2 MiB |
+| Standard | `1 + 8 + 1` | 34.6 MiB |
 | Soft and Fused | 3 | 10.4 MiB |
 
 Jobe step-time estimates from the measured twelve-layer replay (about 3.8 ms
 per layer evaluation plus a fixed head cost per pass, block checkpointing
-adding one third to the trunk), at the expected `E[r] = 7.77`:
+adding one third to the trunk), at the expected `E[r] = 3.88`:
 
 | Arm | One pass | Two passes | Three passes | Mean step | Full schedule |
 |---|---:|---:|---:|---:|---:|
 | `df` | 4.8 s | 9.7 s | 14.5 s | 6.2 s | ~19 h |
-| `df-loop` | 17.0 s | 34.1 s | 51.1 s | 21.8 s | ~65 h |
+| `df-loop` | 10.7 s | 21.5 s | 32.2 s | 13.7 s | ~41 h |
 
 The implementation must reproduce the parameter counts, the cache shapes, and
 the mode semantics above before the arm is registered.
+
+## Flagship-width loop run
+
+Beyond the screen, one loop run is outlined at flagship width with the
+screen's naive depth: the same three cells, one each for prelude, core, and
+coda, with the flagship's layer geometry from `architecture.md` and a deeper
+draw. It is a loop counterpart to the Stage 3 plan in `design.md`, not a
+replacement for the flagship, and it is gated the same way.
+
+| Field | Value |
+|---|---:|
+| Residual width / SwiGLU intermediate | 1,536 / 6,656 |
+| PKDA heads x width, projection width | 20 x 128, 2,560 |
+| Global query / KV heads, head width | 16 / 8, 96 |
+| Unique layers / cells | 12 / 3 |
+| Context | 8,192 |
+| `r_mean` / `r_max` | 16 / 32 |
+| Compute depth per pass | `4 + 4r + 4` layers, mean 70.2 |
+
+| Component | Parameters |
+|---|---:|
+| Tied embedding and readout | 233,373,696 |
+| 12 SwiGLU channel mixers | 368,050,176 |
+| 9 PKDA mixers | 152,148,816 |
+| 3 gated global GQA mixers, including Q/K norms | 28,312,128 |
+| Hard-DF fusion | 4,718,592 |
+| Trunk, entry, and payload norms | 43,008 |
+| 24 within-column routers and one payload router | 115,200 |
+| **Total** | **786,761,616** |
+| **Active non-embedding** | **553,387,920** |
+
+Under the cap the draw gives `E[r] = 15.56`, median 14, `P(r = 1) = 0.1%`,
+`P(r = 32) = 5.9%`, and 17.56 expected cells per pass. Evaluation uses fixed
+`r = 16`; the sweep runs to 32.
+
+The run inherits the flagship recipe: 400 predicted tokens per active
+non-embedding parameter aligned to the flagship batch of 40 sequences by
+8,192 predictions, the same optimizer, pass mixture, and schedule shape, and
+the same 8xH100 DDP target with every block checkpointed on every pass.
+
+| Quantity | Value |
+|---|---:|
+| Global batch | 327,680 predictions |
+| Optimizer steps | 675,523 |
+| Exact aligned budget | 221,355,376,640 predicted tokens (400.000377 per active parameter) |
+| Warmup / stable heat / cooldown | steps 1–200 / 201–506,642 / 506,643–675,523 |
+| Feedback boundary | after step 506,642, with the cooldown |
+| Expected pass-tokens | approximately 283.3B |
+| Expected cell-tokens | approximately 4.98T |
+
+The flagship spends about 3.39T cell-tokens, so this run costs about 1.5x the
+flagship's compute with 50% of its active parameters. Per sequence at 8,192
+context one cell's mixer cache is 27.9 MiB: Standard decoding at `r_max`
+holds 34 cells, 949 MiB, and Soft or Fused decoding holds 3 cells, 83.7 MiB.
+
+Entry requires an admissible `df-loop - df` screen result, the Prime gates
+of `design.md`, the loop-specific parity gates below, and explicit spend
+confirmation.
 
 ## Sources
 
 | Source | Adopted | Replaced here |
 |---|---|---|
-| Recurrent-depth language models | tied core between prelude and coda, log-normal Poisson iteration draw, cache shared across iterations, effective-depth accounting | adapter by MHDB reads of seed and `Delta_P`; random initial state by the prelude output; residual sandwich norm by branch-output norm; untrained warm start by the trained payload; truncated backpropagation by full backpropagation; a cache budget of several slots by a trained budget of one |
+| Recurrent-depth language models | tied core between prelude and coda, log-normal Poisson iteration draw, cache shared across iterations, effective-depth accounting | adapter by MHDB reads of seed and `Delta_P`; random initial state by the prelude output; sandwich norms by the unchanged pre-norm shell under Hyperball radii and gates; untrained warm start by the trained payload; truncated backpropagation by full backpropagation; a cache budget of several slots by a trained budget of one |
 | Full-Bandwidth Transformer | asymmetric fusion, payload, Jacobi passes, prefix mixin, jitter, pass mixture, loss | — |
 | This project | Markov source window, pass-level mixing mode, shared-mode PKDA read with own-term substitution, cell-token accounting | — |
 
 ## Exclusions
 
 Not part of this specification: loop variants of `base`, `mhdb`, or `fbt`;
-truncated backpropagation; a random or learned initial core state; a raw
-embedding path into the core; a shared-cache budget above one; per-iteration
-halting readouts and pause tokens, which belong to a separate specification;
-adaptive exit as anything but a diagnostic; and the flagship mapping of
-prelude, core, and coda onto six cells.
+truncated backpropagation; branch-output or residual-state norms in the core;
+a random or learned initial core state; a raw embedding path into the core; a
+shared-cache budget above one; per-iteration halting readouts and pause
+tokens, which belong to a separate specification; adaptive exit as anything
+but a diagnostic; and any loop mapping onto the six-cell flagship.
 
 ## Adoption
 
@@ -366,6 +413,7 @@ Registering `df-loop` changes the following together:
   bank capacity, and the coda with the head, replayed with alternating
   buffers; the graph pool is requalified and its reservation recorded.
 - `design.md` adds `df-loop` to the arm table, cell-tokens to the accounting,
-  two registered runs (`df-loop`, seeds 1 and 2) to Stage 1, and `r = 8` to
-  the evaluation contract. `df-loop - df` is a paired contrast on the complete
-  package only; depth alone is not attributable without an unrouted loop arm.
+  two registered runs (`df-loop`, seeds 1 and 2) to Stage 1, `r = r_mean` to
+  the evaluation contract, and the flagship-width loop run to the scale plan.
+  `df-loop - df` is a paired contrast on the complete package only; depth
+  alone is not attributable without an unrouted loop arm.
