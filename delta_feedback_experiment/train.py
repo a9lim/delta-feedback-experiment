@@ -41,7 +41,7 @@ from .model import (
 from .optim import OptimizerPair, apply_schedule, build_optimizers
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=15, resumable=frozenset({15}), surface_version=15
+    version=16, resumable=frozenset({16}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 1.0
@@ -58,7 +58,6 @@ EXACT_FIELDS = (
     "warmup_steps",
     "cooldown_frac",
     "feedback_start",
-    "feedback_batch_prob",
     "three_pass",
     "lr_h",
     "lr_adam",
@@ -129,20 +128,17 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument(
         "--feedback-start",
         type=probability,
-        default=0.5,
-        help="fraction of steps before the mixed pass curriculum begins",
-    )
-    schedule.add_argument(
-        "--feedback-batch-prob",
-        type=probability,
-        default=0.5,
-        help="P(k > 1) after the mixed pass curriculum begins",
+        default=0.75,
+        help=(
+            "fraction of steps before feedback passes begin; every later step "
+            "draws two or three passes (default: the cooldown boundary)"
+        ),
     )
     schedule.add_argument(
         "--three-pass",
         type=probability,
         default=0.12,
-        help="P(k = 3 | k > 1) after the mixed pass curriculum begins",
+        help="P(k = 3) on each feedback-phase step; otherwise k = 2",
     )
 
     recipe = parser.add_argument_group("recipe (state-defining)")
@@ -202,18 +198,24 @@ def mix(*parts: int) -> int:
     return value
 
 
+def feedback_boundary(args, total: int) -> int:
+    """Last one-pass step; feedback arms draw k > 1 on every later step."""
+    return round(args.feedback_start * total)
+
+
 def draw_passes(args, step: int, total: int) -> int:
-    """The step's pass count — shared across every feedback-bearing arm."""
-    if step <= round(args.feedback_start * total):
+    """The step's pass count — shared across every feedback-bearing arm.
+
+    Before the boundary every step is one pass. After it there are no
+    one-pass steps at all: each step draws three passes with probability
+    ``three_pass`` and two passes otherwise, so the fused mode is trained
+    on every update rather than eroded between them.
+    """
+    if step <= feedback_boundary(args, total):
         return 1
     generator = torch.Generator().manual_seed(mix(args.data_seed, step, 1))
     draw = torch.rand((), generator=generator).item()
-    three_pass_prob = args.feedback_batch_prob * args.three_pass
-    if draw < three_pass_prob:
-        return 3
-    if draw < args.feedback_batch_prob:
-        return 2
-    return 1
+    return 3 if draw < args.three_pass else 2
 
 
 def micro_draws(
@@ -911,7 +913,10 @@ def train(argv: list[str] | None = None) -> dict:
         if device.type == "cuda"
         else contextlib.nullcontext()
     )
-    protected = {schedule.heat_end, total}
+    # Persistent snapshots at the cooldown boundary, the feedback boundary
+    # (the last one-pass state), and the end, so cooldown and feedback
+    # variants can continue from the exact pre-boundary state.
+    protected = {schedule.heat_end, feedback_boundary(args, total), total} - {0}
     end_step = total
     if args.max_steps is not None:
         end_step = min(total, start_step + args.max_steps)
@@ -921,6 +926,7 @@ def train(argv: list[str] | None = None) -> dict:
         preheat_steps=schedule.preheat_steps,
         heat_steps=schedule.heat_steps,
         cooldown_steps=schedule.cooldown_steps,
+        feedback_boundary=feedback_boundary(args, total),
         start_step=start_step,
         end_step=end_step,
         total_steps=total,

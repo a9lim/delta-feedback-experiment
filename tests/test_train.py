@@ -42,6 +42,7 @@ from delta_feedback_experiment.train import (
     build_schedule,
     clip_gradients,
     draw_passes,
+    feedback_boundary,
     mix,
     route_summary,
     train,
@@ -80,8 +81,6 @@ TINY_ARGS = [
     "0.25",
     "--feedback-start",
     "0.5",
-    "--feedback-batch-prob",
-    "1",
     "--eval-every",
     "4",
     "--snapshot-every",
@@ -266,8 +265,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 1.0
-    assert CONTRACT.version == 15
-    assert CONTRACT.resumable == frozenset({15})
+    assert CONTRACT.version == 16
+    assert CONTRACT.resumable == frozenset({16})
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(1.0)
@@ -411,6 +410,7 @@ def test_build_schedule_screen_shape():
     assert schedule.phase(8060)[0] == "cooldown"
     assert schedule.rate_at(8059, 1.0) == 1.0
     assert schedule.rate_at(10745, 1.0) < 1e-6
+    assert feedback_boundary(args, schedule.total) == schedule.heat_end == 8059
 
 
 def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
@@ -425,7 +425,7 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
     prime = build_parser().parse_args(["x", "--steps", "171909"])
     schedule = build_schedule(prime)
     assert schedule.spans == (200, 0, 128_732, 42_977)
-    assert round(prime.feedback_start * schedule.total) == 85_954
+    assert feedback_boundary(prime, schedule.total) == schedule.heat_end == 128_932
 
 
 def test_log_every_flag_is_removed():
@@ -441,12 +441,17 @@ def test_legacy_optimizer_flags_are_removed(flag):
 
 @pytest.mark.parametrize(
     "flag",
-    ["--feedback-start", "--feedback-batch-prob", "--three-pass"],
+    ["--feedback-start", "--three-pass"],
 )
 @pytest.mark.parametrize("value", ["-0.1", "1.1", "nan", "inf"])
 def test_pass_probabilities_reject_values_outside_unit_interval(flag, value):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", flag, value])
+
+
+def test_feedback_batch_prob_flag_is_removed():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", "--feedback-batch-prob", "0.5"])
 
 
 def test_mix_is_stable():
@@ -457,21 +462,21 @@ def test_mix_is_stable():
 
 def test_pass_mixture_fractions():
     args = build_parser().parse_args(["x", "--steps", "4000"])
-    assert args.feedback_start == 0.5
-    assert args.feedback_batch_prob == 0.5
+    assert args.feedback_start == 0.75
     assert args.three_pass == 0.12
+    assert feedback_boundary(args, 4000) == 3000
 
-    first_half = [draw_passes(args, step, 4000) for step in range(1, 2001)]
-    second_half = [draw_passes(args, step, 4000) for step in range(2001, 4001)]
-    assert set(first_half) == {1}
+    heat = [draw_passes(args, step, 4000) for step in range(1, 3001)]
+    feedback = [draw_passes(args, step, 4000) for step in range(3001, 4001)]
+    assert set(heat) == {1}
+    assert 1 not in feedback
 
-    second_counts = {k: second_half.count(k) for k in (1, 2, 3)}
-    assert 0.45 < second_counts[1] / 2000 < 0.55
-    assert 0.39 < second_counts[2] / 2000 < 0.49
-    assert 0.04 < second_counts[3] / 2000 < 0.08
+    feedback_counts = {k: feedback.count(k) for k in (2, 3)}
+    assert 0.84 < feedback_counts[2] / 1000 < 0.92
+    assert 0.08 < feedback_counts[3] / 1000 < 0.16
 
     counts = {1: 0, 2: 0, 3: 0}
-    for n_passes in first_half + second_half:
+    for n_passes in heat + feedback:
         counts[n_passes] += 1
     assert 0.72 < counts[1] / 4000 < 0.78
     assert 0.20 < counts[2] / 4000 < 0.24
@@ -509,7 +514,8 @@ def test_tiny_run_completes(tmp_path, capsys, arm):
     if arm in ("fbt", "df"):
         assert np.isfinite(summary["val_fused"])
     snapshots = list((tmp_path / "runs").glob(f"t-{arm}.pt.*"))
-    assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {6, 8}
+    # Protected: feedback boundary (4), cooldown boundary (6), end (8).
+    assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {4, 6, 8}
     step_records = [
         line
         for line in capsys.readouterr().out.splitlines()
@@ -547,12 +553,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14])
+@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[15\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[16\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

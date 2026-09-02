@@ -160,7 +160,8 @@ is ordinary teacher forcing with plain embeddings. For every later pass:
 The shift and prefix preserve token causality. Position 0 is always plain and
 every row has at least one feedback position. A `k`-pass batch trains a
 feedback horizon of `k-1` transitions and costs `k` transformer evaluations.
-Non-feedback arms always use one pass.
+Non-feedback arms always use one pass; feedback arms use one pass before the
+feedback boundary and two or three passes on every step after it.
 
 Let `ell_k` be mean next-token cross-entropy on pass `k`:
 
@@ -181,14 +182,17 @@ default 10,745-step Jobe schedule is:
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–5,372 | one pass |
-| Stable heat | 5,373–8,059 | feedback arms draw 1, 2, or 3 passes |
-| Cooldown | 8,060–10,745 | feedback arms draw 1, 2, or 3 passes |
+| Stable heat | 201–8,059 | one pass |
+| Cooldown | 8,060–10,745 | feedback arms draw 2 or 3 passes |
 
-After step 5,372, the draw is 50% / 44% / 6% for one / two / three passes.
-Across the full run this targets 75% / 22% / 3% and an expected feedback-arm
-compute multiplier of 1.28 pass-tokens per predicted token. Exact realized
-pass-tokens are recorded.
+The feedback boundary is `round(feedback_start * steps)`, by default three
+quarters of the schedule, which coincides with the cooldown boundary. Before
+it every step is one pass. After it there are no one-pass steps: each step
+draws three passes with probability `three_pass = 0.12` and two passes
+otherwise, so the fused mode is trained on every update rather than eroded
+between feedback steps. Across the full run this targets 75% / 22% / 3% and
+an expected feedback-arm compute multiplier of 1.28 pass-tokens per
+predicted token. Exact realized pass-tokens are recorded.
 
 `--max-steps` caps additional steps in one process. It never rescales the
 schedule, feedback boundary, protected checkpoints, or any state-defining
@@ -258,7 +262,8 @@ Median graph replay is 63.1 ms, 127.5 ms, and 192.0 ms for one, two, and three
 passes. The same probe measures PKDA chunk parity at relative error 0.0039,
 fused Q/K/V convolution parity at 0.0035, fused output norm-gate parity at
 0.0032, and cached decode parity at 0.0069/0.0128. Resumed from the completed
-`screen-df-s1` step-10,500 snapshot, this path reproduces that run's logged
+`screen-df-s1` step-10,500 snapshot (a v15 snapshot from the superseded
+mixed-heat recipe), this path reproduces that run's logged
 per-step losses to four decimals over 100 mixed-pass steps, its step-10,600
 validation losses within 0.001, and runs at 60.0k one-pass tokens per second
 against the run's 50.9k. Inductor artifacts live in
@@ -269,15 +274,17 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v15, and only v15 is resumable. A
+New snapshots use checkpoint contract v16, and only v16 is resumable. A
 snapshot contains the model, both optimizer states, fixed NorMuonH radii,
 state-defining arguments, cumulative step, and Python/Torch/CUDA RNG state. A
 resume inherits every state-defining field and rejects explicit conflicts.
 Runtime paths, device, evaluation cadence, snapshot cadence, and evaluation-row
 count may change between invocations.
 
-Each run retains the latest two snapshots plus protected end-of-heat and
-end-of-run snapshots. The durable queue stores exact arguments, not Git state.
+Each run retains the latest two snapshots plus protected snapshots at the
+cooldown boundary, the feedback boundary (the last one-pass state), and the
+end of the run, so cooldown and feedback variants can continue from the
+exact pre-boundary state. The durable queue stores exact arguments, not Git state.
 Source changes do not stop an active child; the worker refreshes before the
 next job and runs that job's probe from the current checkout. `df stop queue`
 atomically removes every pending job without touching the active child or
@@ -370,7 +377,9 @@ The stage asks:
 3. whether every feedback arm remains stable under self-composition;
 4. whether null, seed, block, and payload paths are actually used.
 
-Only `screen-df-s1` is complete under the current screen contract. This is a
+No run is complete under the current screen contract; `screen-df-s1` ran
+under the superseded mixed-heat recipe and remains a diagnostic checkpoint
+only. This is a
 sensitivity and interaction screen, not a decisive test of FBT formation at
 high token-per-parameter ratio.
 
@@ -391,9 +400,8 @@ The fresh WSD schedule is:
 | Phase | Steps | Pass behavior |
 |---|---:|---|
 | Warmup | 1–200 | one pass |
-| Stable heat | 201–85,954 | one pass |
-| Stable heat | 85,955–128,932 | feedback draw active |
-| Cooldown | 128,933–171,909 | feedback draw active |
+| Stable heat | 201–128,932 | one pass |
+| Cooldown | 128,933–171,909 | feedback arms draw 2 or 3 passes |
 
 The pair consumes 112.662B predicted tokens and approximately 128.435B
 expected pass-tokens. It tests only the complete DF package against its shared
@@ -435,7 +443,7 @@ tokens per active non-embedding parameter before batch alignment.
 | Warmup | steps 1–200 |
 | Stable heat | steps 201–1,008,954 |
 | Cooldown | steps 1,008,955–1,345,272 |
-| Feedback boundary | after step 672,636 |
+| Feedback boundary | after step 1,008,954, with the cooldown |
 | Whole-run pass mixture | expected 75% / 22% / 3% |
 | Expected compute | approximately 564.248B pass-tokens |
 

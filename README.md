@@ -32,13 +32,15 @@ separate whole-trunk control.
 
 ## Status
 
-`screen-df-s1` (the `df` arm, seed 1) is the only completed run under the
-current screen contract; the remaining nine registered runs are pending, no
-screen job is active, and there are no accepted experiment findings.
+No run is complete under the current screen contract: all ten registered
+runs are pending, no screen job is active, and there are no accepted
+experiment findings. The earlier `screen-df-s1` run used the superseded
+mixed-heat feedback recipe and is retained only as a diagnostic checkpoint;
+its examination is in [docs/journal.md](docs/journal.md).
 
 The 230–258M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
-runs remain serial because the full v15 DF graph pool reserves 22.99 GiB on
+runs remain serial because the qualified DF graph pool reserves 22.99 GiB on
 its 24 GiB RTX 4090.
 
 The realized Jobe token store is a 35.000B-token prefix of the pinned stream.
@@ -119,13 +121,16 @@ leaves the active run and worker untouched; it is the complement of `df stop
 live`, which stops only the active run and preserves the pending queue.
 
 The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024 predictions
-per row: 3,520,921,600 predicted tokens. Feedback starts halfway through the
-schedule and draws one, two, or three passes. Every arm sees the same addressed
+per row: 3,520,921,600 predicted tokens. Feedback starts at three quarters of
+the schedule, with the cooldown, and every later step draws two or three
+passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 1.0 before the shared
 NorMuonH/Adam update.
 
-Snapshots use checkpoint contract v15, and only v15 is resumable.
+Snapshots use checkpoint contract v16, and only v16 is resumable. Protected
+snapshots persist at the cooldown boundary, the feedback boundary, and the end
+of the run.
 `--max-steps` limits the current invocation without changing the registered
 schedule.
 

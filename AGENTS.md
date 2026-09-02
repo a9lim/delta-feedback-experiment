@@ -4,8 +4,8 @@ This repository owns a five-arm pretraining study of MHDB depth routing and FBT
 latent recurrence on a common PKDA/gated-GQA hybrid. The primary factorial is
 `{base, mhdb, fbt, df}`; pure-GQA `vanilla` is the external trunk control.
 
-Only `screen-df-s1` is complete under the current screen contract and no job is
-active. Keep [docs/findings.md](docs/findings.md) empty of architecture claims
+No run is complete under the current screen contract and no job is active;
+the earlier `screen-df-s1` run used the superseded mixed-heat recipe. Keep [docs/findings.md](docs/findings.md) empty of architecture claims
 until a matched comparison is admissible.
 
 ## Documents
@@ -77,7 +77,7 @@ a contract changes.
 - Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
   monitor serving, and spool orchestration from the workspace root package.
 - Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified v15 DF graph pool reserves 22.99 GiB. New snapshots are v15
+  the qualified DF graph pool reserves 22.99 GiB. New snapshots are v16
   and every older version is rejected.
 - Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
   The queue stores arguments rather than Git state; a worker refreshes before

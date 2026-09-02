@@ -286,7 +286,14 @@ plausible cause of the final gap's size, but the run cannot separate
 25x fused metric under 75/22/3 is not comparable to FBT's numbers, and the
 pass-1 factorial stands on its own.
 
-### Options (decisions for a9, not taken)
+### Options (a9 chose option 1 the same day)
+
+Landed: `--feedback-start` defaults to 0.75 (the cooldown boundary),
+`--feedback-batch-prob` is removed so every feedback-phase step draws two or
+three passes (`three_pass` = 0.12), protected snapshots persist at the
+cooldown and feedback boundaries, and the checkpoint contract is v16. The
+whole-run 75/22/3 mixture and 1.28 pass-token multiplier are unchanged; the
+erosion is gone by construction. `screen-df-s1` is a superseded-recipe run.
 
 1. **Match FBT's recipe to the token-per-parameter regime.** FBT chose its
    mixture per scale; at 25x the closest precedents are 75/0/25 (100 tok/param)
