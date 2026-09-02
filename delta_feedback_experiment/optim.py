@@ -1,5 +1,5 @@
 """The experiment optimizer stack: NorMuonH for ordinary hidden matrices and
-Adam for parameters whose norm carries semantic information, under one WSD
+NAdam for parameters whose norm carries semantic information, under one WSD
 learning-rate multiplier.
 
 NorMuonH combines NorMuon's Nesterov momentum, Newton-Schulz
@@ -24,8 +24,14 @@ NS_COEFFS = (3.4445, -4.7750, 2.0315)
 DEFAULT_NORMUONH_LR = 2e-2
 """Stable dimensionless NorMuonH relative step for fresh runs."""
 
-DEFAULT_ADAM_LR = 5e-4
-"""Stable Adam learning rate for fresh runs."""
+DEFAULT_NADAM_LR = 5e-4
+"""Stable NAdam learning rate for fresh runs."""
+
+DEFAULT_NADAM_BETAS = (0.9, 0.95)
+"""First- and second-moment coefficients for NAdam."""
+
+NADAM_MOMENTUM_DECAY = 4e-3
+"""PyTorch/Dozat time-varying Nesterov momentum schedule coefficient."""
 
 
 def orthogonalize(matrix: Tensor, steps: int = 5) -> Tensor:
@@ -230,17 +236,17 @@ class NorMuonH(torch.optim.Optimizer):
 
 
 def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
-    """Partition trainable parameters into the sole NorMuonH and Adam groups.
+    """Partition trainable parameters into the sole NorMuonH and NAdam groups.
 
     Ordinary hidden 2D weights get NorMuonH. The tied embedding/unembedding,
     global-attention gates, the FBT token gate, and PKDA's packed controls,
     decay expansion, and output-gate expansion are explicit matrix exceptions;
     they join norms, depthwise convolutions, routing parameters, and vectors in
-    Adam. PKDA Q/K/V/output projections and the FBT value projection use
+    NAdam. PKDA Q/K/V/output projections and the FBT value projection use
     NorMuonH.
     """
     matrices, rest = [], []
-    pkda_adam = (
+    pkda_nadam = (
         ".attn.control_proj.",
         ".attn.decay_up.",
         ".attn.output_gate_up.",
@@ -248,13 +254,13 @@ def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        adam_matrix = (
+        nadam_matrix = (
             "embed_tokens" in name
             or name.startswith("attention_gates.")
             or name == "fuse_gate.weight"
-            or any(marker in name for marker in pkda_adam)
+            or any(marker in name for marker in pkda_nadam)
         )
-        if parameter.ndim == 2 and not adam_matrix:
+        if parameter.ndim == 2 and not nadam_matrix:
             matrices.append(parameter)
         else:
             rest.append(parameter)
@@ -265,30 +271,30 @@ def build_optimizers(
     model: torch.nn.Module,
     *,
     lr_h: float = DEFAULT_NORMUONH_LR,
-    lr_adam: float = DEFAULT_ADAM_LR,
-    adam_betas: tuple[float, float] = (0.9, 0.95),
+    lr_nadam: float = DEFAULT_NADAM_LR,
+    nadam_betas: tuple[float, float] = DEFAULT_NADAM_BETAS,
 ) -> list[torch.optim.Optimizer]:
-    """Build the authoritative NorMuonH/Adam stack with stable WSD rates."""
+    """Build the authoritative NorMuonH/NAdam stack with stable WSD rates."""
     matrices, rest = split_parameters(model)
     normuonh = NorMuonH(matrices, lr=lr_h)
-    use_fused_adam = bool(rest) and rest[0].is_cuda
-    adam = torch.optim.Adam(
+    use_foreach_nadam = bool(rest) and rest[0].is_cuda
+    nadam = torch.optim.NAdam(
         rest,
-        lr=lr_adam,
-        betas=adam_betas,
+        lr=lr_nadam,
+        betas=nadam_betas,
         eps=1e-8,
-        fused=use_fused_adam,
-        capturable=use_fused_adam,
+        momentum_decay=NADAM_MOMENTUM_DECAY,
+        foreach=use_foreach_nadam,
     )
     for group in normuonh.param_groups:
         group["stable_lr"] = lr_h
-    for group in adam.param_groups:
-        group["stable_lr"] = lr_adam
-    return [normuonh, adam]
+    for group in nadam.param_groups:
+        group["stable_lr"] = lr_nadam
+    return [normuonh, nadam]
 
 
 class OptimizerPair:
-    """Checkpoint-facing facade over the NorMuonH/Adam stack.
+    """Checkpoint-facing facade over the NorMuonH/NAdam stack.
 
     The shared checkpoints module speaks to one optimizer object; this
     bundles both state dicts under a single stable schema.

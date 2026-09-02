@@ -39,7 +39,7 @@ from .model import (
     multipass_loss,
 )
 from .optim import (
-    DEFAULT_ADAM_LR,
+    DEFAULT_NADAM_LR,
     DEFAULT_NORMUONH_LR,
     OptimizerPair,
     apply_schedule,
@@ -47,7 +47,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=18, resumable=frozenset({18}), surface_version=16
+    version=19, resumable=frozenset({19}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 1.0
@@ -66,7 +66,7 @@ EXACT_FIELDS = (
     "feedback_start",
     "three_pass",
     "lr_h",
-    "lr_adam",
+    "lr_nadam",
     "jitter",
     "zloss",
     "vocab_size",
@@ -163,10 +163,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="dimensionless NorMuonH relative step (default: 0.02)",
     )
     recipe.add_argument(
-        "--lr-adam",
+        "--lr-nadam",
         type=float,
-        default=DEFAULT_ADAM_LR,
-        help="Adam learning rate (default: 0.0005)",
+        default=DEFAULT_NADAM_LR,
+        help="NAdam learning rate (default: 0.0005)",
     )
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -472,7 +472,11 @@ class CudaGraphTrainer:
         for optimizer in self.optimizers:
             for values in optimizer.state.values():
                 for name, value in values.items():
-                    if isinstance(value, torch.Tensor) and name != "radius":
+                    if not isinstance(value, torch.Tensor) or name == "radius":
+                        continue
+                    if name == "mu_product":
+                        value.fill_(1)
+                    else:
                         value.zero_()
         for rate, group in zip(
             saved,
@@ -888,7 +892,7 @@ def train(argv: list[str] | None = None) -> dict:
             max_seq_len=args.seq_len + 1,
         )
     ).to(device)
-    optimizers = build_optimizers(model, lr_h=args.lr_h, lr_adam=args.lr_adam)
+    optimizers = build_optimizers(model, lr_h=args.lr_h, lr_nadam=args.lr_nadam)
     pair = OptimizerPair(optimizers)
 
     if payload is not None:

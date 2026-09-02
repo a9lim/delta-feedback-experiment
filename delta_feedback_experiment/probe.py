@@ -521,7 +521,7 @@ def cuda_gate() -> None:
     optimizers = build_optimizers(
         model,
         lr_h=args.lr_h,
-        lr_adam=args.lr_adam,
+        lr_nadam=args.lr_nadam,
     )
     model.refresh_shadows()
     classifier_shadow = model._classifier_shadow
@@ -554,6 +554,14 @@ def cuda_gate() -> None:
 
     started = time.monotonic()
     runner = CudaGraphTrainer(model, optimizers, args, schedule)
+    nadam = optimizers[1]
+    if not nadam.param_groups[0]["foreach"] or nadam.param_groups[0]["capturable"]:
+        raise AssertionError("CUDA NAdam is not using the qualified foreach path")
+    if not nadam.state or any(
+        state["step"].item() != 0 or state["mu_product"].item() != 1
+        for state in nadam.state.values()
+    ):
+        raise AssertionError("CUDA NAdam did not materialize fresh optimizer state")
     eval_runner = CudaEvalRunner(model, args, runner.pool)
     backend = execution_fields(model, runner, eval_runner)
     if backend["flash"] != 1 or backend["cuda_graphs"] != 4:

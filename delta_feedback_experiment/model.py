@@ -974,7 +974,7 @@ class DFModel(nn.Module):
                     attn.v_proj.weight,
                 )
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-                # The Adam-owned control matrices keep ordinary autograd
+                # The NAdam-owned control matrices keep ordinary autograd
                 # gradients but read shadows too, so no replay casts them.
                 attn.control_shadow = shadow(
                     attn.control_shadow, attn.control_proj.weight

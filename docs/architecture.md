@@ -361,7 +361,7 @@ address-stable BF16 classifier shadow that is refreshed from the tied embedding
 once after every optimizer update and is neither a parameter nor checkpoint
 state. Its authoritative tied parameter and accumulated gradient remain FP32.
 
-## NorMuonH and Adam
+## NorMuonH and NAdam
 
 The flagship uses one optimizer recipe with two disjoint parameter groups and
 no weight decay.
@@ -392,8 +392,7 @@ M_t = 0.95 M_{t-1} + 0.05 G_t
 N_t = 0.05 G_t + 0.95 M_t
 ```
 
-Newton-Schulz and the NorMuon row normalization act on `N_t`. Adam remains the
-ordinary non-Nesterov optimizer specified below.
+Newton-Schulz and the NorMuon row normalization act on `N_t`.
 
 With dimensionless learning rate `lr_h = 2e-2` and normalized direction `U`:
 
@@ -404,9 +403,9 @@ W_next = R * Normalize_F(W - lr_h * R * Normalize_F(U))
 The initial radius is checkpointed and must remain invariant across eager,
 compiled, captured, staged, and resumed updates.
 
-### Adam parameters
+### NAdam parameters
 
-Adam owns parameters whose norm carries semantic scale and every non-matrix
+NAdam owns parameters whose norm carries semantic scale and every non-matrix
 parameter:
 
 - tied embedding/readout;
@@ -417,9 +416,25 @@ parameter:
 - RMSNorm weights, router queries and nulls, depthwise convolutions, biases,
   rates, time constants, and preconditioner centers.
 
-Its defaults are learning rate `5e-4`, betas `(0.9, 0.95)`, epsilon `1e-8`,
-and no weight decay. Both optimizers receive the same warmup-stable-cooldown
-multiplier defined by the current scale's schedule.
+Its defaults are learning rate `5e-4`, moment betas `(0.9, 0.95)`, momentum
+decay `psi = 0.004`, epsilon `1e-8`, and no weight decay. At optimizer step `t`,
+PyTorch NAdam uses:
+
+```text
+m_t = beta1 m_{t-1} + (1 - beta1) G_t
+v_t = beta2 v_{t-1} + (1 - beta2) G_t^2
+mu_t = beta1 (1 - 0.5 * 0.96^(t psi))
+P_t = product_{i=1}^t mu_i
+U_t = ((1 - mu_t) G_t / (1 - P_t)
+       + mu_{t+1} m_t / (1 - P_t mu_{t+1}))
+      / (sqrt(v_t / (1 - beta2^t)) + eps)
+```
+
+The update is `theta_t = theta_{t-1} - lr * U_t`. Both optimizers receive the
+same warmup-stable-cooldown multiplier defined by the current scale's schedule.
+CUDA uses PyTorch's foreach NAdam path outside the captured forward/backward
+graphs; its scalar step and momentum-product state stay on CPU, while both
+moment tensors and all parameters remain FP32 on-device.
 
 After synchronized microbatch accumulation, the single global FP32 gradient
 vector is clipped to L2 norm 1.0 immediately before both optimizer steps. The

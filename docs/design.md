@@ -138,7 +138,7 @@ Every scale uses 327,680 predicted tokens per optimizer update:
 | Prime screen | 8 ranks x 4 rows x 10 accumulation microsteps |
 | Flagship | 8 ranks x 1 row x 8,192 predictions x 5 accumulation microsteps |
 
-All arms use the NorMuonH/Adam partition and defaults in
+All arms use the NorMuonH/NAdam partition and defaults in
 [architecture.md](architecture.md). After all microbatches—and, for
 distributed runs, all ranks—have accumulated, the single global FP32 gradient
 vector is clipped to L2 norm 1.0 immediately before both optimizer steps.
@@ -223,7 +223,7 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   addend and the output, so no weight gradient is materialized apart from its
   accumulator and those parameters hand autograd no gradient at all;
 - address-stable BF16 shadows of every sink-fed projection's concatenated
-  weights and of PKDA's three Adam-owned control matrices, refreshed together
+  weights and of PKDA's three NAdam-owned control matrices, refreshed together
   with the classifier shadow once per optimizer update, so no replay casts or
   concatenates FP32 parameters;
 - the workspace FLA fork's PKDA chunk kernel retaining its WY and chunk-state
@@ -306,10 +306,11 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v18, and only v18 is resumable. V16 and
-v17 snapshots remain readable for evaluation and forks but cannot be continued:
-v16 used different feedback-prefix draws, and both predate the Nesterov
-NorMuonH update. A snapshot contains the model, both optimizer states, fixed
+New snapshots use checkpoint contract v19, and only v19 is resumable. V16-v18
+snapshots remain readable for evaluation and forks but cannot be continued:
+v16 used different feedback-prefix draws, v16-v17 predate the Nesterov
+NorMuonH update, and all three predate NAdam. A snapshot contains the model,
+both optimizer states, fixed
 NorMuonH radii, state-defining arguments, cumulative step, and
 Python/Torch/CUDA RNG state. A resume inherits every state-defining field and
 rejects explicit conflicts. Runtime paths, device, evaluation cadence, snapshot

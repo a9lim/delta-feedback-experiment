@@ -782,7 +782,7 @@ class ShadowOperand(torch.autograd.Function):
     The forward hands the caller the shadow as the GEMM operand; the backward
     either adds the operand gradient into a persistent FP32 ``sink`` and hands
     autograd nothing (the tied classifier), or returns it widened to FP32 as
-    the master's ordinary autograd gradient (the small Adam-owned matrices).
+    the master's ordinary autograd gradient (the small NAdam-owned matrices).
     Either way no replay casts the master.
     """
 

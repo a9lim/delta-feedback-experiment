@@ -32,7 +32,7 @@
   <div class="chart"><h2>NLL <small>nats · solid train loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
 </div>
 <div class="grid two">
-  <div class="chart"><h2>Hyperball learning rate <small>dimensionless NorMuonH relative step; Adam follows WSD</small></h2><div class="plot" id="p-lr"></div></div>
+  <div class="chart"><h2>Hyperball learning rate <small>dimensionless NorMuonH relative step; NAdam follows WSD</small></h2><div class="plot" id="p-lr"></div></div>
   <div class="chart"><h2>gradient norm <small>global L2 before update</small></h2><div class="plot" id="p-gnorm"></div></div>
 </div>
 <div class="grid two">
@@ -142,7 +142,7 @@ function renderTiles(view) {
 const CONFIG_GROUPS = [
   ['arm & seeds', ['arm', 'seed', 'data_seed']],
   ['trunk', ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
-  ['optimizer', ['lr_h', 'lr_adam', 'zloss']],
+  ['optimizer', ['lr_h', 'lr_nadam', 'zloss']],
   ['feedback', ['feedback_start', 'feedback_batch_prob', 'three_pass', 'jitter']],
   ['batch', ['batch_rows', 'micro_rows']],
 ];

@@ -123,13 +123,22 @@ references:
       NorMuonH preserves this ordering before its row normalization and
       Hyperball projection.
 
+  - url: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/optim/nadam.py#L380-L531
+    slug: pytorch291-nadam-implementation
+    note: >
+      Defines the foreach NAdam update used for semantic-scale parameters:
+      fixed first and second moments, the scheduled Nesterov momentum cache,
+      cumulative momentum-product bias correction, and the default momentum
+      decay of 0.004. The experiment uses this implementation without weight
+      decay.
+
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
     note: >
       Defines Hyperball's fixed initial Frobenius radius, unit-Frobenius base
       update, dimensionless relative step, and exact radial projection. The
       experiment applies it to every NorMuon matrix except the semantic FBT
-      token-gate projection, uses plain Adam for all semantic-scale parameters,
+      token-gate projection, uses NAdam for all semantic-scale parameters,
       and uses no weight decay.
 
   - arxiv: "2603.15031"

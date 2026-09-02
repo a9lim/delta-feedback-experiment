@@ -50,7 +50,7 @@ The next stages are specified but not runnable: a fresh `{base, df}` 400x
 comparison on one 8xH100-80GB Prime node, followed—only after the evidence and
 implementation gates—by the 1.335B-parameter, 441B-token flagship. See
 [docs/architecture.md](docs/architecture.md) for the exact flagship and
-NorMuonH/Adam specification, and [docs/design.md](docs/design.md) for the
+NorMuonH/NAdam specification, and [docs/design.md](docs/design.md) for the
 experiment and scale plan.
 
 ## Install
@@ -126,12 +126,12 @@ the schedule, with the cooldown, and every later step draws two or three
 passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 1.0 before the shared
-NorMuonH/Adam update; NorMuonH applies its Nesterov blend before
-orthogonalization, while Adam remains ordinary Adam.
+NorMuonH/NAdam update. Both sides apply their specified Nesterov construction:
+NorMuonH before orthogonalization and NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v18, and only v18 is resumable. V16 and v17
-remain readable for evaluation and forks but predate the current Nesterov
-NorMuonH update. Protected snapshots persist at the cooldown boundary, the
+Snapshots use checkpoint contract v19, and only v19 is resumable. V16-v18
+remain readable for evaluation and forks but predate the NAdam update.
+Protected snapshots persist at the cooldown boundary, the
 feedback boundary, and the end of the run.
 `--max-steps` limits the current invocation without changing the registered
 schedule.

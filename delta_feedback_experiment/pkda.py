@@ -132,7 +132,7 @@ class PreconditionedKDA(nn.Module):
             bias=False,
         )
 
-        # These five small hidden-width projections share one Adam-side GEMM.
+        # These five small hidden-width projections share one NAdam-side GEMM.
         # Their non-overlapping row slices retain independent parameters and
         # exactly the unpacked parameter count.
         self.control_splits = (

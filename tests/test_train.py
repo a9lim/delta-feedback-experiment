@@ -29,8 +29,10 @@ from delta_feedback_experiment.data import (
     write_synthetic,
 )
 from delta_feedback_experiment.optim import (
-    DEFAULT_ADAM_LR,
+    DEFAULT_NADAM_BETAS,
+    DEFAULT_NADAM_LR,
     DEFAULT_NORMUONH_LR,
+    NADAM_MOMENTUM_DECAY,
     NorMuonH,
     build_optimizers,
     orthogonalize,
@@ -39,6 +41,7 @@ from delta_feedback_experiment.optim import (
 from delta_feedback_experiment.train import (
     CONTRACT,
     GRAD_CLIP_NORM,
+    CudaGraphTrainer,
     automatic_checkpoint,
     build_parser,
     build_schedule,
@@ -299,8 +302,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 1.0
-    assert CONTRACT.version == 18
-    assert CONTRACT.resumable == frozenset({18})
+    assert CONTRACT.version == 19
+    assert CONTRACT.resumable == frozenset({19})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -308,7 +311,7 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     assert clipped.tolist() == pytest.approx([3 / 13, 4 / 13, 12 / 13])
 
 
-def test_semantic_scale_gates_use_adam_and_value_matrices_use_normuonh():
+def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     from delta_feedback_experiment.model import DFModel, arm_config
 
     model = DFModel(
@@ -326,36 +329,58 @@ def test_semantic_scale_gates_use_adam_and_value_matrices_use_normuonh():
             max_seq_len=17,
         )
     )
-    normuonh, adam = split_parameters(model)
+    normuonh, nadam = split_parameters(model)
     names = {id(parameter): name for name, parameter in model.named_parameters()}
     normuonh_names = {names[id(parameter)] for parameter in normuonh}
-    adam_names = {names[id(parameter)] for parameter in adam}
+    nadam_names = {names[id(parameter)] for parameter in nadam}
 
-    assert "attention_gates.0.weight" in adam_names
-    assert "embed_tokens.weight" in adam_names
-    assert "blocks.0.attn_router.query" in adam_names
-    assert "blocks.0.attn_router.key_norm.weight" in adam_names
+    assert "attention_gates.0.weight" in nadam_names
+    assert "embed_tokens.weight" in nadam_names
+    assert "blocks.0.attn_router.query" in nadam_names
+    assert "blocks.0.attn_router.key_norm.weight" in nadam_names
     assert "fuse_value.weight" in normuonh_names
-    assert "fuse_gate.weight" in adam_names
+    assert "fuse_gate.weight" in nadam_names
     assert "blocks.0.attn.q_proj.weight" in normuonh_names
     assert "blocks.3.attn.qkv_proj.weight" in normuonh_names
-    assert "blocks.0.attn.control_proj.weight" in adam_names
-    assert "blocks.0.attn.decay_up.weight" in adam_names
-    assert "blocks.0.attn.output_gate_up.weight" in adam_names
-    assert "blocks.0.attn.q_conv.weight" in adam_names
+    assert "blocks.0.attn.control_proj.weight" in nadam_names
+    assert "blocks.0.attn.decay_up.weight" in nadam_names
+    assert "blocks.0.attn.output_gate_up.weight" in nadam_names
+    assert "blocks.0.attn.q_conv.weight" in nadam_names
     assert "blocks.0.mlp.gate_up_proj.weight" in normuonh_names
-    assert not (normuonh_names & adam_names)
-    assert len(normuonh_names) + len(adam_names) == len(names)
+    assert not (normuonh_names & nadam_names)
+    assert len(normuonh_names) + len(nadam_names) == len(names)
 
-    normuonh_optimizer, adam_optimizer = build_optimizers(model)
+    normuonh_optimizer, nadam_optimizer = build_optimizers(model)
     assert isinstance(normuonh_optimizer, NorMuonH)
+    assert isinstance(nadam_optimizer, torch.optim.NAdam)
     assert DEFAULT_NORMUONH_LR == 2e-2
     assert normuonh_optimizer.param_groups[0]["lr"] == DEFAULT_NORMUONH_LR
     assert normuonh_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NORMUONH_LR
     assert "weight_decay" not in normuonh_optimizer.param_groups[0]
-    assert adam_optimizer.param_groups[0]["lr"] == DEFAULT_ADAM_LR
-    assert adam_optimizer.param_groups[0]["stable_lr"] == DEFAULT_ADAM_LR
-    assert adam_optimizer.param_groups[0]["weight_decay"] == 0
+    assert nadam_optimizer.param_groups[0]["lr"] == DEFAULT_NADAM_LR
+    assert nadam_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NADAM_LR
+    assert nadam_optimizer.param_groups[0]["betas"] == DEFAULT_NADAM_BETAS
+    assert nadam_optimizer.param_groups[0]["momentum_decay"] == NADAM_MOMENTUM_DECAY
+    assert nadam_optimizer.param_groups[0]["weight_decay"] == 0
+
+
+def test_optimizer_materialization_restores_fresh_nadam_state():
+    parameter = torch.nn.Parameter(torch.randn(4))
+    parameter.grad = torch.zeros_like(parameter)
+    nadam = torch.optim.NAdam(
+        [parameter], lr=DEFAULT_NADAM_LR, betas=DEFAULT_NADAM_BETAS
+    )
+    nadam.param_groups[0]["stable_lr"] = DEFAULT_NADAM_LR
+    runner = object.__new__(CudaGraphTrainer)
+    runner.optimizers = [nadam]
+
+    runner._initialize_optimizers()
+
+    state = nadam.state[parameter]
+    assert state["step"].item() == 0
+    assert state["mu_product"].item() == 1
+    assert torch.count_nonzero(state["exp_avg"]) == 0
+    assert torch.count_nonzero(state["exp_avg_sq"]) == 0
 
 
 def test_route_summary_reports_universal_nulls_and_payload_seed():
@@ -471,7 +496,7 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
     assert args.lr_h == DEFAULT_NORMUONH_LR == 2e-2
-    assert args.lr_adam == DEFAULT_ADAM_LR == 5e-4
+    assert args.lr_nadam == DEFAULT_NADAM_LR == 5e-4
 
 
 def test_log_every_flag_is_removed():
@@ -479,7 +504,7 @@ def test_log_every_flag_is_removed():
         build_parser().parse_args(["x", "--log-every", "2"])
 
 
-@pytest.mark.parametrize("flag", ["--lr-muon", "--wd-muon"])
+@pytest.mark.parametrize("flag", ["--lr-muon", "--wd-muon", "--lr-adam"])
 def test_legacy_optimizer_flags_are_removed(flag):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", flag, "0.01"])
@@ -599,12 +624,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15, 16, 17])
+@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[18\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[19\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

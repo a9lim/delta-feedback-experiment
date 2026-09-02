@@ -109,7 +109,7 @@ The shell is chosen because it has no mechanism that forces a nonzero update:
 a branch-output norm would pin every iteration's update size and make a
 fixed point unreachable by construction. Whether the tied core actually
 contracts is not assumed. Hyperball radii bound the NorMuonH matrices, but
-norm scales, router values, and the Adam-owned gates and controls are not
+norm scales, router values, and the NAdam-owned gates and controls are not
 radius-bounded, so the safety argument is the measured one: per-iteration
 residual RMS and the depth-contraction trace below are registered guards, and
 a diverging trace invalidates the loop comparison and forces a new
@@ -486,7 +486,7 @@ Registering `df-loop` changes the following together:
   and `r_max`; `ColumnOutput` gains the write bank and `forward_column` takes
   a per-position plain mask and a previous bank; `AGENTS.md` and `README.md`
   state six arms.
-- Checkpoint contract v18 with `r_mean`, `r_max`, and the `r` sub-stream as
+- Checkpoint contract v20 with `r_mean`, `r_max`, and the `r` sub-stream as
   state-defining fields; realized `r` and cell-tokens in the run log.
 - The workspace FLA fork gains the fused-position PKDA operator, forward and
   backward; the gated GQA layer gains the two-piece merge; the router gains
