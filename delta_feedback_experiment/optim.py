@@ -21,6 +21,12 @@ from torch import Tensor
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
 
+DEFAULT_NORMUONH_LR = 2e-2
+"""Stable dimensionless NorMuonH relative step for fresh runs."""
+
+DEFAULT_ADAM_LR = 5e-4
+"""Stable Adam learning rate for fresh runs."""
+
 
 def orthogonalize(matrix: Tensor, steps: int = 5) -> Tensor:
     """Approximately orthogonalize a matrix via Newton-Schulz iteration.
@@ -87,7 +93,7 @@ class NorMuonH(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 1e-2,
+        lr: float = DEFAULT_NORMUONH_LR,
         momentum: float = 0.95,
         beta2: float = 0.95,
         eps: float = 1e-8,
@@ -257,8 +263,8 @@ def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
 def build_optimizers(
     model: torch.nn.Module,
     *,
-    lr_h: float = 1e-2,
-    lr_adam: float = 5e-4,
+    lr_h: float = DEFAULT_NORMUONH_LR,
+    lr_adam: float = DEFAULT_ADAM_LR,
     adam_betas: tuple[float, float] = (0.9, 0.95),
 ) -> list[torch.optim.Optimizer]:
     """Build the authoritative NorMuonH/Adam stack with stable WSD rates."""

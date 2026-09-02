@@ -29,6 +29,8 @@ from delta_feedback_experiment.data import (
     write_synthetic,
 )
 from delta_feedback_experiment.optim import (
+    DEFAULT_ADAM_LR,
+    DEFAULT_NORMUONH_LR,
     NorMuonH,
     build_optimizers,
     orthogonalize,
@@ -314,7 +316,12 @@ def test_semantic_scale_gates_use_adam_and_value_matrices_use_normuonh():
 
     normuonh_optimizer, adam_optimizer = build_optimizers(model)
     assert isinstance(normuonh_optimizer, NorMuonH)
+    assert DEFAULT_NORMUONH_LR == 2e-2
+    assert normuonh_optimizer.param_groups[0]["lr"] == DEFAULT_NORMUONH_LR
+    assert normuonh_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NORMUONH_LR
     assert "weight_decay" not in normuonh_optimizer.param_groups[0]
+    assert adam_optimizer.param_groups[0]["lr"] == DEFAULT_ADAM_LR
+    assert adam_optimizer.param_groups[0]["stable_lr"] == DEFAULT_ADAM_LR
     assert adam_optimizer.param_groups[0]["weight_decay"] == 0
 
 
@@ -426,6 +433,12 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
     schedule = build_schedule(prime)
     assert schedule.spans == (200, 0, 128_732, 42_977)
     assert feedback_boundary(prime, schedule.total) == schedule.heat_end == 128_932
+
+
+def test_fresh_run_uses_authoritative_optimizer_defaults():
+    args = build_parser().parse_args(["x"])
+    assert args.lr_h == DEFAULT_NORMUONH_LR == 2e-2
+    assert args.lr_adam == DEFAULT_ADAM_LR == 5e-4
 
 
 def test_log_every_flag_is_removed():
@@ -618,4 +631,3 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--grad-checkpoint"])
-

@@ -38,7 +38,13 @@ from .model import (
     multipass,
     multipass_loss,
 )
-from .optim import OptimizerPair, apply_schedule, build_optimizers
+from .optim import (
+    DEFAULT_ADAM_LR,
+    DEFAULT_NORMUONH_LR,
+    OptimizerPair,
+    apply_schedule,
+    build_optimizers,
+)
 
 CONTRACT = checkpoints.CheckpointContract(
     version=16, resumable=frozenset({16}), surface_version=16
@@ -153,10 +159,15 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--lr-h",
         type=float,
-        default=1e-2,
-        help="dimensionless NorMuonH relative step",
+        default=DEFAULT_NORMUONH_LR,
+        help="dimensionless NorMuonH relative step (default: 0.02)",
     )
-    recipe.add_argument("--lr-adam", type=float, default=5e-4)
+    recipe.add_argument(
+        "--lr-adam",
+        type=float,
+        default=DEFAULT_ADAM_LR,
+        help="Adam learning rate (default: 0.0005)",
+    )
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
 

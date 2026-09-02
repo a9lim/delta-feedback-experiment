@@ -383,7 +383,7 @@ the life of the run. NorMuonH forms an update direction by:
 4. unit-Frobenius normalization;
 5. a Hyperball trial step and exact radial projection.
 
-With dimensionless learning rate `lr_h = 1e-2` and normalized direction `U`:
+With dimensionless learning rate `lr_h = 2e-2` and normalized direction `U`:
 
 ```text
 W_next = R * Normalize_F(W - lr_h * R * Normalize_F(U))
