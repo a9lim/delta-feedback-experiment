@@ -24,7 +24,7 @@ data-build = [
 ]
 cuda = [
     "cut-cross-entropy",
-    "flash-attn==2.8.3.post1",
+    "flash-attn==2.8.3",
     "flash-linear-attention[cuda]",
 ]
 
