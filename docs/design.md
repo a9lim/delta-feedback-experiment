@@ -244,7 +244,9 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   log-partition output for the exact squared-log-partition gradient;
 - the Triton PKDA control-gradient packer;
 - fixed-shape, exhaustive Inductor autotuning for compiled global-attention
-  blocks and segmented PKDA blocks around the opaque FLA recurrence;
+  blocks and segmented PKDA blocks around the opaque FLA recurrence, with one
+  process-wide Dynamo recompile budget covering every block, source-count,
+  mode, and grad-state specialization so no path silently demotes to eager;
 - one fixed-address train CUDA graph per reachable pass count and shared-pool
   no-grad validation graphs;
 - BF16 keyed jitter written directly into graph input buffers;

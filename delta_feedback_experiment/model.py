@@ -1412,10 +1412,9 @@ def iterate_fused(
     if not cfg.feedback_active:
         raise ValueError("the contraction diagnostic needs a feedback-bearing arm")
     # This is part of the standing training monitor, so CUDA must follow the
-    # same BF16 activation path as captured training and evaluation.  Besides
-    # preserving the numerical contract, keeping autocast state identical
-    # avoids an unprepared whole-block Dynamo specialization at every routed
-    # source count after the capture-time recompile limit has been restored.
+    # same BF16 activation path as captured training and evaluation, which
+    # preserves the numerical contract and reuses the captured block
+    # specializations instead of compiling a second set.
     autocast = (
         torch.autocast("cuda", dtype=torch.bfloat16)
         if tokens.is_cuda

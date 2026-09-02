@@ -313,18 +313,12 @@ class CudaGraphTrainer:
         self._buffers = {p: torch.zeros_like(p) for p in self.parameters}
         self.sink_fed = model.bind_gradient_sinks(self._buffers)
 
-        # The pointer-list router intentionally specializes on source count
-        # (up to 27), while retaining dynamic B/T. Raise Dynamo's frame-local
-        # guard only during exhaustive preparation, then restore the process
-        # default before timed execution.
-        prior_recompile_limit = torch._dynamo.config.recompile_limit
-        torch._dynamo.config.recompile_limit = max(prior_recompile_limit, 64)
-        try:
-            active_by_spec = {
-                spec: self._warm(state) for spec, state in self.states.items()
-            }
-        finally:
-            torch._dynamo.config.recompile_limit = prior_recompile_limit
+        # The package sets Dynamo's recompile budget once for the process, so
+        # every block and router specialization compiles here and in later
+        # eager evaluation alike.
+        active_by_spec = {
+            spec: self._warm(state) for spec, state in self.states.items()
+        }
         model.zero_grad(set_to_none=True)
         union = set().union(*active_by_spec.values())
         self.grad_buffers = {p: self._buffers[p] for p in self.parameters if p in union}
@@ -536,12 +530,7 @@ class CudaEvalRunner:
         sizes = {min(args.eval_rows, args.micro_rows)}
         if remainder:
             sizes.add(remainder)
-        prior_recompile_limit = torch._dynamo.config.recompile_limit
-        torch._dynamo.config.recompile_limit = max(prior_recompile_limit, 64)
-        try:
-            self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
-        finally:
-            torch._dynamo.config.recompile_limit = prior_recompile_limit
+        self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
 
     def _body(self, state: CapturedEval) -> None:
         n_passes = 2 if self.model.cfg.feedback_active else 1
