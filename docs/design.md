@@ -216,7 +216,7 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   CCE classifier gradient) and every large projection accumulate into directly
   from backward, so no weight gradient is materialized apart from its
   accumulator and those parameters hand autograd no gradient at all;
-- the pinned FLA PKDA chunk kernel retaining its WY and chunk-state
+- the workspace FLA fork's PKDA chunk kernel retaining its WY and chunk-state
   intermediates for backward, one GEMM over the concatenated Q/K/V weights and
   one fused causal-convolution launch per PKDA layer, and fused PKDA output
   norm/gate;
@@ -228,9 +228,9 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   query and null gradients from FP32 per-program partials;
 - an address-stable, non-checkpoint BF16 classifier shadow refreshed from its
   FP32 tied-embedding master once per optimizer update;
-- pinned current cut cross-entropy with BF16 operands, capture-safe fixed-shape
-  no-ignore preprocessing, and its native differentiable log-partition output
-  for the exact squared-log-partition gradient;
+- the workspace cut-cross-entropy fork with BF16 operands, capture-safe
+  fixed-shape no-ignore preprocessing, and its native differentiable
+  log-partition output for the exact squared-log-partition gradient;
 - the Triton PKDA control-gradient packer;
 - fixed-shape, exhaustive Inductor autotuning for compiled global-attention
   blocks and segmented PKDA blocks around the opaque FLA recurrence;

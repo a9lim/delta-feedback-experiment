@@ -179,9 +179,9 @@ zero-initialized bias.
 
 ### Training and decoding state
 
-CUDA training and long-prompt prefill use the pinned upstream FLA chunk
-operator at chunk size 64 with backward recomputation. CPU and MPS execute the
-literal recurrence. CUDA never silently substitutes the sequential fallback.
+CUDA training and long-prompt prefill use the workspace FLA fork's chunk
+operator at chunk size 64. CPU and MPS execute the literal recurrence. CUDA
+never silently substitutes the sequential fallback.
 
 Autoregressive decoding continues, per PKDA layer:
 
