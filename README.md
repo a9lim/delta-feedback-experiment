@@ -38,7 +38,7 @@ screen job is active, and there are no accepted experiment findings.
 
 The 230–258M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
-runs remain serial because the full v15 DF graph pool reserves 22.97 GiB on
+runs remain serial because the full v15 DF graph pool reserves 22.99 GiB on
 its 24 GiB RTX 4090.
 
 The realized Jobe token store is a 35.000B-token prefix of the pinned stream.
