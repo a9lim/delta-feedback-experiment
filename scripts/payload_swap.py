@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 from pathlib import Path
 
 import torch
@@ -75,7 +76,18 @@ def main() -> None:
     model = DFModel(cfg)
     model.load_state_dict(payload["state"])
     model = model.to(device).eval()
+    # CUDA cross-entropy reads the BF16 classifier shadow that the trainer
+    # refreshes after every update; analysis must prepare it once itself.
+    model.refresh_shadows()
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
+
+    # The CUDA loss path reads BF16 operands, exactly like the trainer's
+    # captured evaluation; portable devices stay in FP32.
+    autocast = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else contextlib.nullcontext()
+    )
 
     @torch.no_grad()
     def losses() -> tuple[float, float]:
@@ -86,8 +98,9 @@ def main() -> None:
                 first, min(args.micro_rows, args.rows - first), device
             )
             prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
-            outs = multipass(model, rows, 2, prefix_lens=prefix)
-            _, per_pass = multipass_loss(model, rows, outs)
+            with autocast:
+                outs = multipass(model, rows, 2, prefix_lens=prefix)
+                _, per_pass = multipass_loss(model, rows, outs)
             sums[0] += per_pass[0].item()
             sums[1] += per_pass[1].item()
             batches += 1

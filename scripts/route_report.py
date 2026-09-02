@@ -20,6 +20,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 from pathlib import Path
 
@@ -55,7 +56,9 @@ def load_model(path: Path, device) -> tuple[DFModel, dict]:
     )
     model = DFModel(cfg)
     model.load_state_dict(payload["state"])
-    return model.to(device).eval(), saved
+    model = model.to(device).eval()
+    model.refresh_shadows()
+    return model, saved
 
 
 def site_names(layers: int) -> list[str]:
@@ -80,11 +83,18 @@ def collect(model, data_val, device, rows: int, micro: int):
     final_source_names: dict[int, tuple[str, ...]] = {}
     route_source_names: dict[tuple[int, str], tuple[str, ...]] = {}
     counted = 0
+    # Match the trainer's evaluation numerics: BF16 activations on CUDA.
+    autocast = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else contextlib.nullcontext()
+    )
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
         n = batch.shape[0]
         prefix = torch.ones((1, n), dtype=torch.long, device=device)
-        outs = multipass(model, batch, 2, prefix_lens=prefix, want_weights=True)
+        with autocast:
+            outs = multipass(model, batch, 2, prefix_lens=prefix, want_weights=True)
         for p, out in enumerate(outs):
             values = torch.stack(out.sources)  # [N, B, T, D]
             rms = values.float().pow(2).mean(-1).sqrt().mean((1, 2)).cpu() * n
