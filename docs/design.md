@@ -141,7 +141,7 @@ Every scale uses 327,680 predicted tokens per optimizer update:
 All arms use the NorMuonH/NAdam partition and defaults in
 [architecture.md](architecture.md). After all microbatches—and, for
 distributed runs, all ranks—have accumulated, the single global FP32 gradient
-vector is clipped to L2 norm 1.0 immediately before both optimizer steps.
+vector is clipped to L2 norm 3.0 immediately before both optimizer steps.
 Telemetry reports the pre-clip norm. Equal optimizer steps are matched-data,
 not matched-compute, comparisons.
 
@@ -177,7 +177,7 @@ penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 
 ### WSD schedule
 
-Both optimizer learning rates use one warmup-stable-cooldown multiplier.
+All three parameter-group learning rates use one warmup-stable-cooldown multiplier.
 Warmup and cooldown occupy `round(warmup_frac * steps)` and
 `round(cooldown_frac * steps)` updates. Their defaults are 0.02 and 0.20.
 Warmup rises linearly to the stable rate. For local cooldown progress `u` in
@@ -310,11 +310,12 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v20, and only v20 is resumable. V16-v19
+New snapshots use checkpoint contract v21, and only v21 is resumable. V16-v20
 snapshots remain readable for evaluation and forks but cannot be continued:
 v16 used different feedback-prefix draws, v16-v17 predate the Nesterov
 NorMuonH update, v16-v18 predate NAdam, and v19 stores the retired fixed-step
-warmup contract. A snapshot contains the model,
+warmup contract. V20 predates the split NAdam rates and the 3.0 gradient clip.
+A snapshot contains the model,
 both optimizer states, fixed
 NorMuonH radii, state-defining arguments, cumulative step, and
 Python/Torch/CUDA RNG state. A resume inherits every state-defining field and

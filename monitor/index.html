@@ -32,7 +32,7 @@
   <div class="chart"><h2>NLL <small>nats · solid train loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
 </div>
 <div class="grid two">
-  <div class="chart"><h2>Hyperball learning rate <small>dimensionless NorMuonH relative step; NAdam follows WSD</small></h2><div class="plot" id="p-lr"></div></div>
+  <div class="chart"><h2>learning rates <small>NorMuonH · embedding/readout NAdam · remaining NAdam</small></h2><div class="plot" id="p-lr"></div></div>
   <div class="chart"><h2>gradient norm <small>global L2 before update</small></h2><div class="plot" id="p-gnorm"></div></div>
 </div>
 <div class="grid two">
@@ -71,14 +71,16 @@ const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         state, runFor } = M;
 
 // ---------------------------------------------------------------- records
-// step: loss/pass1/k/lr_h/gnorm/tok_s/mem/elapsed.  eval: val (+val_fused on
+// step: loss/pass1/k/three learning rates/gnorm/tok_s/mem/elapsed.  eval: val (+val_fused on
 // feedback arms).  route: per-site weights at eval cadence.  contract: the
 // standing contraction diagnostic.  Non-step series live in run.evals so the
 // chassis's resume-fold rewinds them with everything else.
 function onStep(run, rec) {
   return {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k),
-    lr_h: num(rec.lr_h), gnorm: num(rec.gnorm),
+    lr_normuonh: num(rec.lr_normuonh ?? rec.lr_h),
+    lr_embedding: num(rec.lr_embedding), lr_nadam: num(rec.lr_nadam),
+    gnorm: num(rec.gnorm),
     tok_s: num(rec.tok_s), mem: num(rec.mem), elapsed: num(rec.elapsed),
   };
 }
@@ -131,7 +133,7 @@ function renderTiles(view) {
     tile('elapsed', fmtDuration(elapsed), began != null ? `began ${fmtWhen(began)}` : ''),
     tile('loss', fmt(last.loss), `pass1 ${fmt(last.pass1)} · k ${last.k ?? '–'}`),
     tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `fused ${fmt(lastVal.val_fused)} · @ ${lastVal.step.toLocaleString()}` : arm === 'vanilla' || arm === 'mhdb' ? 'no feedback arm' : ''),
-    tile('lr H', fmt(last.lr_h, 3), `gnorm ${fmt(last.gnorm, 3)}`),
+    tile('lr NorMuonH', fmt(last.lr_normuonh, 3), `gnorm ${fmt(last.gnorm, 3)}`),
     tile('memory', `${fmt(last.mem, 3)} <small>GiB</small>`, `${last.tok_s != null ? Math.round(last.tok_s).toLocaleString() : '–'} tok/s`),
     gpuTile(live),
     tile('updated', fmtAge(age), `${esc(status)}${activeHere && state.active.phase ? ' · ' + esc(state.active.phase) : ''}`, live ? 'ok' : (/KILLED|FAILED/.test(status) ? 'bad' : '')),
@@ -142,7 +144,7 @@ function renderTiles(view) {
 const CONFIG_GROUPS = [
   ['arm & seeds', ['arm', 'seed', 'data_seed']],
   ['trunk', ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
-  ['optimizer', ['lr_h', 'lr_nadam', 'zloss']],
+  ['optimizer', ['lr_normuonh', 'lr_embedding', 'lr_nadam', 'lr_h', 'zloss']],
   ['feedback', ['feedback_start', 'feedback_batch_prob', 'three_pass', 'jitter']],
   ['batch', ['batch_rows', 'micro_rows']],
 ];
@@ -203,8 +205,15 @@ function rebuild() {
     yScale: yLog, bands: () => bandsOf(primary()), forks,
   });
   makeChart('p-lr', {
-    series: [line('lr H', P.s1, { value: (u, v) => fmt(v, 3) }),
-      ...ovs.map((t, i) => line(`lr H · ${t}`, hue(i), { value: (u, v) => fmt(v, 3) }))],
+    series: [
+      line('NorMuonH', P.s1, { value: (u, v) => fmt(v, 3) }),
+      dashed('embedding', P.s1), dotted('NAdam', P.s1),
+      ...ovs.flatMap((t, i) => [
+        line(`NorMuonH · ${t}`, hue(i), { value: (u, v) => fmt(v, 3) }),
+        dashed(`embedding · ${t}`, hue(i)), dotted(`NAdam · ${t}`, hue(i)),
+      ]),
+    ],
+    yScale: { distr: 3, log: 10, range: tightLogRange },
     bands: () => bandsOf(primary()), forks,
   });
   makeChart('p-gnorm', {
@@ -261,7 +270,12 @@ function seriesOf(view) {
   return {
     nll: [[xs, steps.map((s) => s.loss), steps.map((s) => s.pass1)]],
     val: [[vals.map((e) => e.step), vals.map((e) => e.val), vals.map((e) => e.val_fused)]],
-    lr_h: [[xs, steps.map((s) => s.lr_h)]],
+    lr: [[
+      xs,
+      steps.map((s) => s.lr_normuonh),
+      steps.map((s) => s.lr_embedding),
+      steps.map((s) => s.lr_nadam),
+    ]],
     gnorm: [[xs, steps.map((s) => s.gnorm)]],
     route: [at(sites.payload, 'max'), at(sites.attn, 'max'), at(sites.mlp, 'max')],
     seed: [at(sites.payload, 'seed'), at(sites.attn, 'seed'), at(sites.mlp, 'seed')],
@@ -283,7 +297,7 @@ function render(view) {
   const vals = view.evals.get('val') || [];
   setData('p-nll', join(merged.nll), lastX);
   setData('p-val', join(merged.val), vals.length ? vals[vals.length - 1].step : null);
-  setData('p-lr', join(merged.lr_h), lastX);
+  setData('p-lr', join(merged.lr), lastX);
   setData('p-gnorm', join(merged.gnorm), lastX);
   setData('p-route', join(merged.route), lastX);
   setData('p-seed', join(merged.seed), lastX);

@@ -520,7 +520,8 @@ def cuda_gate() -> None:
     )
     optimizers = build_optimizers(
         model,
-        lr_h=args.lr_h,
+        lr_normuonh=args.lr_normuonh,
+        lr_embedding=args.lr_embedding,
         lr_nadam=args.lr_nadam,
     )
     model.refresh_shadows()
@@ -555,7 +556,7 @@ def cuda_gate() -> None:
     started = time.monotonic()
     runner = CudaGraphTrainer(model, optimizers, args, schedule)
     nadam = optimizers[1]
-    if not nadam.param_groups[0]["foreach"] or nadam.param_groups[0]["capturable"]:
+    if any(not group["foreach"] or group["capturable"] for group in nadam.param_groups):
         raise AssertionError("CUDA NAdam is not using the qualified foreach path")
     if not nadam.state or any(
         state["step"].item() != 0 or state["mu_product"].item() != 1

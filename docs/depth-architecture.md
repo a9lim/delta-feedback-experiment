@@ -317,7 +317,7 @@ backpropagation through the last iterations is excluded.
 Optimizer ownership follows `architecture.md`: the tied core's matrices are
 NorMuonH parameters whose gradients sum across iterations and passes, with
 one fixed Hyperball radius each. The global FP32 gradient is clipped to norm
-1.0 before both steps.
+3.0 before both steps.
 
 Execution keeps the whole-step capture of `design.md`: one fixed-address
 train CUDA graph per reachable `(pass count, r)` pair, twenty-four at the
@@ -486,7 +486,7 @@ Registering `df-loop` changes the following together:
   and `r_max`; `ColumnOutput` gains the write bank and `forward_column` takes
   a per-position plain mask and a previous bank; `AGENTS.md` and `README.md`
   state six arms.
-- Checkpoint contract v20 with `r_mean`, `r_max`, and the `r` sub-stream as
+- Checkpoint contract v22 with `r_mean`, `r_max`, and the `r` sub-stream as
   state-defining fields; realized `r` and cell-tokens in the run log.
 - The workspace FLA fork gains the fused-position PKDA operator, forward and
   backward; the gated GQA layer gains the two-piece merge; the router gains

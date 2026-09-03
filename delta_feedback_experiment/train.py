@@ -39,6 +39,7 @@ from .model import (
     multipass_loss,
 )
 from .optim import (
+    DEFAULT_EMBEDDING_LR,
     DEFAULT_NADAM_LR,
     DEFAULT_NORMUONH_LR,
     OptimizerPair,
@@ -47,10 +48,10 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=20, resumable=frozenset({20}), surface_version=16
+    version=21, resumable=frozenset({21}), surface_version=16
 )
 
-GRAD_CLIP_NORM = 1.0
+GRAD_CLIP_NORM = 3.0
 """Global FP32 gradient-norm ceiling shared by every registered run."""
 
 EXACT_FIELDS = (
@@ -65,7 +66,8 @@ EXACT_FIELDS = (
     "cooldown_frac",
     "feedback_start",
     "three_pass",
-    "lr_h",
+    "lr_normuonh",
+    "lr_embedding",
     "lr_nadam",
     "jitter",
     "zloss",
@@ -167,16 +169,22 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument("--micro-rows", type=int, default=4)
     recipe.add_argument("--seq-len", type=int, default=1024)
     recipe.add_argument(
-        "--lr-h",
+        "--lr-normuonh",
         type=float,
         default=DEFAULT_NORMUONH_LR,
         help="dimensionless NorMuonH relative step (default: 0.02)",
     )
     recipe.add_argument(
+        "--lr-embedding",
+        type=float,
+        default=DEFAULT_EMBEDDING_LR,
+        help="tied embedding/readout NAdam learning rate (default: 0.00045)",
+    )
+    recipe.add_argument(
         "--lr-nadam",
         type=float,
         default=DEFAULT_NADAM_LR,
-        help="NAdam learning rate (default: 0.0005)",
+        help="non-embedding NAdam learning rate (default: 0.0003)",
     )
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -903,7 +911,12 @@ def train(argv: list[str] | None = None) -> dict:
             max_seq_len=args.seq_len + 1,
         )
     ).to(device)
-    optimizers = build_optimizers(model, lr_h=args.lr_h, lr_nadam=args.lr_nadam)
+    optimizers = build_optimizers(
+        model,
+        lr_normuonh=args.lr_normuonh,
+        lr_embedding=args.lr_embedding,
+        lr_nadam=args.lr_nadam,
+    )
     pair = OptimizerPair(optimizers)
 
     if payload is not None:
@@ -968,7 +981,7 @@ def train(argv: list[str] | None = None) -> dict:
     try:
         for step in range(start_step + 1, end_step + 1):
             snapshot_writer.poll()
-            lr_h = apply_schedule(optimizers, schedule, step)
+            learning_rates = apply_schedule(optimizers, schedule, step)
             phase = schedule.phase(step)[0]
             z_coef = args.zloss if phase == "cooldown" else 0.0
             n_passes = 1
@@ -1036,7 +1049,9 @@ def train(argv: list[str] | None = None) -> dict:
                 "loss": telemetry.format_metric(step_loss),
                 "pass1": telemetry.format_metric(pass1_loss),
                 "k": n_passes,
-                "lr_h": telemetry.format_metric(lr_h),
+                "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
+                "lr_embedding": telemetry.format_metric(learning_rates["embedding"]),
+                "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
                 "gnorm": telemetry.format_metric(grad_norm),
                 "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
                 "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),

@@ -60,8 +60,9 @@ a contract changes.
 - NorMuonH owns ordinary hidden matrices and uses the released NorMuon
   Nesterov blend before orthogonalization; NAdam owns semantic-scale gates,
   embeddings, norms, routing parameters, PKDA controls, convolutions, and
-  vectors. No group uses weight decay. Clip the global FP32 gradient to norm
-  1.0 immediately before both steps.
+  vectors, with the tied embedding/readout isolated in its own NAdam rate
+  group. No group uses weight decay. Clip the global FP32 gradient to norm 3.0
+  immediately before both steps.
 
 ## Evidence discipline
 
@@ -84,8 +85,8 @@ a contract changes.
 - Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
   monitor serving, and spool orchestration from the workspace root package.
 - Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified DF graph pool reserves 22.98 GiB. New snapshots are v20;
-  only v20 resumes, and v16-v19 stay readable for evaluation and forks.
+  the qualified DF graph pool reserves 22.98 GiB. New snapshots are v21;
+  only v21 resumes, and v16-v20 stay readable for evaluation and forks.
 - Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
   The queue stores arguments rather than Git state; a worker refreshes before
   the next job and runs the current checkout's probe.

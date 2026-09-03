@@ -127,11 +127,13 @@ of updates and the `1 - sqrt(u)` cooldown occupies the final 20%. Feedback
 starts independently at three quarters of the schedule, and every later step
 draws two or three passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
-streams. The global FP32 gradient is clipped to norm 1.0 before the shared
-NorMuonH/NAdam update. Both sides apply their specified Nesterov construction:
+streams. The global FP32 gradient is clipped to norm 3.0 before the shared
+NorMuonH/NAdam update. NorMuonH uses a `2e-2` stable rate; the tied
+embedding/readout and remaining NAdam parameters use `4.5e-4` and `3e-4`.
+Both sides apply their specified Nesterov construction:
 NorMuonH before orthogonalization and NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v20, and only v20 is resumable. V16-v19
+Snapshots use checkpoint contract v21, and only v21 is resumable. V16-v20
 remain readable for evaluation and forks; v19 retains the retired fixed-step
 warmup contract.
 Protected snapshots persist at the cooldown boundary, the
