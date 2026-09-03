@@ -122,16 +122,18 @@ leaves the active run and worker untouched; it is the complement of `df stop
 live`, which stops only the active run and preserves the pending queue.
 
 The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024 predictions
-per row: 3,520,921,600 predicted tokens. Feedback starts at three quarters of
-the schedule, with the cooldown, and every later step draws two or three
-passes. Every arm sees the same addressed
+per row: 3,520,921,600 predicted tokens. Linear warmup occupies the first 2%
+of updates and the `1 - sqrt(u)` cooldown occupies the final 20%. Feedback
+starts independently at three quarters of the schedule, and every later step
+draws two or three passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 1.0 before the shared
 NorMuonH/NAdam update. Both sides apply their specified Nesterov construction:
 NorMuonH before orthogonalization and NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v19, and only v19 is resumable. V16-v18
-remain readable for evaluation and forks but predate the NAdam update.
+Snapshots use checkpoint contract v20, and only v20 is resumable. V16-v19
+remain readable for evaluation and forks; v19 retains the retired fixed-step
+warmup contract.
 Protected snapshots persist at the cooldown boundary, the
 feedback boundary, and the end of the run.
 `--max-steps` limits the current invocation without changing the registered

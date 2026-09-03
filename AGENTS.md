@@ -5,8 +5,9 @@ latent recurrence on a common PKDA/gated-GQA hybrid. The primary factorial is
 `{base, mhdb, fbt, df}`; pure-GQA `vanilla` is the external trunk control.
 
 No run is complete under the current screen contract. The unregistered
-full-feedback diagnostic `screen-df-fullN-s1` is active on Jobe; the earlier
-`screen-df-s1` run used the superseded mixed-heat recipe. Keep
+full-feedback diagnostic `screen-df-fullN-s1` is active on Jobe under the
+non-resumable v19 contract; the earlier `screen-df-s1` run used the superseded
+mixed-heat recipe. Keep
 [docs/findings.md](docs/findings.md) empty of architecture claims until a
 matched comparison is admissible.
 
@@ -83,8 +84,8 @@ a contract changes.
 - Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
   monitor serving, and spool orchestration from the workspace root package.
 - Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified DF graph pool reserves 22.98 GiB. New snapshots are v19;
-  only v19 resumes, and v16-v18 stay readable for evaluation and forks.
+  the qualified DF graph pool reserves 22.98 GiB. New snapshots are v20;
+  only v20 resumes, and v16-v19 stay readable for evaluation and forks.
 - Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
   The queue stores arguments rather than Git state; a worker refreshes before
   the next job and runs the current checkout's probe.

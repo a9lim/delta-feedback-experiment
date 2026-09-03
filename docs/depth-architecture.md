@@ -446,8 +446,8 @@ the same 8xH100 DDP target with every block checkpointed on every pass.
 | Global batch | 327,680 predictions |
 | Optimizer steps | 675,523 |
 | Exact aligned budget | 221,355,376,640 predicted tokens (400.000377 per active parameter) |
-| Warmup / stable heat / cooldown | steps 1–200 / 201–506,642 / 506,643–675,523 |
-| Feedback boundary | after step 506,642, with the cooldown |
+| Warmup / stable heat / cooldown | steps 1–13,510 / 13,511–540,418 / 540,419–675,523 |
+| Feedback boundary | after step 506,642 |
 | Expected pass-tokens | approximately 283.3B |
 | Expected cell-tokens | approximately 4.97T |
 

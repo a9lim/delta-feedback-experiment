@@ -47,7 +47,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=19, resumable=frozenset({19}), surface_version=16
+    version=20, resumable=frozenset({20}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 1.0
@@ -61,7 +61,7 @@ EXACT_FIELDS = (
     "batch_rows",
     "micro_rows",
     "steps",
-    "warmup_steps",
+    "warmup_frac",
     "cooldown_frac",
     "feedback_start",
     "three_pass",
@@ -129,15 +129,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     schedule = parser.add_argument_group("schedule (state-defining)")
     schedule.add_argument("--steps", type=runs.parse_step_count, default=10745)
-    schedule.add_argument("--warmup-steps", type=int, default=200)
-    schedule.add_argument("--cooldown-frac", type=float, default=0.25)
+    schedule.add_argument(
+        "--warmup-frac",
+        type=probability,
+        default=0.02,
+        help="fraction of total steps used for linear learning-rate warmup",
+    )
+    schedule.add_argument(
+        "--cooldown-frac",
+        type=probability,
+        default=0.2,
+        help="fraction of total steps used for 1-sqrt learning-rate cooldown",
+    )
     schedule.add_argument(
         "--feedback-start",
         type=probability,
         default=0.75,
         help=(
             "fraction of steps before feedback passes begin; every later step "
-            "draws two or three passes (default: the cooldown boundary)"
+            "draws two or three passes"
         ),
     )
     schedule.add_argument(
@@ -799,16 +809,17 @@ def build_schedule(args) -> Schedule:
     """WSD as the shared four-phase Schedule (no preheat), with ratio
     nudges so integer spans land exactly."""
     total = args.steps
+    warmup = round(args.warmup_frac * total)
     cooldown = round(args.cooldown_frac * total)
-    heat = total - args.warmup_steps - cooldown
+    heat = total - warmup - cooldown
     if heat < 1:
         raise ValueError(f"steps={total} leaves no stable phase")
     schedule = Schedule(
         heat=heat,
-        warmup=(args.warmup_steps + 1e-9) / heat,
+        warmup=(warmup + 1e-9) / heat,
         cooldown=(cooldown + 1e-9) / heat,
     )
-    assert schedule.warmup_steps == args.warmup_steps
+    assert schedule.warmup_steps == warmup
     assert schedule.cooldown_steps == cooldown
     assert schedule.total == total
     return schedule

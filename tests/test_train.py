@@ -80,8 +80,8 @@ TINY_ARGS = [
     "2",
     "--steps",
     "8",
-    "--warmup-steps",
-    "2",
+    "--warmup-frac",
+    "0.25",
     "--cooldown-frac",
     "0.25",
     "--feedback-start",
@@ -302,8 +302,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 1.0
-    assert CONTRACT.version == 19
-    assert CONTRACT.resumable == frozenset({19})
+    assert CONTRACT.version == 20
+    assert CONTRACT.resumable == frozenset({20})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -468,14 +468,15 @@ def test_build_schedule_screen_shape():
     assert args.batch_rows == 320
     assert args.batch_rows // args.micro_rows == 80
     schedule = build_schedule(args)
-    assert schedule.spans == (200, 0, 7859, 2686)
+    assert schedule.spans == (215, 0, 8381, 2149)
     assert schedule.total == 10745
-    assert schedule.phase(200)[0] == "warmup"
-    assert schedule.phase(201)[0] == "heat"
-    assert schedule.phase(8060)[0] == "cooldown"
-    assert schedule.rate_at(8059, 1.0) == 1.0
+    assert schedule.phase(215)[0] == "warmup"
+    assert schedule.phase(216)[0] == "heat"
+    assert schedule.phase(8597)[0] == "cooldown"
+    assert schedule.rate_at(8596, 1.0) == 1.0
     assert schedule.rate_at(10745, 1.0) < 1e-6
-    assert feedback_boundary(args, schedule.total) == schedule.heat_end == 8059
+    assert feedback_boundary(args, schedule.total) == 8059
+    assert schedule.heat_end == 8596
 
 
 def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
@@ -489,14 +490,22 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
 
     prime = build_parser().parse_args(["x", "--steps", "171909"])
     schedule = build_schedule(prime)
-    assert schedule.spans == (200, 0, 128_732, 42_977)
-    assert feedback_boundary(prime, schedule.total) == schedule.heat_end == 128_932
+    assert schedule.spans == (3438, 0, 134_089, 34_382)
+    assert feedback_boundary(prime, schedule.total) == 128_932
+    assert schedule.heat_end == 137_527
 
 
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
     assert args.lr_h == DEFAULT_NORMUONH_LR == 2e-2
     assert args.lr_nadam == DEFAULT_NADAM_LR == 5e-4
+    assert args.warmup_frac == 0.02
+    assert args.cooldown_frac == 0.2
+
+
+def test_fixed_warmup_steps_flag_is_removed():
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", "--warmup-steps", "200"])
 
 
 def test_log_every_flag_is_removed():
@@ -512,7 +521,7 @@ def test_legacy_optimizer_flags_are_removed(flag):
 
 @pytest.mark.parametrize(
     "flag",
-    ["--feedback-start", "--three-pass"],
+    ["--warmup-frac", "--cooldown-frac", "--feedback-start", "--three-pass"],
 )
 @pytest.mark.parametrize("value", ["-0.1", "1.1", "nan", "inf"])
 def test_pass_probabilities_reject_values_outside_unit_interval(flag, value):
@@ -624,12 +633,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", [9, 10, 11, 12, 13, 14, 15, 16, 17, 18])
+@pytest.mark.parametrize("version", range(9, 20))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[19\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[20\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 

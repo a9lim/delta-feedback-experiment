@@ -154,7 +154,7 @@ function renderConfig(run) {
     // Once the resolved schedule is present, its address and phase lengths
     // supersede the raw step/warmup/cooldown inputs below.
     if (run.meta.schedule) {
-      for (const key of ['steps', 'warmup_steps', 'cooldown_frac']) used.add(key);
+      for (const key of ['steps', 'warmup_frac', 'cooldown_frac']) used.add(key);
     }
     for (const [title, keys] of CONFIG_GROUPS) {
       const fields = {};

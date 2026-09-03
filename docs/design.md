@@ -177,25 +177,27 @@ penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 
 ### WSD schedule
 
-Both optimizer learning rates use one warmup-stable-cooldown multiplier. The
-warmup rises linearly to the stable rate. For local cooldown progress `u` in
+Both optimizer learning rates use one warmup-stable-cooldown multiplier.
+Warmup and cooldown occupy `round(warmup_frac * steps)` and
+`round(cooldown_frac * steps)` updates. Their defaults are 0.02 and 0.20.
+Warmup rises linearly to the stable rate. For local cooldown progress `u` in
 `(0, 1]`, the multiplier is `1 - sqrt(u)` and therefore reaches zero at the
 terminal step. The default 10,745-step Jobe schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
-| Warmup | 1–200 | one pass |
-| Stable heat | 201–8,059 | one pass |
-| Cooldown | 8,060–10,745 | feedback arms draw 2 or 3 passes |
+| Warmup | 1–215 | one pass |
+| Stable heat | 216–8,596 | one pass through 8,059; then feedback arms draw 2 or 3 passes |
+| Cooldown | 8,597–10,745 | feedback arms draw 2 or 3 passes |
 
-The feedback boundary is `round(feedback_start * steps)`, by default three
-quarters of the schedule, which coincides with the cooldown boundary. Before
-it every step is one pass. After it there are no one-pass steps: each step
-draws three passes with probability `three_pass = 0.12` and two passes
+The feedback boundary is `round(feedback_start * steps)`, independently of
+the learning-rate phases, and defaults to three quarters of the schedule.
+Before it every step is one pass. After it there are no one-pass steps: each
+step draws three passes with probability `three_pass = 0.12` and two passes
 otherwise, so the fused mode is trained on every update rather than eroded
 between feedback steps. Across the full run this targets 75% / 22% / 3% and
-an expected feedback-arm compute multiplier of 1.28 pass-tokens per
-predicted token. Exact realized pass-tokens are recorded.
+an expected feedback-arm compute multiplier of 1.28 pass-tokens per predicted
+token. Exact realized pass-tokens are recorded.
 
 `--max-steps` caps additional steps in one process. It never rescales the
 schedule, feedback boundary, protected checkpoints, or any state-defining
@@ -308,10 +310,11 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v19, and only v19 is resumable. V16-v18
+New snapshots use checkpoint contract v20, and only v20 is resumable. V16-v19
 snapshots remain readable for evaluation and forks but cannot be continued:
 v16 used different feedback-prefix draws, v16-v17 predate the Nesterov
-NorMuonH update, and all three predate NAdam. A snapshot contains the model,
+NorMuonH update, v16-v18 predate NAdam, and v19 stores the retired fixed-step
+warmup contract. A snapshot contains the model,
 both optimizer states, fixed
 NorMuonH radii, state-defining arguments, cumulative step, and
 Python/Torch/CUDA RNG state. A resume inherits every state-defining field and
@@ -436,9 +439,9 @@ The fresh WSD schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
-| Warmup | 1–200 | one pass |
-| Stable heat | 201–128,932 | one pass |
-| Cooldown | 128,933–171,909 | feedback arms draw 2 or 3 passes |
+| Warmup | 1–3,438 | one pass |
+| Stable heat | 3,439–137,527 | one pass through 128,932; then feedback arms draw 2 or 3 passes |
+| Cooldown | 137,528–171,909 | feedback arms draw 2 or 3 passes |
 
 The pair consumes 112.662B predicted tokens and approximately 128.435B
 expected pass-tokens. It tests only the complete DF package against its shared
@@ -477,10 +480,10 @@ tokens per active non-embedding parameter before batch alignment.
 | Unrounded target | 440,818,598,400 predicted tokens |
 | Optimizer steps | 1,345,272 |
 | Exact aligned budget | 440,818,728,960 predicted tokens |
-| Warmup | steps 1–200 |
-| Stable heat | steps 201–1,008,954 |
-| Cooldown | steps 1,008,955–1,345,272 |
-| Feedback boundary | after step 1,008,954, with the cooldown |
+| Warmup | steps 1–26,905 |
+| Stable heat | steps 26,906–1,076,218 |
+| Cooldown | steps 1,076,219–1,345,272 |
+| Feedback boundary | after step 1,008,954 |
 | Whole-run pass mixture | expected 75% / 22% / 3% |
 | Expected compute | approximately 564.248B pass-tokens |
 

@@ -288,7 +288,7 @@ pass-1 factorial stands on its own.
 
 ### Options (a9 chose option 1 the same day)
 
-Landed: `--feedback-start` defaults to 0.75 (the cooldown boundary),
+Landed: `--feedback-start` defaults to 0.75,
 `--feedback-batch-prob` is removed so every feedback-phase step draws two or
 three passes (`three_pass` = 0.12), protected snapshots persist at the
 cooldown and feedback boundaries, and the checkpoint contract is v16. The
