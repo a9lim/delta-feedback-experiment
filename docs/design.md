@@ -141,7 +141,7 @@ Every scale uses 327,680 predicted tokens per optimizer update:
 All arms use the NorMuonH/NAdam partition and defaults in
 [architecture.md](architecture.md). After all microbatches—and, for
 distributed runs, all ranks—have accumulated, the single global FP32 gradient
-vector is clipped to L2 norm 3.0 immediately before both optimizer steps.
+vector is clipped to L2 norm 10.0 immediately before both optimizer steps.
 Telemetry reports the pre-clip norm. Equal optimizer steps are matched-data,
 not matched-compute, comparisons.
 
@@ -314,7 +314,8 @@ New snapshots use checkpoint contract v22, and only v22 is resumable. V16-v21
 snapshots remain readable for evaluation and forks but cannot be continued:
 v16 used different feedback-prefix draws, v16-v17 predate the Nesterov
 NorMuonH update, v16-v18 predate NAdam, and v19 stores the retired fixed-step
-warmup contract. V20 predates the split NAdam rates and the 3.0 gradient clip.
+warmup contract. V20 predates the split NAdam rates and the global clipping
+contract.
 V21 predates inverse-square-root fan-in initialization of NorMuonH matrices. A
 snapshot contains the model,
 both optimizer states, fixed

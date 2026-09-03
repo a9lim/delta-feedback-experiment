@@ -317,7 +317,7 @@ backpropagation through the last iterations is excluded.
 Optimizer ownership follows `architecture.md`: the tied core's matrices are
 NorMuonH parameters whose gradients sum across iterations and passes, with
 one fixed Hyperball radius each. The global FP32 gradient is clipped to norm
-3.0 before both steps.
+10.0 before both steps.
 
 Execution keeps the whole-step capture of `design.md`: one fixed-address
 train CUDA graph per reachable `(pass count, r)` pair, twenty-four at the

@@ -63,7 +63,7 @@ a contract changes.
   NAdam owns semantic-scale gates, embeddings, norms, routing parameters, PKDA
   controls, convolutions, and vectors, with the tied embedding/readout isolated
   in its own NAdam rate group. No group uses weight decay. Clip the global FP32
-  gradient to norm 3.0 immediately before both steps.
+  gradient to norm 10.0 immediately before both steps.
 
 ## Evidence discipline
 

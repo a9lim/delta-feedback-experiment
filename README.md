@@ -127,7 +127,7 @@ of updates and the `1 - sqrt(u)` cooldown occupies the final 20%. Feedback
 starts independently at three quarters of the schedule, and every later step
 draws two or three passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
-streams. The global FP32 gradient is clipped to norm 3.0 before the shared
+streams. The global FP32 gradient is clipped to norm 10.0 before the shared
 NorMuonH/NAdam update. NorMuonH uses a `2e-2` stable rate; the tied
 embedding/readout and remaining NAdam parameters use `6e-4` and `3e-4`.
 Both sides apply their specified Nesterov construction:

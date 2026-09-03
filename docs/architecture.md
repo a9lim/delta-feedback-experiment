@@ -446,7 +446,7 @@ graphs; its scalar step and momentum-product state stay on CPU, while both
 moment tensors and all parameters remain FP32 on-device.
 
 After synchronized microbatch accumulation, the single global FP32 gradient
-vector is clipped to L2 norm 3.0 immediately before both optimizer steps. The
+vector is clipped to L2 norm 10.0 immediately before both optimizer steps. The
 reported gradient norm is the pre-clip norm, and a non-finite norm terminates
 the run.
 

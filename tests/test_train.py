@@ -303,14 +303,14 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
 
     preclip = clip_gradients([first, second])
 
-    assert GRAD_CLIP_NORM == 3.0
+    assert GRAD_CLIP_NORM == 10.0
     assert CONTRACT.version == 22
     assert CONTRACT.resumable == frozenset({22})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
-    assert clipped.norm().item() == pytest.approx(3.0)
-    assert clipped.tolist() == pytest.approx([9 / 13, 12 / 13, 36 / 13])
+    assert clipped.norm().item() == pytest.approx(10.0)
+    assert clipped.tolist() == pytest.approx([30 / 13, 40 / 13, 120 / 13])
 
 
 def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
