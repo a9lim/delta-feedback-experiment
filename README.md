@@ -33,10 +33,11 @@ separate whole-trunk control.
 ## Status
 
 No run is complete under the current screen contract: all ten registered
-runs are pending, no screen job is active, and there are no accepted
-experiment findings. The earlier `screen-df-s1` run used the superseded
-mixed-heat feedback recipe and is retained only as a diagnostic checkpoint;
-its examination is in [docs/journal.md](docs/journal.md).
+runs are pending, and there are no accepted experiment findings. The
+unregistered full-feedback diagnostic `screen-df-fullN-s1` is active on Jobe.
+The earlier `screen-df-s1` run used the superseded mixed-heat feedback recipe
+and is retained only as a diagnostic checkpoint; its examination is in
+[docs/journal.md](docs/journal.md).
 
 The 230–258M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe

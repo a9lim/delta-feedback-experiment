@@ -178,7 +178,9 @@ penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 ### WSD schedule
 
 Both optimizer learning rates use one warmup-stable-cooldown multiplier. The
-default 10,745-step Jobe schedule is:
+warmup rises linearly to the stable rate. For local cooldown progress `u` in
+`(0, 1]`, the multiplier is `1 - sqrt(u)` and therefore reaches zero at the
+terminal step. The default 10,745-step Jobe schedule is:
 
 | Phase | Steps | Pass behavior |
 |---|---:|---|
