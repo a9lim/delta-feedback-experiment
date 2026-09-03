@@ -14,6 +14,7 @@ import torch
 
 from delta_feedback_experiment.model import (
     ARMS,
+    BASE_NORMAL_INIT_STD,
     DFModel,
     KVCache,
     arm_config,
@@ -196,6 +197,36 @@ def test_factorial_initialization_is_paired_by_semantic_factor():
             assert torch.equal(states["mhdb"][null], states["df"][null])
     for name in ("fuse_value.weight", "fuse_gate.weight"):
         assert torch.equal(states["fbt"][name], states["df"][name])
+
+
+def test_normuonh_matrices_use_inverse_sqrt_fan_in_initialization():
+    model = tiny("df", seed=23)
+
+    def rms(weight):
+        return weight.detach().square().mean().sqrt().item()
+
+    # NorMuonH matrices use the paper's fan-in scale, including both projection
+    # orientations and the factor-private FBT value map.
+    assert rms(model.blocks[0].attn.q_proj.weight) == pytest.approx(
+        1 / math.sqrt(32), rel=0.08
+    )
+    assert rms(model.blocks[0].mlp.down_proj.weight) == pytest.approx(
+        1 / math.sqrt(64), rel=0.08
+    )
+    assert rms(model.fuse_value.weight) == pytest.approx(1 / math.sqrt(32), rel=0.08)
+
+    # Semantic-scale matrices remain on their architecture-specific NAdam
+    # initialization rather than inheriting the Hyperball radius convention.
+    assert rms(model.embed_tokens.weight) == pytest.approx(
+        BASE_NORMAL_INIT_STD, rel=0.08
+    )
+    assert rms(model.attention_gates[0].weight) == pytest.approx(
+        BASE_NORMAL_INIT_STD, rel=0.08
+    )
+    assert rms(model.fuse_gate.weight) == pytest.approx(BASE_NORMAL_INIT_STD, rel=0.08)
+    assert rms(model.blocks[0].attn.control_proj.weight) == pytest.approx(
+        BASE_NORMAL_INIT_STD, rel=0.08
+    )
 
 
 def test_classifier_shadow_is_derived_and_preserves_master_gradients():
@@ -640,7 +671,9 @@ def test_cached_feedback_decode_matches_exact_recurrence():
         stepped = torch.cat(stepped, dim=1)
 
         reference = reference_decode(model, toks, prompt_len)
-        assert torch.allclose(stepped, reference, atol=3e-5), arm
+        # Parallel and single-column attention accumulate FP32 products in
+        # different orders; keep the bound tight relative to O(1) activations.
+        assert torch.allclose(stepped, reference, atol=5e-5), arm
 
 
 def test_cached_standard_decode_matches_full_forward():

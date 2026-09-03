@@ -48,7 +48,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=21, resumable=frozenset({21}), surface_version=16
+    version=22, resumable=frozenset({22}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 3.0

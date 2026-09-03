@@ -310,12 +310,13 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v21, and only v21 is resumable. V16-v20
+New snapshots use checkpoint contract v22, and only v22 is resumable. V16-v21
 snapshots remain readable for evaluation and forks but cannot be continued:
 v16 used different feedback-prefix draws, v16-v17 predate the Nesterov
 NorMuonH update, v16-v18 predate NAdam, and v19 stores the retired fixed-step
 warmup contract. V20 predates the split NAdam rates and the 3.0 gradient clip.
-A snapshot contains the model,
+V21 predates inverse-square-root fan-in initialization of NorMuonH matrices. A
+snapshot contains the model,
 both optimizer states, fixed
 NorMuonH radii, state-defining arguments, cumulative step, and
 Python/Torch/CUDA RNG state. A resume inherits every state-defining field and

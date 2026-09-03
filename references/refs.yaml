@@ -135,11 +135,13 @@ references:
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
     note: >
-      Defines Hyperball's fixed initial Frobenius radius, unit-Frobenius base
-      update, dimensionless relative step, and exact radial projection. The
-      experiment applies it to every NorMuon matrix except the semantic FBT
-      token-gate projection, uses NAdam for all semantic-scale parameters,
-      and uses no weight decay.
+      Initializes each constrained [d_out, d_in] matrix from a normal with
+      standard deviation 1/sqrt(d_in), then defines Hyperball's fixed realized
+      Frobenius radius, unit-Frobenius base update, dimensionless relative step,
+      and exact radial projection. The experiment applies this initialization
+      and constraint to every NorMuon matrix except the semantic FBT token-gate
+      projection, uses NAdam for all semantic-scale parameters, and uses no
+      weight decay.
 
   - arxiv: "2603.15031"
     slug: kimi2026-attention-residuals

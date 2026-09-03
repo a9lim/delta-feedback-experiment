@@ -133,9 +133,9 @@ embedding/readout and remaining NAdam parameters use `6e-4` and `3e-4`.
 Both sides apply their specified Nesterov construction:
 NorMuonH before orthogonalization and NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v21, and only v21 is resumable. V16-v20
+Snapshots use checkpoint contract v22, and only v22 is resumable. V16-v21
 remain readable for evaluation and forks; v19 retains the retired fixed-step
-warmup contract.
+warmup contract, and v21 predates the NorMuonH fan-in initialization.
 Protected snapshots persist at the cooldown boundary, the
 feedback boundary, and the end of the run.
 `--max-steps` limits the current invocation without changing the registered

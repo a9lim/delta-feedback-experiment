@@ -348,11 +348,13 @@ Each `mhdb` call above implicitly prepends its own learned null.
 
 ## Precision and initialization
 
-Ordinary dense weights and the tied embedding are initialized from
-`Normal(0, 0.02)`. Depthwise convolution weights keep PyTorch Conv1d's
-Kaiming-uniform initialization at fan-in 4. RMSNorm scales initialize to one;
-routing queries and nulls initialize to zero. PKDA rates, time constants,
-centers, and output-gate bias use the special initializations stated above.
+Each NorMuonH-owned matrix `W` with shape `[d_out, d_in]` is initialized from
+`Normal(0, 1 / sqrt(d_in))`, following the Hyperball parameterization. The tied
+embedding/readout and NAdam-owned dense matrices use `Normal(0, 0.02)`.
+Depthwise convolution weights keep PyTorch Conv1d's Kaiming-uniform
+initialization at fan-in 4. RMSNorm scales initialize to one; routing queries
+and nulls initialize to zero. PKDA rates, time constants, centers, and
+output-gate bias use the special initializations stated above.
 
 Embedding parameters and optimizer state are FP32. On CUDA, the residual
 stream, routed values, payloads, mixer activations, and caches are BF16 except
@@ -377,7 +379,9 @@ NorMuonH owns ordinary trainable two-dimensional hidden weights, including:
 - the FBT payload-value projection.
 
 For matrix `W`, its initial FP32 Frobenius radius `R = ||W_0||_F` is fixed for
-the life of the run. NorMuonH forms an update direction by:
+the life of the run. With the fan-in initialization above,
+`E[R^2] = d_out`; the realized sampled radius, rather than that expectation, is
+the exact constraint. NorMuonH forms an update direction by:
 
 1. EMA momentum with coefficient `0.95`;
 2. the released NorMuon Nesterov blend of `0.05` times the current gradient

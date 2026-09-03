@@ -18,6 +18,8 @@ from collections import defaultdict
 import torch
 from torch import Tensor
 
+from .parameter_groups import is_normuonh_parameter
+
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
 
@@ -250,23 +252,13 @@ def split_parameters(model: torch.nn.Module) -> tuple[list, list, list]:
     NorMuonH.
     """
     matrices, embedding, rest = [], [], []
-    pkda_nadam = (
-        ".attn.control_proj.",
-        ".attn.decay_up.",
-        ".attn.output_gate_up.",
-    )
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if name == "embed_tokens.weight":
             embedding.append(parameter)
             continue
-        nadam_matrix = (
-            name.startswith("attention_gates.")
-            or name == "fuse_gate.weight"
-            or any(marker in name for marker in pkda_nadam)
-        )
-        if parameter.ndim == 2 and not nadam_matrix:
+        if is_normuonh_parameter(name, parameter):
             matrices.append(parameter)
         else:
             rest.append(parameter)

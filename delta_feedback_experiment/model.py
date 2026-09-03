@@ -42,6 +42,7 @@ from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
 from .cuda_kernels import ShadowOperand, sink_linear
+from .parameter_groups import is_normuonh_parameter
 from .pkda import PreconditionedKDA
 
 try:  # Triton is deliberately a CUDA-only optimization dependency.
@@ -69,6 +70,9 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     compute_z_loss = None
 
 ARMS = ("vanilla", "base", "mhdb", "fbt", "df")
+
+BASE_NORMAL_INIT_STD = 0.02
+"""Sampling scale retained for embeddings and NAdam-owned dense matrices."""
 
 
 @dataclass(frozen=True)
@@ -842,10 +846,11 @@ class DFModel(nn.Module):
                 (self.fuse_value, self.fuse_gate),
                 factor_seed ^ 0x524543555252454E,
             )
+        self._scale_normuonh_initialization()
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, std=0.02)
+            nn.init.normal_(module.weight, std=BASE_NORMAL_INIT_STD)
             if isinstance(module, nn.Linear) and module.bias is not None:
                 nn.init.zeros_(module.bias)
         elif isinstance(module, Router):
@@ -863,7 +868,22 @@ class DFModel(nn.Module):
         """
         generator = torch.Generator().manual_seed(seed % ((1 << 63) - 1))
         for linear in linears:
-            nn.init.normal_(linear.weight, std=0.02, generator=generator)
+            nn.init.normal_(
+                linear.weight, std=BASE_NORMAL_INIT_STD, generator=generator
+            )
+
+    @torch.no_grad()
+    def _scale_normuonh_initialization(self) -> None:
+        """Give each constrained matrix the Hyperball paper's fan-in scale.
+
+        Scaling the already sampled normal values is distributionally identical
+        to drawing with the target standard deviation. It also preserves the
+        common and factor-private paired random streams exactly.
+        """
+        for name, parameter in self.named_parameters():
+            if is_normuonh_parameter(name, parameter):
+                target_std = 1 / math.sqrt(parameter.shape[1])
+                parameter.mul_(target_std / BASE_NORMAL_INIT_STD)
 
     # -- pieces ----------------------------------------------------------------
 

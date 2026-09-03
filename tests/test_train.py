@@ -304,8 +304,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 3.0
-    assert CONTRACT.version == 21
-    assert CONTRACT.resumable == frozenset({21})
+    assert CONTRACT.version == 22
+    assert CONTRACT.resumable == frozenset({22})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -696,12 +696,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", range(9, 21))
+@pytest.mark.parametrize("version", range(9, 22))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[21\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[22\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 
