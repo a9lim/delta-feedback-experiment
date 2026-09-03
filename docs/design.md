@@ -286,12 +286,12 @@ default capture is:
 |---|---:|---:|---:|---:|
 | `df` | 149.2 s | 13.85 GiB | 22.98 GiB | 4 |
 
-Median graph replay is 55.9 ms, 113.1 ms, and 170.2 ms for one, two, and three
+Median graph replay is 55.8 ms, 112.9 ms, and 169.8 ms for one, two, and three
 passes at random initialization; at a trained checkpoint the cut
 cross-entropy backward keeps more tiles and the one-pass replay is about
 five milliseconds longer. The same probe measures PKDA chunk parity at
 relative error 0.0039, fused Q/K/V convolution parity at 0.0035, fused output
-norm-gate parity at 0.0032, cached decode parity at 0.0069/0.0128, and that
+norm-gate parity at 0.0032, cached decode parity at 0.0101/0.0347, and that
 the head's early tile skip computes exactly the late filter's tile set. The
 fork kernels are additionally gated on the workspace PKDA layer benchmark,
 whose gradient drift against its stored reference is unchanged across the
