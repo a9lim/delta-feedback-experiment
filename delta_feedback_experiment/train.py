@@ -178,7 +178,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-embedding",
         type=float,
         default=DEFAULT_EMBEDDING_LR,
-        help="tied embedding/readout NAdam learning rate (default: 0.00045)",
+        help="tied embedding/readout NAdam learning rate (default: 0.0006)",
     )
     recipe.add_argument(
         "--lr-nadam",

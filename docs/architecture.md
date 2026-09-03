@@ -420,7 +420,7 @@ parameter:
   rates, time constants, and preconditioner centers.
 
 The tied embedding/readout is its own parameter group with learning rate
-`4.5e-4`; every other NAdam-owned parameter uses `3e-4`. Both groups use moment
+`6e-4`; every other NAdam-owned parameter uses `3e-4`. Both groups use moment
 betas `(0.9, 0.95)`, momentum decay `psi = 0.004`, epsilon `1e-8`, and no weight
 decay. At optimizer step `t`, PyTorch NAdam uses:
 

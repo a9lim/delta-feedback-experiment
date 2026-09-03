@@ -363,7 +363,7 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     assert normuonh_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NORMUONH_LR
     assert "weight_decay" not in normuonh_optimizer.param_groups[0]
     embedding_group, nadam_group = nadam_optimizer.param_groups
-    assert embedding_group["lr"] == DEFAULT_EMBEDDING_LR == 4.5e-4
+    assert embedding_group["lr"] == DEFAULT_EMBEDDING_LR == 6e-4
     assert embedding_group["stable_lr"] == DEFAULT_EMBEDDING_LR
     assert embedding_group["rate_name"] == "embedding"
     assert nadam_group["lr"] == DEFAULT_NADAM_LR == 3e-4
@@ -539,7 +539,7 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
     assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 2e-2
-    assert args.lr_embedding == DEFAULT_EMBEDDING_LR == 4.5e-4
+    assert args.lr_embedding == DEFAULT_EMBEDDING_LR == 6e-4
     assert args.lr_nadam == DEFAULT_NADAM_LR == 3e-4
     assert args.warmup_frac == 0.02
     assert args.cooldown_frac == 0.2

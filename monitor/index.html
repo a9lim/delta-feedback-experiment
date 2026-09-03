@@ -78,7 +78,7 @@ const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
 function onStep(run, rec) {
   return {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k),
-    lr_normuonh: num(rec.lr_normuonh ?? rec.lr_h),
+    lr_normuonh: num(rec.lr_normuonh),
     lr_embedding: num(rec.lr_embedding), lr_nadam: num(rec.lr_nadam),
     gnorm: num(rec.gnorm),
     tok_s: num(rec.tok_s), mem: num(rec.mem), elapsed: num(rec.elapsed),
@@ -144,7 +144,7 @@ function renderTiles(view) {
 const CONFIG_GROUPS = [
   ['arm & seeds', ['arm', 'seed', 'data_seed']],
   ['trunk', ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
-  ['optimizer', ['lr_normuonh', 'lr_embedding', 'lr_nadam', 'lr_h', 'zloss']],
+  ['optimizer', ['lr_normuonh', 'lr_embedding', 'lr_nadam', 'zloss']],
   ['feedback', ['feedback_start', 'feedback_batch_prob', 'three_pass', 'jitter']],
   ['batch', ['batch_rows', 'micro_rows']],
 ];

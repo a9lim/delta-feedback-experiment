@@ -24,7 +24,7 @@ NS_COEFFS = (3.4445, -4.7750, 2.0315)
 DEFAULT_NORMUONH_LR = 2e-2
 """Stable dimensionless NorMuonH relative step for fresh runs."""
 
-DEFAULT_EMBEDDING_LR = 4.5e-4
+DEFAULT_EMBEDDING_LR = 6e-4
 """Stable NAdam learning rate for the tied embedding/readout."""
 
 DEFAULT_NADAM_LR = 3e-4
