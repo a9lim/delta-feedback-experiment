@@ -53,7 +53,7 @@ previous payload p_(t-1) --------------+                  |
         +----------------------- prelude P ------------------------+  Delta_P
         |                                                          |
         |   +--------------- core R, tied, r iterations --------+  |
-        |   | iteration i reads: seed, Delta_P, Delta_R^(<i),   |  |  Delta_R^(i)
+        |   | iteration i reads: seed, Delta_P, core partial,   |  |  Delta_R
         |   |                    core cache (mode by position)  |  |
         |   +---------------------------------------------------+  |
         |                                                          |
@@ -77,8 +77,7 @@ Delta_P = h - seed
 
 core_entry = h
 for i in range(r):                                   # same r for every pass of a step
-    prior = [h - core_entry] if i > 0 else []        # Delta_R^(<i), the core's progress
-    h = core_cell(h, sources=[seed, Delta_P, *prior], cache=core_cache)
+    h = core_cell(h, sources=[seed, Delta_P], entry=core_entry, cache=core_cache)
 Delta_R = h - core_entry
 
 h = coda_cell(h, sources=[seed, Delta_P, Delta_R])
@@ -88,11 +87,13 @@ payload = payload_norm(h + mhdb([seed, Delta_P, Delta_R, Delta_C], site="payload
 logits = tied_readout(final_norm(h))
 ```
 
-Each `mhdb` call prepends its site's learned null. There is no adapter and no
-random initial state: the core's entry state is the prelude output, and the
-seed and prelude delta are re-readable at every iteration through the
-routers. At a fused position the token enters only through the FBT gate, as
-in `df`; a plain position seeds from the embedding itself.
+Each `mhdb` call prepends its site's learned null. Every cell measures its
+partial from its own entry; the core's entry is pinned to the prelude output
+for all `r` iterations, so the core is one cell of `4r` layers whose partial
+accumulates across iterations. There is no adapter and no random initial
+state: the seed and prelude delta are re-readable at every iteration through
+the routers. At a fused position the token enters only through the FBT gate,
+as in `df`; a plain position seeds from the embedding itself.
 
 ## Residual shell in the core
 
@@ -102,7 +103,7 @@ branch-output or residual-state norm is added, and the telescoping identity
 holds in every cell:
 
 ```text
-h_top = seed + Delta_P + sum_i Delta_R^(i) + Delta_C
+h_top = seed + Delta_P + Delta_R + Delta_C
 ```
 
 The shell is chosen because it has no mechanism that forces a nonzero update:
@@ -150,34 +151,85 @@ is a diagnostic, not a metric.
 Routers follow `architecture.md` exactly: zero-initialized width-`D` query,
 full-width RMS key statistics, raw values, one softmax per routing group, a
 site-local null prepended to every bank. The core's eight sites are shared
-across iterations because they are core weights. What changes is the bank:
+across iterations because they are core weights. The core is one cell, so
+its bank is a cell's bank:
 
 | Site | Sources after the null |
 |---|---|
 | prelude, attention entry | seed |
 | prelude, other sublayers | seed, partial |
-| core iteration 1, attention entry | seed, `Delta_P` |
-| core iteration `i > 1`, attention entry | seed, `Delta_P`, `Delta_R^(<i)` |
-| core, other sublayers | the entry bank plus the current partial |
+| core, attention entry of iteration 1 | seed, `Delta_P` |
+| core, every other sublayer | seed, `Delta_P`, core partial |
 | coda, attention entry | seed, `Delta_P`, `Delta_R` |
 | coda, other sublayers | seed, `Delta_P`, `Delta_R`, partial |
 | payload | seed, `Delta_P`, `Delta_R`, `Delta_C` |
 
-`Delta_R^(<i)` is the core's completed progress before iteration `i`, the sum
-of the earlier iteration deltas; `Delta_R` is the whole core's completed
-delta. Every bank's non-null sources therefore reconstruct the current
-residual exactly, as in `architecture.md`, so the uniform zero-query mixture
-stays collinear with the residual and pass-1 routing is functionally inert at
-initialization at every iteration. The core reads a fixed-size window rather
-than every past iteration: the residual is the state, the window is only the
-read, and the routers act as the learned input injection of the seed and the
-prelude.
+The core partial is `h - core_entry`, the core's progress since the prelude
+output, accumulated across iterations rather than reset at each; `Delta_R`
+is its value at core exit. The core's bank therefore has the shape and
+meaning of a `df` second-cell bank at every iteration, and the tied routers
+answer one stationary question rather than one per iteration index. Every
+bank's non-null sources reconstruct the current residual exactly, as in
+`architecture.md`, so the uniform zero-query mixture stays collinear with
+the residual and pass-1 routing is functionally inert at initialization at
+every iteration. The residual is the state; the routers are the learned
+input injection of the seed and the prelude. Per-iteration deltas are never
+sources: an iteration boundary is a boundary in weights, not in state.
 
-At iteration 1 the `Delta_R^(<i)` slot is absent. The fixed-capacity router
-carries a zero-valued placeholder in that slot together with a boolean source
+The core partial is exactly absent at one site, the attention entry of
+iteration 1, where the core has not yet moved. The fixed-capacity router
+there carries a zero-valued placeholder together with a boolean source
 presence mask; an absent source has logit `-inf`, contributes no value, and
-receives no gradient. Router weights, values, and gradients at `r = 1` must
-match `df` exactly, and the telemetry labels the slot `core_prior`.
+receives no gradient. The mask is load-bearing rather than cosmetic: the
+routed mixture is added to the residual before the norm, so an unmasked zero
+source at logit zero would take softmax mass `1 / (S + 1)` from the live
+sources, `S` the sum of their exponentiated scores, and shrink the routed
+term relative to `h` once the query has trained. Router weights, values, and
+gradients at `r = 1` must match `df` exactly, and the telemetry labels the
+slot `core_partial`.
+
+## Input injection and column start
+
+The recurrent-depth decoder computes `e = P(x)`, draws a random state `s_0`,
+iterates `s_i = R(e, s_(i-1))` where `R` opens with an adapter that maps the
+concatenation of the state and `e` back to the residual width once per
+iteration, and reads out `C(s_r)`. Its warm start is an inference-only
+substitution of the previous token's `s_r` for the noise. `df-loop` realizes
+each piece differently:
+
+| Recurrent-depth decoder | `df-loop` |
+|---|---|
+| injected input `e = P(x)` | `seed + Delta_P`, the prelude output |
+| adapter on `[s; e]`, once per iteration | router reads of seed and `Delta_P` at all eight core sites |
+| separate latent stream `s` | the residual itself; `h_top = seed + Delta_P + Delta_R + Delta_C` |
+| random `s_0` | the prelude output |
+| warm start from the previous token's `s_r` | the FBT payload at the seed, and the shared core cache at fused positions |
+
+The two designs differ in one structural place: where the previous
+position's state enters. The recurrent-depth warm start hands the core its
+previous fixed point directly. Here the previous column enters at the seed,
+through the token-gated FBT fusion, and the prelude reprocesses the fused
+seed before the core starts, so the vertical iteration restarts from the
+prelude output at every column. The previous column's converged core state
+reaches the current core through two trained channels only: the payload,
+compressed by the payload norm and the token gate, and the shared cache,
+which is the recurrent-depth "attend to later iterations of earlier tokens"
+mechanism trained rather than zero-shot.
+
+Two expressivity gaps against the adapter are known and accepted:
+
+- The router is a per-group convex mixture of raw values, and the branch's
+  projections are shared across every source; the adapter is a dedicated
+  linear map that can transform `e` independently of the state. The
+  recurrent-depth paper found additive re-injection matched concatenation at
+  small scale and lost at scale; the router is closer to addition with
+  learned gates.
+- The core carries no state across positions in its residual. Whether the
+  restart costs anything is what the warm-start sweep measures.
+
+Landing the payload at the core entry instead would move the horizontal
+channel for the whole family and break `r = 1` parity with `df`. That is a
+new screen contract, not a loop variant, and is not specified here.
 
 ## Horizontal channels
 
@@ -347,9 +399,9 @@ A loop result is uninterpretable without two stability traces:
 
 - **Depth contraction.** Run one column pass over held-out rows in a fixed
   label assignment (all plain, and prefix-1 fused) at `r = r_max`, record
-  `||h^(i) - h^(i-1)||_2` per position for every iteration, and record the
-  loss with the coda applied after each iteration `i`. The loss curve is the
-  fixed-`r` sweep.
+  `||h^(i) - h^(i-1)||_2` per position for every iteration, the increment of
+  the core partial, and record the loss with the coda applied after each
+  iteration `i`. The loss curve is the fixed-`r` sweep.
 - **Sequence contraction.** Repeated fully fused prefill with prefix length 1
   in which **both** channels advance each iteration: the shifted payload and
   the write bank of the previous iteration. Record held-out loss and mean
@@ -358,11 +410,24 @@ A loop result is uninterpretable without two stability traces:
   is not this trace.
 
 Additional registered diagnostics: residual RMS per iteration; the core
-routers' mass on seed, `Delta_P`, and `Delta_R^(<i)` by iteration, which is
-the learned input-injection profile; the own-term share of PKDA output at
-fused positions. Routing summaries remain diagnostics, not wins. The
-recurrent-depth KL exit rule may be run as a diagnostic; adaptive exit is not
-part of any metric.
+routers' mass on the null, seed, `Delta_P`, and the core partial by
+iteration, which is the learned input-injection profile; the own-term share
+of PKDA output at fused positions. Routing summaries remain diagnostics, not
+wins. The recurrent-depth KL exit rule may be run as a diagnostic; adaptive
+exit is not part of any metric.
+
+One same-checkpoint intervention is registered as a diagnostic, never as a
+metric or a training input: the **warm-start sweep**, the recurrent-depth
+warm start applied zero-shot to a model trained without it. At fused
+evaluation with prefix length 1, every fused position's core starts from
+`h_entry + lambda * Delta_R` of the previous pass at the position before it,
+shifted exactly as the payload is, for `lambda` in `{0, 0.5, 1}`. The warm
+term counts as core progress: the core partial is still measured from the
+prelude output, so iteration 1's attention entry reads a live partial and
+the reconstruction identity holds. The fixed-`r` sweep is repeated at each
+`lambda`. A gain at `lambda > 0` means core-state continuity is missing from
+the two trained channels and motivates a registered variant that carries it;
+no gain means the payload and the shared cache already carry it.
 
 ## Parameter, cache, and cost accounting
 
@@ -464,16 +529,18 @@ spend confirmation.
 
 | Source | Adopted | Replaced here |
 |---|---|---|
-| Recurrent-depth language models | tied core between prelude and coda, log-normal Poisson iteration draw, cache shared across iterations, effective-depth accounting | adapter by MHDB reads of seed and `Delta_P`; random initial state by the prelude output; sandwich norms by the unchanged pre-norm shell; untrained warm start by the trained payload; truncated backpropagation by full backpropagation; a cache budget of several slots by a trained budget of one |
+| Recurrent-depth language models | tied core between prelude and coda, log-normal Poisson iteration draw, cache shared across iterations, effective-depth accounting | adapter by router reads of the prelude output at every core site; random initial state by the prelude output; sandwich norms by the unchanged pre-norm shell; untrained warm start by the trained payload and shared cache, kept only as the warm-start sweep; truncated backpropagation by full backpropagation; a cache budget of several slots by a trained budget of one |
 | Full-Bandwidth Transformer | asymmetric fusion, payload, Jacobi passes, prefix mixin, jitter, pass mixture, loss | — |
-| This project | cumulative-progress source window, plain/fused position labels governing both channels, fused-position PKDA read with own-term substitution, cell-token accounting | — |
+| This project | one-cell core partial, plain/fused position labels governing both channels, fused-position PKDA read with own-term substitution, cell-token accounting, warm-start sweep | — |
 
 ## Exclusions
 
 Not part of this specification: loop variants of `base`, `mhdb`, or `fbt`;
 truncated backpropagation; branch-output or residual-state norms in the core;
-a random or learned initial core state; a raw embedding path into the core; a
-shared-cache budget above one; per-iteration halting readouts and pause
+a random or learned initial core state; an untrained warm start anywhere but
+the warm-start sweep; a raw embedding path into the core; a payload landing
+at the core entry, which is a new screen contract rather than a loop variant;
+a shared-cache budget above one; per-iteration halting readouts and pause
 tokens, which belong to a separate specification; adaptive exit as anything
 but a diagnostic; a decode `r` that varies within a request; and any loop
 mapping onto the six-cell flagship.

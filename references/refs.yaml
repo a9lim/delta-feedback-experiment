@@ -159,5 +159,5 @@ references:
       zero-shot warm start of the next token's state. The depth-recurrent arm
       takes the tied core, the iteration draw, and the shared-cache idea; it
       replaces the adapter with MHDB reads, the random initial state with the
-      prelude output, the residual sandwich norm with branch-output norms, and
+      prelude output, the sandwich norm with the unchanged pre-norm shell, and
       the untrained warm start with the trained FBT payload.
