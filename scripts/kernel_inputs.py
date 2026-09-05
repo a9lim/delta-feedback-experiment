@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--data-dir", default="/data/df/tokens")
+    parser.add_argument("--head-only", action="store_true")
     options = parser.parse_args()
     options.output.mkdir(parents=True, exist_ok=True)
     torch.set_float32_matmul_precision("high")
@@ -94,6 +95,9 @@ def main() -> None:
             options.output / "head.pt",
         )
         del head
+        if options.head_only:
+            print(json.dumps({"head": str(options.output / "head.pt")}), flush=True)
+            return
         loss, _ = model_module.multipass_loss(model, rows, outputs, z_coef=1e-5)
     loss.backward()
     torch.cuda.synchronize()
