@@ -79,6 +79,21 @@ def main() -> None:
     rows = data.batch(100000, 4, "cuda")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         outputs = model_module.multipass(model, rows, 1)
+        head = model.final_norm(outputs[0].h_top)
+        torch.save(
+            {
+                "e": head.detach().cpu(),
+                "c": model._classifier_shadow.detach().cpu(),
+                "targets": rows[:, 1:].contiguous().cpu(),
+                "metadata": {
+                    "snapshot": str(options.snapshot),
+                    "first_row": 100000,
+                    "pass": 1,
+                },
+            },
+            options.output / "head.pt",
+        )
+        del head
         loss, _ = model_module.multipass_loss(model, rows, outputs, z_coef=1e-5)
     loss.backward()
     torch.cuda.synchronize()
