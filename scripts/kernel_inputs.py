@@ -1,4 +1,4 @@
-"""Record representative trained PKDA backward operands for kernel benchmarks."""
+"""Record trained PKDA backward and CCE head operands for kernel benchmarks."""
 
 from __future__ import annotations
 

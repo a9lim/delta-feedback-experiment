@@ -4,10 +4,9 @@ This repository owns a five-arm pretraining study of MHDB depth routing and FBT
 latent recurrence on a common PKDA/gated-GQA hybrid. The primary factorial is
 `{base, mhdb, fbt, df}`; pure-GQA `vanilla` is the external trunk control.
 
-No run is complete under the current screen contract. The unregistered
-full-feedback diagnostic `screen-df-fullN-s1` is active on Jobe under the
-non-resumable v19 contract; the earlier `screen-df-s1` run used the superseded
-mixed-heat recipe. Keep
+No run is complete under the current screen contract. Jobe is between runs;
+existing diagnostic checkpoints are engineering inputs, not registered
+comparisons. Keep
 [docs/findings.md](docs/findings.md) empty of architecture claims until a
 matched comparison is admissible.
 

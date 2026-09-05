@@ -221,11 +221,11 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 - execution of exactly the `seq_len` input positions of every stored row; the
   final stored token is only ever a target, and keyed jitter is still drawn at
   the stored-row width so the draws do not depend on the executed length;
-- persistent FP32 gradient buffers that the tied embedding (lookup scatter and
-  CCE classifier gradient) and every large projection accumulate into directly
-  from backward through cuBLAS, with the FP32 sink as both the unit-beta
-  addend and the output, so no weight gradient is materialized apart from its
-  accumulator and those parameters hand autograd no gradient at all;
+- persistent FP32 gradient buffers: the tied embedding scatters lookup
+  contributions into its buffer and adds the CCE classifier's BF16 gradient;
+  large projections accumulate through cuBLAS with the FP32 sink as both the
+  unit-beta addend and output, avoiding a separate projection weight gradient.
+  These parameters hand autograd no further gradient;
 - address-stable BF16 shadows of every sink-fed projection's concatenated
   weights and of PKDA's three NAdam-owned control matrices, refreshed together
   with the classifier shadow once per optimizer update, so no replay casts or
@@ -234,10 +234,15 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   intermediates for backward and recomputing only the gated query, one GEMM
   over the concatenated Q/K/V weights per PKDA layer feeding one causal
   convolution launch that also applies the SiLU and the per-head Q/K L2
-  normalization, recomputes its own pre-activation in backward, and writes Q,
+  normalization, recomputes its nonlinear derivative once per backward tile
+  plus a compact halo and reuses it across convolution taps, and writes Q,
   K, and V as three contiguous slabs whose gradients return separately, so the
   recurrence reads them without contiguity copies and the backward never
-  concatenates them, Ada-tuned intra-chunk backward and inter/solve forward
+  concatenates them. The screen's Ada backward uses 32-row tiles while its
+  forward retains 64-row tiles; heads narrower than 32 use per-tap
+  recomputation. Intra-chunk backward evaluates two direct gate differences
+  together, retaining the unbounded-gate semantics and FP32 state boundaries.
+  The fork also provides Ada-tuned inter/solve forward
   kernels, a WY/inter backward that keeps its value-side tiles across its
   key loop at 128-wide value tiles, a gate backward that folds the decay
   gradient's reverse cumulative sum and narrowing into its own kernel, a
@@ -262,9 +267,11 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   before the forward, inside the graph and without state; ascending because
   the backward accumulates each row's embedding gradient across vocabulary
   tiles in BF16 through locks and the smallest contributions must arrive
-  first), storing each tile's per-row maximum logit in the forward, and
+  first), storing each tile's per-row maximum logit and each target's tile
+  index in the forward, and
   skipping every backward tile the gradient filter would drop before
-  recomputing its logits, a decision identical to the late filter's;
+  recomputing its logits, a decision identical to the late filter's. Skipped
+  tiles need no vocabulary-permutation load or target-membership matrix;
 - the Triton PKDA control-gradient packer;
 - each compiled block also emitting the residual's distance from its cell
   entry, so partial and completed block deltas are never formed eagerly
@@ -279,30 +286,40 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 - internal activation checkpointing above the measured work threshold;
 - asynchronous pinned-host snapshot staging and atomic background writes.
 
-These choices are not exposed as experiment axes. The qualified maximal
-default capture is:
+These choices are not exposed as experiment axes. The qualified default
+geometry uses four 1,024-token rows per microbatch and 80 microbatches per
+update. With trained diagnostic weights, the full train/eval capture is:
 
-| Arm | Prepare | Peak allocated | Peak reserved | Train/eval graphs |
+| Arm | Observed prepare | Peak allocated | Peak reserved | Train/eval graphs |
 |---|---:|---:|---:|---:|
-| `df` | 149.2 s | 13.85 GiB | 22.98 GiB | 4 |
+| `df` | 78.4 s | 13.839 GiB | 22.984 GiB | 4 |
 
-Median graph replay is 55.8 ms, 112.9 ms, and 169.8 ms for one, two, and three
-passes at random initialization; at a trained checkpoint the cut
-cross-entropy backward keeps more tiles and the one-pass replay is about
-five milliseconds longer. The same probe measures PKDA chunk parity at
-relative error 0.0039, fused Q/K/V convolution parity at 0.0035, fused output
-norm-gate parity at 0.0032, cached decode parity at 0.0101/0.0347, and that
-the head's early tile skip computes exactly the late filter's tile set. The
-fork kernels are additionally gated on the workspace PKDA layer benchmark,
-whose gradient drift against its stored reference is unchanged across the
-kernel rounds (7.44e-3 at the largest row). The head's ordering direction was
-qualified against an exact FP32 dense head on one full 80-microbatch step of
-the `screen-df-s1` step-10,500 snapshot: upstream's per-batch ascending
-order and this path give the same trunk gradient norm (0.3211) within 1.4%
-of the exact head's (0.3256), whereas a descending, a held-out-frequency,
-and a per-step average ordering each dropped the same probability mass but
-rounded the BF16-locked tail away first and came out 20 to 25% too large. Inductor
-artifacts live in
+Median trained graph replay is 59.41 ms, 120.29 ms, and 180.99 ms for one,
+two, and three passes. The corresponding full-batch forward/backward times
+are 4.751 s, 9.599 s, and 14.449 s. Qualification uses the
+`screen-df-full-s1` step-10,745 diagnostic, training rows starting at 100,000,
+keyed randomness step 9,000, and z-loss coefficient 1e-5. Against the preceding
+kernel revisions, full-batch gradients differ by 0.75–0.85% relative L2,
+with norm ratios 0.999883–0.999987 and cosine similarity at least 0.999964.
+These are engineering comparisons, not training-quality findings.
+
+A paired 12-update check from those trained weights, with identical fresh
+optimizer states and fixed learning rates, measures median complete steps of
+4.835 s, 9.691 s, and 14.579 s for one, two, and three passes. Final pass-1
+validation differs by 0.000224 and fused validation by 0.000127 from the
+preceding kernels, with no nonfinite gradients. This checks the actual
+training path; it does not establish long-run quality equivalence.
+
+The trained head computes the exact same filtered-tile set with target
+metadata. Its 128×128 tile geometry, BF16 gradient accumulation, and ascending
+vocabulary ordering remain authoritative. The convolution's 32-row backward
+tile adds 4.6875 MiB of live partial-gradient scratch; spill elimination does
+not imply lower allocated memory. Full-pool memory remains essentially
+unchanged. Reproducible trained-input, full-gradient, and short-update checks
+are in `scripts/kernel_inputs.py`, `scripts/kernel_qualification.py`, and
+`scripts/kernel_training_check.py`.
+
+Inductor artifacts live in
 `~/.cache/delta-feedback/torchinductor` by default; the probe performs the
 fixed-shape search once and later processes reuse the cache with no autotuning
 work. The reserved graph pool is the concurrency boundary. Screen runs remain
