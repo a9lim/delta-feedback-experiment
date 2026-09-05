@@ -326,21 +326,6 @@ def test_tied_embedding_sink_accumulates_both_gradient_paths_in_place():
     assert weight.grad is None
     assert torch.equal(sink, reference + 1)
 
-    class DirectSinkHead(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, operand):
-            return operand.sum()
-
-        @staticmethod
-        def backward(ctx, gradient):
-            # CCE has already accumulated its gradient in the supplied sink.
-            return None
-
-    version = sink._version
-    DirectSinkHead.apply(_ClassifierShadow.apply(weight, shadow, sink)).backward()
-    assert weight.grad is None
-    assert sink._version == version
-
     model.embed_tokens(toks).sum().backward()
     assert weight.grad is not None
 

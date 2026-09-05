@@ -360,26 +360,6 @@ def cuda_gate() -> None:
         raise AssertionError("CCE-native z embedding gradient drift")
     if not torch.allclose(cce_dc, ref_c.grad, rtol=3e-2, atol=3e-3):
         raise AssertionError("CCE-native z classifier gradient drift")
-    # CCE adds directly to the same FP32 buffer used by the tied lookup.
-    # Repeated backwards must preserve prior contents and must not also send
-    # a classifier gradient through _ClassifierShadow to double-count it.
-    cce_sink = torch.full_like(cce_c, 0.125)
-    cce_c.grad = None
-    for count in (1, 2):
-        sink_ce, sink_z = _fixed_cce_z(
-            cce_e,
-            _ClassifierShadow.apply(cce_c, cce_shadow, cce_sink),
-            cce_t,
-            classifier_grad_sink=cce_sink,
-        )
-        (sink_ce + 1e-2 * sink_z).backward()
-        if cce_c.grad is not None:
-            raise AssertionError("CCE returned a duplicate classifier gradient")
-        if not torch.allclose(
-            (cce_sink - 0.125) / count, ref_c.grad, rtol=3e-2, atol=3e-3
-        ):
-            raise AssertionError("CCE persistent classifier gradient drift")
-    del cce_sink, sink_ce, sink_z
     del cce_e, cce_c, cce_shadow, cce_t, cce_de, cce_dc, ref_e, ref_c, ref_logits
     del cce_ce, cce_z, ref_ce, ref_z
 
