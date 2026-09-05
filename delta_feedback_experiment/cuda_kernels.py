@@ -789,10 +789,16 @@ class ShadowOperand(torch.autograd.Function):
     @staticmethod
     def forward(ctx, master: Tensor, shadow: Tensor, sink: Tensor | None) -> Tensor:
         ctx.sink = sink
+        # CCE may already have written the complete classifier contribution
+        # into the sink and return no operand gradient. Do not materialize a
+        # vocabulary-sized zero tensor on that edge.
+        ctx.set_materialize_grads(False)
         return shadow
 
     @staticmethod
-    def backward(ctx, gradient: Tensor) -> tuple[Tensor | None, None, None]:
+    def backward(ctx, gradient: Tensor | None) -> tuple[Tensor | None, None, None]:
+        if gradient is None:
+            return None, None, None
         if ctx.sink is not None:
             ctx.sink.add_(gradient)
             return None, None, None
