@@ -526,7 +526,6 @@ def cuda_gate() -> None:
     optimizers = build_optimizers(
         model,
         lr_normuonh=args.lr_normuonh,
-        lr_embedding=args.lr_embedding,
         lr_nadam=args.lr_nadam,
     )
     model.refresh_shadows()
@@ -543,7 +542,9 @@ def cuda_gate() -> None:
         probe_order.sort().values,
         torch.arange(args.vocab_size, device="cuda", dtype=torch.int32),
     ):
-        raise AssertionError("the head's batch ordering is not a vocabulary permutation")
+        raise AssertionError(
+            "the head's batch ordering is not a vocabulary permutation"
+        )
     del probe_order
     if any("classifier_shadow" in name for name in model.state_dict()):
         raise AssertionError("derived classifier shadow entered the checkpoint state")

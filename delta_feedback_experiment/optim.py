@@ -23,14 +23,11 @@ from .parameter_groups import is_normuonh_parameter
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
 
-DEFAULT_NORMUONH_LR = 2e-2
+DEFAULT_NORMUONH_LR = 9e-3
 """Stable dimensionless NorMuonH relative step for fresh runs."""
 
-DEFAULT_EMBEDDING_LR = 6e-4
-"""Stable NAdam learning rate for the tied embedding/readout."""
-
 DEFAULT_NADAM_LR = 3e-4
-"""Stable NAdam learning rate for non-embedding parameters."""
+"""Stable learning rate for every NAdam-owned parameter."""
 
 DEFAULT_NADAM_BETAS = (0.9, 0.95)
 """First- and second-moment coefficients for NAdam."""
@@ -240,48 +237,39 @@ class NorMuonH(torch.optim.Optimizer):
         return loss
 
 
-def split_parameters(model: torch.nn.Module) -> tuple[list, list, list]:
-    """Partition trainable parameters into one NorMuonH and two NAdam groups.
+def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
+    """Partition trainable parameters into NorMuonH and NAdam groups.
 
-    The tied embedding/unembedding is isolated so it can use its own NAdam
-    learning rate. Ordinary hidden 2D weights get NorMuonH. Global-attention
-    gates, the FBT token gate, and PKDA's packed controls, decay expansion, and
-    output-gate expansion are explicit matrix exceptions; they join norms,
-    depthwise convolutions, routing parameters, and vectors in the remaining
-    NAdam group. PKDA Q/K/V/output projections and the FBT value projection use
-    NorMuonH.
+    Ordinary hidden 2D weights get NorMuonH. The tied embedding/unembedding,
+    global-attention gates, the FBT token gate, and PKDA's packed controls,
+    decay expansion, and output-gate expansion join norms, depthwise
+    convolutions, routing parameters, and vectors in the NAdam group. PKDA
+    Q/K/V/output projections and the FBT value projection use NorMuonH.
     """
-    matrices, embedding, rest = [], [], []
+    matrices, nadam = [], []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
-            continue
-        if name == "embed_tokens.weight":
-            embedding.append(parameter)
             continue
         if is_normuonh_parameter(name, parameter):
             matrices.append(parameter)
         else:
-            rest.append(parameter)
-    return matrices, embedding, rest
+            nadam.append(parameter)
+    return matrices, nadam
 
 
 def build_optimizers(
     model: torch.nn.Module,
     *,
     lr_normuonh: float = DEFAULT_NORMUONH_LR,
-    lr_embedding: float = DEFAULT_EMBEDDING_LR,
     lr_nadam: float = DEFAULT_NADAM_LR,
     nadam_betas: tuple[float, float] = DEFAULT_NADAM_BETAS,
 ) -> list[torch.optim.Optimizer]:
     """Build the authoritative NorMuonH/NAdam stack with stable WSD rates."""
-    matrices, embedding, rest = split_parameters(model)
+    matrices, nadam_parameters = split_parameters(model)
     normuonh = NorMuonH(matrices, lr=lr_normuonh)
-    use_foreach_nadam = bool(rest) and rest[0].is_cuda
+    use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda
     nadam = torch.optim.NAdam(
-        [
-            {"params": embedding, "lr": lr_embedding},
-            {"params": rest, "lr": lr_nadam},
-        ],
+        nadam_parameters,
         lr=lr_nadam,
         betas=nadam_betas,
         eps=1e-8,
@@ -291,10 +279,8 @@ def build_optimizers(
     for group in normuonh.param_groups:
         group["rate_name"] = "normuonh"
         group["stable_lr"] = lr_normuonh
-    nadam.param_groups[0]["rate_name"] = "embedding"
-    nadam.param_groups[0]["stable_lr"] = lr_embedding
-    nadam.param_groups[1]["rate_name"] = "nadam"
-    nadam.param_groups[1]["stable_lr"] = lr_nadam
+    nadam.param_groups[0]["rate_name"] = "nadam"
+    nadam.param_groups[0]["stable_lr"] = lr_nadam
     return [normuonh, nadam]
 
 

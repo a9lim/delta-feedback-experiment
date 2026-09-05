@@ -29,7 +29,6 @@ from delta_feedback_experiment.data import (
     write_synthetic,
 )
 from delta_feedback_experiment.optim import (
-    DEFAULT_EMBEDDING_LR,
     DEFAULT_NADAM_BETAS,
     DEFAULT_NADAM_LR,
     DEFAULT_NORMUONH_LR,
@@ -246,9 +245,7 @@ def test_normuonh_applies_nesterov_before_orthogonalization():
     momentum = torch.zeros_like(expected)
     row_moment = torch.zeros(expected.shape[0], 1)
     beta1, beta2, lr, eps = 0.8, 0.7, 0.03, 1e-8
-    optimizer = NorMuonH(
-        [weight], lr=lr, momentum=beta1, beta2=beta2, eps=eps
-    )
+    optimizer = NorMuonH([weight], lr=lr, momentum=beta1, beta2=beta2, eps=eps)
 
     for gradient in (torch.randn_like(weight), torch.randn_like(weight)):
         weight.grad = gradient.clone()
@@ -304,8 +301,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 22
-    assert CONTRACT.resumable == frozenset({22})
+    assert CONTRACT.version == 23
+    assert CONTRACT.resumable == frozenset({23})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -331,14 +328,13 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
             max_seq_len=17,
         )
     )
-    normuonh, embedding, nadam = split_parameters(model)
+    normuonh, nadam = split_parameters(model)
     names = {id(parameter): name for name, parameter in model.named_parameters()}
     normuonh_names = {names[id(parameter)] for parameter in normuonh}
-    embedding_names = {names[id(parameter)] for parameter in embedding}
     nadam_names = {names[id(parameter)] for parameter in nadam}
 
     assert "attention_gates.0.weight" in nadam_names
-    assert embedding_names == {"embed_tokens.weight"}
+    assert "embed_tokens.weight" in nadam_names
     assert "blocks.0.attn_router.query" in nadam_names
     assert "blocks.0.attn_router.key_norm.weight" in nadam_names
     assert "fuse_value.weight" in normuonh_names
@@ -351,21 +347,16 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     assert "blocks.0.attn.q_conv.weight" in nadam_names
     assert "blocks.0.mlp.gate_up_proj.weight" in normuonh_names
     assert not (normuonh_names & nadam_names)
-    assert not (normuonh_names & embedding_names)
-    assert not (embedding_names & nadam_names)
-    assert len(normuonh_names) + len(embedding_names) + len(nadam_names) == len(names)
+    assert len(normuonh_names) + len(nadam_names) == len(names)
 
     normuonh_optimizer, nadam_optimizer = build_optimizers(model)
     assert isinstance(normuonh_optimizer, NorMuonH)
     assert isinstance(nadam_optimizer, torch.optim.NAdam)
-    assert DEFAULT_NORMUONH_LR == 2e-2
+    assert DEFAULT_NORMUONH_LR == 9e-3
     assert normuonh_optimizer.param_groups[0]["lr"] == DEFAULT_NORMUONH_LR
     assert normuonh_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NORMUONH_LR
     assert "weight_decay" not in normuonh_optimizer.param_groups[0]
-    embedding_group, nadam_group = nadam_optimizer.param_groups
-    assert embedding_group["lr"] == DEFAULT_EMBEDDING_LR == 6e-4
-    assert embedding_group["stable_lr"] == DEFAULT_EMBEDDING_LR
-    assert embedding_group["rate_name"] == "embedding"
+    [nadam_group] = nadam_optimizer.param_groups
     assert nadam_group["lr"] == DEFAULT_NADAM_LR == 3e-4
     assert nadam_group["stable_lr"] == DEFAULT_NADAM_LR
     assert nadam_group["rate_name"] == "nadam"
@@ -384,11 +375,9 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     )
     assert rates == {
         "normuonh": DEFAULT_NORMUONH_LR / 2,
-        "embedding": DEFAULT_EMBEDDING_LR / 2,
         "nadam": DEFAULT_NADAM_LR / 2,
     }
     assert normuonh_optimizer.param_groups[0]["lr"] == rates["normuonh"]
-    assert embedding_group["lr"] == rates["embedding"]
     assert nadam_group["lr"] == rates["nadam"]
 
 
@@ -398,24 +387,17 @@ def test_optimizer_materialization_restores_fresh_nadam_state():
     embedding.grad = torch.zeros_like(embedding)
     other.grad = torch.zeros_like(other)
     nadam = torch.optim.NAdam(
-        [
-            {"params": [embedding], "lr": DEFAULT_EMBEDDING_LR},
-            {"params": [other], "lr": DEFAULT_NADAM_LR},
-        ],
+        [embedding, other],
         lr=DEFAULT_NADAM_LR,
         betas=DEFAULT_NADAM_BETAS,
     )
-    nadam.param_groups[0]["stable_lr"] = DEFAULT_EMBEDDING_LR
-    nadam.param_groups[1]["stable_lr"] = DEFAULT_NADAM_LR
+    nadam.param_groups[0]["stable_lr"] = DEFAULT_NADAM_LR
     runner = object.__new__(CudaGraphTrainer)
     runner.optimizers = [nadam]
 
     runner._initialize_optimizers()
 
-    assert [group["lr"] for group in nadam.param_groups] == [
-        DEFAULT_EMBEDDING_LR,
-        DEFAULT_NADAM_LR,
-    ]
+    assert [group["lr"] for group in nadam.param_groups] == [DEFAULT_NADAM_LR]
     for parameter in (embedding, other):
         state = nadam.state[parameter]
         assert state["step"].item() == 0
@@ -538,9 +520,9 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
 
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
-    assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 2e-2
-    assert args.lr_embedding == DEFAULT_EMBEDDING_LR == 6e-4
+    assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 9e-3
     assert args.lr_nadam == DEFAULT_NADAM_LR == 3e-4
+    assert not hasattr(args, "lr_embedding")
     assert args.warmup_frac == 0.02
     assert args.cooldown_frac == 0.2
 
@@ -551,14 +533,11 @@ def test_optimizer_learning_rate_flags_are_independent():
             "x",
             "--lr-normuonh",
             "0.03",
-            "--lr-embedding",
-            "0.0004",
             "--lr-nadam",
             "0.0002",
         ]
     )
     assert args.lr_normuonh == 0.03
-    assert args.lr_embedding == 0.0004
     assert args.lr_nadam == 0.0002
 
 
@@ -572,7 +551,9 @@ def test_log_every_flag_is_removed():
         build_parser().parse_args(["x", "--log-every", "2"])
 
 
-@pytest.mark.parametrize("flag", ["--lr-h", "--lr-muon", "--wd-muon", "--lr-adam"])
+@pytest.mark.parametrize(
+    "flag", ["--lr-h", "--lr-muon", "--wd-muon", "--lr-adam", "--lr-embedding"]
+)
 def test_legacy_optimizer_flags_are_removed(flag):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", flag, "0.01"])
@@ -662,8 +643,8 @@ def test_tiny_run_completes(tmp_path, capsys, arm):
     ]
     assert len(step_records) == 8
     assert all("lr_normuonh=" in line for line in step_records)
-    assert all("lr_embedding=" in line for line in step_records)
     assert all("lr_nadam=" in line for line in step_records)
+    assert all("lr_embedding=" not in line for line in step_records)
     assert all("lr_h=" not in line for line in step_records)
 
 
@@ -696,12 +677,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", range(9, 22))
+@pytest.mark.parametrize("version", range(9, 23))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[22\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[23\\]"):
         run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
 
 
@@ -773,9 +754,7 @@ def test_prefix_draw_leaves_every_row_one_fused_position():
     args = SimpleNamespace(data_seed=0, seq_len=16, jitter=0.02)
     seen = set()
     for step in range(64):
-        prefix, jitter = micro_draws(
-            args, step, step * 7, 3, 8, 4, torch.device("cpu")
-        )
+        prefix, jitter = micro_draws(args, step, step * 7, 3, 8, 4, torch.device("cpu"))
         assert prefix.shape == (2, 8)
         assert jitter.shape == (2, 8, args.seq_len + 1, 4)
         assert int(prefix.min()) >= 1

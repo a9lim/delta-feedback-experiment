@@ -39,7 +39,6 @@ from .model import (
     multipass_loss,
 )
 from .optim import (
-    DEFAULT_EMBEDDING_LR,
     DEFAULT_NADAM_LR,
     DEFAULT_NORMUONH_LR,
     OptimizerPair,
@@ -48,7 +47,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=22, resumable=frozenset({22}), surface_version=16
+    version=23, resumable=frozenset({23}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 10.0
@@ -67,7 +66,6 @@ EXACT_FIELDS = (
     "feedback_start",
     "three_pass",
     "lr_normuonh",
-    "lr_embedding",
     "lr_nadam",
     "jitter",
     "zloss",
@@ -172,19 +170,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-normuonh",
         type=float,
         default=DEFAULT_NORMUONH_LR,
-        help="dimensionless NorMuonH relative step (default: 0.02)",
-    )
-    recipe.add_argument(
-        "--lr-embedding",
-        type=float,
-        default=DEFAULT_EMBEDDING_LR,
-        help="tied embedding/readout NAdam learning rate (default: 0.0006)",
+        help="dimensionless NorMuonH relative step (default: 0.009)",
     )
     recipe.add_argument(
         "--lr-nadam",
         type=float,
         default=DEFAULT_NADAM_LR,
-        help="non-embedding NAdam learning rate (default: 0.0003)",
+        help="NAdam learning rate (default: 0.0003)",
     )
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -914,7 +906,6 @@ def train(argv: list[str] | None = None) -> dict:
     optimizers = build_optimizers(
         model,
         lr_normuonh=args.lr_normuonh,
-        lr_embedding=args.lr_embedding,
         lr_nadam=args.lr_nadam,
     )
     pair = OptimizerPair(optimizers)
@@ -1050,7 +1041,6 @@ def train(argv: list[str] | None = None) -> dict:
                 "pass1": telemetry.format_metric(pass1_loss),
                 "k": n_passes,
                 "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
-                "lr_embedding": telemetry.format_metric(learning_rates["embedding"]),
                 "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
                 "gnorm": telemetry.format_metric(grad_norm),
                 "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",

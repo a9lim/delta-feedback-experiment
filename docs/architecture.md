@@ -365,10 +365,9 @@ state. Its authoritative tied parameter and accumulated gradient remain FP32.
 
 ## NorMuonH and NAdam
 
-The flagship uses one optimizer recipe with three disjoint parameter groups:
-one NorMuonH group and two NAdam groups. Their public controls are
-`--lr-normuonh`, `--lr-embedding`, and `--lr-nadam`. No group uses weight
-decay.
+The flagship uses one optimizer recipe with two disjoint parameter groups:
+one NorMuonH group and one NAdam group. Their public controls are
+`--lr-normuonh` and `--lr-nadam`. No group uses weight decay.
 
 ### NorMuonH matrices
 
@@ -400,7 +399,7 @@ N_t = 0.05 G_t + 0.95 M_t
 
 Newton-Schulz and the NorMuon row normalization act on `N_t`.
 
-With dimensionless learning rate `lr_normuonh = 2e-2` and normalized direction
+With dimensionless learning rate `lr_normuonh = 9e-3` and normalized direction
 `U`:
 
 ```text
@@ -423,9 +422,9 @@ parameter:
 - RMSNorm weights, router queries and nulls, depthwise convolutions, biases,
   rates, time constants, and preconditioner centers.
 
-The tied embedding/readout is its own parameter group with learning rate
-`6e-4`; every other NAdam-owned parameter uses `3e-4`. Both groups use moment
-betas `(0.9, 0.95)`, momentum decay `psi = 0.004`, epsilon `1e-8`, and no weight
+Every NAdam-owned parameter, including the tied embedding/readout, belongs to
+one parameter group with learning rate `3e-4`. It uses moment betas
+`(0.9, 0.95)`, momentum decay `psi = 0.004`, epsilon `1e-8`, and no weight
 decay. At optimizer step `t`, PyTorch NAdam uses:
 
 ```text
@@ -438,7 +437,7 @@ U_t = ((1 - mu_t) G_t / (1 - P_t)
       / (sqrt(v_t / (1 - beta2^t)) + eps)
 ```
 
-The update is `theta_t = theta_{t-1} - lr * U_t`. All three parameter groups
+The update is `theta_t = theta_{t-1} - lr * U_t`. Both parameter groups
 receive the same warmup-stable-cooldown multiplier defined by the current
 scale's schedule.
 CUDA uses PyTorch's foreach NAdam path outside the captured forward/backward

@@ -553,8 +553,9 @@ Registering `df-loop` changes the following together:
   and `r_max`; `ColumnOutput` gains the write bank and `forward_column` takes
   a per-position plain mask and a previous bank; `AGENTS.md` and `README.md`
   state six arms.
-- Checkpoint contract v22 with `r_mean`, `r_max`, and the `r` sub-stream as
-  state-defining fields; realized `r` and cell-tokens in the run log.
+- A checkpoint contract beyond v23 with `r_mean`, `r_max`, and the `r`
+  sub-stream as state-defining fields; realized `r` and cell-tokens in the run
+  log.
 - The workspace FLA fork gains the fused-position PKDA operator, forward and
   backward; the gated GQA layer gains the two-piece merge; the router gains
   the presence mask. `df probe` gates each against its portable oracle and

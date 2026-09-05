@@ -32,7 +32,7 @@
   <div class="chart"><h2>NLL <small>nats · solid train loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
 </div>
 <div class="grid two">
-  <div class="chart"><h2>learning rates <small>NorMuonH · embedding/readout NAdam · remaining NAdam</small></h2><div class="plot" id="p-lr"></div></div>
+  <div class="chart"><h2>learning rates <small>NorMuonH · NAdam</small></h2><div class="plot" id="p-lr"></div></div>
   <div class="chart"><h2>gradient norm <small>global L2 before update</small></h2><div class="plot" id="p-gnorm"></div></div>
 </div>
 <div class="grid two">
@@ -71,7 +71,7 @@ const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         state, runFor } = M;
 
 // ---------------------------------------------------------------- records
-// step: loss/pass1/k/three learning rates/gnorm/tok_s/mem/elapsed.  eval: val (+val_fused on
+// step: loss/pass1/k/two learning rates/gnorm/tok_s/mem/elapsed.  eval: val (+val_fused on
 // feedback arms).  route: per-site weights at eval cadence.  contract: the
 // standing contraction diagnostic.  Non-step series live in run.evals so the
 // chassis's resume-fold rewinds them with everything else.
@@ -79,7 +79,7 @@ function onStep(run, rec) {
   return {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k),
     lr_normuonh: num(rec.lr_normuonh),
-    lr_embedding: num(rec.lr_embedding), lr_nadam: num(rec.lr_nadam),
+    lr_nadam: num(rec.lr_nadam),
     gnorm: num(rec.gnorm),
     tok_s: num(rec.tok_s), mem: num(rec.mem), elapsed: num(rec.elapsed),
   };
@@ -144,7 +144,7 @@ function renderTiles(view) {
 const CONFIG_GROUPS = [
   ['arm & seeds', ['arm', 'seed', 'data_seed']],
   ['trunk', ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
-  ['optimizer', ['lr_normuonh', 'lr_embedding', 'lr_nadam', 'zloss']],
+  ['optimizer', ['lr_normuonh', 'lr_nadam', 'zloss']],
   ['feedback', ['feedback_start', 'feedback_batch_prob', 'three_pass', 'jitter']],
   ['batch', ['batch_rows', 'micro_rows']],
 ];
@@ -207,10 +207,10 @@ function rebuild() {
   makeChart('p-lr', {
     series: [
       line('NorMuonH', P.s1, { value: (u, v) => fmt(v, 3) }),
-      dashed('embedding', P.s1), dotted('NAdam', P.s1),
+      dotted('NAdam', P.s1),
       ...ovs.flatMap((t, i) => [
         line(`NorMuonH · ${t}`, hue(i), { value: (u, v) => fmt(v, 3) }),
-        dashed(`embedding · ${t}`, hue(i)), dotted(`NAdam · ${t}`, hue(i)),
+        dotted(`NAdam · ${t}`, hue(i)),
       ]),
     ],
     yScale: { distr: 3, log: 10, range: tightLogRange },
@@ -273,7 +273,6 @@ function seriesOf(view) {
     lr: [[
       xs,
       steps.map((s) => s.lr_normuonh),
-      steps.map((s) => s.lr_embedding),
       steps.map((s) => s.lr_nadam),
     ]],
     gnorm: [[xs, steps.map((s) => s.gnorm)]],

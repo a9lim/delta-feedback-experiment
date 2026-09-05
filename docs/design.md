@@ -177,7 +177,7 @@ penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 
 ### WSD schedule
 
-All three parameter-group learning rates use one warmup-stable-cooldown multiplier.
+Both parameter-group learning rates use one warmup-stable-cooldown multiplier.
 Warmup and cooldown occupy `round(warmup_frac * steps)` and
 `round(cooldown_frac * steps)` updates. Their defaults are 0.02 and 0.20.
 Warmup rises linearly to the stable rate. For local cooldown progress `u` in
@@ -310,13 +310,14 @@ serial; concurrent execution is outside the qualified deterministic path.
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v22, and only v22 is resumable. V16-v21
+New snapshots use checkpoint contract v23, and only v23 is resumable. V16-v22
 snapshots remain readable for evaluation and forks but cannot be continued:
 v16 used different feedback-prefix draws, v16-v17 predate the Nesterov
 NorMuonH update, v16-v18 predate NAdam, and v19 stores the retired fixed-step
 warmup contract. V20 predates the split NAdam rates and the global clipping
 contract.
-V21 predates inverse-square-root fan-in initialization of NorMuonH matrices. A
+V21 predates inverse-square-root fan-in initialization of NorMuonH matrices,
+and v22 predates the unified NAdam rate and reduced NorMuonH rate. A
 snapshot contains the model,
 both optimizer states, fixed
 NorMuonH radii, state-defining arguments, cumulative step, and

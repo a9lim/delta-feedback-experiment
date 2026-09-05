@@ -61,9 +61,9 @@ a contract changes.
   Nesterov blend before orthogonalization. Its matrices initialize from
   `Normal(0, 1/sqrt(d_in))`; their realized initial Frobenius radii remain fixed.
   NAdam owns semantic-scale gates, embeddings, norms, routing parameters, PKDA
-  controls, convolutions, and vectors, with the tied embedding/readout isolated
-  in its own NAdam rate group. No group uses weight decay. Clip the global FP32
-  gradient to norm 10.0 immediately before both steps.
+  controls, convolutions, and vectors in one parameter group. No group uses
+  weight decay. Clip the global FP32 gradient to norm 10.0 immediately before
+  both steps.
 
 ## Evidence discipline
 
@@ -86,8 +86,8 @@ a contract changes.
 - Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
   monitor serving, and spool orchestration from the workspace root package.
 - Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified DF graph pool reserves 22.98 GiB. New snapshots are v22;
-  only v22 resumes, and v16-v21 stay readable for evaluation and forks.
+  the qualified DF graph pool reserves 22.98 GiB. New snapshots are v23;
+  only v23 resumes, and v16-v22 stay readable for evaluation and forks.
 - Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
   The queue stores arguments rather than Git state; a worker refreshes before
   the next job and runs the current checkout's probe.

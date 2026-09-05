@@ -128,14 +128,15 @@ starts independently at three quarters of the schedule, and every later step
 draws two or three passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 10.0 before the shared
-NorMuonH/NAdam update. NorMuonH uses a `2e-2` stable rate; the tied
-embedding/readout and remaining NAdam parameters use `6e-4` and `3e-4`.
+NorMuonH/NAdam update. NorMuonH uses a `9e-3` stable rate; every NAdam-owned
+parameter, including the tied embedding/readout, uses `3e-4`.
 Both sides apply their specified Nesterov construction:
 NorMuonH before orthogonalization and NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v22, and only v22 is resumable. V16-v21
+Snapshots use checkpoint contract v23, and only v23 is resumable. V16-v22
 remain readable for evaluation and forks; v19 retains the retired fixed-step
-warmup contract, and v21 predates the NorMuonH fan-in initialization.
+warmup contract, v21 predates the NorMuonH fan-in initialization, and v22
+predates the unified NAdam rate and reduced NorMuonH rate.
 Protected snapshots persist at the cooldown boundary, the
 feedback boundary, and the end of the run.
 `--max-steps` limits the current invocation without changing the registered
