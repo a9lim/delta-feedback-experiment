@@ -8,8 +8,12 @@ import json
 import time
 from pathlib import Path
 
+import cut_cross_entropy
+import fla
 import torch
+from kernel_qualification import revision
 
+import delta_feedback_experiment
 from delta_feedback_experiment.data import TokenData
 from delta_feedback_experiment.model import DFModel, arm_config, iterate_fused
 from delta_feedback_experiment.optim import build_optimizers
@@ -48,6 +52,7 @@ def main() -> None:
     )
     for field in (*fields, "seq_len"):
         setattr(args, field, saved[field])
+    args.arm = saved["arm"]
     model = DFModel(
         arm_config(
             saved["arm"],
@@ -70,6 +75,25 @@ def main() -> None:
         json.dumps(
             {
                 "snapshot": str(options.snapshot),
+                "revisions": {
+                    name: revision(Path(module.__file__).resolve().parents[1])
+                    for name, module in (
+                        ("experiment", delta_feedback_experiment),
+                        ("fla", fla),
+                        ("cce", cut_cross_entropy),
+                    )
+                },
+                "inputs": {
+                    "data_dir": options.data_dir,
+                    "first_row": 100000,
+                    "first_randomness_step": 9000,
+                    "data_seed": args.data_seed,
+                    "jitter": args.jitter,
+                    "zloss": args.zloss,
+                    "batch_rows": args.batch_rows,
+                    "micro_rows": args.micro_rows,
+                    "seq_len": args.seq_len,
+                },
                 "updates": options.updates,
                 "optimizer_state": "fresh, identical in baseline and candidate",
                 "learning_rates": [args.lr_normuonh, args.lr_nadam],
