@@ -1357,6 +1357,7 @@ def _fixed_cce_z(
     *,
     skip_early: bool = True,
     tile_flags: Tensor | None = None,
+    classifier_grad_sink: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Current CCE with capture-safe preprocessing and differentiable LSE.
 
@@ -1400,6 +1401,7 @@ def _fixed_cce_z(
         vocab_ordering=vocab_ordering,
         skip_early=skip_early,
         tile_flags=tile_flags,
+        classifier_grad_sink=classifier_grad_sink,
     )
     ce, lse = linear_cross_entropy_apply(
         embeddings,
@@ -1438,7 +1440,15 @@ def sequence_ce(
             if torch.is_grad_enabled()
             else None
         )
-        return _fixed_cce_z(normalized, model.classifier_for_loss(), targets, ordering)
+        return _fixed_cce_z(
+            normalized,
+            model.classifier_for_loss(),
+            targets,
+            ordering,
+            classifier_grad_sink=(
+                model.embed_tokens.grad_sink if torch.is_grad_enabled() else None
+            ),
+        )
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)
