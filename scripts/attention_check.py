@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--length", type=int, default=1024)
     length = parser.parse_args().length
     torch.manual_seed(42)
+    torch.set_float32_matmul_precision("high")
     values = [
         torch.randn(4, length, heads, 96, device="cuda", dtype=torch.bfloat16)
         .transpose(1, 2)
@@ -80,6 +81,7 @@ def main():
                 {
                     "mode": mode,
                     "length": length,
+                    "matmul_precision": torch.get_float32_matmul_precision(),
                     "milliseconds": statistics.median(samples),
                     "samples": samples,
                     "relative_l2_output_q_k_v": relative,
