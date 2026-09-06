@@ -1,4 +1,4 @@
-# Published mechanisms synthesized into the recurrent model organism.
+# Published mechanisms and explicit design comparisons for the recurrent model organism.
 # Roles and departures are explained in docs/literature.md; source results
 # do not establish local capabilities or interpretability findings. Fetched Markdown/PDF copies
 # are regenerable and remain untracked:
@@ -165,3 +165,15 @@ references:
       initial state with the prelude output, the sandwich norm with the
       unchanged pre-norm shell, and the untrained warm start with the trained
       FBT payload.
+
+  - arxiv: "2609.03807"
+    slug: langford2026-free-pause-tokens
+    note: >
+      Free Pause Tokens; the v1 HTML body is titled Almost Free State
+      Prediction Separation. Defines weight-shared state and prediction
+      streams, prediction-only queries over state keys/values without
+      prediction writes, and optional shared gated FFNs and late phasing.
+      A design comparison for df-loop, not an adopted component: it separates
+      persistent memory from prediction but does not supply recurrent depth.
+      The B200 latency and training-cost results do not qualify our PKDA/GQA
+      implementation. See docs/literature.md for the integration assessment.
