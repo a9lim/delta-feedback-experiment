@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import gc
 import json
 import time
@@ -33,7 +34,40 @@ def main() -> None:
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("--data-dir", default="/data/df/tokens")
     parser.add_argument("--updates", type=int, default=12)
+    parser.add_argument("--label", default="current")
+    parser.add_argument("--gemm-backends")
+    parser.add_argument("--attention", choices=("plain", "hints", "prescale"))
+    parser.add_argument("--input-mode", choices=("micro", "staged"), default="micro")
+    parser.add_argument("--profile-optimizer", type=Path)
     options = parser.parse_args()
+    if options.gemm_backends:
+        torch._inductor.config.max_autotune_gemm_backends = options.gemm_backends
+    if options.attention:
+        import delta_feedback_experiment.attention as attention
+        from torch.nn.attention.flex_attention import flex_attention
+
+        kernel_options = {"BACKEND": "TRITON"}
+        if options.attention != "plain":
+            kernel_options.update(ROWS_GUARANTEED_SAFE=True, BLOCKS_ARE_CONTIGUOUS=True)
+        if options.attention == "prescale":
+            kernel_options["PRESCALE_QK"] = True
+
+        def causal(query, key, value, block_mask):
+            return flex_attention(
+                query,
+                key,
+                value,
+                block_mask=block_mask,
+                enable_gqa=True,
+                kernel_options=kernel_options,
+            )
+
+        attention._compiled_causal_attention = torch.compile(
+            causal,
+            fullgraph=True,
+            dynamic=False,
+            mode=delta_feedback_experiment.INDUCTOR_MODE,
+        )
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1)
     args = build_parser().parse_args(["kernel-stability", "--arm", "df"])
@@ -78,6 +112,12 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "label": options.label,
+                "variants": {
+                    "attention": options.attention,
+                    "input_mode": options.input_mode,
+                    "gemm_backends": torch._inductor.config.max_autotune_gemm_backends,
+                },
                 "snapshot": str(options.snapshot),
                 "runtime": {
                     "torch": torch.__version__,
@@ -123,18 +163,58 @@ def main() -> None:
         state = runner.begin(GraphSpec(passes, False), args.zloss)
         torch.cuda.synchronize()
         started = time.perf_counter()
-        for micro in range(args.batch_rows // args.micro_rows):
-            first = 100000 + index * args.batch_rows + micro * args.micro_rows
-            runner.replay(
-                state, train.batch(first, args.micro_rows), 9000 + index, first
+        events = [torch.cuda.Event(enable_timing=True) for _ in range(7)]
+        events[0].record()
+        if options.input_mode == "staged":
+            runner.replay_batch(
+                state, train, 9000 + index, 100000 + index * args.batch_rows
             )
+        else:
+            for micro in range(args.batch_rows // args.micro_rows):
+                first = 100000 + index * args.batch_rows + micro * args.micro_rows
+                runner.replay(
+                    state, train.batch(first, args.micro_rows), 9000 + index, first
+                )
+        events[1].record()
         runner.prepare_optimizer(state)
-        norm = clip_gradients(model.parameters())
-        for optimizer in optimizers:
-            optimizer.step()
-        model.refresh_shadows()
-        runner.zero_grad()
+        profiling = (
+            options.profile_optimizer is not None and index == options.updates - 1
+        )
+        profile = (
+            torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                profile_memory=True,
+            )
+            if profiling
+            else contextlib.nullcontext()
+        )
+        with profile:
+            with torch.profiler.record_function("clip"):
+                norm = clip_gradients(model.parameters())
+            events[2].record()
+            for slot, optimizer in enumerate(optimizers):
+                with torch.profiler.record_function(type(optimizer).__name__):
+                    optimizer.step()
+                events[3 + slot].record()
+            with torch.profiler.record_function("refresh_shadows"):
+                model.refresh_shadows()
+            events[5].record()
+            with torch.profiler.record_function("zero_grad"):
+                runner.zero_grad()
+            events[6].record()
         torch.cuda.synchronize()
+        elapsed = time.perf_counter() - started
+        if profiling:
+            profile.export_chrome_trace(str(options.profile_optimizer))
+            print(
+                profile.key_averages().table(
+                    sort_by="self_cuda_time_total", row_limit=30
+                ),
+                flush=True,
+            )
         print(
             json.dumps(
                 {
@@ -143,7 +223,25 @@ def main() -> None:
                     "loss": state.loss_sum.item(),
                     "pass1_loss": state.pass1_sum.item(),
                     "gradient_norm": norm,
-                    "seconds": time.perf_counter() - started,
+                    "seconds": elapsed,
+                    "profiled": profiling,
+                    "stages_ms": dict(
+                        zip(
+                            (
+                                "forward_backward",
+                                "clip",
+                                "normuonh",
+                                "nadam",
+                                "shadows",
+                                "zero_grad",
+                            ),
+                            (
+                                left.elapsed_time(right)
+                                for left, right in zip(events, events[1:])
+                            ),
+                        )
+                    ),
+                    "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
                 }
             ),
             flush=True,
