@@ -30,7 +30,6 @@ def cuda_gate() -> None:
         _route_sources,
         arm_config,
         batch_vocab_order,
-        flash_attn_func,
         iterate_fused,
         linear_cross_entropy,
     )
@@ -54,8 +53,8 @@ def cuda_gate() -> None:
         route_summary,
     )
 
-    if flash_attn_func is None or linear_cross_entropy is None:
-        raise RuntimeError("Jobe gate requires flash-attn and cut-cross-entropy")
+    if linear_cross_entropy is None:
+        raise RuntimeError("Jobe gate requires cut-cross-entropy")
     if route_triton is None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
     if not pkda_cuda_available():
@@ -431,8 +430,8 @@ def cuda_gate() -> None:
         raise AssertionError("packed-control gradient assembly drift")
     del control, control_ref, cotangents, control_parts, reference_parts
 
-    # Exercise both FlashAttention entry points: full causal attention and the
-    # in-place native GQA KV cache. BF16 changes with block partitioning, so the
+    # Exercise causal FlexAttention and explicit GQA prefix-cache decoding.
+    # BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
     def decode_parity(arm: str, layers: int) -> float:
         decode_cfg = arm_config(
@@ -571,7 +570,7 @@ def cuda_gate() -> None:
         raise AssertionError("CUDA NAdam did not materialize fresh optimizer state")
     eval_runner = CudaEvalRunner(model, args, runner.pool)
     backend = execution_fields(model, runner, eval_runner)
-    if backend["flash"] != 1 or backend["cuda_graphs"] != 4:
+    if backend["flex"] != 1 or backend["cuda_graphs"] != 4:
         raise AssertionError(f"invalid production execution telemetry: {backend}")
     torch.cuda.synchronize()
     prepared = time.monotonic() - started

@@ -447,7 +447,6 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
     from delta_feedback_experiment.model import (
         DFModel,
         arm_config,
-        flash_attn_func,
     )
     from delta_feedback_experiment.train import GraphSpec, execution_fields
 
@@ -475,7 +474,7 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
     evaluator = SimpleNamespace(states={4: None})
     fields = execution_fields(model, trainer, evaluator)
     assert fields == {
-        "flash": int(flash_attn_func is not None),
+        "flex": 1,
         "cce": 1,
         "cuda_graphs": 3,
         "eval_graphs": 1,

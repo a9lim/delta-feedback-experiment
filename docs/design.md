@@ -214,7 +214,8 @@ the same model, loss, optimizer, data, and checkpoint semantics.
 
 ### Jobe CUDA path
 
-Jobe is the authoritative single-GPU screen surface. It uses:
+Jobe is the authoritative single-GPU screen surface, on PyTorch 2.14 and
+CUDA 13.2. It uses:
 
 - BF16 trunk activations with FP32 parameters, accumulated gradients, and
   optimizer state;
@@ -250,8 +251,12 @@ Jobe is the authoritative single-GPU screen surface. It uses:
   recomputed, whose chunk kernels run without register spills, and whose
   summary kernel folds in the intra-chunk key gradient, and fused PKDA
   output norm/gate;
-- FlashAttention for full-sequence, prefill, GQA, and cached decode, with each
-  gated global layer projecting Q/K/V and its gate in one GEMM;
+- compiled FlexAttention for full-sequence, prefill, native GQA, and cached
+  decode, with each gated global layer projecting Q/K/V and its gate in one
+  GEMM. Causal block masks are shared across layers and passes; decoding
+  explicitly updates the KV cache and exposes only its valid prefix. The
+  Triton training backend ships with PyTorch, and short-query decoding uses
+  FlexAttention's automatic backend selection without external `flash-attn`;
 - a fixed-capacity Triton MHDB router that reads every source once per token
   with the source softmax folded in online, holds each site's width-`D` null in
   place, keeps full-width RMS coupling in its analytic backward, and reduces the
@@ -286,38 +291,18 @@ Jobe is the authoritative single-GPU screen surface. It uses:
 - internal activation checkpointing above the measured work threshold;
 - asynchronous pinned-host snapshot staging and atomic background writes.
 
-These choices are not exposed as experiment axes. The qualified default
-geometry uses four 1,024-token rows per microbatch and 80 microbatches per
-update. With trained diagnostic weights, the full train/eval capture is:
-
-| Arm | Observed prepare | Peak allocated | Peak reserved | Train/eval graphs |
-|---|---:|---:|---:|---:|
-| `df` | 78.4 s | 13.839 GiB | 22.984 GiB | 4 |
-
-Median trained graph replay is 59.41 ms, 120.29 ms, and 180.99 ms for one,
-two, and three passes. The corresponding full-batch forward/backward times
-are 4.751 s, 9.599 s, and 14.449 s. Qualification uses the
-`screen-df-full-s1` step-10,745 diagnostic, training rows starting at 100,000,
-keyed randomness step 9,000, and z-loss coefficient 1e-5. Against the preceding
-kernel revisions, full-batch gradients differ by 0.75–0.85% relative L2,
-with norm ratios 0.999883–0.999987 and cosine similarity at least 0.999964.
-These are engineering comparisons, not training-quality findings.
-
-A paired 12-update check from those trained weights, with identical fresh
-optimizer states and fixed learning rates, measures median complete steps of
-4.835 s, 9.691 s, and 14.579 s for one, two, and three passes. Final pass-1
-validation differs by 0.000224 and fused validation by 0.000127 from the
-preceding kernels, with no nonfinite gradients. This checks the actual
-training path; it does not establish long-run quality equivalence.
-
-The trained head computes the exact same filtered-tile set with target
-metadata. Its 128×128 tile geometry, BF16 gradient accumulation, and ascending
-vocabulary ordering remain authoritative. The convolution's 32-row backward
-tile adds 4.6875 MiB of live partial-gradient scratch; spill elimination does
-not imply lower allocated memory. Full-pool memory remains essentially
-unchanged. Reproducible trained-input, full-gradient, and short-update checks
+These choices are not exposed as experiment axes. The default geometry uses
+four 1,024-token rows per microbatch and 80 microbatches per update.
+The PyTorch 2.14 / FlexAttention runtime must pass the full CUDA gate and a
+trained-checkpoint short-update comparison before its memory and throughput
+are considered qualified. These are engineering checks, not training-quality
+findings. Reproducible trained-input, full-gradient, and short-update checks
 are in `scripts/kernel_inputs.py`, `scripts/kernel_qualification.py`, and
 `scripts/kernel_training_check.py`.
+
+Hopper uses the same FlexAttention API but remains hardware-unqualified until
+the forward/backward, cache, graph, memory, and throughput gates pass there.
+The optional external FlashAttention-4 backend is not part of this runtime.
 
 Inductor artifacts live in
 `~/.cache/delta-feedback/torchinductor` by default; the probe performs the
@@ -528,7 +513,8 @@ clipping, checkpoint portability, restart behavior, memory, and throughput.
 `df probe` must pass from the source that will run the job. On Jobe it covers
 portable tests, Triton router value/weight/gradient parity for four and eight
 groups, PKDA forward/backward and cache parity, cut-cross-entropy z-loss
-parity, cached FlashAttention, eager/captured evaluation parity, every
+parity, causal/prefix FlexAttention values and gradients, cached decoding,
+eager/captured evaluation parity, every
 schedule-reachable graph, finite optimizer updates, exact NorMuonH radius
 preservation, contraction monitoring, and production-scale snapshot staging.
 

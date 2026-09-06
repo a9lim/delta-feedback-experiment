@@ -41,6 +41,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
+from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, sink_linear
 from .parameter_groups import is_normuonh_parameter
 from .pkda import PreconditionedKDA
@@ -51,12 +52,6 @@ try:  # Triton is deliberately a CUDA-only optimization dependency.
 except (ImportError, OSError):  # pragma: no cover - portable fallback
     bespoke_route = None
     route_triton = None
-
-try:  # CUDA-only wheels; CPU/MPS retain the exact portable fallbacks.
-    from flash_attn import flash_attn_func, flash_attn_with_kvcache
-except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
-    flash_attn_func = None
-    flash_attn_with_kvcache = None
 
 try:
     from cut_cross_entropy import linear_cross_entropy
@@ -277,7 +272,7 @@ class KVCache:
         self.global_slots = {
             layer: slot for slot, layer in enumerate(cfg.global_attention_layers)
         }
-        # FlashAttention's native cache layout: [B, S, Hkv, D].
+        # Position-major storage keeps each incoming column's write contiguous.
         shape = (
             len(self.global_slots),
             batch,
@@ -395,36 +390,22 @@ class Attention(nn.Module):
                 raise ValueError("vanilla GQA requires rotary position tables")
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
-        q_flash = q.transpose(1, 2)
-        k_flash = k.transpose(1, 2)
-        v_flash = v.transpose(1, 2)
-        use_flash = q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
-
         if cache is not None and length > 1 and cache.pos != 0:
             raise ValueError("multi-column append to a non-empty cache")
-        if cache is not None and use_flash and flash_attn_with_kvcache is not None:
-            cache_k, cache_v = cache.attention_tensors(layer)
-            out = flash_attn_with_kvcache(
-                q_flash,
-                cache_k,
-                cache_v,
-                k=k_flash,
-                v=v_flash,
-                cache_seqlens=cache.pos,
-                causal=True,
+        causal = cache is None or length > 1
+        if cache is not None:
+            k_prefix, v_prefix = cache.update(
+                layer, k.transpose(1, 2), v.transpose(1, 2)
             )
-        elif cache is None and use_flash and flash_attn_func is not None:
-            # FlashAttention natively accepts Hq/Hkv GQA without expanding K/V.
-            out = flash_attn_func(q_flash, k_flash, v_flash, causal=True)
+            k, v = k_prefix.transpose(1, 2), v_prefix.transpose(1, 2)
+        if q.is_cuda:
+            attention = causal_attention if causal else prefix_attention
+            out = attention(q, k, v).transpose(1, 2)
         else:
-            causal = True
-            if cache is not None:
-                k_flash, v_flash = cache.update(layer, k_flash, v_flash)
-                causal = length > 1
             out = F.scaled_dot_product_attention(
                 q,
-                k_flash.transpose(1, 2),
-                v_flash.transpose(1, 2),
+                k,
+                v,
                 is_causal=causal,
                 enable_gqa=cfg.heads != cfg.kv_heads,
             ).transpose(1, 2)

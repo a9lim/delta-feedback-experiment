@@ -213,8 +213,11 @@ projection and residual-branch scaling. It does not change attention logits
 or softmax weights. It is distinct from every PKDA control and from the FBT
 entry gate.
 
-Full-sequence, prefill, and cached CUDA execution use FlashAttention. Cached
-decoding stores BF16 K/V only for the six global layers.
+Full-sequence and prefill CUDA execution use compiled PyTorch FlexAttention
+with a shared causal block mask and native GQA. Cached decoding writes BF16
+K/V explicitly, then attends only to the valid prefix; a one-token query sees
+every key in that prefix. Only the six global layers own KV storage.
+The external `flash-attn` extension is not required.
 
 ## Multi-Head Delta Block routing
 

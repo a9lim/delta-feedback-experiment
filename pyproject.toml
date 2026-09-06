@@ -9,7 +9,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
     "transformer-experiments>=0.1,<0.2",
-    "torch",
+    "torch>=2.14,<2.15",
     "numpy",
     "transformers",
     "datasets",
@@ -24,7 +24,6 @@ data-build = [
 ]
 cuda = [
     "cut-cross-entropy",
-    "flash-attn==2.8.3",
     "flash-linear-attention[cuda]",
 ]
 

@@ -65,8 +65,7 @@ uv pip install -e .
 ```
 
 On Jobe, initialize the workspace's kernel forks and install the CUDA extras
-into its shared environment without changing the pinned Torch/FlashAttention
-pair:
+into its shared PyTorch 2.14 / CUDA 13.2 environment:
 
 ```bash
 git -C .. submodule update --init vendor/flash-linear-attention vendor/ml-cross-entropy
@@ -76,8 +75,9 @@ uv pip install -e '.[cuda]'
 CCE and FLA install editable from the workspace forks under `../vendor/`
 through `tool.uv.sources` in `pyproject.toml`, so the root repository's
 submodule pointers are their only pin and kernel edits there are live without
-reinstalling. The compatible FlashAttention version is pinned in the extra;
-machine-wide constraints continue to own Torch itself. The first `df probe` performs the fixed-shape Inductor search and preserves its
+reinstalling. CUDA GQA uses compiled PyTorch FlexAttention; the external
+`flash-attn` package is not used. Machine-wide constraints own Torch itself.
+The first `df probe` performs the fixed-shape Inductor search and preserves its
 generated artifacts at `~/.cache/delta-feedback/torchinductor`; later probes
 and training processes reuse that cache. Set `DF_INDUCTOR_CACHE_DIR` only when
 the durable cache belongs elsewhere.

@@ -33,7 +33,6 @@ from .model import (
     ARMS,
     DFModel,
     arm_config,
-    flash_attn_func,
     iterate_fused,
     multipass,
     multipass_loss,
@@ -637,7 +636,7 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
     """Production CUDA telemetry without assuming a packed mixer layout."""
     has_global_attention = any(not block.is_pkda for block in model.blocks)
     return {
-        "flash": int(flash_attn_func is not None and has_global_attention),
+        "flex": int(has_global_attention),
         "cce": 1,
         "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
         "eval_graphs": len(eval_graph_runner.states),
