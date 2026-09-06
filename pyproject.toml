@@ -26,6 +26,10 @@ cuda = [
     "cut-cross-entropy",
     "flash-linear-attention[cuda]",
 ]
+kernel-bench = [
+    "nvidia-cutlass-operators[torch]==0.2.0; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]==4.7.1; sys_platform == 'linux'",
+]
 
 [project.scripts]
 df = "delta_feedback_experiment.cli:main"

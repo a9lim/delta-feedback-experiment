@@ -304,6 +304,30 @@ class CapturedMicro:
     active: frozenset[torch.nn.Parameter] = frozenset()
 
 
+class CudaBatchStager:
+    """Reuse one pinned host batch and one device batch on the replay stream.
+
+    The copy event protects host storage from being overwritten while DMA is
+    still reading it. Device copies and graph replays use the same stream, so
+    the next batch cannot overwrite tokens still consumed by the prior one.
+    """
+
+    def __init__(self, rows: int, columns: int, device: torch.device):
+        self.host = torch.empty(rows, columns, dtype=torch.long, pin_memory=True)
+        self.device = torch.empty(rows, columns, dtype=torch.long, device=device)
+        self.copied = torch.cuda.Event()
+        self.pending = False
+
+    def stage(self, data: TokenData, first_row: int) -> torch.Tensor:
+        if self.pending:
+            self.copied.synchronize()
+        self.host.copy_(data.batch(first_row, self.host.shape[0]))
+        self.device.copy_(self.host, non_blocking=True)
+        self.copied.record()
+        self.pending = True
+        return self.device
+
+
 @contextlib.contextmanager
 def _capture_without_gc(graph, pool):
     """Keep cyclic CUDA resource destruction outside stream capture."""
@@ -345,6 +369,9 @@ class CudaGraphTrainer:
         self.autocast = torch.autocast("cuda", dtype=torch.bfloat16)
         self.generator = torch.Generator(device=self.device)
         self.parameters = [p for p in model.parameters() if p.requires_grad]
+        self.batch_stager = CudaBatchStager(
+            args.batch_rows, args.seq_len + 1, self.device
+        )
         self.states: dict[GraphSpec, CapturedMicro] = {}
         self.model.refresh_shadows()
         specs = self._reachable_specs(schedule)
@@ -520,7 +547,7 @@ class CudaGraphTrainer:
         return state
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
-        state.rows.copy_(rows)
+        state.rows.copy_(rows, non_blocking=rows.is_cuda)
         if state.spec.n_passes > 1:
             micro_draws(
                 self.args,
@@ -535,6 +562,18 @@ class CudaGraphTrainer:
                 generator=self.generator,
             )
         state.graph.replay()
+
+    def replay_batch(
+        self, state: CapturedMicro, data: TokenData, step: int, first_row: int
+    ) -> None:
+        rows = self.batch_stager.stage(data, first_row)
+        for offset in range(0, self.args.batch_rows, self.args.micro_rows):
+            self.replay(
+                state,
+                rows[offset : offset + self.args.micro_rows],
+                step,
+                first_row + offset,
+            )
 
     def prepare_optimizer(self, state: CapturedMicro) -> None:
         for parameter in self.parameters:
@@ -1001,10 +1040,9 @@ def train(argv: list[str] | None = None) -> dict:
             if graph_runner is not None:
                 spec = GraphSpec(n_passes, checkpointing)
                 graph_state = graph_runner.begin(spec, z_coef)
-                for micro in range(micros):
-                    first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
-                    rows = data_train.batch(first_row, args.micro_rows)
-                    graph_runner.replay(graph_state, rows, step, first_row)
+                graph_runner.replay_batch(
+                    graph_state, data_train, step, (step - 1) * args.batch_rows
+                )
                 step_loss = graph_state.loss_sum.item()
                 pass1_loss = graph_state.pass1_sum.item()
                 graph_runner.prepare_optimizer(graph_state)

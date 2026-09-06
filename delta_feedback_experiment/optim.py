@@ -88,8 +88,43 @@ def _normuonh_batch(
     return momentum, row_moment, projected
 
 
-_compiled_normuonh_batch = torch.compile(
-    _normuonh_batch,
+def _normuonh_bucket_step(
+    parameters: list[Tensor],
+    gradients: list[Tensor],
+    momenta: list[Tensor],
+    row_moments: list[Tensor],
+    radii: list[Tensor],
+    lr: Tensor,
+    momentum_beta: float,
+    beta2: float,
+    eps: float,
+    ns_steps: int,
+) -> None:
+    """Keep packing and state writebacks inside the compiled bucket boundary.
+
+    State remains ordinary per-parameter tensors for checkpoints. Inductor can
+    fuse the stack producers and update epilogues without retaining a second
+    packed copy of the model or optimizer between updates.
+    """
+    new_momenta, new_rows, projected = _normuonh_batch(
+        torch.stack(momenta),
+        torch.stack(row_moments),
+        torch.stack(parameters),
+        torch.stack(radii),
+        torch.stack(gradients),
+        lr,
+        momentum_beta,
+        beta2,
+        eps,
+        ns_steps,
+    )
+    torch._foreach_copy_(momenta, list(new_momenta.unbind()))
+    torch._foreach_copy_(row_moments, list(new_rows.unbind()))
+    torch._foreach_copy_(parameters, list(projected.unbind()))
+
+
+_compiled_normuonh_bucket_step = torch.compile(
+    _normuonh_bucket_step,
     fullgraph=True,
     dynamic=True,
     mode="max-autotune-no-cudagraphs",
@@ -147,24 +182,32 @@ class NorMuonH(torch.optim.Optimizer):
             for (device, dtype, shape), parameters in buckets.items():
                 if device.type != "cuda":
                     continue
-                batch_shape = (len(parameters), *shape)
-                matrices = torch.full(
-                    batch_shape,
-                    1 / math.sqrt(shape[0] * shape[1]),
-                    device=device,
-                    dtype=dtype,
-                )
-                rows = torch.zeros(
-                    len(parameters), shape[0], 1, device=device, dtype=dtype
-                )
-                radii = torch.ones(len(parameters), device=device, dtype=dtype)
+                matrices = [
+                    torch.nn.Parameter(
+                        torch.full(
+                            shape,
+                            1 / math.sqrt(shape[0] * shape[1]),
+                            device=device,
+                            dtype=dtype,
+                        ),
+                        requires_grad=parameter.requires_grad,
+                    )
+                    for parameter in parameters
+                ]
+                gradients = [torch.zeros_like(matrix) for matrix in matrices]
+                momenta = [torch.zeros_like(matrix) for matrix in matrices]
+                rows = [
+                    torch.zeros(shape[0], 1, device=device, dtype=dtype)
+                    for _ in parameters
+                ]
+                radii = [torch.ones((), device=device, dtype=dtype) for _ in parameters]
                 scalar = torch.zeros((), device=device)
-                _compiled_normuonh_batch(
+                _compiled_normuonh_bucket_step(
                     matrices,
+                    gradients,
+                    momenta,
                     rows,
-                    matrices,
                     radii,
-                    matrices,
                     scalar,
                     group["momentum"],
                     group["beta2"],
@@ -196,44 +239,24 @@ class NorMuonH(torch.optim.Optimizer):
                 )
 
             for (device, _dtype, _shape), parameters in buckets.items():
-                gradients = torch.stack([parameter.grad for parameter in parameters])
-                parameter_batch = torch.stack(parameters)
-                momenta = torch.stack(
-                    [self.state[parameter]["momentum"] for parameter in parameters]
-                )
-                row_moments = torch.stack(
-                    [self.state[parameter]["row_moment"] for parameter in parameters]
-                )
-                radii = torch.stack(
-                    [self.state[parameter]["radius"] for parameter in parameters]
-                )
                 lr = torch.scalar_tensor(group["lr"], device=device)
                 update_fn = (
-                    _compiled_normuonh_batch
+                    _compiled_normuonh_bucket_step
                     if device.type == "cuda"
-                    else _normuonh_batch
+                    else _normuonh_bucket_step
                 )
-                momenta, row_moments, projected = update_fn(
-                    momenta,
-                    row_moments,
-                    parameter_batch,
-                    radii,
-                    gradients,
+                update_fn(
+                    parameters,
+                    [parameter.grad for parameter in parameters],
+                    [self.state[parameter]["momentum"] for parameter in parameters],
+                    [self.state[parameter]["row_moment"] for parameter in parameters],
+                    [self.state[parameter]["radius"] for parameter in parameters],
                     lr,
                     group["momentum"],
                     group["beta2"],
                     group["eps"],
                     group["ns_steps"],
                 )
-                torch._foreach_copy_(
-                    [self.state[p]["momentum"] for p in parameters],
-                    list(momenta.unbind()),
-                )
-                torch._foreach_copy_(
-                    [self.state[p]["row_moment"] for p in parameters],
-                    list(row_moments.unbind()),
-                )
-                torch._foreach_copy_(parameters, list(projected.unbind()))
         return loss
 
 

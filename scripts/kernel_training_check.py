@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import importlib.util
 import itertools
 import json
 import time
@@ -40,6 +41,7 @@ def main() -> None:
     parser.add_argument("--attention", choices=("plain", "hints", "prescale"))
     parser.add_argument("--input-mode", choices=("micro", "staged"), default="micro")
     parser.add_argument("--profile-optimizer", type=Path)
+    parser.add_argument("--optimizer-reference", type=Path)
     options = parser.parse_args()
     if options.gemm_backends:
         torch._inductor.config.max_autotune_gemm_backends = options.gemm_backends
@@ -101,7 +103,16 @@ def main() -> None:
     del payload
     gc.collect()
     model.cuda().train()
-    optimizers = build_optimizers(
+    optimizer_factory = build_optimizers
+    if options.optimizer_reference:
+        spec = importlib.util.spec_from_file_location(
+            "delta_feedback_experiment._benchmark_optimizer",
+            options.optimizer_reference,
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        optimizer_factory = module.build_optimizers
+    optimizers = optimizer_factory(
         model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam
     )
     train = TokenData.load(options.data_dir, "train", args.seq_len)
@@ -116,6 +127,9 @@ def main() -> None:
             {
                 "label": options.label,
                 "variants": {
+                    "optimizer_reference": str(options.optimizer_reference)
+                    if options.optimizer_reference
+                    else None,
                     "attention": options.attention,
                     "input_mode": options.input_mode,
                     "gemm_backends": torch._inductor.config.max_autotune_gemm_backends,
