@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import itertools
 import json
 import time
 from importlib.metadata import version
@@ -43,8 +44,9 @@ def main() -> None:
     if options.gemm_backends:
         torch._inductor.config.max_autotune_gemm_backends = options.gemm_backends
     if options.attention:
-        import delta_feedback_experiment.attention as attention
         from torch.nn.attention.flex_attention import flex_attention
+
+        from delta_feedback_experiment import attention
 
         kernel_options = {"BACKEND": "TRITON"}
         if options.attention != "plain":
@@ -237,7 +239,7 @@ def main() -> None:
                             ),
                             (
                                 left.elapsed_time(right)
-                                for left, right in zip(events, events[1:])
+                                for left, right in itertools.pairwise(events)
                             ),
                         )
                     ),
