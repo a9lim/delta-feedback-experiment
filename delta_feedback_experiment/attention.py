@@ -17,13 +17,21 @@ def _causal_mask(batch, head, query, key):
     return query >= key
 
 
-@torch.compiler.assume_constant_result
 @lru_cache(maxsize=64)
-def causal_block_mask(length: int, device: torch.device):
-    """Build a broadcast mask once, outside captured training work."""
+def _cached_causal_mask(length: int, device: torch.device):
     return create_block_mask(
-        _causal_mask, None, None, length, length, device=device, _compile=True
+        _causal_mask, None, None, length, length, device=device
     )
+
+
+@torch.compiler.assume_constant_result
+def causal_block_mask(length: int, device: torch.device):
+    """Build a broadcast mask once, outside captured training work.
+
+    Keep the constant-result function separate from the LRU wrapper: Dynamo
+    deliberately unwraps LRU functions and otherwise traces mask construction.
+    """
+    return _cached_causal_mask(length, device)
 
 
 def _causal_attention(query, key, value):
