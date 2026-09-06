@@ -142,6 +142,8 @@ def run(options) -> None:
     gc.collect()
     model.cuda().train()
     optimizer_factory = build_optimizers
+    from delta_feedback_experiment import optim as optimizer_module
+
     if options.optimizer_reference:
         spec = importlib.util.spec_from_file_location(
             "delta_feedback_experiment._benchmark_optimizer",
@@ -150,6 +152,30 @@ def run(options) -> None:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         optimizer_factory = module.build_optimizers
+        optimizer_module = module
+    if options.gemm_backends and "NVGEMM" in options.gemm_backends:
+        # The comparison targets static trunk GEMMs. Torch 2.14's NVGEMM
+        # discovery cannot hash the symbolic dimensions in NorMuonH's BMMs;
+        # keep that separately measured optimizer on the baseline backend.
+        body = (
+            "_normuonh_batch"
+            if options.optimizer_reference
+            else "_normuonh_bucket_step"
+        )
+        config = dict(
+            torch._inductor.list_mode_options()[delta_feedback_experiment.INDUCTOR_MODE]
+        )
+        config["max_autotune_gemm_backends"] = "ATEN,TRITON,CPP"
+        setattr(
+            optimizer_module,
+            "_compiled" + body,
+            torch.compile(
+                getattr(optimizer_module, body),
+                fullgraph=True,
+                dynamic=True,
+                options=config,
+            ),
+        )
     optimizers = optimizer_factory(
         model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam
     )
@@ -166,6 +192,7 @@ def run(options) -> None:
                 "label": options.label,
                 "variants": {
                     "ada_target_workaround": options.ada_target_workaround,
+                    "optimizer_gemm_backends": "ATEN,TRITON,CPP",
                     "optimizer_reference": str(options.optimizer_reference)
                     if options.optimizer_reference
                     else None,

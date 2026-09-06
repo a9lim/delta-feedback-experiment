@@ -43,7 +43,7 @@ def _inputs(length, heads=8, kv_heads=4):
 
 
 @CUDA_ONLY
-@pytest.mark.parametrize("length", [129, 257])
+@pytest.mark.parametrize("length", [129, 257, 1025])
 def test_causal_gqa_bf16_forward_and_gradients_match_math(length):
     query, key, value = _inputs(length)
     reference_inputs = tuple(
