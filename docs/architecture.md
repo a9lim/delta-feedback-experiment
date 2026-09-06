@@ -446,6 +446,9 @@ scale's schedule.
 CUDA uses PyTorch's foreach NAdam path outside the captured forward/backward
 graphs; its scalar step and momentum-product state stay on CPU, while both
 moment tensors and all parameters remain FP32 on-device.
+NorMuonH compiles each active shape bucket's packing, mathematical update,
+and in-place state writeback together. Its checkpoint state remains ordinary
+per-parameter tensors; the compiled path retains no second packed state.
 
 After synchronized microbatch accumulation, the single global FP32 gradient
 vector is clipped to L2 norm 10.0 immediately before both optimizer steps. The

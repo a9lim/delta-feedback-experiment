@@ -257,6 +257,9 @@ CUDA 13.2. It uses:
   explicitly updates the KV cache and exposes only its valid prefix. The
   Triton training backend ships with PyTorch, and short-query decoding uses
   FlexAttention's automatic backend selection without external `flash-attn`;
+- causal row-safety hints and forward-only contiguous-block traversal. The
+  incomplete final block makes backward's partial query-block lists
+  noncontiguous, so backward keeps indexed traversal;
 - a fixed-capacity Triton MHDB router that reads every source once per token
   with the source softmax folded in online, holds each site's width-`D` null in
   place, keeps full-width RMS coupling in its analytic backward, and reduces the
@@ -288,6 +291,12 @@ CUDA 13.2. It uses:
 - one fixed-address train CUDA graph per reachable pass count and shared-pool
   no-grad validation graphs, with Python cyclic garbage collection kept
   outside capture;
+- one pinned host token batch and one device token batch per trainer, staged
+  once per optimizer update. An event protects host reuse during asynchronous
+  transfer; copies into each graph's microbatch input remain stream-ordered
+  and retain the same global row and feedback-randomness addresses;
+- compiled NorMuonH shape buckets including tensor packing, the update, and
+  state writeback, without persistent packed copies of optimizer state;
 - BF16 keyed jitter written directly into graph input buffers;
 - internal activation checkpointing above the measured work threshold;
 - asynchronous pinned-host snapshot staging and atomic background writes.

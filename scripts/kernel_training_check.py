@@ -8,6 +8,7 @@ import gc
 import importlib.util
 import itertools
 import json
+import math
 import time
 from importlib.metadata import version
 from pathlib import Path
@@ -52,8 +53,34 @@ def main() -> None:
 
 
 def run(options) -> None:
+    gemm_searches = []
     if options.gemm_backends:
         torch._inductor.config.max_autotune_gemm_backends = options.gemm_backends
+        from torch._inductor.select_algorithm import add_feedback_saver
+
+        def record_search(timings, operation, inputs, choices, *_):
+            measured = [
+                choice
+                for choice in choices
+                if math.isfinite(timings.get(choice, math.inf))
+            ]
+            best = (
+                min(measured, key=lambda choice: timings[choice]) if measured else None
+            )
+            gemm_searches.append(
+                {
+                    "operation": operation,
+                    "candidate_count": len(choices),
+                    "nvgemm_candidates": sum(
+                        "NVUniversalGemm" in type(c).__name__ for c in choices
+                    ),
+                    "fastest_timed_backend": type(best).__name__
+                    if best is not None
+                    else None,
+                }
+            )
+
+        add_feedback_saver(record_search)
     if options.attention:
         from torch.nn.attention.flex_attention import flex_attention
 
@@ -158,6 +185,7 @@ def run(options) -> None:
                     "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
                     "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
                 },
+                "gemm_searches": gemm_searches,
                 "revisions": {
                     name: revision(Path(module.__file__).resolve().parents[1])
                     for name, module in (
