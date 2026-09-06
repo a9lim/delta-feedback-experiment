@@ -170,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-normuonh",
         type=float,
         default=DEFAULT_NORMUONH_LR,
-        help="dimensionless NorMuonH relative step (default: 0.009)",
+        help="dimensionless NorMuonH relative step (default: 0.006)",
     )
     recipe.add_argument(
         "--lr-nadam",

@@ -127,7 +127,7 @@ starts independently at three quarters of the schedule, and every later step
 draws two or three passes. Every arm sees the same addressed
 token rows; feedback arms also share deterministic pass, prefix, and jitter
 streams. The global FP32 gradient is clipped to norm 10.0 before the shared
-NorMuonH/NAdam update. NorMuonH uses a `9e-3` stable rate; every NAdam-owned
+NorMuonH/NAdam update. NorMuonH uses a `6e-3` stable rate; every NAdam-owned
 parameter, including the tied embedding/readout, uses `3e-4`.
 Both sides apply their specified Nesterov construction:
 NorMuonH before orthogonalization and NAdam through its scheduled first moment.

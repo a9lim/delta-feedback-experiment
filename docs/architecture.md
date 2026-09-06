@@ -402,7 +402,7 @@ N_t = 0.05 G_t + 0.95 M_t
 
 Newton-Schulz and the NorMuon row normalization act on `N_t`.
 
-With dimensionless learning rate `lr_normuonh = 9e-3` and normalized direction
+With dimensionless learning rate `lr_normuonh = 6e-3` and normalized direction
 `U`:
 
 ```text

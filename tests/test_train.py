@@ -352,7 +352,7 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     normuonh_optimizer, nadam_optimizer = build_optimizers(model)
     assert isinstance(normuonh_optimizer, NorMuonH)
     assert isinstance(nadam_optimizer, torch.optim.NAdam)
-    assert DEFAULT_NORMUONH_LR == 9e-3
+    assert DEFAULT_NORMUONH_LR == 6e-3
     assert normuonh_optimizer.param_groups[0]["lr"] == DEFAULT_NORMUONH_LR
     assert normuonh_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NORMUONH_LR
     assert "weight_decay" not in normuonh_optimizer.param_groups[0]
@@ -519,7 +519,7 @@ def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
 
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
-    assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 9e-3
+    assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 6e-3
     assert args.lr_nadam == DEFAULT_NADAM_LR == 3e-4
     assert not hasattr(args, "lr_embedding")
     assert args.warmup_frac == 0.02

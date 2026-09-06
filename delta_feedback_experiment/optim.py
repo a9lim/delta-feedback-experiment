@@ -23,7 +23,7 @@ from .parameter_groups import is_normuonh_parameter
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
 
-DEFAULT_NORMUONH_LR = 9e-3
+DEFAULT_NORMUONH_LR = 6e-3
 """Stable dimensionless NorMuonH relative step for fresh runs."""
 
 DEFAULT_NADAM_LR = 3e-4
