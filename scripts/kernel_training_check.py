@@ -52,7 +52,9 @@ def main() -> None:
 
         kernel_options = {"BACKEND": "TRITON"}
         if options.attention != "plain":
-            kernel_options.update(ROWS_GUARANTEED_SAFE=True, BLOCKS_ARE_CONTIGUOUS=True)
+            kernel_options.update(
+                ROWS_GUARANTEED_SAFE=True, fwd_BLOCKS_ARE_CONTIGUOUS=True
+            )
         if options.attention == "prescale":
             kernel_options["PRESCALE_QK"] = True
 

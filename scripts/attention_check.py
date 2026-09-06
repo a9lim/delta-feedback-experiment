@@ -25,7 +25,7 @@ def main():
     for mode in ("plain", "hints", "prescale"):
         options = {"BACKEND": "TRITON"}
         if mode != "plain":
-            options.update(ROWS_GUARANTEED_SAFE=True, BLOCKS_ARE_CONTIGUOUS=True)
+            options.update(ROWS_GUARANTEED_SAFE=True, fwd_BLOCKS_ARE_CONTIGUOUS=True)
         if mode == "prescale":
             options["PRESCALE_QK"] = True
 
