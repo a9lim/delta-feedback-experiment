@@ -18,36 +18,31 @@ def _causal_mask(batch, head, query, key):
 
 
 @lru_cache(maxsize=64)
-def _cached_causal_mask(length: int, device: torch.device):
-    return create_block_mask(
-        _causal_mask, None, None, length, length, device=device
-    )
-
-
-@torch.compiler.assume_constant_result
 def causal_block_mask(length: int, device: torch.device):
-    """Build a broadcast mask once, outside captured training work.
-
-    Keep the constant-result function separate from the LRU wrapper: Dynamo
-    deliberately unwraps LRU functions and otherwise traces mask construction.
-    """
-    return _cached_causal_mask(length, device)
+    """Build a broadcast mask once, outside compiled/captured training work."""
+    return create_block_mask(_causal_mask, None, None, length, length, device=device)
 
 
-def _causal_attention(query, key, value):
+def _causal_attention(query, key, value, block_mask):
     return flex_attention(
         query,
         key,
         value,
-        block_mask=causal_block_mask(query.shape[-2], query.device),
+        block_mask=block_mask,
         enable_gqa=True,
         kernel_options={"BACKEND": "TRITON"},
     )
 
 
-causal_attention = torch.compile(
+_compiled_causal_attention = torch.compile(
     _causal_attention, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
 )
+
+
+def causal_attention(query, key, value, block_mask=None):
+    if block_mask is None:
+        block_mask = causal_block_mask(query.shape[-2], query.device)
+    return _compiled_causal_attention(query, key, value, block_mask)
 
 
 def _prefix_attention(query, key, value):

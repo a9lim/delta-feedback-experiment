@@ -41,7 +41,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
-from .attention import causal_attention, prefix_attention
+from .attention import causal_attention, causal_block_mask, prefix_attention
 from .cuda_kernels import ShadowOperand, sink_linear
 from .parameter_groups import is_normuonh_parameter
 from .pkda import PreconditionedKDA
@@ -354,6 +354,7 @@ class Attention(nn.Module):
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
+        self._causal_mask = None
 
     def forward(
         self,
@@ -399,8 +400,11 @@ class Attention(nn.Module):
             )
             k, v = k_prefix.transpose(1, 2), v_prefix.transpose(1, 2)
         if q.is_cuda:
-            attention = causal_attention if causal else prefix_attention
-            out = attention(q, k, v).transpose(1, 2)
+            if causal:
+                mask = self._causal_mask if torch.compiler.is_compiling() else None
+                out = causal_attention(q, k, v, mask).transpose(1, 2)
+            else:
+                out = prefix_attention(q, k, v).transpose(1, 2)
         else:
             out = F.scaled_dot_product_attention(
                 q,
@@ -1073,6 +1077,13 @@ class DFModel(nn.Module):
         cos, sin = (
             (None, None) if cfg.hybrid else self.rope(x.device, start, x.shape[1])
         )
+        # Mask construction belongs outside fullgraph block compilation. The
+        # same immutable geometry is reused by all global layers and passes.
+        if x.is_cuda and cache is None:
+            mask = causal_block_mask(x.shape[1], x.device)
+            for block in self.blocks:
+                if not block.is_pkda:
+                    block.attn._causal_mask = mask
 
         sources: list[Tensor] | None = None
         source_names: list[str] = []
