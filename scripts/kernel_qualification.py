@@ -191,11 +191,7 @@ def main() -> None:
         runner.begin(spec, args.zloss)
         torch.cuda.synchronize()
         started = time.perf_counter()
-        for micro in range(args.batch_rows // args.micro_rows):
-            first = options.first_row + micro * args.micro_rows
-            runner.replay(
-                state, data.batch(first, args.micro_rows), options.step, first
-            )
+        runner.replay_batch(state, data, options.step, options.first_row)
         torch.cuda.synchronize()
         batch_ms = (time.perf_counter() - started) * 1000
         runner.prepare_optimizer(state)

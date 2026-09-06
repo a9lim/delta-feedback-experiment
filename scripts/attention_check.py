@@ -1,5 +1,6 @@
 """Screen-shape forward/backward CUDA-graph comparison of causal mask hints."""
 
+import argparse
 import json
 import statistics
 
@@ -12,15 +13,18 @@ from delta_feedback_experiment.train import _capture_without_gc
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--length", type=int, default=1024)
+    length = parser.parse_args().length
     torch.manual_seed(42)
     values = [
-        torch.randn(4, 1025, heads, 96, device="cuda", dtype=torch.bfloat16)
+        torch.randn(4, length, heads, 96, device="cuda", dtype=torch.bfloat16)
         .transpose(1, 2)
         .requires_grad_()
         for heads in (8, 4, 4)
     ]
     upstream = torch.randn_like(values[0])
-    mask = causal_block_mask(1025, torch.device("cuda"))
+    mask = causal_block_mask(length, torch.device("cuda"))
     baseline = None
     for mode in ("plain", "hints", "prescale"):
         options = {"BACKEND": "TRITON"}
@@ -75,6 +79,7 @@ def main():
             json.dumps(
                 {
                     "mode": mode,
+                    "length": length,
                     "milliseconds": statistics.median(samples),
                     "samples": samples,
                     "relative_l2_output_q_k_v": relative,

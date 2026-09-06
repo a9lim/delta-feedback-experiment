@@ -258,8 +258,8 @@ CUDA 13.2. It uses:
   Triton training backend ships with PyTorch, and short-query decoding uses
   FlexAttention's automatic backend selection without external `flash-attn`;
 - causal row-safety hints and forward-only contiguous-block traversal. The
-  incomplete final block makes backward's partial query-block lists
-  noncontiguous, so backward keeps indexed traversal;
+  incomplete final block in arbitrary-length prefills makes backward's partial
+  query-block lists noncontiguous, so backward keeps indexed traversal;
 - a fixed-capacity Triton MHDB router that reads every source once per token
   with the source softmax folded in online, holds each site's width-`D` null in
   place, keeps full-width RMS coupling in its analytic backward, and reduces the

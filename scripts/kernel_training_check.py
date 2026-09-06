@@ -41,7 +41,7 @@ def main() -> None:
     parser.add_argument("--label", default="current")
     parser.add_argument("--gemm-backends")
     parser.add_argument("--attention", choices=("plain", "hints", "prescale"))
-    parser.add_argument("--input-mode", choices=("micro", "staged"), default="micro")
+    parser.add_argument("--input-mode", choices=("micro", "staged"), default="staged")
     parser.add_argument("--profile-optimizer", type=Path)
     parser.add_argument("--optimizer-reference", type=Path)
     parser.add_argument("--ada-target-workaround", action="store_true")
@@ -192,7 +192,9 @@ def run(options) -> None:
                 "label": options.label,
                 "variants": {
                     "ada_target_workaround": options.ada_target_workaround,
-                    "optimizer_gemm_backends": "ATEN,TRITON,CPP",
+                    "optimizer_gemm_backends": "ATEN,TRITON,CPP"
+                    if options.gemm_backends and "NVGEMM" in options.gemm_backends
+                    else torch._inductor.config.max_autotune_gemm_backends,
                     "optimizer_reference": str(options.optimizer_reference)
                     if options.optimizer_reference
                     else None,
