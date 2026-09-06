@@ -58,8 +58,13 @@ def test_causal_gqa_bf16_forward_and_gradients_match_math(length):
     expected.backward(upstream.float())
     for tensor, reference in zip((query, key, value), reference_inputs, strict=True):
         assert torch.isfinite(tensor.grad).all()
+        # On Ada, both Flex and built-in Flash SDPA have 0.23--0.32% gradient
+        # L2 error against FP32 math. Cancellation near zero reaches 0.0076
+        # absolute error, so combine an absolute floor with a tight L2 bound.
+        relative = (tensor.grad.float() - reference.grad).norm() / reference.grad.norm()
+        assert relative < 5e-3
         torch.testing.assert_close(
-            tensor.grad.float(), reference.grad, rtol=3e-2, atol=5e-3
+            tensor.grad.float(), reference.grad, rtol=3e-2, atol=1e-2
         )
 
 
@@ -126,3 +131,54 @@ def test_prefix_cache_reads_every_valid_key_and_excludes_unused_tail(device):
         # Tail poison is still present: finite output cannot result from merely
         # overwriting the entire allocation with valid values.
         assert torch.isnan(cache.v[:, :, length:]).all()
+
+
+@CUDA_ONLY
+def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
+    from delta_feedback_experiment.model import DFModel
+
+    torch.manual_seed(314)
+    cfg = arm_config(
+        "vanilla", vocab_size=97, dim=192, layers=1, heads=2,
+        kv_heads=1, head_dim=96, intermediate=64, max_seq_len=257,
+    )
+    checkpointed = DFModel(cfg).cuda().train()
+    reference = DFModel(cfg).cuda().train()
+    reference.load_state_dict(checkpointed.state_dict())
+    checkpointed.grad_checkpoint = True
+    reference.grad_checkpoint = False
+
+    actual_inputs, reference_inputs, actual_outputs, reference_outputs = [], [], [], []
+    upstreams = []
+    # Backward for the long graph happens after a shorter forward has run on
+    # the same module. A mutable "latest mask" would truncate recomputation.
+    for length in (257, 129):
+        x = torch.randn(1, length, cfg.dim, device="cuda", dtype=torch.bfloat16)
+        actual_inputs.append(x.detach().requires_grad_())
+        reference_inputs.append(x.detach().clone().requires_grad_())
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            actual_outputs.append(checkpointed.forward_column(actual_inputs[-1]).h_top)
+            reference_outputs.append(reference.forward_column(reference_inputs[-1]).h_top)
+        torch.testing.assert_close(
+            actual_outputs[-1], reference_outputs[-1], rtol=0, atol=0
+        )
+        upstreams.append(torch.randn_like(actual_outputs[-1]))
+
+    for index, upstream in enumerate(upstreams):
+        actual_outputs[index].backward(upstream)
+        reference_outputs[index].backward(upstream)
+        torch.testing.assert_close(
+            actual_inputs[index].grad, reference_inputs[index].grad,
+            rtol=2e-5, atol=2e-6,
+        )
+        for (name, parameter), (ref_name, ref_parameter) in zip(
+            checkpointed.named_parameters(), reference.named_parameters(), strict=True
+        ):
+            assert name == ref_name
+            if ref_parameter.grad is None:
+                assert parameter.grad is None, name
+            else:
+                torch.testing.assert_close(
+                    parameter.grad, ref_parameter.grad, rtol=2e-5, atol=2e-6,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )

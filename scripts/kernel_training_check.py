@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import time
+from importlib.metadata import version
 from pathlib import Path
 
 import cut_cross_entropy
@@ -69,12 +70,26 @@ def main() -> None:
     )
     train = TokenData.load(options.data_dir, "train", args.seq_len)
     validation = TokenData.load(options.data_dir, "val", args.seq_len)
+    torch.cuda.reset_peak_memory_stats()
+    prepared_at = time.perf_counter()
     runner = CudaGraphTrainer(model, optimizers, args, build_schedule(args))
     evaluation = CudaEvalRunner(model, args, runner.pool)
+    torch.cuda.synchronize()
     print(
         json.dumps(
             {
                 "snapshot": str(options.snapshot),
+                "runtime": {
+                    "torch": torch.__version__,
+                    "cuda": torch.version.cuda,
+                    "triton": version("triton"),
+                    "gpu": torch.cuda.get_device_name(),
+                },
+                "capture": {
+                    "prepare_seconds": time.perf_counter() - prepared_at,
+                    "peak_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
+                    "peak_reserved_gib": torch.cuda.max_memory_reserved() / 2**30,
+                },
                 "revisions": {
                     name: revision(Path(module.__file__).resolve().parents[1])
                     for name, module in (

@@ -354,7 +354,6 @@ class Attention(nn.Module):
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
-        self._causal_mask = None
 
     def forward(
         self,
@@ -364,6 +363,7 @@ class Attention(nn.Module):
         gate_weight: Tensor | None,
         cache: KVCache | None,
         layer: int,
+        attention_mask=None,
     ) -> Tensor:
         batch, length, _ = x.shape
         cfg = self.cfg
@@ -401,8 +401,7 @@ class Attention(nn.Module):
             k, v = k_prefix.transpose(1, 2), v_prefix.transpose(1, 2)
         if q.is_cuda:
             if causal:
-                mask = self._causal_mask if torch.compiler.is_compiling() else None
-                out = causal_attention(q, k, v, mask).transpose(1, 2)
+                out = causal_attention(q, k, v, attention_mask).transpose(1, 2)
             else:
                 out = prefix_attention(q, k, v).transpose(1, 2)
         else:
@@ -661,6 +660,7 @@ class Block(nn.Module):
         gate_weight: Tensor | None,
         want_weights: bool,
         *sources: Tensor,
+        attention_mask=None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
         """Returns (h, attn delta, mlp delta, cell delta, attn weights, mlp
         weights). ``block_start`` is the residual at the cell's entry, or None
@@ -687,7 +687,9 @@ class Block(nn.Module):
             if cache is not None:
                 cache.update_pkda(self.layer, state, a_state, conv_state)
         else:
-            mixed = self.attn(normalized, cos, sin, gate_weight, cache, self.layer)
+            mixed = self.attn(
+                normalized, cos, sin, gate_weight, cache, self.layer, attention_mask
+            )
         a = self.branch_scale * mixed
         h = h + a
         if self.mlp_router is not None and self.has_prior_partial:
@@ -700,11 +702,18 @@ class Block(nn.Module):
         return h, a, m, h - start, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources):
-    """Tensor-only wrapper for activation checkpointing (no cache, no
-    weights) — the recomputation must be free of side effects."""
+def _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, mask, *sources):
+    """Pure checkpoint wrapper; immutable mask geometry is a per-call input."""
     h, a, m, delta, _, _ = block(
-        h, block_start, cos, sin, None, gate_weight, False, *sources
+        h,
+        block_start,
+        cos,
+        sin,
+        None,
+        gate_weight,
+        False,
+        *sources,
+        attention_mask=mask,
     )
     return h, a, m, delta
 
@@ -713,12 +722,16 @@ def _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources
 # cache on the code object and, when it recompiles, evaluates every earlier
 # entry's guards against the current call to log the reason; one family's
 # guards name attributes the other family's mixer does not have.
-def _attention_block(block, h, block_start, cos, sin, gate_weight, *sources):
-    return _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources)
+def _attention_block(block, h, block_start, cos, sin, gate_weight, mask, *sources):
+    return _block_for_checkpoint(
+        block, h, block_start, cos, sin, gate_weight, mask, *sources
+    )
 
 
-def _pkda_block(block, h, block_start, cos, sin, gate_weight, *sources):
-    return _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, *sources)
+def _pkda_block(block, h, block_start, cos, sin, gate_weight, mask, *sources):
+    return _block_for_checkpoint(
+        block, h, block_start, cos, sin, gate_weight, mask, *sources
+    )
 
 
 _compiled_block = torch.compile(
@@ -1079,11 +1092,11 @@ class DFModel(nn.Module):
         )
         # Mask construction belongs outside fullgraph block compilation. The
         # same immutable geometry is reused by all global layers and passes.
-        if x.is_cuda and cache is None:
-            mask = causal_block_mask(x.shape[1], x.device)
-            for block in self.blocks:
-                if not block.is_pkda:
-                    block.attn._causal_mask = mask
+        attention_mask = (
+            causal_block_mask(x.shape[1], x.device)
+            if x.is_cuda and cache is None
+            else None
+        )
 
         sources: list[Tensor] | None = None
         source_names: list[str] = []
@@ -1125,6 +1138,7 @@ class DFModel(nn.Module):
                 else None
             )
             block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
+            mask = None if block.is_pkda else attention_mask
             if checkpointing:
                 h, _a, _m, delta = torch.utils.checkpoint.checkpoint(
                     block_fn if h.is_cuda else _block_for_checkpoint,
@@ -1134,13 +1148,14 @@ class DFModel(nn.Module):
                     cos,
                     sin,
                     gate_weight,
+                    mask,
                     *passed,
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
             elif h.is_cuda and cache is None and not want_weights:
                 h, _a, _m, delta = block_fn(
-                    block, h, entry, cos, sin, gate_weight, *passed
+                    block, h, entry, cos, sin, gate_weight, mask, *passed
                 )
             else:
                 h, _a, _m, delta, w_attn, w_mlp = block(
@@ -1152,6 +1167,7 @@ class DFModel(nn.Module):
                     gate_weight,
                     want_weights,
                     *passed,
+                    attention_mask=mask,
                 )
                 if w_attn is not None:
                     site = f"L{block.layer}.attn"
