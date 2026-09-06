@@ -55,8 +55,8 @@ experiment and scale plan.
 
 ## Install
 
-Python 3.12 is required. Install the shared operational package from the
-workspace root, then this project:
+The workspace runtime is Python 3.13. Install the shared operational package
+from the workspace root, then this project:
 
 ```bash
 cd /path/to/transformer-experiments

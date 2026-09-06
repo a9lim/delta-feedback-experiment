@@ -1,10 +1,15 @@
 # Runtime qualification
 
-On 2026-09-06, commit `8bdd89eb1f82eb096c7f81b3bb04b4a9e2216a86`
-passed the full Jobe gate on PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0,
-and RTX 4090. CUDA GQA uses native compiled FlexAttention. The separate FLA
+The maintained Jobe runtime passed the full gate on 2026-09-06: PyTorch
+2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and RTX 4090. CUDA GQA uses native
+compiled FlexAttention. The separate FLA
 PKDA and cut-cross-entropy vendor revisions are unchanged. The Mac uses
 PyTorch 2.14.0, with portable SDPA for CPU/MPS attention.
+
+The machine interpreter is standard, GIL-enabled CPython 3.13.15 on both
+machines. The [Python migration record](../data/summary/python-runtime-2026-09-06.json)
+records its separate qualification. The short paired update measurements below
+were collected on Python 3.12.13 before the interpreter migration.
 
 The [machine-readable record](../data/summary/flexattention-runtime-2026-09-06.json)
 contains both diagnostic traces, exact revisions, inputs, and gate results.
@@ -17,11 +22,18 @@ Jobe passed 109 experiment tests and the full `df probe` CUDA gate. The Mac
 passed 104 tests with five CUDA cases skipped. The workspace's own 122 tests
 passed on each machine, and both environments passed `uv pip check`.
 
-The gate covers PKDA and fused-kernel parity, causal and cached attention,
+The Python 3.13 gate covers PKDA and fused-kernel parity, causal and cached attention,
 all four train/eval graphs, replay, optimizer state and radius invariants,
-post-capture reporting, and checkpoint staging. Capture peaked at 13.85 GiB
-allocated and 22.99 GiB reserved; the trained-checkpoint diagnostic reserved
-23.01 GiB. Keep Jobe runs serial. Checkpoint v23 remains unchanged.
+post-capture reporting, and checkpoint staging. Capture peaked at 13.84 GiB
+allocated and 22.71 GiB reserved; the earlier trained-checkpoint diagnostic
+reserved 23.01 GiB. One/two/three-pass microbatch replay took
+53.5/107.8/162.2 ms. Keep Jobe runs serial. Checkpoint v23 remains unchanged.
+
+Both machines select only the Python 3.13 environment. Obsolete Python 3.12
+environments and rejected Python 3.14 candidates were removed. The latest
+Prime, Verifiers, and Renderers metadata still excludes Python 3.14, which
+sets the common machine pin. The migration record includes these constraints
+and the Mac MPS, MLX, and orchestration checks.
 
 The initial migration failed during three-pass capture. Instrumentation showed
 a generation-1 Python garbage collection changing the CUDA stream from active
