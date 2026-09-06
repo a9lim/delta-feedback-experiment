@@ -20,6 +20,9 @@ def test_staging_reuses_storage_without_overwriting_inflight_batches(tmp_path):
     # No caller synchronization between uploads. The next stage must protect
     # the pinned host bytes and preserve the earlier device consumer's input.
     for first in (0, 4, 8, 12, 16, 20, 24, 28, 0):
+        # Make even these tiny uploads wait behind queued device work so a
+        # missing host-reuse fence cannot pass merely because DMA was fast.
+        torch.cuda._sleep(10_000_000)
         staged = stager.stage(data, first)
         copies.append((first, staged.clone()))
         assert (stager.host.data_ptr(), staged.data_ptr()) == pointers

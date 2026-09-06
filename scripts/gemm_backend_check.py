@@ -179,6 +179,7 @@ def benchmark_case(name: str, options: argparse.Namespace) -> dict:
     }
     if not all(row["finite"] for row in [drift["output"], *drift["gradients"]]):
         raise RuntimeError(f"{name}: nonfinite output or gradient: {drift}")
+    del actual
     # Drift is reported without imposing a tight equivalence threshold.
     for _ in range(3):
         step()

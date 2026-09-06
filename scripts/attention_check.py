@@ -57,6 +57,8 @@ def main():
             for a, b in zip(results, baseline)
         ]
         assert all(torch.isfinite(result).all() for result in results)
+        # Release the warmup autograd nodes before capture switches streams.
+        del output
         graph = torch.cuda.CUDAGraph()
         with _capture_without_gc(graph, None):
             step()
@@ -80,7 +82,7 @@ def main():
             ),
             flush=True,
         )
-        del graph, output, results
+        del graph, results
 
 
 if __name__ == "__main__":
