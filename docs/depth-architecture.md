@@ -449,10 +449,11 @@ its final iteration:
 Training memory is not established by this arithmetic. The three-pass
 `r_max` batch holds 120 checkpointed block inputs, two write banks, and the
 bank-side scan intermediates on a card whose qualified pool already reserves
-22.98 GiB; the adoption list requires a staged memory gate.
+23.0 GiB; the adoption list requires a staged memory gate.
 
 Jobe step times are **unqualified estimates**. The anchor is the measured
-14.8 s three-pass `df` step of the current kernels, read as
+14.21 s three-pass `df` step in the short
+[runtime qualification](runtime-qualification.md), approximated conservatively as
 `k x (1.3 s + 0.30 s per layer evaluation)` per step, with block
 checkpointing adding one third to the layer term. At the expected
 `E[r] = 3.88`:

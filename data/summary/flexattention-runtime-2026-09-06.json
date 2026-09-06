@@ -1,0 +1,352 @@
+{
+  "date": "2026-09-06",
+  "kind": "runtime engineering qualification; not a registered experiment finding",
+  "baseline_runtime": {
+    "torch": "2.9.1+cu130",
+    "cuda": "13.0",
+    "triton": "3.5.1",
+    "flash_attn": "2.8.3",
+    "gpu": "NVIDIA GeForce RTX 4090"
+  },
+  "baseline": [
+    {
+      "snapshot": "runs/screen-df-full-s1.pt.10745",
+      "revisions": {
+        "experiment": "4547d8e81d56be58f8e7d6affecf5e581b21c452",
+        "fla": "a9e1d05d7ef25604987af56f514e1fd2629cc504",
+        "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
+      },
+      "inputs": {
+        "data_dir": "/data/df/tokens",
+        "first_row": 100000,
+        "first_randomness_step": 9000,
+        "data_seed": 0,
+        "jitter": 0.02,
+        "zloss": 1e-05,
+        "batch_rows": 320,
+        "micro_rows": 4,
+        "seq_len": 1024
+      },
+      "updates": 6,
+      "optimizer_state": "fresh, identical in baseline and candidate",
+      "learning_rates": [
+        0.009,
+        0.0003
+      ],
+      "pass_pattern": [
+        1,
+        1,
+        1,
+        2,
+        2,
+        3
+      ],
+      "initial_validation": {
+        "val": 3.1134085655212402,
+        "val_fused": 3.113090991973877
+      }
+    },
+    {
+      "update": 1,
+      "passes": 1,
+      "loss": 3.0479094982147217,
+      "pass1_loss": 3.0447945594787598,
+      "gradient_norm": 0.20134297013282776,
+      "seconds": 4.853348616976291
+    },
+    {
+      "update": 2,
+      "passes": 1,
+      "loss": 3.063180446624756,
+      "pass1_loss": 3.0600807666778564,
+      "gradient_norm": 0.7370533347129822,
+      "seconds": 4.822750210005324
+    },
+    {
+      "update": 3,
+      "passes": 1,
+      "loss": 3.0942485332489014,
+      "pass1_loss": 3.091106414794922,
+      "gradient_norm": 0.6857582330703735,
+      "seconds": 4.83667097898433
+    },
+    {
+      "update": 4,
+      "passes": 2,
+      "loss": 6.046163558959961,
+      "pass1_loss": 3.0219740867614746,
+      "gradient_norm": 1.1550250053405762,
+      "seconds": 9.708531387033872
+    },
+    {
+      "update": 5,
+      "passes": 2,
+      "loss": 6.190487384796143,
+      "pass1_loss": 3.086782693862915,
+      "gradient_norm": 1.3767938613891602,
+      "seconds": 9.66426978301024
+    },
+    {
+      "update": 6,
+      "passes": 3,
+      "loss": 6.098301887512207,
+      "pass1_loss": 3.0465333461761475,
+      "gradient_norm": 1.0769789218902588,
+      "seconds": 14.537771945004351
+    },
+    {
+      "final_validation": {
+        "val": 3.154473066329956,
+        "val_fused": 3.1629788875579834
+      },
+      "contraction": [
+        {
+          "loss": 3.4563605785369873,
+          "update_norm": 4.081607818603516
+        },
+        {
+          "loss": 3.4599666595458984,
+          "update_norm": 0.9510167241096497
+        },
+        {
+          "loss": 3.4592843055725098,
+          "update_norm": 0.2809683680534363
+        },
+        {
+          "loss": 3.460416793823242,
+          "update_norm": 0.19373637437820435
+        },
+        {
+          "loss": 3.459427833557129,
+          "update_norm": 0.1859828233718872
+        },
+        {
+          "loss": 3.459423065185547,
+          "update_norm": 0.18337605893611908
+        },
+        {
+          "loss": 3.4594075679779053,
+          "update_norm": 0.18378740549087524
+        },
+        {
+          "loss": 3.4597272872924805,
+          "update_norm": 0.18375223875045776
+        }
+      ]
+    }
+  ],
+  "capture_failure": {
+    "affected_runtime": "PyTorch 2.14.0+cu132",
+    "observation": "Automatic generation-1 Python garbage collection changed cudaStreamIsCapturing from active (1) to invalidated (2) during the three-pass training capture; 44 cyclic objects were collected.",
+    "cause": "PyTorch 2.14 stopped unconditionally collecting Python garbage before capture, allowing CUDA resources in warm-up cycles to be destroyed during stream capture.",
+    "fix": "Collect warm-up cycles before each train/eval capture, disable automatic cyclic collection through capture entry/body/exit, restore the caller setting in finally.",
+    "fix_commit": "8bdd89eb1f82eb096c7f81b3bb04b4a9e2216a86"
+  },
+  "limitations": [
+    "One short paired diagnostic on RTX 4090; no long-run training-quality conclusion.",
+    "Hopper has not been tested.",
+    "Baseline and candidate change the entire PyTorch/CUDA/Triton stack as well as the attention backend, so differences cannot be attributed to FlexAttention alone."
+  ],
+  "qualification": {
+    "commit": "8bdd89eb1f82eb096c7f81b3bb04b4a9e2216a86",
+    "jobe_df_tests": {
+      "passed": 109,
+      "failed": 0
+    },
+    "mac_df_tests": {
+      "passed": 104,
+      "skipped_cuda": 5,
+      "failed": 0
+    },
+    "workspace_tests": {
+      "mac_passed": 122,
+      "jobe_passed": 122
+    },
+    "dependency_checks": {
+      "mac": "377 packages compatible",
+      "jobe": "289 packages compatible"
+    },
+    "cuda_gate": {
+      "passed": true,
+      "prepare_seconds": 72.4,
+      "peak_allocated_gib": 13.85,
+      "peak_reserved_gib": 22.99,
+      "graphs": 4,
+      "pkda_relative_error": 0.0038,
+      "conv_relative_error": 0.0035,
+      "norm_gate_relative_error": 0.0032,
+      "vanilla_decode_relative_error": 0.0103,
+      "hybrid_decode_relative_error": 0.0351,
+      "microbatch_replay_ms": {
+        "1_pass": 53.6,
+        "2_pass": 107.9,
+        "3_pass": 162.1
+      }
+    },
+    "gc_boundary_review": "8 CPU-only checks passed: initial GC enabled/disabled, success and errors at capture entry/body/exit."
+  },
+  "candidate": [
+    {
+      "snapshot": "runs/screen-df-full-s1.pt.10745",
+      "runtime": {
+        "torch": "2.14.0+cu132",
+        "cuda": "13.2",
+        "triton": "3.8.0",
+        "gpu": "NVIDIA GeForce RTX 4090"
+      },
+      "capture": {
+        "prepare_seconds": 51.18526889599161,
+        "peak_allocated_gib": 13.837670803070068,
+        "peak_reserved_gib": 23.013671875
+      },
+      "revisions": {
+        "experiment": "8bdd89eb1f82eb096c7f81b3bb04b4a9e2216a86",
+        "fla": "a9e1d05d7ef25604987af56f514e1fd2629cc504",
+        "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
+      },
+      "inputs": {
+        "data_dir": "/data/df/tokens",
+        "first_row": 100000,
+        "first_randomness_step": 9000,
+        "data_seed": 0,
+        "jitter": 0.02,
+        "zloss": 1e-05,
+        "batch_rows": 320,
+        "micro_rows": 4,
+        "seq_len": 1024
+      },
+      "updates": 6,
+      "optimizer_state": "fresh, identical in baseline and candidate",
+      "learning_rates": [
+        0.009,
+        0.0003
+      ],
+      "pass_pattern": [
+        1,
+        1,
+        1,
+        2,
+        2,
+        3
+      ],
+      "initial_validation": {
+        "val": 3.1134235858917236,
+        "val_fused": 3.113102436065674
+      }
+    },
+    {
+      "update": 1,
+      "passes": 1,
+      "loss": 3.047844409942627,
+      "pass1_loss": 3.044729471206665,
+      "gradient_norm": 0.20137637853622437,
+      "seconds": 4.761599404970184
+    },
+    {
+      "update": 2,
+      "passes": 1,
+      "loss": 3.063110589981079,
+      "pass1_loss": 3.0600106716156006,
+      "gradient_norm": 0.7359036803245544,
+      "seconds": 4.734852910973132
+    },
+    {
+      "update": 3,
+      "passes": 1,
+      "loss": 3.094137191772461,
+      "pass1_loss": 3.0909929275512695,
+      "gradient_norm": 0.6850383877754211,
+      "seconds": 4.74762328597717
+    },
+    {
+      "update": 4,
+      "passes": 2,
+      "loss": 6.046181678771973,
+      "pass1_loss": 3.0219662189483643,
+      "gradient_norm": 1.157096266746521,
+      "seconds": 9.48690840502968
+    },
+    {
+      "update": 5,
+      "passes": 2,
+      "loss": 6.190642356872559,
+      "pass1_loss": 3.086852550506592,
+      "gradient_norm": 1.3773068189620972,
+      "seconds": 9.452463319990784
+    },
+    {
+      "update": 6,
+      "passes": 3,
+      "loss": 6.098025321960449,
+      "pass1_loss": 3.0463621616363525,
+      "gradient_norm": 1.074515461921692,
+      "seconds": 14.209175912023056
+    },
+    {
+      "final_validation": {
+        "val": 3.154480457305908,
+        "val_fused": 3.1629416942596436
+      },
+      "contraction": [
+        {
+          "loss": 3.457258462905884,
+          "update_norm": 4.078862190246582
+        },
+        {
+          "loss": 3.4602365493774414,
+          "update_norm": 0.9477897882461548
+        },
+        {
+          "loss": 3.459451675415039,
+          "update_norm": 0.2839709520339966
+        },
+        {
+          "loss": 3.458866596221924,
+          "update_norm": 0.1991036981344223
+        },
+        {
+          "loss": 3.4591736793518066,
+          "update_norm": 0.18821066617965698
+        },
+        {
+          "loss": 3.4589662551879883,
+          "update_norm": 0.1867041289806366
+        },
+        {
+          "loss": 3.4590444564819336,
+          "update_norm": 0.1869196742773056
+        },
+        {
+          "loss": 3.45859694480896,
+          "update_norm": 0.1844310313463211
+        }
+      ]
+    }
+  ],
+  "comparison": {
+    "timing": "Median by pass count, excluding update 1; only 2/2/1 observations for 1/2/3 passes.",
+    "step_times": {
+      "1": {
+        "baseline_seconds": 4.829710594494827,
+        "candidate_seconds": 4.741238098475151,
+        "time_reduction_percent": 1.8318384567498125
+      },
+      "2": {
+        "baseline_seconds": 9.686400585022056,
+        "candidate_seconds": 9.469685862510232,
+        "time_reduction_percent": 2.2373091078529916
+      },
+      "3": {
+        "baseline_seconds": 14.537771945004351,
+        "candidate_seconds": 14.209175912023056,
+        "time_reduction_percent": 2.260291564789685
+      }
+    },
+    "max_update_loss_absolute_difference": 0.0002765655517578125,
+    "max_gradient_norm_relative_difference": 0.0022873799277734743,
+    "final_validation_absolute_difference": {
+      "val": 7.3909759521484375e-06,
+      "val_fused": 3.719329833984375e-05
+    }
+  }
+}

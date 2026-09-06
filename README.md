@@ -39,8 +39,9 @@ they do not constitute a registered comparison.
 
 The 230–258M screen model, deterministic single-process trainer, portable
 semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
-runs remain serial because the qualified DF graph pool reserves 22.98 GiB on
-its 24 GiB RTX 4090.
+runs remain serial because the qualified DF graph pool reserves about 23.0 GiB
+on its 24 GiB RTX 4090. See the [runtime qualification](docs/runtime-qualification.md)
+for the PyTorch 2.14 / CUDA 13.2 correctness and short-update comparison.
 
 The realized Jobe token store is a 35.000B-token prefix of the pinned stream.
 The canonical 57B store has not yet been materialized.

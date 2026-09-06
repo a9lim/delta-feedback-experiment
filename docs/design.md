@@ -286,17 +286,20 @@ CUDA 13.2. It uses:
   process-wide Dynamo recompile budget covering every block, source-count,
   mode, and grad-state specialization so no path silently demotes to eager;
 - one fixed-address train CUDA graph per reachable pass count and shared-pool
-  no-grad validation graphs;
+  no-grad validation graphs, with Python cyclic garbage collection kept
+  outside capture;
 - BF16 keyed jitter written directly into graph input buffers;
 - internal activation checkpointing above the measured work threshold;
 - asynchronous pinned-host snapshot staging and atomic background writes.
 
 These choices are not exposed as experiment axes. The default geometry uses
 four 1,024-token rows per microbatch and 80 microbatches per update.
-The PyTorch 2.14 / FlexAttention runtime must pass the full CUDA gate and a
-trained-checkpoint short-update comparison before its memory and throughput
-are considered qualified. These are engineering checks, not training-quality
-findings. Reproducible trained-input, full-gradient, and short-update checks
+The PyTorch 2.14 / FlexAttention runtime passed the full CUDA gate and a
+trained-checkpoint short-update comparison on Jobe. The graph pool reserves
+about 23.0 GiB; paired one/two/three-pass updates took 4.74/9.47/14.21 s.
+See [runtime qualification](runtime-qualification.md) for exact revisions,
+numerical differences, and measurement limits. These are engineering checks,
+not training-quality findings. Reproducible trained-input, full-gradient, and short-update checks
 are in `scripts/kernel_inputs.py`, `scripts/kernel_qualification.py`, and
 `scripts/kernel_training_check.py`.
 
