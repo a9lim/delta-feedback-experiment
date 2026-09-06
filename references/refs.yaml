@@ -1,4 +1,6 @@
-# Primary sources used by the current experiment. Fetched Markdown/PDF copies
+# Published mechanisms synthesized into the recurrent model organism.
+# Roles and departures are explained in docs/literature.md; source results
+# do not establish local capabilities or interpretability findings. Fetched Markdown/PDF copies
 # are regenerable and remain untracked:
 #   python -m transformer_experiments.references
 references:
@@ -28,9 +30,9 @@ references:
       global-attention layers, the empirically selected 3:1 KDA-to-global MLA
       cadence, fixed 128-dimensional key/value heads, and the width-1,536
       scaling-law point with 20 heads. Its scaling convention reports active
-      parameters without embedding parameters. The screen and flagship keep
-      the KDA substrate and cadence inside PKDA but use dense global GQA
-      instead of MLA.
+      parameters without embedding parameters. The small organism and optional
+      larger reference keep the KDA substrate and cadence inside PKDA but use
+      dense global GQA instead of MLA.
 
   - url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json
     slug: kimi2025-kimi-linear-config
@@ -49,19 +51,20 @@ references:
       stable log-space squash onto [1/x, x], chunkwise and recurrent forms, and
       language-model evidence at 340M and 1B. It supplies the preconditioner,
       not the screen's head-count rule: the screen uses 10-by-128 to preserve
-      the flagship Kimi prior's 5/3 recurrent projection ratio. Both scales use
-      the registered x=1.5 PKDA parameterization rather than unpreconditioned
-      KDA.
+      the larger reference Kimi prior's 5/3 recurrent projection ratio. Both
+      scales use the registered x=1.5 PKDA parameterization rather than
+      unpreconditioned KDA.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/layers/precond_kda.py
     slug: fla2026-preconditioned-kda
     note: >
       The upstream PrecondKDA reference layer defines the independent ATK gate
       projections and initialization, bounded preconditioner, auxiliary A-state
-      cache, chunkwise training kernel, and fused-recurrent decoding kernel that
-      the screen and flagship implementations reproduce and qualify. Its output
-      norm defaults to epsilon 1e-5; this experiment deliberately uses its
-      unified model-wide epsilon 1e-6 instead.
+      cache, chunkwise training kernel, and fused-recurrent decoding kernel
+      that the small implementation reproduces and qualifies and the optional
+      larger reference specifies. Its output norm defaults to epsilon 1e-5;
+      this experiment deliberately uses its unified model-wide epsilon 1e-6
+      instead.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/modules/conv/short_conv.py
     slug: fla2026-short-convolution
@@ -76,8 +79,8 @@ references:
     note: >
       The upstream PKDA training operator fixes chunk size 64, returns outputs
       in the activation dtype, retains FP32 recurrent boundary states, and
-      recomputes large intermediates in backward by default. These are the
-      screen and flagship kernel and precision contracts.
+      recomputes large intermediates in backward by default. These define the
+      kernel and precision contracts at both specified scales.
 
   - url: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json
     slug: qwen2025-qwen3-next-config
@@ -93,8 +96,8 @@ references:
       The released Qwen3-Next attention implementation projects a gate beside
       each query-head coordinate and applies its sigmoid elementwise to the
       concatenated attention output before the output projection. Every hybrid
-      screen arm and the flagship adopt this gate; only the external screen
-      `vanilla` control remains ungated.
+      screen arm and the optional larger reference adopt this gate; only the
+      external screen `vanilla` control remains ungated.
 
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer
@@ -102,17 +105,17 @@ references:
       Defines latent feedback through the asymmetric state-value/token-gate
       fusion, Jacobi multi-pass training, prefix mixin, recurrent-state jitter,
       the 75/22/3 pass mixture, contraction diagnostics, depth scaling, and the
-      width-1,536 / intermediate-6,656 trunk geometry. The screen uses its exact
-      half-width intermediate of 3,328. It also supplies the shared pretraining
-      recipe used by every arm.
+      width-1,536 / intermediate-6,656 trunk geometry. The screen uses its
+      exact half-width intermediate of 3,328. It also supplies the shared
+      pretraining recipe used by every arm.
 
   - arxiv: "2510.05491"
     slug: li2025-normuon
     note: >
       Defines NorMuon: momentum, Newton-Schulz orthogonalization, neuron-wise
-      second-moment normalization, and global update rescaling. NorMuon supplies
-      the base matrix direction inside NorMuonH; Hyperball normalization replaces
-      its global rescaling before the parameter update.
+      second-moment normalization, and global update rescaling. NorMuon
+      supplies the base matrix direction inside NorMuonH; Hyperball
+      normalization replaces its global rescaling before the parameter update.
 
   - url: https://github.com/zichongli5/NorMuon/blob/c6989a8354730695d9f5a9faa6c55eeb24865209/normuon.py#L35-L42
     slug: li2025-normuon-implementation
@@ -137,11 +140,11 @@ references:
     note: >
       Initializes each constrained [d_out, d_in] matrix from a normal with
       standard deviation 1/sqrt(d_in), then defines Hyperball's fixed realized
-      Frobenius radius, unit-Frobenius base update, dimensionless relative step,
-      and exact radial projection. The experiment applies this initialization
-      and constraint to every NorMuon matrix except the semantic FBT token-gate
-      projection, uses NAdam for all semantic-scale parameters, and uses no
-      weight decay.
+      Frobenius radius, unit-Frobenius base update, dimensionless relative
+      step, and exact radial projection. The experiment applies this
+      initialization and constraint to every NorMuon matrix except the semantic
+      FBT token-gate projection, uses NAdam for all semantic-scale parameters,
+      and uses no weight decay.
 
   - arxiv: "2603.15031"
     slug: kimi2026-attention-residuals
@@ -155,9 +158,10 @@ references:
     note: >
       Defines the prelude/recurrent-core/coda decoder, the log-normal Poisson
       draw of the iteration count, truncated backpropagation through the last
-      iterations, a KV cache budget shared across iterations, and the
-      zero-shot warm start of the next token's state. The depth-recurrent arm
-      takes the tied core, the iteration draw, and the shared-cache idea; it
-      replaces the adapter with MHDB reads, the random initial state with the
-      prelude output, the sandwich norm with the unchanged pre-norm shell, and
-      the untrained warm start with the trained FBT payload.
+      iterations, a KV cache budget shared across iterations, and the zero-shot
+      warm start of the next token's state. The unimplemented depth-recurrent
+      specification takes the tied core, the iteration draw, and the
+      shared-cache idea; it replaces the adapter with MHDB reads, the random
+      initial state with the prelude output, the sandwich norm with the
+      unchanged pre-norm shell, and the untrained warm start with the trained
+      FBT payload.

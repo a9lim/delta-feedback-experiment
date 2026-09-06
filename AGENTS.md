@@ -1,36 +1,45 @@
 # AGENTS.md
 
-This repository owns a five-arm pretraining study of MHDB depth routing and FBT
-latent recurrence on a common PKDA/gated-GQA hybrid. The primary factorial is
-`{base, mhdb, fbt, df}`; pure-GQA `vanilla` is the external trunk control.
+This repository develops a small recurrent model organism for interpretability.
+It synthesizes already-published mechanisms so we can inspect latent
+computation, test causal explanations, and develop methods for monitoring
+models capable of opaque reasoning. Capabilities serve task acquisition and
+experimental usefulness; advancing the capabilities frontier is not the goal.
 
-No run is complete under the current screen contract. Jobe is between runs;
-existing diagnostic checkpoints are engineering inputs, not registered
-comparisons. Keep
-[docs/findings.md](docs/findings.md) empty of architecture claims until a
-matched comparison is admissible.
+The implemented five-arm pretraining study produces controlled specimens:
+`{base, mhdb, fbt, df}` is the primary factorial and pure-GQA `vanilla` is the
+external trunk control. No completed comparison under the current screen
+contract or accepted scientific finding is recorded. Diagnostic checkpoints may
+support explicitly scoped exploratory analysis with original provenance. Do not
+present the organism as already exhibiting understood reasoning or validated
+monitoring, or infer live Jobe availability from documentation.
 
 ## Documents
 
-- [README.md](README.md) is the concise operator entry point and live status.
-- [docs/architecture.md](docs/architecture.md) is the sole flagship model,
-  state, parameter, and optimizer contract.
-- [docs/design.md](docs/design.md) owns comparisons, data, schedules,
-  execution, evaluation, scaling, and gates.
+- [README.md](README.md) is the research purpose, organism overview, and entry point.
+- [docs/design.md](docs/design.md) owns the controlled study, data, schedules,
+  evaluation, evidence, and research decision gates.
+- [docs/interpretability.md](docs/interpretability.md) owns behavioral,
+  tracing, causal-intervention, and monitoring protocols and implementation status.
+- [docs/architecture.md](docs/architecture.md) is the sole model, state,
+  parameter, and optimizer contract, with small and optional larger geometry.
 - [docs/depth-architecture.md](docs/depth-architecture.md) specifies the
-  unimplemented depth-recurrent `df-loop` arm; nothing in it is registered
-  until its adoption list lands.
-- [docs/findings.md](docs/findings.md) contains accepted scientific findings
-  only; engineering tests, throughput, isolated checkpoints, and plans do not
-  belong there.
+  unimplemented `df-loop`; it is not registered until its adoption list lands.
+- [docs/operations.md](docs/operations.md) owns operator commands;
+  [docs/runtime-qualification.md](docs/runtime-qualification.md) owns numerical
+  and execution qualification.
+- [docs/scaling.md](docs/scaling.md) preserves optional longer/larger recipes,
+  gated on a named interpretability need, implementation, and spend approval.
+- [docs/literature.md](docs/literature.md) maps published components to the
+  organism; [references/refs.yaml](references/refs.yaml) owns primary-source roles.
+- [docs/findings.md](docs/findings.md) and [figures/README.md](figures/README.md)
+  hold accepted scientific findings and their figures.
 - [docs/journal.md](docs/journal.md) is disposable active scratch space.
-- [references/refs.yaml](references/refs.yaml) records current primary-source
-  roles; [figures/README.md](figures/README.md) indexes accepted-result figures.
 
 Keep active documentation current-only. Remove superseded configurations,
-chronology, compatibility aliases, speculative extensions, and unearned
-claims. Update code, tests, CLI help, and all affected documents together when
-a contract changes.
+chronology, compatibility aliases, speculative extensions, and unearned claims.
+Update code, tests, CLI help, and all affected documents together when a
+contract changes.
 
 ## Nonnegotiable model contract
 
@@ -38,8 +47,8 @@ a contract changes.
   implementations or aliases.
 - Every hybrid screen arm is exactly
   `[PKDA, PKDA, PKDA, gated global GQA] x 3`; `vanilla` is twelve-layer RoPE
-  GQA. The flagship is the corresponding six-cell hard-DF architecture in
-  `architecture.md`.
+  GQA. The optional larger reference is the corresponding six-cell hard-DF
+  architecture in `architecture.md`; it is not the project objective.
 - PKDA uses the literal portable recurrence off CUDA and the workspace FLA
   fork's chunk and recurrent kernels on CUDA. Recurrent matrix and
   preconditioner boundaries are FP32. Never silently use the sequential
@@ -52,8 +61,8 @@ a contract changes.
   the group count equals `kv_heads`. Routing is a transient pre-norm read and
   never changes the telescoping residual identity.
 - Hard DF uses the FBT asymmetric payload-value/token-gate fusion as its MHDB
-  seed. Its payload is the normalized top state plus a routed mixture over the
-  null, seed, and completed block deltas.
+  seed. Its payload normalizes the sum of the top state and a routed mixture over
+  the null, seed, and completed block deltas.
 - Multi-pass feedback stays causal and differentiable across passes. Never
   detach the payload to solve memory pressure.
 - NorMuonH owns ordinary hidden matrices and uses the released NorMuon
@@ -77,8 +86,18 @@ a contract changes.
   `vanilla - base` separately as a whole-trunk contrast.
 - Pass-1 validation is the common metric. Feedback arms also report the fused
   metric and contraction trace. Routing summaries are diagnostics, not wins.
-- Accept claims only from completed registered comparisons or clearly labeled
-  same-checkpoint interventions. Keep engineering qualification separate.
+- Training-effect claims require completed registered comparisons. A scoped
+  same-checkpoint causal finding requires reproducible interventions, controls,
+  and held-out confirmation; it does not require an architecture win.
+- Routing weights and decodable features do not establish causal importance.
+  Empirical settling does not prove contraction, reasoning, or safe behavior.
+  The training dashboard is not a validated monitor of hidden computation.
+- Monitoring claims need an independent target, declared observation budget,
+  held-out evaluation, calibration/error reporting, and shift tests. Treat
+  transfer to larger reasoning models as a separate empirical question.
+- Prefer the smallest specimen that answers the question. Useful null or
+  negative results can qualify; capabilities improvements alone do not.
+  Keep engineering qualification separate from scientific findings.
 
 ## Runtime and scale boundary
 
@@ -94,10 +113,12 @@ a contract changes.
   The queue stores arguments rather than Git state; a worker refreshes before
   the next job and runs the current checkout's probe.
 - The implemented local program is the two-seed 25x Jobe screen plus a fresh
-  single-process 400x schedule. Prime DDP and the exact flagship remain gated
+  single-process 400x schedule. Prime DDP and the exact larger reference remain gated
   on pinned direct-HF data materialization with byte-checksum parity,
   distributed parity, durable artifacts, memory/throughput, checkpoint
   portability, and restart tests.
-- Flagship promotion requires an admissible Jobe factorial, a fresh Prime
-  `{base, df}` result, stable long-horizon contraction, the exact implementation
-  gate, and explicit spend confirmation from a9.
+- Larger runs require a named interpretability question that the smaller
+  specimen cannot resolve. The larger reference also requires an admissible
+  Jobe factorial, a fresh Prime `{base, df}` result, stable long-horizon
+  recurrence, the exact implementation gate, and explicit spend confirmation
+  from a9. A useful small organism is a valid endpoint.

@@ -1,63 +1,100 @@
-# Runtime qualification
+# Runtime qualification for faithful experiments
 
-The maintained Jobe runtime passed the full gate on 2026-09-06: PyTorch
-2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and RTX 4090. CUDA GQA uses native
-compiled FlexAttention. The separate FLA
-PKDA and cut-cross-entropy vendor revisions are unchanged. The Mac uses
-PyTorch 2.14.0, with portable SDPA for CPU/MPS attention.
+Interpretability results depend on the measured computation matching the
+trained computation. This page records the maintained execution contract and
+its engineering evidence. Passing it establishes numerical and operational
+coherence; it does not establish a learned mechanism, useful reasoning, or a
+validated monitor.
 
-The machine interpreter is standard, GIL-enabled CPython 3.13.15 on both
-machines. The [Python migration record](../data/summary/python-runtime-2026-09-06.json)
-records its separate qualification. The six-update runtime-migration comparison
-below was collected on Python 3.12.13; the execution-optimization measurements
-use Python 3.13.15.
+The committed qualification records dated 2026-09-06 cover Jobe's RTX 4090 with
+PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and standard GIL-enabled CPython
+3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. These records are
+evidence for their exact sources and inputs, not live machine status. Hopper
+remains unqualified until the same relevant gates run there.
 
-The [machine-readable record](../data/summary/flexattention-runtime-2026-09-06.json)
-contains both diagnostic traces, exact revisions, inputs, and gate results.
-This is engineering qualification; there are still no accepted experiment
-findings. Hopper remains unqualified until the same checks run there.
+## Evidence records
 
-## Correctness and capture
+| Record | What it establishes |
+|---|---|
+| [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Exact environment selection, dependency checks, portable/CUDA gates, and capture memory |
+| [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Paired six-update diagnostic from a trained checkpoint, with runtime versions, revisions, loss/gradient differences, and limitations |
+| [Execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces, component measurements, profiler counts, backend decisions, and reproduction commands |
 
 Jobe passed 114 experiment tests and the full `df probe` CUDA gate. The Mac
-passed 106 tests with eight CUDA cases skipped. The workspace's own 122 tests
-passed on each machine, and both environments passed `uv pip check`.
+passed 106 tests with eight CUDA cases skipped. The workspace's 122 tests
+passed on each machine, and both environments passed `uv pip check`. Checkpoint
+v23 is unchanged.
 
-The Python 3.13 gate covers PKDA and fused-kernel parity, causal and cached attention,
-all four train/eval graphs, replay, optimizer state and radius invariants,
-post-capture reporting, and checkpoint staging. Capture peaked at 13.85 GiB
-allocated and 23.01 GiB reserved. One/two/three-pass microbatch replay took
-53.4/107.7/161.9 ms. Keep Jobe runs serial. Checkpoint v23 remains unchanged.
+The Python 3.13 gate covers PKDA and fused-kernel parity, causal/cached
+attention, all four train/eval graphs, replay, optimizer state and radius
+invariants, post-capture reporting, and checkpoint staging. Capture peaked at
+13.85 GiB allocated and 23.01 GiB reserved. One/two/three-pass microbatch
+replay took 53.4/107.7/161.9 ms. Keep GPU work serial on Jobe's 24 GiB card.
+Cache-size arithmetic is not a substitute for this measured training envelope.
 
-Both machines select only the Python 3.13 environment. Obsolete Python 3.12
-environments and rejected Python 3.14 candidates were removed. The latest
-Prime, Verifiers, and Renderers metadata still excludes Python 3.14, which
-sets the common machine pin. The migration record includes these constraints
-and the Mac MPS, MLX, and orchestration checks.
+## Maintained execution contract
 
-The initial migration failed during three-pass capture. Instrumentation showed
-a generation-1 Python garbage collection changing the CUDA stream from active
-capture to invalidated capture. PyTorch 2.14 no longer unconditionally collects
-warm-up garbage before capture. Both train and evaluation now collect those
-cycles before capture and suspend automatic collection through capture entry,
-body, and exit, restoring the caller's setting even on an exception. The full
-gate and the independent trained-checkpoint capture both passed with this fix.
+Portable CPU/MPS execution uses PyTorch scaled-dot-product attention, the
+literal PKDA recurrence, algebraic MHDB routing, chunked tied-head loss, and
+eager execution. It is the numerical reference for focused invariants and
+analysis. CUDA training uses the same equations through the following path:
 
-## Execution optimizations
+- BF16 trunk activations with FP32 parameters, recurrent/preconditioner
+  boundaries, accumulated gradients, and optimizer state.
+- Exactly `seq_len` executed inputs per stored `seq_len + 1` row; the final
+  token is a target. Keyed jitter retains the stored-row draw width so data
+  and randomness addresses do not change with the executed length.
+- Workspace FLA PKDA chunk kernels for training/prefill and recurrent kernels
+  for cached decode. Q/K/V projection and convolution work is packed; output
+  norm/gate and control-gradient packing are fused. CUDA training never falls
+  back silently to a sequential implementation.
+- Compiled native FlexAttention with causal masks shared across layers and
+  passes. Cached decode writes BF16 K/V and exposes only the valid prefix.
+  Global Q/K/V and gate projections share a GEMM. No external `flash-attn`
+  package or FlashAttention-4 backend is part of this runtime.
+- Triton MHDB routing with site-local nulls, raw values, a source softmax per
+  group, and full-width RMS coupling in backward. Each compiled block emits
+  its distance from the cell entry for the current/completed delta bank.
+- Persistent FP32 projection/embedding gradient sinks and address-stable BF16
+  weight shadows refreshed once per optimizer update. Shadows are runtime
+  operands, not additional learned or checkpointed state.
+- Workspace cut-cross-entropy with BF16 operands, capture-safe preprocessing,
+  differentiable log-partition for z-loss, ascending mean-logit vocabulary
+  tiling, and backward filtering equivalent to its late-filter decision.
+- Fixed-shape Inductor tuning; one train graph per reachable pass count and
+  shared-pool no-grad validation graphs. Cyclic Python garbage is collected
+  before capture and automatic collection is suspended through capture entry,
+  body, and exit, restoring the caller's setting even on exceptions.
+- One pinned host batch and one device batch per update. An event fences host
+  reuse during asynchronous transfer; graph-input copies remain stream ordered.
+  The screen uses four 1,024-token rows per microbatch and 80 microbatches per
+  update, with BF16 keyed jitter written directly into graph inputs.
+- NorMuonH shape-bucket compilation including packing, update, and state
+  writeback; ordinary per-parameter checkpoint state with no persistent packed
+  duplicate. NAdam and global FP32 clipping follow [architecture.md](architecture.md).
+- Activation checkpointing above the measured work threshold, preserving the
+  full feedback graph, and asynchronous pinned-host snapshot staging with
+  atomic background writes.
 
-The Python 3.13 / PyTorch 2.14 screen runtime uses causal row-safety and
-forward-only contiguous-block hints, one pinned whole-update input upload, and
-NorMuonH bucket compilation that includes packing and state writeback. The
-[optimization record](../data/summary/runtime-optimizations-2026-09-06.json)
-contains the component measurements, paired update traces, profiler counts,
-and rejected backend diagnostics. Model equations, optimizer ownership, and
-checkpoint v23 are unchanged.
+Inductor artifacts live at `~/.cache/delta-feedback/torchinductor` by default.
+The first probe performs the fixed-shape search; later processes reuse it. Set
+`DF_INDUCTOR_CACHE_DIR` only to relocate that durable cache. Run the probe on
+the exact source and hardware before a training job; compilation and graph
+capture are part of the experiment's reproducibility boundary.
 
-The 18-update comparison loads the same diagnostic checkpoint as below, with
-fresh optimizer state and identical data addresses, learning rates, pass
-schedule, and keyed randomness. Both sides use the same current runtime; the
-baseline selects plain causal attention, per-microbatch uploads, and the
-pre-change optimizer. Timing excludes the first update.
+For analysis, prepare the classifier shadow and use the model's activation
+precision. The maintained route and payload scripts do this. New hooks or
+portable replays must reproduce the relevant baseline before their changed
+outputs can be attributed to a scientific intervention.
+
+## Short-update evidence and its limits
+
+The 18-update optimization comparison starts from the same diagnostic
+checkpoint on each side with fresh optimizer state and identical data
+addresses, learning rates, pass schedule, and keyed randomness. Both sides use
+Python 3.13 and the current runtime; the baseline selects plain causal
+attention, per-microbatch uploads, and the baseline optimizer recorded in the
+artifact. Timing excludes the first update.
 
 | Passes | Baseline update | Combined update | Time reduction | Samples per side |
 |---|---:|---:|---:|---:|
@@ -65,90 +102,56 @@ pre-change optimizer. Timing excludes the first update.
 | 2 | 9.471 s | 9.449 s | 0.24% | 6 |
 | 3 | 14.278 s | 14.252 s | 0.19% | 3 |
 
-These are small sequential diagnostic samples. The observed whole-update gain
-is modest and does not establish a long-run throughput or training result.
 The largest update-loss difference was 0.000118, the largest gradient-norm
-relative difference was 0.98%, and final pass-one/fused validation differed by
-0.000128/0.000160. Both eight-pass contraction traces remained finite. Combined
-capture peaked at 13.83 GiB allocated and 22.91 GiB reserved.
+relative difference 0.98%, and final pass-one/fused validation differences
+0.000128/0.000160. Both eight-pass traces remained finite. Combined capture
+peaked at 13.83 GiB allocated and 22.91 GiB reserved. These small sequential
+samples show a modest observed throughput change, not long-run training parity
+or a scientific result about the architecture.
+
 The separate optimizer comparison reduced warmed NorMuonH time from 62.15 to
-50.43 ms (18.9%). In the profiled clipping/optimizer/shadow/zeroing interval,
-CUDA kernel launches fell from 629 to 582, and eager `stack`/`cat` calls from
-31 each to one each. Eager allocation counts did not fall; the supported gain
-is reduced dispatch and compiled packing/writeback. Optimizer state remains
-ordinary per-parameter tensors, with no additional persistent packed copy.
+50.43 ms. In the profiled clipping/optimizer/shadow/zeroing interval, launches
+fell from 629 to 582 and eager `stack`/`cat` calls from 31 each to one each.
+Eager allocation counts did not fall. Staging alone stayed within 0.2% of the
+baseline and adds about 2.5 MiB each of pinned host and device storage.
 
-The staging-only comparison stayed within 0.2% of baseline. It replaces 80
-small host-to-device uploads with one pinned asynchronous upload per update,
-then copies device slices into graph inputs. An event fences reuse of the
-pinned storage; uploads and replays remain ordered on one stream. The screen
-adds about 2.5 MiB each of pinned host and device storage. Tests delay DMA to
-exercise host-buffer lifetime and compare addressed rows and feedback draws.
+The six-update whole-runtime migration comparison used Python 3.12.13 on both
+sides, the same checkpoint and rows, and pass counts `1,1,1,2,2,3`. Candidate
+one/two/three-pass update medians were 4.741/9.470/14.209 s. Maximum
+update-loss difference was 0.000277 and gradient-norm relative difference
+0.229%. The record contains the baseline stack and full traces. It does not
+isolate FlexAttention's contribution or establish long-run training
+equivalence. The distinct Python 3.13 gate is recorded separately.
 
-Contiguity is a forward-only promise: a 1,025-position causal prefill has
-noncontiguous backward partial query-block lists, and enabling the global
-hint produced roughly 44%/38% relative dK/dV error. The adopted scoped hint
-had zero output/gradient drift against plain FlexAttention in that case.
-Screen training attends over 1,024 positions; its stored 1,025-token rows
-include the next-token target. Both geometries are recorded separately.
-At production's `high` matrix precision, plain/hinted forward-backward graph
-times were 0.453/0.453 ms for 1,024 positions and 0.561/0.556 ms for 1,025.
-The hints therefore show no material isolated screen gain. Earlier
-highest-precision component runs selected different kernels and are retained
-as separate diagnostics. `PRESCALE_QK` added about 0.1–0.6% component speed,
-within the timing spread, with output/gradient relative L2 drift below 0.5%;
-it remains off because there is no measured material benefit.
+## Backend constraints
 
-NVGEMM is available only through the `kernel-bench` optional dependencies and
-diagnostic flags. It is not enabled in training. The native Ada discovery path
-requests nonexistent `89a`; the benchmark-only correction retains real SM89
-capabilities without editing installed packages. After that correction, four
-NVGEMM candidates per GEMM were timed in projection and SwiGLU
-forward/backward comparisons, but none were selected. Projection graph time
-was 0.193 versus 0.211 ms and SwiGLU 1.304 versus 1.304 ms. Full training
-compilation failed on symbolic optimizer BMM dimensions; restricting NVGEMM
-to trunk regions still failed with `Invalid leading dimension: 2`. These
-results do not support adopting this backend on Jobe.
+Causal row-safety hints and forward-only contiguous-block hints are enabled.
+Backward keeps indexed traversal: a 1,025-position prefill can have
+noncontiguous partial query-block lists, and a global contiguous hint produced
+large gradient errors. The scoped hint had zero output/gradient drift against
+plain FlexAttention in that case. At production `high` matrix precision,
+component timing showed no material isolated screen gain. `PRESCALE_QK` stays
+off because its small measured gain did not justify the numerical change.
 
-Reproduce the current combined diagnostic and component checks with:
+NVGEMM is a diagnostic option through `kernel-bench`, not a training backend.
+The record documents candidate selection and compilation failures on Ada; it
+does not support adopting that backend. Hardware or kernel changes need fresh
+qualification before any scientific comparison relies on them.
+
+## Reproduce a diagnostic
+
+Run GPU checks serially after inspecting live status, the active log, and GPU
+ownership. The snapshot below is an engineering input, not a registered result.
 
 ```bash
 python scripts/kernel_training_check.py runs/screen-df-full-s1.pt.10745 --updates 18
 python scripts/attention_check.py --length 1024
 python scripts/attention_check.py --length 1025
 python scripts/gemm_backend_check.py --backends ATEN,TRITON --output-dir tmp/gemm-base
-python scripts/gemm_backend_check.py --backends ATEN,TRITON,NVGEMM --ada-target-workaround --output-dir tmp/gemm-nv
 ```
 
-Run GPU diagnostics serially. The record preserves the exact baseline
-optimizer revision and explicit variant flags needed for the paired control.
-
-## Runtime migration comparison
-
-Both stacks loaded `runs/screen-df-full-s1.pt.10745`, used fresh identical
-optimizer settings, the same token rows and keyed randomness, and six updates
-with pass counts `1, 1, 1, 2, 2, 3`. Each update contains 320 rows of 1,024
-tokens in microbatches of four. Reproduce the candidate with:
-
-```bash
-python scripts/kernel_training_check.py runs/screen-df-full-s1.pt.10745 --updates 6
-```
-
-The baseline used PyTorch 2.9.1+cu130, CUDA 13.0, Triton 3.5.1, and external
-FlashAttention 2.8.3. These measurements compare the whole runtime migration;
-they cannot isolate FlexAttention's contribution.
-
-| Passes | Baseline update | New update | Time reduction |
-|---|---:|---:|---:|
-| 1 | 4.830 s | 4.741 s | 1.8% |
-| 2 | 9.686 s | 9.470 s | 2.2% |
-| 3 | 14.538 s | 14.209 s | 2.3% |
-
-Times are medians excluding the first update: only two, two, and one samples,
-respectively. They establish no observed slowdown in this diagnostic, not a
-precise performance estimate.
-
-The largest update-loss difference was 0.000277 and the largest gradient-norm
-relative difference was 0.229%. Final validation differed by 0.0000074 for
-pass one and 0.0000372 for the fused pass. Both contraction traces remained
-finite. This short check does not establish long-run training equivalence.
+Use the optimization record's exact baseline revision and explicit variant
+flags for a paired reproduction. Trained-input and full-gradient checks also
+live in `scripts/kernel_inputs.py` and `scripts/kernel_qualification.py`. A new
+intervention must preserve relevant numerical, cache, and state-boundary
+invariants even when the original training runtime has passed all gates.

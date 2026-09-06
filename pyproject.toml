@@ -1,7 +1,7 @@
 [project]
 name = "delta-feedback-experiment"
 version = "0.4.0"
-description = "Pretraining factorial: MHDB x full-bandwidth feedback on a PKDA/GGQA hybrid."
+description = "A small recurrent model organism for interpretability and latent-computation monitoring."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "CC-BY-SA-4.0"

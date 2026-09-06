@@ -1,168 +1,106 @@
 # delta-feedback-experiment
 
-This repository tests whether depth routing and latent recurrence help a common
-hybrid decoder independently or become more useful together.
+We are developing a small recurrent **model organism for interpretability**: a
+miniature language model whose latent computation we can analyze, inspect, and
+intervene on. The goal is to better understand and eventually monitor models
+that reason through internal states whose computation is opaque to us.
+Capabilities matter insofar as the organism needs meaningful behavior to study.
+Advancing the capabilities frontier is not this research's objective.
 
-The hybrid trunk repeats three recurrent PKDA layers and one dense gated global
-GQA layer. PKDA supplies efficient causal state; global GQA periodically gives
-every token a full-prefix read. Multi-Head Delta Block routing (MHDB) lets each
-sublayer transiently revisit the column seed and completed four-layer deltas.
-Full-Bandwidth Transformer (FBT) carries the previous token column's top state
-through a token-gated entry. Hard Delta Feedback (`df`) combines both and uses
-MHDB to enrich the payload sent to the next column.
+The architecture synthesizes already-published work on latent feedback,
+recurrent memory, and depth routing. We are assembling an experimental object,
+not claiming a new frontier architecture or reproducing any one paper's
+results. The intended contribution is a reproducible organism, causal
+explanations of its behavior, and monitoring methods tested against those
+explanations.
+
+## What we want to understand
+
+- What information survives in recurrent state, and how is it transformed?
+- When does later behavior depend on the payload, mixer memory, or depth routes?
+- Does repeated computation preserve, refine, overwrite, or destabilize state?
+- Can a monitor detect a specific internal change before it appears in outputs,
+  and does that detection survive controlled interventions and held-out tasks?
+
+Readable activations and routing plots are starting points. Understanding
+requires interventions that predictably change behavior. A monitor requires an
+independently defined target and measured errors. Neither lower loss nor a
+decaying state-update norm demonstrates interpretable reasoning.
+
+## The organism
+
+The implemented model is a 230–258M-parameter decoder family that can be
+trained and examined on one RTX 4090. “Small” is relative to frontier models:
+this is still a substantial pretraining workload, and smaller diagnostic
+geometries are useful for implementation checks.
 
 ```text
-previous payload + token embedding
-                │
-              FBT gate
-                │
-                v
- [PKDA, PKDA, PKDA, gated global GQA] x cells
-                │
-        MHDB-routed payload
-                │
-                v
-          next token column
+previous token's latent payload + current token embedding
+                         │
+                 FBT token-gated entry
+                         │
+        [PKDA, PKDA, PKDA, gated global GQA] × 3
+           MHDB reads seed and block deltas at each site
+                         │
+                 top state + routed sources
+                         │
+                   next latent payload
 ```
 
-The primary screen is the factorial `{base, mhdb, fbt, df}`. All four share
-the same hybrid trunk; `base` deletes both packages, `mhdb` and `fbt` retain
-one each, and `df` retains both. Pure twelve-layer RoPE GQA `vanilla` is a
-separate whole-trunk control.
+PKDA supplies recurrent token-mixer memory; GQA supplies periodic full-prefix
+reads. FBT carries a latent payload across token columns. MHDB makes the seed
+and block contributions addressable inside a column and in the outgoing `df`
+payload. These are concrete places to observe and perturb computation; their
+presence does not make their learned contents interpretable.
 
-## Status
+The five arms provide controls for studying those mechanisms:
 
-No run is complete under the current screen contract: all ten registered
-runs are pending, and there are no accepted experiment findings. Jobe is
-between runs. Existing diagnostic checkpoints provide engineering inputs;
-they do not constitute a registered comparison.
+| Arm | Role |
+|---|---|
+| `base` | Common PKDA/GQA trunk, with neither MHDB nor FBT |
+| `mhdb` | Depth routing without latent feedback |
+| `fbt` | Latent feedback without depth routing |
+| `df` | Both, including routed payload enrichment |
+| `vanilla` | Separate pure-GQA whole-trunk control |
 
-The 230–258M screen model, deterministic single-process trainer, portable
-semantics, and optimized Jobe CUDA path are implemented and qualified. Jobe
-runs remain serial because the qualified DF graph pool reserves about 23.0 GiB
-on its 24 GiB RTX 4090. See the [runtime qualification](docs/runtime-qualification.md)
-for the PyTorch 2.14 / CUDA 13.2 correctness and short-update comparison.
+`base` already has PKDA recurrence. The factorial isolates the MHDB and FBT
+packages; it does not compare all recurrence against none. The proposed
+[`df-loop`](docs/depth-architecture.md) adds a tied core iterated within each
+column. It is specified but unimplemented and is not a sixth registered arm.
 
-The realized Jobe token store is a 35.000B-token prefix of the pinned stream.
-The canonical 57B store has not yet been materialized.
+## Current status
 
-The next stages are specified but not runnable: a fresh `{base, df}` 400x
-comparison on one 8xH100-80GB Prime node, followed—only after the evidence and
-implementation gates—by the 1.335B-parameter, 441B-token flagship. See
-[docs/architecture.md](docs/architecture.md) for the exact flagship and
-NorMuonH/NAdam specification, and [docs/design.md](docs/design.md) for the
-experiment and scale plan.
+The repository has a single `DFModel`, deterministic single-process training,
+portable semantics, a qualified Jobe CUDA path, route reports, payload-source
+interventions, and recurrent stability diagnostics. No completed comparison
+under the current screen contract or accepted scientific finding is recorded.
+Existing diagnostic checkpoints can support explicitly scoped exploratory
+analysis; they do not constitute the registered factorial.
 
-## Install
+The next work is to build and characterize reproducible specimens, establish
+behavior that causally uses recurrent state, and develop the analysis and
+monitoring protocol. There is no registered reasoning benchmark or validated
+hidden-state monitor yet. The model has not been shown to be a faithful proxy
+for opaque reasoning in larger systems.
 
-The workspace runtime is Python 3.13. Install the shared operational package
-from the workspace root, then this project:
+The primary training recipe is a two-seed, five-arm Jobe screen. Longer
+training and larger geometries are [optional references](docs/scaling.md),
+gated on a specific interpretability need, implementation qualification, and
+spend approval. A useful organism at the current size is a successful endpoint.
 
-```bash
-cd /path/to/transformer-experiments
-uv pip install -e .
-cd delta-feedback-experiment
-uv pip install -e .
-```
+## Start here
 
-On Jobe, initialize the workspace's kernel forks and install the CUDA extras
-into its shared PyTorch 2.14 / CUDA 13.2 environment:
+Read the [research design](docs/design.md) and [interpretability
+program](docs/interpretability.md) for the questions, controls, deliverables,
+and evidence rules. The [architecture](docs/architecture.md) defines the exact
+state and computation; the [literature map](docs/literature.md) explains the
+source roles and synthesis.
 
-```bash
-git -C .. submodule update --init vendor/flash-linear-attention vendor/ml-cross-entropy
-uv pip install -e '.[cuda]'
-```
+For installation, data materialization, training, queue control, and analysis
+commands, use [operations](docs/operations.md). Run `df probe` before training.
+Jobe's qualified graph pool reserves about 23 GiB, so GPU work stays serial;
+[runtime qualification](docs/runtime-qualification.md) records its evidence.
 
-CCE and FLA install editable from the workspace forks under `../vendor/`
-through `tool.uv.sources` in `pyproject.toml`, so the root repository's
-submodule pointers are their only pin and kernel edits there are live without
-reinstalling. CUDA GQA uses compiled PyTorch FlexAttention; the external
-`flash-attn` package is not used. Machine-wide constraints own Torch itself.
-The first `df probe` performs the fixed-shape Inductor search and preserves its
-generated artifacts at `~/.cache/delta-feedback/torchinductor`; later probes
-and training processes reuse that cache. Set `DF_INDUCTOR_CACHE_DIR` only when
-the durable cache belongs elsewhere.
-
-Install the exact data-build stack on any staging host that materializes the
-canonical token stream:
-
-```bash
-uv pip install -e '.[data-build]'
-```
-
-## Operate
-
-```bash
-# Portable invariant suite; includes the full CUDA gate on a CUDA host.
-df probe
-
-# Materialize the canonical 57B stream from pinned HF dataset/tokenizer commits.
-df tokenize --out /data/df/tokens
-
-# Run or queue one arm.
-df train example-df-s1 --arm df --seed 1 --data-seed 0 \
-  --data-dir /data/df/tokens
-df queue example-df-s1 --arm df --seed 1 --data-seed 0 \
-  --data-dir /data/df/tokens
-
-# Inspect and control the detached queue.
-df status
-df watch
-df stop TAG|live [--at STEP]
-df stop queue
-df stop all
-df clear TAG|all
-```
-
-The queue records exact arguments, not Git state. A source change never stops
-an active child; the worker refreshes before the next queued job and runs its
-probe from the current checkout. `df stop queue` removes every pending job but
-leaves the active run and worker untouched; it is the complement of `df stop
-live`, which stops only the active run and preserves the pending queue.
-
-The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024 predictions
-per row: 3,520,921,600 predicted tokens. Linear warmup occupies the first 2%
-of updates and the `1 - sqrt(u)` cooldown occupies the final 20%. Feedback
-starts independently at three quarters of the schedule, and every later step
-draws two or three passes. Every arm sees the same addressed
-token rows; feedback arms also share deterministic pass, prefix, and jitter
-streams. The global FP32 gradient is clipped to norm 10.0 before the shared
-NorMuonH/NAdam update. NorMuonH uses a `6e-3` stable rate; every NAdam-owned
-parameter, including the tied embedding/readout, uses `3e-4`.
-Both sides apply their specified Nesterov construction:
-NorMuonH before orthogonalization and NAdam through its scheduled first moment.
-
-Snapshots use checkpoint contract v23, and only v23 is resumable. V16-v22
-remain readable for evaluation and forks; v19 retains the retired fixed-step
-warmup contract, v21 predates the NorMuonH fan-in initialization, and v22
-predates the unified NAdam rate and reduced NorMuonH rate.
-Protected snapshots persist at the cooldown boundary, the
-feedback boundary, and the end of the run.
-`--max-steps` limits the current invocation without changing the registered
-schedule.
-
-## Analysis
-
-```bash
-python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
-python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
-```
-
-The route report summarizes per-head block-source selection, null/source
-scale, and query geometry. The payload sweep is a same-checkpoint intervention,
-not a separately trained arm.
-
-## Documentation
-
-- [docs/architecture.md](docs/architecture.md): exact flagship architecture,
-  state, parameter accounting, and optimizer contract.
-- [docs/design.md](docs/design.md): comparisons, data, schedules, execution,
-  evaluation, scale plan, and promotion gates.
-- [docs/depth-architecture.md](docs/depth-architecture.md): specified,
-  unimplemented `df-loop` arm: tied recurrent core, shared core cache,
-  and its contract deltas.
-- [docs/findings.md](docs/findings.md): accepted experiment findings only.
-- [docs/journal.md](docs/journal.md): disposable active notes.
-- [references/refs.yaml](references/refs.yaml): primary references and their
-  current roles.
-- [figures/README.md](figures/README.md): committed finding figures.
+[Findings](docs/findings.md) contains accepted scientific results,
+[figures](figures/README.md) indexes their figures, and [the
+journal](docs/journal.md) holds disposable working notes.

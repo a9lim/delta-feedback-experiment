@@ -1,10 +1,12 @@
 # Depth-recurrent architecture (`df-loop`)
 
-This document specifies `df-loop`, a sixth arm that adds a weight-tied
-recurrent core to Hard Delta Feedback. It is fully specified and not yet
-implemented; it is not part of the registered screen until the adoption list
-at the end has landed. Where this document and [architecture.md](architecture.md)
-both speak, this document governs the loop arm only.
+This document specifies `df-loop`, a proposed extension of the small model
+organism with a weight-tied recurrent core. Its purpose is to expose repeated
+within-column computation for iteration-level interpretability experiments. It
+is specified and not yet implemented; it is not part of the registered screen
+until the adoption list at the end has landed. Where this document and
+[architecture.md](architecture.md) both speak, this document governs the loop
+arm only.
 
 `df-loop` combines two recurrences on one hybrid trunk:
 
@@ -16,6 +18,26 @@ both speak, this document governs the loop arm only.
   every core iteration of a fused position reads. FBT supplies the payload,
   its fusion, and the Jacobi multi-pass training that makes both channels
   trainable in parallel.
+
+## Research role
+
+The tied core offers a second experimental axis: track what changes within a
+column as the same weights are reused, intervene at a particular iteration, and
+distinguish newly computed information from carried state. The horizontal
+payload and shared cache make it possible to ask how that computation persists
+across tokens. These are proposed studies, not demonstrated properties.
+
+Adopt the loop to answer a named question that the implemented token-column
+recurrence cannot resolve. Extra depth or a loss improvement alone is not the
+research justification. The shared cache, source-bank changes, and tied depth
+form a package; their effects need controls before they can be attributed to
+one mechanism. A small loop organism with reproducible causal behavior is a
+sufficient target; a wider model is optional.
+
+The [interpretability protocol](interpretability.md) governs trace provenance,
+behavioral witnesses, interventions, and monitoring evaluation. Every
+iteration-indexed trace must distinguish core depth from Jacobi pass number and
+token position.
 
 ## Geometry
 
@@ -35,13 +57,13 @@ three cells:
 
 Every cell is `[PKDA, PKDA, PKDA, gated global GQA]` with the mixer, gate,
 routing-group, and precision contracts of `architecture.md`. At `r = 1` the
-column executes the same twelve layers as `df` with the same parameters and
-the same source banks; plain positions then coincide with `df` exactly, and
-fused positions differ from `df` only by the shared mixing defined below.
+column executes the same twelve layers as `df` with the same parameters and the
+same source banks; plain positions then coincide with `df` exactly, and fused
+positions differ from `df` only by the shared mixing defined below.
 
-A `k`-pass batch at iteration count `r` costs `k (2 + r)` cell evaluations
-per predicted token. Results report **cell-tokens** beside pass-tokens: `df`
-spends three cell-tokens per pass-token, `df-loop` spends `2 + r`.
+A `k`-pass batch at iteration count `r` costs `k (2 + r)` cell evaluations per
+predicted token. Results report **cell-tokens** beside pass-tokens: `df` spends
+three cell-tokens per pass-token, `df-loop` spends `2 + r`.
 
 ## Column
 
@@ -90,10 +112,10 @@ logits = tied_readout(final_norm(h))
 Each `mhdb` call prepends its site's learned null. Every cell measures its
 partial from its own entry; the core's entry is pinned to the prelude output
 for all `r` iterations, so the core is one cell of `4r` layers whose partial
-accumulates across iterations. There is no adapter and no random initial
-state: the seed and prelude delta are re-readable at every iteration through
-the routers. At a fused position the token enters only through the FBT gate,
-as in `df`; a plain position seeds from the embedding itself.
+accumulates across iterations. There is no adapter and no random initial state:
+the seed and prelude delta are re-readable at every iteration through the
+routers. At a fused position the token enters only through the FBT gate, as in
+`df`; a plain position seeds from the embedding itself.
 
 ## Residual shell in the core
 
@@ -106,15 +128,14 @@ holds in every cell:
 h_top = seed + Delta_P + Delta_R + Delta_C
 ```
 
-The shell is chosen because it has no mechanism that forces a nonzero update:
-a branch-output norm would pin every iteration's update size and make a
-fixed point unreachable by construction. Whether the tied core actually
-contracts is not assumed. Hyperball radii bound the NorMuonH matrices, but
-norm scales, router values, and the NAdam-owned gates and controls are not
-radius-bounded, so the safety argument is the measured one: per-iteration
-residual RMS and the depth-contraction trace below are registered guards, and
-a diverging trace invalidates the loop comparison and forces a new
-specification.
+The shell is chosen because it has no mechanism that forces a nonzero update: a
+branch-output norm would pin every iteration's update size and make a fixed
+point unreachable by construction. Whether the tied core actually contracts is
+not assumed. Hyperball radii bound the NorMuonH matrices, but norm scales,
+router values, and the NAdam-owned gates and controls are not radius-bounded,
+so the safety argument is the measured one: per-iteration residual RMS and the
+depth-contraction trace below are registered guards, and a diverging trace
+invalidates the loop comparison and forces a new specification.
 
 ## Iteration count
 
@@ -137,22 +158,22 @@ one so that the uncapped mean of `r` is `r_mean`. Under the cap:
 | expected layers per pass | 23.5 |
 | expected cells per pass | 5.88 |
 
-The draw comes from its own keyed sub-stream of the data seed and step, so
-`df` and `df-loop` share byte-identical pass-count, prefix, and jitter draws.
+The draw comes from its own keyed sub-stream of the data seed and step, so `df`
+and `df-loop` share byte-identical pass-count, prefix, and jitter draws.
 Realized `r` is logged per step and enters the cell-token total.
 
-Evaluation and decoding use one fixed `r` for the prompt passes and the
-entire decode trajectory; `r` never changes within a request. Registered
-metrics use `r = r_mean`. A fixed-`r` sweep over `{1, 2, 4, 8}` at the screen
-is a diagnostic, not a metric.
+Evaluation and decoding use one fixed `r` for the prompt passes and the entire
+decode trajectory; `r` never changes within a request. Registered metrics use
+`r = r_mean`. A fixed-`r` sweep over `{1, 2, 4, 8}` at the screen is a
+diagnostic, not a metric.
 
 ## MHDB source banks
 
 Routers follow `architecture.md` exactly: zero-initialized width-`D` query,
 full-width RMS key statistics, raw values, one softmax per routing group, a
 site-local null prepended to every bank. The core's eight sites are shared
-across iterations because they are core weights. The core is one cell, so
-its bank is a cell's bank:
+across iterations because they are core weights. The core is one cell, so its
+bank is a cell's bank:
 
 | Site | Sources after the null |
 |---|---|
@@ -165,28 +186,27 @@ its bank is a cell's bank:
 | payload | seed, `Delta_P`, `Delta_R`, `Delta_C` |
 
 The core partial is `h - core_entry`, the core's progress since the prelude
-output, accumulated across iterations rather than reset at each; `Delta_R`
-is its value at core exit. The core's bank therefore has the shape and
-meaning of a `df` second-cell bank at every iteration, and the tied routers
-answer one stationary question rather than one per iteration index. Every
-bank's non-null sources reconstruct the current residual exactly, as in
-`architecture.md`, so the uniform zero-query mixture stays collinear with
-the residual and pass-1 routing is functionally inert at initialization at
-every iteration. The residual is the state; the routers are the learned
-input injection of the seed and the prelude. Per-iteration deltas are never
-sources: an iteration boundary is a boundary in weights, not in state.
+output, accumulated across iterations rather than reset at each; `Delta_R` is
+its value at core exit. The core's bank therefore has the shape and meaning of
+a `df` second-cell bank at every iteration, and the tied routers answer one
+stationary question rather than one per iteration index. Every bank's non-null
+sources reconstruct the current residual exactly, as in `architecture.md`, so
+the uniform zero-query mixture stays collinear with the residual and pass-1
+routing is functionally inert at initialization at every iteration. The
+residual is the state; the routers are the learned input injection of the seed
+and the prelude. Per-iteration deltas are never sources: an iteration boundary
+is a boundary in weights, not in state.
 
 The core partial is exactly absent at one site, the attention entry of
-iteration 1, where the core has not yet moved. The fixed-capacity router
-there carries a zero-valued placeholder together with a boolean source
-presence mask; an absent source has logit `-inf`, contributes no value, and
-receives no gradient. The mask is load-bearing rather than cosmetic: the
-routed mixture is added to the residual before the norm, so an unmasked zero
-source at logit zero would take softmax mass `1 / (S + 1)` from the live
-sources, `S` the sum of their exponentiated scores, and shrink the routed
-term relative to `h` once the query has trained. Router weights, values, and
-gradients at `r = 1` must match `df` exactly, and the telemetry labels the
-slot `core_partial`.
+iteration 1, where the core has not yet moved. The fixed-capacity router there
+carries a zero-valued placeholder together with a boolean source presence mask;
+an absent source has logit `-inf`, contributes no value, and receives no
+gradient. The mask is load-bearing rather than cosmetic: the routed mixture is
+added to the residual before the norm, so an unmasked zero source at logit zero
+would take softmax mass `1 / (S + 1)` from the live sources, `S` the sum of
+their exponentiated scores, and shrink the routed term relative to `h` once the
+query has trained. Router weights, values, and gradients at `r = 1` must match
+`df` exactly, and the telemetry labels the slot `core_partial`.
 
 ## Input injection and column start
 
@@ -205,16 +225,16 @@ each piece differently:
 | random `s_0` | the prelude output |
 | warm start from the previous token's `s_r` | the FBT payload at the seed, and the shared core cache at fused positions |
 
-The two designs differ in one structural place: where the previous
-position's state enters. The recurrent-depth warm start hands the core its
-previous fixed point directly. Here the previous column enters at the seed,
-through the token-gated FBT fusion, and the prelude reprocesses the fused
-seed before the core starts, so the vertical iteration restarts from the
-prelude output at every column. The previous column's converged core state
-reaches the current core through two trained channels only: the payload,
-compressed by the payload norm and the token gate, and the shared cache,
-which is the recurrent-depth "attend to later iterations of earlier tokens"
-mechanism trained rather than zero-shot.
+The two designs differ in one structural place: where the previous position's
+state enters. The recurrent-depth warm start hands the core its previous fixed
+point directly. Here the previous column enters at the seed, through the
+token-gated FBT fusion, and the prelude reprocesses the fused seed before the
+core starts, so the vertical iteration restarts from the prelude output at
+every column. The previous column's converged core state reaches the current
+core through two trained channels only: the payload, compressed by the payload
+norm and the token gate, and the shared cache, which is the recurrent-depth
+"attend to later iterations of earlier tokens" mechanism trained rather than
+zero-shot.
 
 Two expressivity gaps against the adapter are known and accepted:
 
@@ -227,24 +247,24 @@ Two expressivity gaps against the adapter are known and accepted:
 - The core carries no state across positions in its residual. Whether the
   restart costs anything is what the warm-start sweep measures.
 
-Landing the payload at the core entry instead would move the horizontal
-channel for the whole family and break `r = 1` parity with `df`. That is a
-new screen contract, not a loop variant, and is not specified here.
+Landing the payload at the core entry instead would move the horizontal channel
+for the whole family and break `r = 1` parity with `df`. That is a new screen
+contract, not a loop variant, and is not specified here.
 
 ## Horizontal channels
 
 ### Payload
 
 Unchanged from `architecture.md` and `design.md`: asymmetric FBT fusion at the
-seed, routed payload over the null, seed, and completed deltas,
-`payload_norm`, keyed uniform jitter, the one-position shift, and the per-row
-plain prefix. The payload is the trained form of warm-starting a column from
-the previous column's final state; no untrained warm start exists.
+seed, routed payload over the null, seed, and completed deltas, `payload_norm`,
+keyed uniform jitter, the one-position shift, and the per-row plain prefix. The
+payload is the trained form of warm-starting a column from the previous
+column's final state; no untrained warm start exists.
 
 ### Plain and fused positions
 
-Every executed position is either **plain** or **fused**, and the label
-governs both horizontal channels at once:
+Every executed position is either **plain** or **fused**, and the label governs
+both horizontal channels at once:
 
 - A plain position seeds from its embedding and mixes **same-depth**: at core
   iteration `i` it reads earlier positions' iteration-`i` writes of the
@@ -253,9 +273,9 @@ governs both horizontal channels at once:
   core iteration it reads earlier positions' **final-iteration** writes plus
   its own current-iteration write.
 
-Plain positions always form a prefix of the row, so a plain position only
-ever reads plain positions and same-depth mixing over the prefix is
-self-contained. Position 0 is always plain. The assignment per context:
+Plain positions always form a prefix of the row, so a plain position only ever
+reads plain positions and same-depth mixing over the prefix is self-contained.
+Position 0 is always plain. The assignment per context:
 
 | Context | Plain | Fused |
 |---|---|---|
@@ -267,11 +287,11 @@ self-contained. Position 0 is always plain. The assignment per context:
 
 "Final" means, in training pass `k ≥ 2`, pass `k-1`'s last iteration at each
 earlier position, whatever that position's label was in pass `k-1`; in
-decoding, each earlier position's last executed iteration. The prefix
-therefore keeps the meaning it has in `design.md`: a plain position computes
-exactly what pass 1 computes. The price is that a feedback pass evaluates
-each core mixer twice per iteration, once same-depth over the prefix and once
-shared, and selects by position.
+decoding, each earlier position's last executed iteration. The prefix therefore
+keeps the meaning it has in `design.md`: a plain position computes exactly what
+pass 1 computes. The price is that a feedback pass evaluates each core mixer
+twice per iteration, once same-depth over the prefix and once shared, and
+selects by position.
 
 ### Shared core cache
 
@@ -300,11 +320,10 @@ for k in range(2, K + 1):
     outs.append(forward_column(x, plain=plain, writes=outs[-1].writes))
 ```
 
-**PKDA at a fused position.** Let `S̄_(t-1)`, `Ā_(t-1)` be the recurrent
-matrix and preconditioner state accumulated over positions `< t` from the
-write bank only, with the transition equations of `architecture.md`; at
-`t = 0` both are zero. Position `t` then applies its own current-iteration
-transition:
+**PKDA at a fused position.** Let `S̄_(t-1)`, `Ā_(t-1)` be the recurrent matrix
+and preconditioner state accumulated over positions `< t` from the write bank
+only, with the transition equations of `architecture.md`; at `t = 0` both are
+zero. Position `t` then applies its own current-iteration transition:
 
 ```text
 A_t        = alphaP_t Ā_(t-1) + betaP_t (k_t ⊙ k_t)
@@ -318,17 +337,17 @@ o_t        = S_t^T q_t
 
 The bank-side scan does not depend on the iteration, so its exclusive states
 and chunk factors are formed once per pass per layer; each iteration performs
-an exclusive read at the modified query and adds the own term. The
-convolution at position `t` uses its own current pre-convolution projections
-with the bank's projections as history. This is a new operator, forward and
-backward, with gradient flowing into the current writes and into the bank.
-Its parity oracle is the literal sequential recurrence over the bank followed
-by the own transition, run on the portable path.
+an exclusive read at the modified query and adds the own term. The convolution
+at position `t` uses its own current pre-convolution projections with the
+bank's projections as history. This is a new operator, forward and backward,
+with gradient flowing into the current writes and into the bank. Its parity
+oracle is the literal sequential recurrence over the bank followed by the own
+transition, run on the portable path.
 
 **Gated GQA at a fused position.** Position `t` attends over the bank's `K̄`,
 `V̄` at positions `< t` and over its own current `k_t`, `v_t`; the two softmax
-pieces are merged in FP32 by log-sum-exp with the layer's usual scale, and
-at `t = 0` only the own term exists. Gradient flows into both.
+pieces are merged in FP32 by log-sum-exp with the layer's usual scale, and at
+`t = 0` only the own term exists. Gradient flows into both.
 
 No jitter is added directly to write tensors; later-pass writes are functions
 of the jittered payload seeds. Pass `k`'s loss reaches pass `k-1` through both
@@ -339,14 +358,14 @@ the payload and the bank, and neither is ever detached.
 The shared cache inherits the payload's training horizon. A `k`-pass batch
 exposes chains of at most `k-1` transitions through both channels, while
 decoding runs unbounded chains in which each generated position's finals were
-themselves produced from a cache of mixed age: prompt finals from the
-prefill, generated finals from the decode trajectory. Training pass 2 reads
-pass-1 finals, pass 3 reads pass-2 finals produced against pass-1 finals, and
-no training pass constructs a deeper joint distribution. This is the same
-mismatch `design.md` already accepts for the payload, and it is gated the same
-way: the sequence-contraction trace over both channels is the registered
-test, and a rising or oscillating trace invalidates the feedback comparison
-regardless of any one-step metric.
+themselves produced from a cache of mixed age: prompt finals from the prefill,
+generated finals from the decode trajectory. Training pass 2 reads pass-1
+finals, pass 3 reads pass-2 finals produced against pass-1 finals, and no
+training pass constructs a deeper joint distribution. This is the same mismatch
+`design.md` already accepts for the payload, and it is gated the same way: the
+sequence-contraction trace over both channels is the registered test, and a
+rising or oscillating trace invalidates the feedback comparison regardless of
+any one-step metric.
 
 ## Training
 
@@ -367,16 +386,16 @@ with block-level activation checkpointing at every pass. Truncated
 backpropagation through the last iterations is excluded.
 
 Optimizer ownership follows `architecture.md`: the tied core's matrices are
-NorMuonH parameters whose gradients sum across iterations and passes, with
-one fixed Hyperball radius each. The global FP32 gradient is clipped to norm
+NorMuonH parameters whose gradients sum across iterations and passes, with one
+fixed Hyperball radius each. The global FP32 gradient is clipped to norm
 10.0 before both steps.
 
-Execution keeps the whole-step capture of `design.md`: one fixed-address
-train CUDA graph per reachable `(pass count, r)` pair, twenty-four at the
-screen, all sharing one pool sized by the three-pass `r_max` case, plus the
-no-grad evaluation graphs at `r = r_mean`. Preparation therefore costs about
-six times today's capture. Autograd sums the tied gradients inside the
-captured step; no per-cell graph composition is used.
+Execution follows the [runtime graph contract](runtime-qualification.md): one
+fixed-address train CUDA graph per reachable `(pass count, r)` pair,
+twenty-four at the screen, all sharing one pool sized by the three-pass `r_max`
+case, plus the no-grad evaluation graphs at `r = r_mean`. Preparation therefore
+costs about six times today's capture. Autograd sums the tied gradients inside
+the captured step; no per-cell graph composition is used.
 
 `df-loop` pairs with `df`: byte-identical initialization of every shared
 parameter, the same stream, row order, schedule, and pass-count, prefix, and
@@ -389,11 +408,11 @@ jitter draws. The `r` draw is the only additional randomness.
 every position but the first is fused. Both report cell-tokens.
 
 `df-loop - df` at equal steps is a **matched-data** contrast on the complete
-loop package: vertical depth, the shared cache, and the changed source
-banks together, at unequal compute. A matched-compute view compares
-checkpoints or curves at equal cumulative cell-tokens or measured
-device-time; equal pass-tokens are never matched compute for this arm.
-Depth alone is not attributable without an unrouted loop arm.
+loop package: vertical depth, the shared cache, and the changed source banks
+together, at unequal compute. A matched-compute view compares checkpoints or
+curves at equal cumulative cell-tokens or measured device-time; equal
+pass-tokens are never matched compute for this arm. Depth alone is not
+attributable without an unrouted loop arm.
 
 A loop result is uninterpretable without two stability traces:
 
@@ -406,125 +425,77 @@ A loop result is uninterpretable without two stability traces:
   in which **both** channels advance each iteration: the shifted payload and
   the write bank of the previous iteration. Record held-out loss and mean
   `||h_top^(j) - h_top^(j-1)||_2` per iteration: eight iterations in the
-  monitor, at least thirty for promotion. The existing payload-only iteration
+  monitor, at least thirty before considering a larger run. The existing payload-only iteration
   is not this trace.
 
 Additional registered diagnostics: residual RMS per iteration; the core
-routers' mass on the null, seed, `Delta_P`, and the core partial by
-iteration, which is the learned input-injection profile; the own-term share
-of PKDA output at fused positions. Routing summaries remain diagnostics, not
-wins. The recurrent-depth KL exit rule may be run as a diagnostic; adaptive
-exit is not part of any metric.
+routers' mass on the null, seed, `Delta_P`, and the core partial by iteration,
+which is the learned input-injection profile; the own-term share of PKDA output
+at fused positions. Routing summaries remain diagnostics, not wins. The
+recurrent-depth KL exit rule may be run as a diagnostic; adaptive exit is not
+part of any metric.
 
 One same-checkpoint intervention is registered as a diagnostic, never as a
-metric or a training input: the **warm-start sweep**, the recurrent-depth
-warm start applied zero-shot to a model trained without it. At fused
-evaluation with prefix length 1, every fused position's core starts from
-`h_entry + lambda * Delta_R` of the previous pass at the position before it,
-shifted exactly as the payload is, for `lambda` in `{0, 0.5, 1}`. The warm
-term counts as core progress: the core partial is still measured from the
-prelude output, so iteration 1's attention entry reads a live partial and
-the reconstruction identity holds. The fixed-`r` sweep is repeated at each
-`lambda`. A gain at `lambda > 0` means core-state continuity is missing from
-the two trained channels and motivates a registered variant that carries it;
-no gain means the payload and the shared cache already carry it.
+metric or a training input: the **warm-start sweep**, the recurrent-depth warm
+start applied zero-shot to a model trained without it. At fused evaluation with
+prefix length 1, every fused position's core starts from `h_entry + lambda *
+Delta_R` of the previous pass at the position before it, shifted exactly as the
+payload is, for `lambda` in `{0, 0.5, 1}`. The warm term counts as core
+progress: the core partial is still measured from the prelude output, so
+iteration 1's attention entry reads a live partial and the reconstruction
+identity holds. The fixed-`r` sweep is repeated at each `lambda`. A
+reproducible gain at `lambda > 0` would motivate testing whether additional
+core-state continuity helps this specimen. No gain would not establish that the
+trained channels already carry it: co-adaptation, injection scale, and the task
+can all limit the intervention. Confirm the explanation with controls and
+held-out examples before registering a new channel.
 
 ## Parameter, cache, and cost accounting
 
-`df-loop` has exactly the parameters of `df`: 257,514,792 total and
-140,827,944 active non-embedding.
+`df-loop` has exactly the parameters of `df`: 257,514,792 total and 140,827,944
+active non-embedding.
 
 Per sequence at 1,024 context, one cell's registered mixer cache is
 3.456 MiB (three FP32 PKDA matrix and diagonal states plus BF16 convolution
 histories, 1.956 MiB; one BF16 KV cache, 1.500 MiB). Standard decoding keeps
 `r` live per-iteration tracks for the core, allocated at `r_max`; fused
-decoding keeps one compact core cache that advances once per position after
-its final iteration:
+decoding keeps one compact core cache that advances once per position after its
+final iteration:
 
 | Decode mode | Cells cached | Cache |
 |---|---:|---:|
 | Standard at `r_max` | `1 + 8 + 1` | 34.6 MiB |
 | Soft and Fused | 3 | 10.4 MiB |
 
-Training memory is not established by this arithmetic. The three-pass
-`r_max` batch holds 120 checkpointed block inputs, two write banks, and the
-bank-side scan intermediates on a card whose qualified pool already reserves
+Training memory is not established by this arithmetic. The three-pass `r_max`
+batch holds 120 checkpointed block inputs, two write banks, and the bank-side
+scan intermediates on a card whose qualified pool already reserves
 23.0 GiB; the adoption list requires a staged memory gate.
 
 Jobe step times are **unqualified estimates**. The anchor is the measured
 14.21 s three-pass `df` step in the short
-[runtime qualification](runtime-qualification.md), approximated conservatively as
-`k x (1.3 s + 0.30 s per layer evaluation)` per step, with block
-checkpointing adding one third to the layer term. At the expected
-`E[r] = 3.88`:
+[runtime qualification](runtime-qualification.md), approximated conservatively
+as `k x (1.3 s + 0.30 s per layer evaluation)` per step, with block
+checkpointing adding one third to the layer term. At the expected `E[r] =
+3.88`:
 
 | Arm | One pass | Two passes | Three passes | Mean step | Full schedule |
 |---|---:|---:|---:|---:|---:|
 | `df` | 5.0 s | 9.9 s | 14.9 s | 6.3 s | ~19 h |
 | `df-loop` | 10.8 s | 21.7 s | 32.5 s | 13.9 s | ~41 h |
 
-The model assigns no cost to the bank-side scan, the write bank, the
-two-piece attention merge, the new backward, or the second mixer evaluation
-on feedback passes, so the loop figure is a lower bound until eager and
-captured prototypes are measured.
+The model assigns no cost to the bank-side scan, the write bank, the two-piece
+attention merge, the new backward, or the second mixer evaluation on feedback
+passes, so the loop figure is a lower bound until eager and captured prototypes
+are measured.
 
-## Flagship-width loop run
+## Optional larger geometry
 
-Beyond the screen, one loop run is outlined at flagship width with the
-screen's naive depth: the same three cells, one each for prelude, core, and
-coda, with the flagship's layer geometry from `architecture.md` and a deeper
-draw. It is a loop counterpart to the Stage 3 plan in `design.md`, not a
-replacement for the flagship, and it is gated the same way.
-
-| Field | Value |
-|---|---:|
-| Residual width / SwiGLU intermediate | 1,536 / 6,656 |
-| PKDA heads x width, projection width | 20 x 128, 2,560 |
-| Global query / KV heads, head width | 16 / 8, 96 |
-| Unique layers / cells | 12 / 3 |
-| Context | 8,192 |
-| `r_mean` / `r_max` | 16 / 32 |
-| Compute depth per pass | `4 + 4r + 4` layers, mean 70.2, cap 136 |
-
-| Component | Parameters |
-|---|---:|
-| Tied embedding and readout | 233,373,696 |
-| 12 SwiGLU channel mixers | 368,050,176 |
-| 9 PKDA mixers | 152,148,816 |
-| 3 gated global GQA mixers, including Q/K norms | 28,312,128 |
-| Hard-DF fusion | 4,718,592 |
-| Trunk, entry, and payload norms | 43,008 |
-| 24 within-column routers and one payload router | 115,200 |
-| **Total** | **786,761,616** |
-| **Active non-embedding** | **553,387,920** |
-
-Under the cap the draw gives `E[r] = 15.56`, median 14, `P(r = 1) = 0.1%`,
-`P(r = 32) = 5.8%`, and 17.56 expected cells per pass. Metrics use fixed
-`r = 16`; the sweep runs to 32.
-
-The run inherits the flagship recipe: 400 predicted tokens per active
-non-embedding parameter aligned to the flagship batch of 40 sequences by
-8,192 predictions, the same optimizer, pass mixture, and schedule shape, and
-the same 8xH100 DDP target with every block checkpointed on every pass.
-
-| Quantity | Value |
-|---|---:|
-| Global batch | 327,680 predictions |
-| Optimizer steps | 675,523 |
-| Exact aligned budget | 221,355,376,640 predicted tokens (400.000377 per active parameter) |
-| Warmup / stable heat / cooldown | steps 1–13,510 / 13,511–540,418 / 540,419–675,523 |
-| Feedback boundary | after step 506,642 |
-| Expected pass-tokens | approximately 283.3B |
-| Expected cell-tokens | approximately 4.97T |
-
-The flagship spends about 3.39T cell-tokens, so this run costs about 1.5x the
-flagship's compute with 50% of its active parameters. Per sequence at 8,192
-context one cell's mixer cache is 27.9 MiB: Standard decoding at `r_max`
-holds 34 cells, 949 MiB, and Soft or Fused decoding holds 3 cells, 83.7 MiB.
-
-Entry requires an admissible `df-loop - df` screen result, the Prime gates
-of `design.md`, the loop-specific gates in the adoption list, and explicit
-spend confirmation.
+The exact wider loop budget and geometry are preserved in
+[scaling.md](scaling.md#larger-loop-reference). They are unimplemented
+references, gated on an informative small-loop comparison, a specific research
+need, hardware qualification, and spend confirmation. They are not a required
+next stage of the model-organism program.
 
 ## Sources
 
@@ -537,14 +508,14 @@ spend confirmation.
 ## Exclusions
 
 Not part of this specification: loop variants of `base`, `mhdb`, or `fbt`;
-truncated backpropagation; branch-output or residual-state norms in the core;
-a random or learned initial core state; an untrained warm start anywhere but
-the warm-start sweep; a raw embedding path into the core; a payload landing
-at the core entry, which is a new screen contract rather than a loop variant;
-a shared-cache budget above one; per-iteration halting readouts and pause
-tokens, which belong to a separate specification; adaptive exit as anything
-but a diagnostic; a decode `r` that varies within a request; and any loop
-mapping onto the six-cell flagship.
+truncated backpropagation; branch-output or residual-state norms in the core; a
+random or learned initial core state; an untrained warm start anywhere but the
+warm-start sweep; a raw embedding path into the core; a payload landing at the
+core entry, which is a new screen contract rather than a loop variant; a
+shared-cache budget above one; per-iteration halting readouts and pause tokens,
+which belong to a separate specification; adaptive exit as anything but a
+diagnostic; a decode `r` that varies within a request; and any loop mapping
+onto the six-cell larger reference.
 
 ## Adoption
 
@@ -553,7 +524,7 @@ Registering `df-loop` changes the following together:
 - `ARMS` gains `df-loop`; `ModelConfig` gains the core recurrence, `r_mean`,
   and `r_max`; `ColumnOutput` gains the write bank and `forward_column` takes
   a per-position plain mask and a previous bank; `AGENTS.md` and `README.md`
-  state six arms.
+  state the new implemented arm count and interpretability role.
 - A checkpoint contract beyond v23 with `r_mean`, `r_max`, and the `r`
   sub-stream as state-defining fields; realized `r` and cell-tokens in the run
   log.
@@ -567,7 +538,8 @@ Registering `df-loop` changes the following together:
   reservation recorded.
 - `design.md` adds `df-loop` to the arm table, cell-tokens and the
   matched-data versus matched-compute definitions to the accounting, two
-  registered runs (`df-loop`, seeds 1 and 2) to Stage 1, `r = r_mean` to the
+  registered runs (`df-loop`, seeds 1 and 2) to the Jobe study, `r = r_mean` to the
   evaluation contract, the two-channel sequence trace in place of the
-  payload-only iteration for loop arms, and the flagship-width loop run to
-  the scale plan.
+  payload-only iteration for loop arms, and any approved wider loop recipe in
+  `scaling.md`. The behavioral question, intervention controls, and analysis
+  deliverables are specified before training.

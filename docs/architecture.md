@@ -1,96 +1,98 @@
-# Flagship architecture
+# Architecture of the recurrent organism
 
-This document is the authoritative specification of the flagship model and
-optimizer. The flagship is a hard Delta Feedback decoder built from gated
-global grouped-query attention (GGQA), Preconditioned Kimi Delta Attention
-(PKDA), Multi-Head Delta Block routing (MHDB), and Full-Bandwidth Transformer
-(FBT) recurrence. MHDB is this project's block-source specialization of
-Multi-Head Delta Attention Residual routing (MHDAR); `mhdb` remains the code
-and experiment name.
+This document defines the exact computation, state, initialization, and
+optimizer of the small model organism. The implemented family is one `DFModel`
+with the five arms in [design.md](design.md). Hard Delta Feedback (`df`)
+combines Preconditioned Kimi Delta Attention (PKDA), gated global GQA,
+Multi-Head Delta Block routing (MHDB), and Full-Bandwidth Transformer (FBT)
+feedback. The controls remove specified packages from that computation.
 
-The architecture is fully specified, but the exact distributed flagship is
-not yet runnable. Generic mixer, routing, feedback, cache, and optimizer
-semantics exist in `DFModel`; exact-geometry distributed execution and its
-qualification belong to the implementation gate in [design.md](design.md).
-Primary source roles are indexed in
-[../references/refs.yaml](../references/refs.yaml).
+The purpose of this synthesis is to create an object we can inspect and
+intervene on. Named states and source identities provide experimental access;
+they do not establish that the learned representations are understood.
+[Interpretability](interpretability.md) defines the research protocol and
+[literature](literature.md) distinguishes source mechanisms from local choices.
+MHDB is the project's block-source specialization of multi-head delta routing;
+`mhdb` remains the code and arm name.
 
 ## Geometry
 
-| Field | Flagship value |
-|---|---:|
-| Vocabulary | 151,936, Qwen3 tokenizer |
-| Residual width | 1,536 |
-| Decoder layers | 24 |
-| Four-layer cells | 6 |
-| SwiGLU intermediate width | 6,656 |
-| Context | 8,192 |
-| Global query heads | 16 |
-| Global KV heads / routing groups | 8 |
-| Global head width | 96 |
-| PKDA query/key heads | 20 |
-| PKDA value heads | 20 |
-| PKDA key/value head width | 128 |
-| PKDA Q/K/V projection width | 2,560 |
-| PKDA convolution width | 4 |
-| RMSNorm epsilon | `1e-6` at every norm site |
-| Explicit position encoding | none |
+The small organism is the default research surface. The larger column preserves
+an exact optional reference geometry; distributed training at that geometry is
+not runnable or qualified. Its use is subject to [scaling gates](scaling.md).
 
-The token-mixing schedule is exactly:
+| Field | Small organism | Optional larger reference |
+|---|---:|---:|
+| Vocabulary, Qwen3 tokenizer | 151,936 | 151,936 |
+| Residual width `D` | 768 | 1,536 |
+| Decoder layers `L` / four-layer cells `C` | 12 / 3 | 24 / 6 |
+| SwiGLU intermediate width | 3,328 | 6,656 |
+| Context, predictions per row | 1,024 | 8,192 |
+| Global query heads | 8 | 16 |
+| Global KV heads / routing groups `H` | 4 | 8 |
+| Global head width | 96 | 96 |
+| PKDA Q/K/V heads | 10 | 20 |
+| PKDA key/value head width | 128 | 128 |
+| PKDA Q/K/V projection width | 1,280 | 2,560 |
+| PKDA convolution width | 4 | 4 |
+| RMSNorm epsilon, every norm site | `1e-6` | `1e-6` |
+| Explicit position encoding, hybrid arms | none | none |
+
+The hybrid token-mixing schedule is exactly:
 
 ```text
-[PKDA, PKDA, PKDA, gated global GQA] x 6
+[PKDA, PKDA, PKDA, gated global GQA] × C
 ```
 
-There is no sliding-window attention, MLA, RoPE, or additive position
-embedding. PKDA's causal convolution and recurrent transition carry local
-order and recency; every fourth layer supplies a dense causal global read.
+Hybrid arms use no sliding-window attention, MLA, RoPE, or additive position
+embedding. PKDA carries token-mixer state, order, and recency; every fourth
+layer supplies a dense causal global read. The separate `vanilla` control uses
+twelve RoPE GQA layers as specified in [design.md](design.md).
 
-At a high level, one recurrent column is:
+One feedback column computes:
 
 ```text
 token embedding e_t -------------------+
                                        +-- FBT fuse --> seed s_t
 previous payload p_(t-1) --------------+                  |
                                                           v
-        +------------------------------------------------------+
-        | [ PKDA - PKDA - PKDA - gated global GQA ] x 6       |
-        |   each sublayer may transiently read MHDB sources    |
-        +------------------------------------------------------+
+        [ PKDA - PKDA - PKDA - gated global GQA ] × C
+           each sublayer transiently reads MHDB sources
                           |                         |
                        h_top                    block deltas
                           +------------+------------+
                                        |
-                                       v
                               routed DF payload p_t
 ```
 
-On the first pass or in Standard decoding, no previous payload exists and the
-seed is the token embedding itself.
+On pass 1 and in Standard decoding the seed is the token embedding. The readout
+uses `final_norm(h_top)`; the outgoing payload has its own routing and
+normalization. Inspecting either one does not substitute for inspecting the
+other. The mixer caches are additional state paths outside this diagram's
+explicit payload edge.
 
-### Synthesis boundary
+## State boundaries for analysis
 
-The flagship combines established components but is not a reproduction of any
-one source model:
-
-| Source family | Adopted contract |
+| State | Lifetime and causal role |
 |---|---|
-| Full-Bandwidth Transformer | outer 1B geometry, latent-feedback entry and training objective, WSD/NorMuon lineage |
-| Kimi Linear | 20-by-128 KDA substrate, causal convolution, NoPE, sigmoid output gate, and 3:1 local/global cadence |
-| Preconditioned DeltaNet | apply-to-key diagonal preconditioner, independent gates, bounded squash, chunk/recurrent forms, and FP32 boundary states |
-| Qwen3-Next | sigmoid-gated global GQA operation and interval-four precedent |
-| Multi-head and Delta Attention Residuals | grouped source selection and additive delta-source semantics |
-| This project | PKDA/GGQA composition, four-layer MHDB sources, hard-DF payload routing, tokenizer, exact optimizer partition, and scale schedule |
+| Column seed | Current embedding or token-gated incoming payload; the actual residual origin |
+| Completed block deltas and current partial | Contributions within one column; MHDB reads them without replacing the residual identity |
+| `h_top` | Completed column state before final readout normalization |
+| Payload | Normalization of top state plus `df` enrichment, shifted to the next token column |
+| PKDA matrix, preconditioner, convolution history | Token-mixer memory, continued during decode and reset within each current Jacobi prefill pass |
+| GQA K/V | Visible-prefix cache for the global layers |
 
-These precedents motivate each piece; only the registered experiments can
-establish their interaction.
+Distinguish token-mixer recurrence from explicit payload feedback. `base` and
+`mhdb` still have PKDA recurrence. The current model has no tied-depth loop;
+that different state transition is specified in
+[depth-architecture.md](depth-architecture.md).
 
 ## Residual shell
 
 The model is a bias-free pre-norm decoder with tied embedding/readout, a final
 RMSNorm, packed SwiGLU channel mixers, and no dropout. Every RMSNorm, including
-PKDA's gated output norm, uses epsilon `1e-6`. For layer `l`, the token
-mixer and MLP produce already-scaled branch deltas `a_l` and `m_l`:
+PKDA's gated output norm, uses epsilon `1e-6`. For layer `l`, the token mixer
+and MLP produce already-scaled branch deltas `a_l` and `m_l`:
 
 ```text
 a_l = mixer_l(rmsnorm(routed_read(h_l))) / sqrt(2L)
@@ -114,9 +116,10 @@ routing and the recurrent payload.
 
 Each PKDA layer is a Kimi Delta Attention recurrence with the stable diagonal
 apply-to-key preconditioner from Preconditioned DeltaNet. The model width does
-not constrain its recurrent projection width: the flagship deliberately uses
-20 heads by 128 coordinates, or 2,560 projected coordinates, at residual width
-1,536.
+not constrain its recurrent projection width: the small organism uses 10 heads
+by 128 coordinates, or 1,280 projected coordinates, at residual width 768. The
+larger reference doubles the head count and residual width, preserving the
+projection ratio.
 
 ### Projection and controls
 
@@ -136,8 +139,8 @@ the corresponding backward packs the five slice gradients directly into one
 contiguous buffer before the shared projection GEMM.
 
 The main decay and diagonal preconditioner have independent parameter slices
-and downstream parameters inside the packed implementation. They are not
-tied. The preconditioner uses:
+and downstream parameters inside the packed implementation. They are not tied.
+The preconditioner uses:
 
 - squash bound `x = 1.5` and epsilon `1e-6`;
 - learned per-head log-space center initialized to `-0.2`;
@@ -148,8 +151,8 @@ tied. The preconditioner uses:
 ### Recurrent equation
 
 For one head, let `S_t` be the key-by-value recurrent matrix and `A_t` the
-nonnegative diagonal preconditioner state. Both begin at zero. In the
-project's key-first convention:
+nonnegative diagonal preconditioner state. Both begin at zero. In the project's
+key-first convention:
 
 ```text
 log alpha_t   = -exp(A) * softplus(decay_t + b)
@@ -191,9 +194,9 @@ Autoregressive decoding continues, per PKDA layer:
 
 A Jacobi or fused-prefill pass starts those states from zero and advances them
 once across that pass's causal token order. PKDA state is not carried between
-repeated passes over the same positions; the DF payload is the sole
-cross-pass state. After the final prefill, the materialized mixer caches
-advance normally during decoding.
+repeated passes over the same positions; the DF payload is the sole cross-pass
+state. After the final prefill, the materialized mixer caches advance normally
+during decoding.
 
 ## Gated global GQA
 
@@ -208,23 +211,23 @@ z       = concat(GQA(q, k, v))
 o       = W_o(sigmoid(W_g x) * z)
 ```
 
-The gate acts on the concatenated attention result before the output
-projection and residual-branch scaling. It does not change attention logits
-or softmax weights. It is distinct from every PKDA control and from the FBT
-entry gate.
+The gate acts on the concatenated attention result before the output projection
+and residual-branch scaling. It does not change attention logits or softmax
+weights. It is distinct from every PKDA control and from the FBT entry gate.
 
 Full-sequence and prefill CUDA execution use compiled PyTorch FlexAttention
-with a shared causal block mask and native GQA. Cached decoding writes BF16
-K/V explicitly, then attends only to the valid prefix; a one-token query sees
-every key in that prefix. Only the six global layers own KV storage.
-The external `flash-attn` extension is not required.
+with a shared causal block mask and native GQA. Cached decoding writes BF16 K/V
+explicitly, then attends only to the valid prefix; a one-token query sees every
+key in that prefix. Only the global layers own KV storage: three at small
+scale, six in the larger reference. The external `flash-attn` extension is not
+required.
 
 ## Multi-Head Delta Block routing
 
 MHDB widens residual access along depth while preserving a clean residual
-stream. It uses the multi-head source-selection operation from multi-head
-Delta Attention Residuals, but its addressable deltas are four-layer blocks,
-not individual attention and MLP branches.
+stream. It uses the multi-head source-selection operation from multi-head Delta
+Attention Residuals, but its addressable deltas are four-layer blocks, not
+individual attention and MLP branches.
 
 ### Router
 
@@ -249,8 +252,8 @@ then has its own softmax over sources and mixes only its own raw value slice.
 There is no score factor `1/sqrt(head_dim)` and no output projection.
 
 Every site prepends its own null. At initialization, the zero query makes the
-source distribution uniform. The null initially contributes no value, but it
-is learnable, so null mass must later be interpreted together with null-vector
+source distribution uniform. The null initially contributes no value, but it is
+learnable, so null mass must later be interpreted together with null-vector
 scale.
 
 ### Block sources
@@ -268,9 +271,9 @@ At a site in cell `b`, the source bank is:
 [site-local null, column seed, completed Delta_0 .. Delta_(b-1), partial_b?]
 ```
 
-The current partial is omitted when it is exactly absent at cell entry. The
-MLP site sees the partial after its layer's attention delta has been added. At
-the cell boundary, the evolving partial becomes the one completed block delta.
+The current partial is omitted when it is exactly absent at cell entry. The MLP
+site sees the partial after its layer's attention delta has been added. At the
+cell boundary, the evolving partial becomes the one completed block delta.
 Individual branch deltas never become addressable sources.
 
 The non-null sources therefore reconstruct the current residual exactly:
@@ -284,9 +287,10 @@ initial zero-query pass, the non-null mixture is collinear with `h_current`, so
 the following RMSNorm makes routed pass-1 reads functionally inert up to its
 epsilon.
 
-The deepest within-column site and the payload router each see at most eight
-sources. The former has null, seed, five completed cells, and one live partial;
-the latter has null, seed, and six completed cells.
+The deepest within-column site and the payload router each see at most `C + 2`
+sources: five at small scale, eight in the larger reference. The former has
+null, seed, `C - 1` completed cells, and one live partial; the latter has null,
+seed, and all `C` completed cells.
 
 ## FBT recurrence and hard Delta Feedback
 
@@ -301,28 +305,29 @@ u_t = entry_norm(
 ```
 
 The payload is the value path and the current token controls the gate. There is
-no additive embedding bypass on a feedback position. Prompt positions, pass-1
-positions, and Standard decoding use `e_t` because no payload is supplied.
+no additive embedding bypass on a feedback position. Plain-prefix positions,
+pass-1 positions, and Standard decoding use `e_t` instead of the fused seed.
 
 Hard DF uses `u_t` as both the residual seed and the first non-null source for
-every within-column MHDB router. After the sixth cell, a dedicated eight-group
-payload router reads its own null, the seed, and the six completed block
+every within-column MHDB router. After the final cell, a dedicated `H`-group
+payload router reads its own null, the seed, and all `C` completed block
 deltas. The recurrent payload is:
 
 ```text
-r_payload = route(null, seed, Delta_0 .. Delta_5)
+r_payload = route(null, seed, Delta_0 .. Delta_(C-1))
 p_t       = payload_norm(h_top + r_payload)
 ```
 
-The additive `h_top` guarantees that the complete column state survives even
-if the learned router specializes. At initialization, the uniform non-null
-mixture equals `h_top / 8`; after the final RMSNorm, the payload therefore
-matches a bare normalized top state up to epsilon. The payload query is not
-conditioned on the next token; token-dependent control happens only after the
-payload shifts into the next column's FBT entry gate.
+The additive `h_top` retains a direct top-state contribution alongside the
+routed enrichment. The mixture and normalization need not preserve every
+feature or its scale. At initialization, the uniform mixture, including the
+zero-valued null, equals `h_top / (C + 2)`; after the payload RMSNorm it
+therefore matches a bare normalized top state up to epsilon. The payload query
+is not conditioned on the next token; token-dependent control happens only
+after the payload shifts into the next column's FBT entry gate.
 
-Sequential generation retains only the immediately previous payload outside
-the mixer caches. Each new column consumes it once, advances all PKDA and GQA
+Sequential generation retains only the immediately previous payload outside the
+mixer caches. Each new column consumes it once, advances all PKDA and GQA
 caches, and emits the next payload.
 
 An equivalent high-level column is:
@@ -333,7 +338,7 @@ seed = e if previous_payload is None else fbt_fuse(previous_payload, e)
 h = seed
 completed = []
 
-for cell in six_four_layer_cells:
+for cell in four_layer_cells:  # C cells
     cell_start = h
     for layer_index, layer in enumerate(cell):
         partial = [] if layer_index == 0 else [h - cell_start]
@@ -368,9 +373,9 @@ state. Its authoritative tied parameter and accumulated gradient remain FP32.
 
 ## NorMuonH and NAdam
 
-The flagship uses one optimizer recipe with two disjoint parameter groups:
-one NorMuonH group and one NAdam group. Their public controls are
-`--lr-normuonh` and `--lr-nadam`. No group uses weight decay.
+All implemented arms and the larger reference use one optimizer recipe with two
+disjoint parameter groups: one NorMuonH group and one NAdam group. Their public
+controls are `--lr-normuonh` and `--lr-nadam`. No group uses weight decay.
 
 ### NorMuonH matrices
 
@@ -381,9 +386,9 @@ NorMuonH owns ordinary trainable two-dimensional hidden weights, including:
 - the FBT payload-value projection.
 
 For matrix `W`, its initial FP32 Frobenius radius `R = ||W_0||_F` is fixed for
-the life of the run. With the fan-in initialization above,
-`E[R^2] = d_out`; the realized sampled radius, rather than that expectation, is
-the exact constraint. NorMuonH forms an update direction by:
+the life of the run. With the fan-in initialization above, `E[R^2] = d_out`;
+the realized sampled radius, rather than that expectation, is the exact
+constraint. NorMuonH forms an update direction by:
 
 1. EMA momentum with coefficient `0.95`;
 2. the released NorMuon Nesterov blend of `0.05` times the current gradient
@@ -426,9 +431,9 @@ parameter:
   rates, time constants, and preconditioner centers.
 
 Every NAdam-owned parameter, including the tied embedding/readout, belongs to
-one parameter group with learning rate `3e-4`. It uses moment betas
-`(0.9, 0.95)`, momentum decay `psi = 0.004`, epsilon `1e-8`, and no weight
-decay. At optimizer step `t`, PyTorch NAdam uses:
+one parameter group with learning rate `3e-4`. It uses moment betas `(0.9,
+0.95)`, momentum decay `psi = 0.004`, epsilon `1e-8`, and no weight decay. At
+optimizer step `t`, PyTorch NAdam uses:
 
 ```text
 m_t = beta1 m_{t-1} + (1 - beta1) G_t
@@ -440,14 +445,13 @@ U_t = ((1 - mu_t) G_t / (1 - P_t)
       / (sqrt(v_t / (1 - beta2^t)) + eps)
 ```
 
-The update is `theta_t = theta_{t-1} - lr * U_t`. Both parameter groups
-receive the same warmup-stable-cooldown multiplier defined by the current
-scale's schedule.
-CUDA uses PyTorch's foreach NAdam path outside the captured forward/backward
-graphs; its scalar step and momentum-product state stay on CPU, while both
-moment tensors and all parameters remain FP32 on-device.
-NorMuonH compiles each active shape bucket's packing, mathematical update,
-and in-place state writeback together. Its checkpoint state remains ordinary
+The update is `theta_t = theta_{t-1} - lr * U_t`. Both parameter groups receive
+the same warmup-stable-cooldown multiplier defined by the current scale's
+schedule. CUDA uses PyTorch's foreach NAdam path outside the captured
+forward/backward graphs; its scalar step and momentum-product state stay on
+CPU, while both moment tensors and all parameters remain FP32 on-device.
+NorMuonH compiles each active shape bucket's packing, mathematical update, and
+in-place state writeback together. Its checkpoint state remains ordinary
 per-parameter tensors; the compiled path retains no second packed state.
 
 After synchronized microbatch accumulation, the single global FP32 gradient
@@ -456,6 +460,21 @@ reported gradient norm is the pre-clip norm, and a non-finite norm terminates
 the run.
 
 ## Parameter and cache accounting
+
+The small `df` organism has **257,514,792** parameters, of which
+**140,827,944** are active non-embedding parameters. The other arm counts are
+in [design.md](design.md#controlled-specimen-family). At 1,024 positions its
+three cells require about 10.37 MiB of token-mixer cache per sequence: about
+5.87 MiB for FP32 PKDA matrix/diagonal states and BF16 convolution histories,
+and 4.50 MiB for BF16 GQA K/V. Payload, logits, allocator overhead, and serving
+metadata are additional. This is decode-state accounting, not training memory;
+Jobe's captured training graph pool reserves about 23 GiB.
+
+### Optional larger reference accounting
+
+The larger reference retains the following exact specification. These counts
+are a gate for its eventual implementation, not a requirement for a useful
+interpretability organism.
 
 | Component | Parameters |
 |---|---:|
@@ -469,7 +488,7 @@ the run.
 | **Total** | **1,335,420,192** |
 | **Active non-embedding** | **1,102,046,496** |
 
-The active non-embedding count is the denominator for the flagship data
+The active non-embedding count is the denominator for the larger reference data
 budget. Relative to unpreconditioned KDA, PKDA's two width-to-head projections
 and three learned per-head vectors add 61,500 parameters per PKDA layer, or
 1,107,000 total. The six GGQA gates add 14,155,776 weights.
@@ -486,5 +505,5 @@ At a full 8,192-token prompt, one sequence's registered token-mixer cache is:
 
 This excludes allocator overhead, the width-1,536 payload, logits, and serving
 metadata. The instantiated implementation must reproduce the parameter count,
-state shapes, and cache continuation semantics before the flagship can pass
-its implementation gate.
+state shapes, and cache continuation semantics before the larger reference can
+pass its implementation gate.
