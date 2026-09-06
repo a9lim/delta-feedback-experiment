@@ -15,6 +15,7 @@ from pathlib import Path
 import cut_cross_entropy
 import fla
 import torch
+from gemm_backend_check import ada_target_workaround
 from kernel_qualification import revision
 
 import delta_feedback_experiment
@@ -42,7 +43,15 @@ def main() -> None:
     parser.add_argument("--input-mode", choices=("micro", "staged"), default="micro")
     parser.add_argument("--profile-optimizer", type=Path)
     parser.add_argument("--optimizer-reference", type=Path)
+    parser.add_argument("--ada-target-workaround", action="store_true")
     options = parser.parse_args()
+    if options.ada_target_workaround and torch.cuda.get_device_capability() != (8, 9):
+        parser.error("--ada-target-workaround is specific to SM89")
+    with ada_target_workaround(options.ada_target_workaround):
+        run(options)
+
+
+def run(options) -> None:
     if options.gemm_backends:
         torch._inductor.config.max_autotune_gemm_backends = options.gemm_backends
     if options.attention:
@@ -129,6 +138,7 @@ def main() -> None:
             {
                 "label": options.label,
                 "variants": {
+                    "ada_target_workaround": options.ada_target_workaround,
                     "optimizer_reference": str(options.optimizer_reference)
                     if options.optimizer_reference
                     else None,

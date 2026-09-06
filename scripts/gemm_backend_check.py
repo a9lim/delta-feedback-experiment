@@ -18,11 +18,44 @@ import json
 import math
 import statistics
 import time
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
+
+
+@contextmanager
+def ada_target_workaround(enabled: bool):
+    """Diagnostic-only correction of Torch 2.14's nonexistent SM89a target.
+
+    Upstream kernel_cache.py appends 'a' unconditionally at four discovery
+    sites. The real architecture is still SM89; no kernel capability is
+    spoofed. Keep the patch in this process and out of installed packages.
+    """
+    if not enabled:
+        yield
+        return
+    import cutlass.operators as ops
+    from cutlass.operators.arch import TargetSm
+    from torch._inductor import config
+    from torch._inductor.codegen.nv_universal_gemm import kernel_cache
+
+    original_get = ops.get_operators
+
+    def get_operators(*args, **kwargs):
+        if kwargs.get("target_sm") == "89a":
+            kwargs["target_sm"] = "89"
+        return original_get(*args, **kwargs)
+
+    with (
+        patch.object(ops, "get_operators", get_operators),
+        patch.object(kernel_cache, "_device_target", lambda cc: TargetSm(cc=cc)),
+        config.patch(compile_threads=1),
+    ):
+        yield
 
 
 def package_version(name: str) -> str | None:
@@ -255,6 +288,11 @@ def main() -> None:
     parser.add_argument("--intermediate", type=int, default=3328)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--ada-target-workaround",
+        action="store_true",
+        help="diagnostic correction of Torch 2.14 SM89a target discovery; single-process compilation",
+    )
     options = parser.parse_args()
     if (
         min(
@@ -270,6 +308,8 @@ def main() -> None:
         parser.error("geometry, iterations, and repeats must be positive")
     if not torch.cuda.is_available():
         parser.error("an idle CUDA device is required")
+    if options.ada_target_workaround and torch.cuda.get_device_capability() != (8, 9):
+        parser.error("--ada-target-workaround is specific to SM89")
     options.output_dir.mkdir(parents=True, exist_ok=True)
     torch.set_float32_matmul_precision("highest")
     runtime = {
@@ -277,6 +317,7 @@ def main() -> None:
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(),
         "capability": torch.cuda.get_device_capability(),
+        "ada_target_workaround": options.ada_target_workaround,
         "packages": {
             name: package_version(name)
             for name in (
@@ -296,13 +337,16 @@ def main() -> None:
             json.dumps(inventory, indent=2) + "\n"
         )
     reports = []
-    for name in ("projection", "swiglu") if options.case == "all" else (options.case,):
-        torch.cuda.reset_peak_memory_stats()
-        report = benchmark_case(name, options)
-        reports.append(report)
-        print(json.dumps(report), flush=True)
-        gc.collect()
-        torch.cuda.empty_cache()
+    with ada_target_workaround(options.ada_target_workaround):
+        for name in (
+            ("projection", "swiglu") if options.case == "all" else (options.case,)
+        ):
+            torch.cuda.reset_peak_memory_stats()
+            report = benchmark_case(name, options)
+            reports.append(report)
+            print(json.dumps(report), flush=True)
+            gc.collect()
+            torch.cuda.empty_cache()
     (options.output_dir / "report.json").write_text(
         json.dumps({"runtime": runtime, "cases": reports}, indent=2) + "\n"
     )

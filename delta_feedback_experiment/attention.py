@@ -30,7 +30,14 @@ def _causal_attention(query, key, value, block_mask):
         value,
         block_mask=block_mask,
         enable_gqa=True,
-        kernel_options={"BACKEND": "TRITON"},
+        kernel_options={
+            "BACKEND": "TRITON",
+            "ROWS_GUARANTEED_SAFE": True,
+            # Forward causal block lists are contiguous. With a partial tail
+            # block (the screen has 1025 positions), backward's partial query
+            # lists contain e.g. [0, 8], so this promise is forward-only.
+            "fwd_BLOCKS_ARE_CONTIGUOUS": True,
+        },
     )
 
 
