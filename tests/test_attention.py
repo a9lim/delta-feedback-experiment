@@ -139,8 +139,15 @@ def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
 
     torch.manual_seed(314)
     cfg = arm_config(
-        "vanilla", vocab_size=97, dim=192, layers=1, heads=2,
-        kv_heads=1, head_dim=96, intermediate=64, max_seq_len=257,
+        "vanilla",
+        vocab_size=97,
+        dim=192,
+        layers=1,
+        heads=2,
+        kv_heads=1,
+        head_dim=96,
+        intermediate=64,
+        max_seq_len=257,
     )
     checkpointed = DFModel(cfg).cuda().train()
     reference = DFModel(cfg).cuda().train()
@@ -158,7 +165,9 @@ def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
         reference_inputs.append(x.detach().clone().requires_grad_())
         with torch.autocast("cuda", dtype=torch.bfloat16):
             actual_outputs.append(checkpointed.forward_column(actual_inputs[-1]).h_top)
-            reference_outputs.append(reference.forward_column(reference_inputs[-1]).h_top)
+            reference_outputs.append(
+                reference.forward_column(reference_inputs[-1]).h_top
+            )
         torch.testing.assert_close(
             actual_outputs[-1], reference_outputs[-1], rtol=0, atol=0
         )
@@ -168,8 +177,10 @@ def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
         actual_outputs[index].backward(upstream)
         reference_outputs[index].backward(upstream)
         torch.testing.assert_close(
-            actual_inputs[index].grad, reference_inputs[index].grad,
-            rtol=2e-5, atol=2e-6,
+            actual_inputs[index].grad,
+            reference_inputs[index].grad,
+            rtol=2e-5,
+            atol=2e-6,
         )
         for (name, parameter), (ref_name, ref_parameter) in zip(
             checkpointed.named_parameters(), reference.named_parameters(), strict=True
@@ -179,6 +190,9 @@ def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
                 assert parameter.grad is None, name
             else:
                 torch.testing.assert_close(
-                    parameter.grad, ref_parameter.grad, rtol=2e-5, atol=2e-6,
+                    parameter.grad,
+                    ref_parameter.grad,
+                    rtol=2e-5,
+                    atol=2e-6,
                     msg=lambda message, name=name: f"{name}: {message}",
                 )

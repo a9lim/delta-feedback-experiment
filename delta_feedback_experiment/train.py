@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import math
 import sys
 import time
@@ -303,6 +304,23 @@ class CapturedMicro:
     active: frozenset[torch.nn.Parameter] = frozenset()
 
 
+@contextlib.contextmanager
+def _capture_without_gc(graph, pool):
+    """Keep cyclic CUDA resource destruction outside stream capture."""
+    # PyTorch 2.14 no longer unconditionally collects warm-up cycles before
+    # capture. A later Python collection can free their CUDA resources and
+    # invalidate the active stream capture, even inside an unrelated kernel.
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        with torch.cuda.graph(graph, pool=pool):
+            yield
+    finally:
+        if was_enabled:
+            gc.enable()
+
+
 class CudaGraphTrainer:
     """Fixed-address forward/backward graphs for every reachable step mode.
 
@@ -457,7 +475,7 @@ class CudaGraphTrainer:
         # default-stream writes from optimizer/kernel preparation.
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=pool):
+        with _capture_without_gc(graph, pool):
             self._body(state)
         state.graph = graph
         state.loss_sum.zero_()
@@ -601,7 +619,7 @@ class CudaEvalRunner:
         graph = torch.cuda.CUDAGraph()
         state.val_sum.zero_()
         state.fused_sum.zero_()
-        with torch.cuda.graph(graph, pool=pool):
+        with _capture_without_gc(graph, pool):
             self._body(state)
         state.graph = graph
         state.val_sum.zero_()
