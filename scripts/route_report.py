@@ -89,12 +89,20 @@ def collect(model, data_val, device, rows: int, micro: int):
         if device.type == "cuda"
         else contextlib.nullcontext()
     )
+    feedback = model.cfg.feedback_active
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
         n = batch.shape[0]
         prefix = torch.ones((1, n), dtype=torch.long, device=device)
         with autocast:
-            outs = multipass(model, batch, 2, prefix_lens=prefix, want_weights=True)
+            # Non-feedback arms have only the plain pass to read.
+            outs = multipass(
+                model,
+                batch,
+                2 if feedback else 1,
+                prefix_lens=prefix if feedback else None,
+                want_weights=True,
+            )
         for p, out in enumerate(outs):
             values = torch.stack(out.sources)  # [N, B, T, D]
             rms = values.float().pow(2).mean(-1).sqrt().mean((1, 2)).cpu() * n
