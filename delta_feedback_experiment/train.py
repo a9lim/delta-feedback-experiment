@@ -116,7 +116,7 @@ def condition(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        "df train", description="Train one condition of the DF family."
+        "delta train", description="Train one condition of the DF family."
     )
     parser.add_argument("tag", type=runs.validate_run_tag, help="run tag")
     parser.add_argument(

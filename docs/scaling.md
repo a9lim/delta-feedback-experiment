@@ -31,7 +31,7 @@ It compares the complete DF package against its shared hybrid baseline.
 Data staging on Prime: after choosing a provider and location and before
 provisioning the H100 node, create a provider-local persistent disk sized for
 the compiled stream and run artifacts, attach it to a cheap compatible
-staging instance, install the `data-build` extra, and run `df tokenize` from
+staging instance, install the `data-build` extra, and run `delta tokenize` from
 the pinned Hugging Face dataset and tokenizer into the mounted path. The
 resulting `meta.json` and byte checksums match Jobe's prefix; then detach the
 disk and attach it to the H100 node. No live Hugging Face reads during
@@ -41,7 +41,7 @@ The single-process trainer expresses this schedule already. Distributed
 execution needs exact row sharding, DDP accumulation with synchronized global
 clipping, rank-safe telemetry and snapshots, persistent artifact staging,
 cross-rank optimizer parity, restart tests, persistent-disk read checks, and
-H100 memory and throughput measurement. Hopper also needs its own `df probe`
+H100 memory and throughput measurement. Hopper also needs its own `delta probe`
 run and FLA kernel constants swept; see
 [runtime-qualification.md](runtime-qualification.md).
 

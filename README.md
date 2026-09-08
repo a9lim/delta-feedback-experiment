@@ -114,8 +114,8 @@ Directions on the bench, none decided:
 - [interpretability.md](docs/interpretability.md): the analysis scripts,
   what each one shows, and the shape of the future study.
 - [operations.md](docs/operations.md): install, tokenize, train, queue,
-  inspect. Run `df probe` before training; Jobe's captured graph pool reserves
-  about 23 GiB, so GPU work stays serial.
+  inspect. Run `delta probe` before training; Jobe's captured graph pool
+  reserves about 23 GiB, so GPU work stays serial.
 - [runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
 - [scaling.md](docs/scaling.md): longer and larger recipes, worked out but

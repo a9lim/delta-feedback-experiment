@@ -5,7 +5,7 @@ Use this page to train specimens and inspect checkpoints. The recipe is in
 [interpretability.md](interpretability.md).
 
 Commands below run from this repository unless they explicitly change
-directory. Before using Jobe, inspect `df status`, the active log, and GPU
+directory. Before using Jobe, inspect `delta status`, the active log, and GPU
 ownership with `nvidia-smi`. Keep GPU jobs serial and preserve active work.
 
 ## Install
@@ -33,9 +33,9 @@ through `tool.uv.sources` in `pyproject.toml`, so the root repository's
 submodule pointers are their only pin and kernel edits there are live without
 reinstalling. CUDA GQA uses compiled PyTorch FlexAttention; the external
 `flash-attn` package is not used. Machine-wide constraints own Torch itself.
-The first `df probe` performs the fixed-shape Inductor search and preserves its
-generated artifacts at `~/.cache/delta-feedback/torchinductor`; later probes
-and training processes reuse that cache. Set `DF_INDUCTOR_CACHE_DIR` only when
+The first `delta probe` performs the fixed-shape Inductor search and preserves
+its generated artifacts at `~/.cache/delta-feedback/torchinductor`; later
+probes and training processes reuse that cache. Set `DF_INDUCTOR_CACHE_DIR` only when
 the durable cache belongs elsewhere.
 
 Install the exact data-build stack on any staging host that materializes the
@@ -52,36 +52,37 @@ Foreground training and queueing are alternative ways to run a condition.
 
 ```bash
 # Portable invariant suite; includes the full CUDA gate on a CUDA host.
-df probe
+delta probe
 
 # Materialize the canonical 57B stream from pinned HF dataset/tokenizer commits.
-df tokenize --out /data/df/tokens
+delta tokenize --out /data/df/tokens
 
 # Run or queue one condition: letters from arfl in any order, empty for the
-# plain RoPE GQA decoder (`df train --help` lists the letters).
-df train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
+# plain RoPE GQA decoder (`delta train --help` lists the letters).
+delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
   --data-dir /data/df/tokens
-df queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
+delta queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
   --data-dir /data/df/tokens
-df queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
+delta queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
   --data-dir /data/df/tokens
 
 # Inspect and control the detached queue.
-df status
-df watch
-df stop TAG --at STEP
-df stop live
-df stop queue
-df stop all
-df clear TAG
-df clear all
+delta status
+delta watch
+delta stop TAG --at STEP
+delta stop live
+delta stop queue
+delta stop all
+delta clear TAG
+delta clear all
 ```
 
 The queue records exact arguments, not Git state. A source change never stops
 an active child; the worker refreshes before the next queued job and runs its
-probe from the current checkout. `df stop queue` removes every pending job but
-leaves the active run and worker untouched; it is the complement of `df stop
-live`, which stops only the active run and preserves the pending queue.
+probe from the current checkout. `delta stop queue` removes every pending job
+but leaves the active run and worker untouched; it is the complement of
+`delta stop live`, which stops only the active run and preserves the pending
+queue.
 
 The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024
 predictions per row: 3,520,921,600 predicted tokens. Linear warmup occupies the
@@ -164,4 +165,4 @@ trained model depends on rather than what an alternative design would achieve.
 Record the checkpoint, data rows, device, precision, and command with any
 output you keep. The shared analysis environment supplies Matplotlib.
 
-`df watch` shows training health, validation, and recurrence diagnostics.
+`delta watch` shows training health, validation, and recurrence diagnostics.

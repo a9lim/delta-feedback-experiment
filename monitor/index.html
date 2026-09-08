@@ -4,14 +4,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
-<title>df runs</title>
+<title>delta runs</title>
 <link rel="stylesheet" href="/vendor/uPlot.min.css">
 <link rel="stylesheet" href="/monitor.css">
 </head>
 <body>
 <div class="wrap">
 <header>
-  <h1><span class="brand">df</span><select id="run" title="run"></select></h1>
+  <h1><span class="brand">delta</span><select id="run" title="run"></select></h1>
   <div class="controls">
     <label><input type="checkbox" id="logy" checked> log y</label>
     <label>every <output id="every">–</output></label>
@@ -315,7 +315,7 @@ M.configure({
     return Number.isFinite(stepSeconds) ? Math.ceil(stepSeconds + 1) : 5;
   },
   metaEvents: ['run', 'schedule', 'resume', 'fork'],
-  title: (run) => `df · ${run.tag}`,
+  title: (run) => `delta · ${run.tag}`,
   meta: (view) => {
     const setup = view.run.meta.run;
     if (!setup) return '';

@@ -39,8 +39,8 @@ across generated tokens. The two execution modes can behave differently.
 | `scripts/downstream_eval.py` | The workspace zero-shot suite in Standard, Soft, or Fused mode, with per-document records for paired comparison | Soft feeds back only along the scored continuation |
 | `scripts/training_curves.py`, `scripts/analysis_figures.py` | Figures from run logs and from the JSON records above | Rendering only |
 | `iterate_fused` | Per-iteration held-out loss and mean top-state update norm on fixed tokens | Payload-only repeated prefill |
-| Trainer telemetry / `df watch` | Training health, validation, routing summaries, recurrent dynamics | Operational |
-| `df probe` and portable semantics | Numerical, causal, gradient, cache, and execution invariants | Engineering |
+| Trainer telemetry / `delta watch` | Training health, validation, routing summaries, recurrent dynamics | Operational |
+| `delta probe` and portable semantics | Numerical, causal, gradient, cache, and execution invariants | Engineering |
 
 Every script rebuilds the condition from a snapshot through
 `delta_feedback_experiment.analysis`, evaluates under the trainer's numerics

@@ -1,6 +1,6 @@
-"""``df`` — the operator entry point.
+"""``delta`` — the operator entry point.
 
-Model-lazy: subcommands import what they need, so ``df --help`` costs
+Model-lazy: subcommands import what they need, so ``delta --help`` costs
 nothing and the spool worker drives phases as separate processes.
 Durable orchestration (queue, worker, status/watch/stop/clear) is the
 shared ``transformer_experiments.spool``; this module owns only the
@@ -18,18 +18,18 @@ from transformer_experiments import spool
 ROOT = Path(__file__).resolve().parents[1]
 
 USAGE = """\
-df — delta-feedback experiment operator
+delta — delta-feedback experiment operator
 
-  df train TAG [FLAGS]      train one condition directly (see df train --help)
-  df tokenize [FLAGS]       build the fixed token stream (once)
-  df probe                  run the offline invariant suite
-  df queue TAG [FLAGS]      append a training job to the detached spool
-  df queue FILE             append jobs from a file (TAG FLAGS per line)
-  df status                 print queue and recent-run state
-  df watch                  follow milestones until the queue is idle
-  df stop TAG|live [--at STEP]
-  df stop queue|all
-  df clear TAG|all          move an idle tag's artifacts to recovery
+  delta train TAG [FLAGS]  train one condition directly (delta train --help)
+  delta tokenize [FLAGS]   build the fixed token stream (once)
+  delta probe              run the offline invariant suite
+  delta queue TAG [FLAGS]  append a training job to the detached spool
+  delta queue FILE         append jobs from a file (TAG FLAGS per line)
+  delta status             print queue and recent-run state
+  delta watch              follow milestones until the queue is idle
+  delta stop TAG|live [--at STEP]
+  delta stop queue|all
+  delta clear TAG|all      move an idle tag's artifacts to recovery
 """
 
 
@@ -75,7 +75,7 @@ LAYOUT = spool.Layout(
     snapshot_dir=Path("runs"),
 )
 
-SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="df")
+SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="delta")
 
 STOP_PHASE = "train run"
 
@@ -89,7 +89,7 @@ def tokenize_command(argv: list[str]) -> None:
         CANONICAL_VAL_TOKENS,
     )
 
-    parser = argparse.ArgumentParser("df tokenize")
+    parser = argparse.ArgumentParser("delta tokenize")
     parser.add_argument("--out", default="data/tokens")
     parser.add_argument(
         "--target",
@@ -152,7 +152,7 @@ def main() -> None:
         SPOOL.stop(target, at=at, phase=STOP_PHASE)
     elif command == "clear":
         if len(rest) != 1:
-            raise SystemExit("usage: df clear TAG|all")
+            raise SystemExit("usage: delta clear TAG|all")
         SPOOL.clear(rest[0])
     else:
         print(USAGE, end="", file=sys.stderr)

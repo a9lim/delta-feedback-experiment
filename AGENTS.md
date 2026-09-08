@@ -104,7 +104,7 @@ change it everywhere at once.
 - Snapshots are v24. Only v24 resumes; v16 through v23 stay readable for
   evaluation and forks, and the loader translates their arm names
   (`vanilla`, `base`, `mhdb`, `fbt`, `df`) into conditions.
-- Before touching Jobe, look at `df status`, the active log, and GPU
+- Before touching Jobe, look at `delta status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker
   refreshes before the next job and runs the current checkout's probe.
 - Prime DDP and the larger reference are worked out in `docs/scaling.md` but

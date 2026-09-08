@@ -94,7 +94,7 @@ at commit `c1899de289a04d12100db370d81485cdf75e47ca`. The `data-build` extra
 pins the four packages that compile the stream and `meta.json` records their
 realized versions. Every non-empty document is followed by EOS.
 
-`df tokenize` materializes the stream as a local contiguous uint32 store so
+`delta tokenize` materializes the stream as a local contiguous uint32 store so
 that step-addressed rows, validation, and resume never depend on network or
 iterator state. The held-out validation slice is the stream head; training
 follows in contiguous shards. One row is a non-overlapping `seq_len + 1`

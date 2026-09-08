@@ -32,7 +32,7 @@ kernel-bench = [
 ]
 
 [project.scripts]
-df = "delta_feedback_experiment.cli:main"
+delta = "delta_feedback_experiment.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -517,8 +517,8 @@ Building `l` touches the following together:
   log.
 - The workspace FLA fork gains the fused-position PKDA operator, forward and
   backward; the gated GQA layer gains the two-piece merge; the router gains the
-  presence mask. `df probe` checks each against its portable oracle and checks
-  `r = 1` value, weight, and gradient parity with `arf`.
+  presence mask. `delta probe` checks each against its portable oracle and
+  checks `r = 1` value, weight, and gradient parity with `arf`.
 - A staged memory measurement before any graph work: eager `r = 1`, eager
   `r_max`, three-pass backward at `r_max`, then the captured `(k, r)` graph
   family; allocated and reserved memory reported separately, and the pool

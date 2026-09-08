@@ -18,7 +18,7 @@ through the same checks.
 | [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Paired six-update diagnostic from a trained checkpoint, with runtime versions, revisions, loss/gradient differences, and limitations |
 | [Execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces, component measurements, profiler counts, backend decisions, and reproduction commands |
 
-Jobe passed 114 experiment tests and the full `df probe` CUDA gate. The Mac
+Jobe passed 114 experiment tests and the full `delta probe` CUDA gate. The Mac
 passed 106 tests with eight CUDA cases skipped. The workspace's 122 tests
 passed on each machine, and both environments passed `uv pip check`. Checkpoint
 v23 is unchanged.
