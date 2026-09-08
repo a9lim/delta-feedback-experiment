@@ -24,7 +24,7 @@ import torch
 from transformer_experiments import checkpoints
 
 from delta_feedback_experiment.analysis import config_from_args
-from delta_feedback_experiment.model import DFModel
+from delta_feedback_experiment.model import DeltaModel
 from delta_feedback_experiment.parameter_groups import is_normuonh_parameter
 from delta_feedback_experiment.train import CONTRACT
 
@@ -79,7 +79,7 @@ def angle(c: float) -> float:
 
 def initial_state(saved: dict) -> tuple[dict, set, set]:
     torch.manual_seed(saved["seed"])
-    model = DFModel(config_from_args(saved))
+    model = DeltaModel(config_from_args(saved))
     state = {k: v.detach().float() for k, v in model.state_dict().items()}
     normuonh = {n for n, p in model.named_parameters() if is_normuonh_parameter(n, p)}
     trainable = {n for n, _ in model.named_parameters()}

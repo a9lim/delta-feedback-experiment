@@ -26,7 +26,7 @@ each, nothing loaded from Jobe.
 | Cooldown | 137,528–171,909 | two or three |
 
 The pair is 112.66B predicted tokens and about 128.44B expected pass-tokens.
-It compares the complete DF package against its shared hybrid baseline.
+It compares the complete `arf` package against its shared hybrid baseline.
 
 Data staging on Prime: after choosing a provider and location and before
 provisioning the H100 node, create a provider-local persistent disk sized for

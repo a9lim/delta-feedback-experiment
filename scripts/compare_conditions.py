@@ -19,7 +19,7 @@ tables are binned on the *reference* model's loss and entropy; read the
 
 Usage:
     python scripts/compare_conditions.py --reference runs/A.pt.10745 --feedback runs/B.pt.10745 \\
-        --data-dir /data/df/tokens
+        --data-dir /data/delta/tokens
 """
 
 from __future__ import annotations

@@ -76,7 +76,7 @@ analysis. CUDA training uses the same equations through the following path:
 
 Inductor artifacts live at `~/.cache/delta-feedback/torchinductor` by default.
 The first probe performs the fixed-shape search; later processes reuse it. Set
-`DF_INDUCTOR_CACHE_DIR` only to relocate that durable cache. Run the probe on
+`DELTA_INDUCTOR_CACHE_DIR` only to relocate that durable cache. Run the probe on
 the exact source and hardware before a training job; compilation and graph
 capture are part of what gets reproduced.
 
@@ -141,7 +141,7 @@ Run GPU checks serially after inspecting live status, the active log, and GPU
 ownership.
 
 ```bash
-python scripts/kernel_training_check.py runs/screen-df-full-s1.pt.10745 --updates 18
+python scripts/kernel_training_check.py runs/screen-delta-arf-s1-highLR.pt.10745 --updates 18
 python scripts/attention_check.py --length 1024
 python scripts/attention_check.py --length 1025
 python scripts/gemm_backend_check.py --backends ATEN,TRITON --output-dir tmp/gemm-base

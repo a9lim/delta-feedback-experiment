@@ -14,7 +14,5 @@ from the snapshots and logs; the commands are in
 | `curves-<A>-vs-<B>/` | `scripts/training_curves.py` | Paired validation and training curves, matched compute, routing and contraction monitors |
 | `downstream-<tag>/` | `scripts/downstream_eval.py` | Zero-shot task records per mode, with paired comparisons beside them |
 
-`figures/fused-screen-df-s1/raw/` holds the raw outputs of the September 2
-analysis of the older `screen-df-s1` snapshot. Anything meant to survive a
-regeneration, such as an architecture diagram, goes under
-`figures/architectures/`, which is tracked.
+Anything meant to survive a regeneration, such as an architecture diagram,
+goes under `figures/architectures/`, which is tracked.

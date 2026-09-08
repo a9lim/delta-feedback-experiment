@@ -8,7 +8,7 @@ measures erosion of the fused mode; ``--trainable fusion`` restricts updates to
 the FBT interface.  The output is a JSON trace.
 
 Usage:
-    python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/df/tokens \\
+    python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/delta/tokens \\
         --steps 150 --passes 2 --out figures/fused-TAG/dense_all.json
 """
 
@@ -25,7 +25,7 @@ from transformer_experiments import checkpoints
 
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DFModel, multipass, multipass_loss
+from delta_feedback_experiment.model import DeltaModel, multipass, multipass_loss
 from delta_feedback_experiment.optim import OptimizerPair, build_optimizers
 from delta_feedback_experiment.train import CONTRACT, clip_gradients, micro_draws
 
@@ -76,7 +76,7 @@ def main() -> None:
     if not cfg.feedback_active:
         raise SystemExit("continuation needs a snapshot of a condition with f")
     torch.manual_seed(saved["seed"])
-    model = DFModel(cfg).to(device)
+    model = DeltaModel(cfg).to(device)
     optimizers = build_optimizers(model, lr_normuonh=saved["lr_normuonh"], lr_nadam=saved["lr_nadam"])
     pair = OptimizerPair(optimizers)
     start_step = checkpoints.restore(payload, CONTRACT, model, pair, current_optimizer_groups=False)

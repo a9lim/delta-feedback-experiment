@@ -11,8 +11,8 @@ alternatives are handicapped: read the landscape's shape (which family helps,
 which hurts, how peaked), not absolute gaps.
 
 Usage:
-    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
-    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens --head 2
+    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens --head 2
 """
 
 from __future__ import annotations

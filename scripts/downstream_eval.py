@@ -37,8 +37,8 @@ from delta_feedback_experiment.data import CANONICAL_TOKENIZER, CANONICAL_TOKENI
 MODES = ("standard", "fused", "soft")
 
 
-class DFScorer:
-    """Continuation scores from a DFModel column pass under the trainer's numerics."""
+class DeltaScorer:
+    """Continuation scores from a DeltaModel column pass under the trainer's numerics."""
 
     def __init__(self, model, mode: str, passes: int = 1):
         if mode not in MODES:
@@ -94,7 +94,7 @@ def main() -> None:
     tag = saved.get("tag", args.snapshot.stem)
     out_dir = args.out_dir or Path("figures") / f"downstream-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    scorer = DFScorer(model, args.mode, args.passes)
+    scorer = DeltaScorer(model, args.mode, args.passes)
     started = time.time()
     results = downstream.run(
         args.tasks,

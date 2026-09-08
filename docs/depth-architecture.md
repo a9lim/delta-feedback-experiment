@@ -3,7 +3,7 @@
 This document specifies the `l` condition letter and its full-stack condition
 `arfl`, a candidate next organism: the small model with a weight-tied
 recurrent core, so that repeated within-column computation exists to look at.
-The letter parses today and `DFModel` refuses to build it; the list at the end
+The letter parses today and `DeltaModel` refuses to build it; the list at the end
 is what building it touches. Where this document and
 [architecture.md](architecture.md) both speak, this one describes the loop
 only.
@@ -79,7 +79,7 @@ previous payload p_(t-1) --------------+                  |
                        h_top                    block deltas
                           +------------+------------+
                                        v
-                              routed DF payload p_t
+                                routed payload p_t
 ```
 
 An equivalent high-level column, with each cell running its four layers and
@@ -509,7 +509,7 @@ reference.
 Building `l` touches the following together:
 
 - `ModelConfig.loop` gains the core recurrence, `r_mean`, and `r_max`, and
-  `DFModel` stops refusing it; `ColumnOutput` gains the write bank and
+  `DeltaModel` stops refusing it; `ColumnOutput` gains the write bank and
   `forward_column` takes a per-position plain mask and a previous bank;
   `AGENTS.md` and `README.md` mark `l` built.
 - A checkpoint contract beyond v24 with `r_mean`, `r_max`, and the `r`

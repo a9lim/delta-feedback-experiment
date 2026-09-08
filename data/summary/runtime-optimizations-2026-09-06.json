@@ -15,7 +15,7 @@
             "input_mode": "micro",
             "gemm_backends": "ATEN,TRITON,CPP"
           },
-          "snapshot": "runs/screen-df-full-s1.pt.10745",
+          "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
           "runtime": {
             "torch": "2.14.0+cu132",
             "cuda": "13.2",
@@ -33,7 +33,7 @@
             "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
           },
           "inputs": {
-            "data_dir": "/data/df/tokens",
+            "data_dir": "/data/delta/tokens",
             "first_row": 100000,
             "first_randomness_step": 9000,
             "data_seed": 0,
@@ -331,7 +331,7 @@
             "input_mode": "staged",
             "gemm_backends": "ATEN,TRITON,CPP"
           },
-          "snapshot": "runs/screen-df-full-s1.pt.10745",
+          "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
           "runtime": {
             "torch": "2.14.0+cu132",
             "cuda": "13.2",
@@ -349,7 +349,7 @@
             "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
           },
           "inputs": {
-            "data_dir": "/data/df/tokens",
+            "data_dir": "/data/delta/tokens",
             "first_row": 100000,
             "first_randomness_step": 9000,
             "data_seed": 0,
@@ -647,7 +647,7 @@
             "input_mode": "micro",
             "gemm_backends": "ATEN,TRITON,CPP"
           },
-          "snapshot": "runs/screen-df-full-s1.pt.10745",
+          "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
           "runtime": {
             "torch": "2.14.0+cu132",
             "cuda": "13.2",
@@ -665,7 +665,7 @@
             "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
           },
           "inputs": {
-            "data_dir": "/data/df/tokens",
+            "data_dir": "/data/delta/tokens",
             "first_row": 100000,
             "first_randomness_step": 9000,
             "data_seed": 0,
@@ -965,7 +965,7 @@
             "input_mode": "micro",
             "gemm_backends": "ATEN,TRITON,CPP"
           },
-          "snapshot": "runs/screen-df-full-s1.pt.10745",
+          "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
           "runtime": {
             "torch": "2.14.0+cu132",
             "cuda": "13.2",
@@ -984,7 +984,7 @@
             "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
           },
           "inputs": {
-            "data_dir": "/data/df/tokens",
+            "data_dir": "/data/delta/tokens",
             "first_row": 100000,
             "first_randomness_step": 9000,
             "data_seed": 0,
@@ -1392,7 +1392,7 @@
             "input_mode": "staged",
             "gemm_backends": "ATEN,TRITON,CPP"
           },
-          "snapshot": "runs/screen-df-full-s1.pt.10745",
+          "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
           "runtime": {
             "torch": "2.14.0+cu132",
             "cuda": "13.2",
@@ -1411,7 +1411,7 @@
             "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
           },
           "inputs": {
-            "data_dir": "/data/df/tokens",
+            "data_dir": "/data/delta/tokens",
             "first_row": 100000,
             "first_randomness_step": 9000,
             "data_seed": 0,
@@ -2877,8 +2877,8 @@
   },
   "reproduction": {
     "baseline_optimizer": "git show 601361d:delta_feedback_experiment/optim.py > tmp/runtime-214/optimizer-reference.py",
-    "baseline": "python scripts/kernel_training_check.py runs/screen-df-full-s1.pt.10745 --updates 18 --label baseline-final --attention plain --input-mode micro --optimizer-reference tmp/runtime-214/optimizer-reference.py",
-    "combined": "python scripts/kernel_training_check.py runs/screen-df-full-s1.pt.10745 --updates 18 --label combined --input-mode staged",
+    "baseline": "python scripts/kernel_training_check.py runs/screen-delta-arf-s1-highLR.pt.10745 --updates 18 --label baseline-final --attention plain --input-mode micro --optimizer-reference tmp/runtime-214/optimizer-reference.py",
+    "combined": "python scripts/kernel_training_check.py runs/screen-delta-arf-s1-highLR.pt.10745 --updates 18 --label combined --input-mode staged",
     "gpu_execution": "Serial on Jobe, otherwise idle; no registered training jobs launched."
   },
   "attention_benchmark_revision": "9b50ac198452e41b6ecce6af7b09ed80988f4a0b",

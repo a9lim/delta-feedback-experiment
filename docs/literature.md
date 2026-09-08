@@ -84,7 +84,7 @@ generation would still propagate the change through the emitted token.
 
 First isolate separation at `r = 1`, before combining it with variable depth:
 
-- Let the state stream retain the existing DF column, MHDB banks, cache writes,
+- Let the state stream retain the existing delta column, MHDB banks, cache writes,
   and FBT payload. Let prediction use its own residual and MHDB source banks,
   with shared backbone/router parameters and one learned initial vector. Feed
   the tied readout from prediction. Apply the existing pass-loss weighting to
@@ -112,7 +112,7 @@ First isolate separation at `r = 1`, before combining it with variable depth:
   shortcut cannot be assumed for that coupled variant.
 
 Use paired continuations from the same checkpoint and data position, comparing
-ordinary DF with the declared split at matched tokens and measured device-time;
+the ordinary model with the declared split at matched tokens and measured device-time;
 report actual FLOPs and stream/cell evaluations separately, with a matched
 extra-compute control before attributing a gain to separation. The
 interesting analyses are fixed-token prediction interventions, state/payload

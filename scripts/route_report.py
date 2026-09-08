@@ -16,7 +16,7 @@ Writes ``route_report.json`` and figures under ``figures/route-TAG/`` and
 prints a per-site table.
 
 Usage:
-    python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+    python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 """
 
 from __future__ import annotations

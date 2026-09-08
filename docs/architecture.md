@@ -1,7 +1,7 @@
 # Architecture of the recurrent organism
 
 This document defines the exact computation, state, initialization, and
-optimizer of the small model organism. The implemented family is one `DFModel`
+optimizer of the small model organism. The implemented family is one `DeltaModel`
 addressed by the condition letters in [design.md](design.md): `a` for
 Preconditioned Kimi Delta Attention (PKDA) with gated global GQA, `r` for
 Multi-Head Delta Block routing (MHDB), and `f` for Full-Bandwidth Transformer
@@ -62,7 +62,7 @@ previous payload p_(t-1) --------------+                  |
                        h_top                    block deltas
                           +------------+------------+
                                        |
-                              routed DF payload p_t
+                                routed payload p_t
 ```
 
 On pass 1 and in Standard decoding the seed is the token embedding. The readout
@@ -193,7 +193,7 @@ Autoregressive decoding continues, per PKDA layer:
 
 A Jacobi or fused-prefill pass starts those states from zero and advances them
 once across that pass's causal token order. PKDA state is not carried between
-repeated passes over the same positions; the DF payload is the sole cross-pass
+repeated passes over the same positions; the FBT payload is the sole cross-pass
 state. After the final prefill, the materialized mixer caches advance normally
 during decoding.
 

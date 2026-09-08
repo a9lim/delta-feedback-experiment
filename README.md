@@ -41,7 +41,7 @@ previous token's latent payload + current token embedding
                    next latent payload
 ```
 
-One `DFModel` implements the whole family. A condition is a string of
+One `DeltaModel` implements the whole family. A condition is a string of
 letters, each one change from the plain twelve-layer RoPE GQA decoder, so any
 two conditions can be trained on identical rows from paired initializations
 and compared:

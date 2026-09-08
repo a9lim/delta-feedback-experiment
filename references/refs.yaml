@@ -172,6 +172,6 @@ references:
       Prediction Separation. Defines weight-shared state and prediction
       streams, prediction-only queries over state keys/values without
       prediction writes, and optional shared gated FFNs and late phasing.
-      A design comparison for df-loop: it separates persistent memory from
+      A design comparison for delta-loop: it separates persistent memory from
       prediction but does not supply recurrent depth. See docs/literature.md
       for the integration assessment.

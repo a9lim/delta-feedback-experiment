@@ -311,9 +311,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
 
 
 def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
-    from delta_feedback_experiment.model import DFModel, condition_config
+    from delta_feedback_experiment.model import DeltaModel, condition_config
 
-    model = DFModel(
+    model = DeltaModel(
         condition_config(
             "arf",
             vocab_size=97,
@@ -409,7 +409,7 @@ def test_optimizer_materialization_restores_fresh_nadam_state():
 def test_route_summary_reports_universal_nulls_and_payload_seed():
     from types import SimpleNamespace
 
-    from delta_feedback_experiment.model import DFModel, condition_config
+    from delta_feedback_experiment.model import DeltaModel, condition_config
 
     class Validation:
         rows = torch.randint(0, 97, (2, 12), generator=torch.Generator().manual_seed(3))
@@ -420,7 +420,7 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
 
     args = SimpleNamespace(eval_rows=2)
     for condition in ("ar", "arf"):
-        model = DFModel(
+        model = DeltaModel(
             condition_config(
                 condition,
                 vocab_size=97,
@@ -445,12 +445,12 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
     from types import SimpleNamespace
 
     from delta_feedback_experiment.model import (
-        DFModel,
+        DeltaModel,
         condition_config,
     )
     from delta_feedback_experiment.train import GraphSpec, execution_fields
 
-    model = DFModel(
+    model = DeltaModel(
         condition_config(
             "a",
             vocab_size=97,
@@ -706,7 +706,7 @@ def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
 def test_multipass_checkpoint_parity():
     """The guarded larger modes preserve plain-path loss and gradients."""
     from delta_feedback_experiment.model import (
-        DFModel,
+        DeltaModel,
         condition_config,
         multipass,
         multipass_loss,
@@ -731,7 +731,7 @@ def test_multipass_checkpoint_parity():
 
     def run(flag):
         torch.manual_seed(1)
-        model = DFModel(cfg)
+        model = DeltaModel(cfg)
         model.grad_checkpoint = flag
         outs = multipass(model, tokens, 2, prefix_lens=prefix)
         loss, _ = multipass_loss(model, tokens, outs)
@@ -748,11 +748,11 @@ def test_multipass_checkpoint_parity():
 
 
 def test_checkpoint_policy_is_internal_and_screen_measured():
-    from delta_feedback_experiment.model import DFModel, condition_config
+    from delta_feedback_experiment.model import DeltaModel, condition_config
 
     args = build_parser().parse_args(["x"])
     with torch.device("meta"):
-        model = DFModel(condition_config("arf"))
+        model = DeltaModel(condition_config("arf"))
     assert not automatic_checkpoint(model, 2, args, torch.device("cuda"))
     assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
     args.micro_rows = 8

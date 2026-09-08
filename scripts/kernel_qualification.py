@@ -19,7 +19,7 @@ import torch
 
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DFModel
+from delta_feedback_experiment.model import DeltaModel
 from delta_feedback_experiment.optim import build_optimizers
 from delta_feedback_experiment.train import (
     CudaEvalRunner,
@@ -82,7 +82,7 @@ def main() -> None:
     parser.add_argument("--write-reference", action="store_true")
     parser.add_argument("--first-row", type=int, default=100000)
     parser.add_argument("--step", type=int, default=9000)
-    parser.add_argument("--data-dir", type=Path, default=Path("/data/df/tokens"))
+    parser.add_argument("--data-dir", type=Path, default=Path("/data/delta/tokens"))
     parser.add_argument("--passes", type=int, nargs="+", default=[1, 2, 3])
     options = parser.parse_args()
     if options.write_reference and options.reference.exists():
@@ -97,7 +97,7 @@ def main() -> None:
     saved = analysis.saved_args(payload)
     for field in (*analysis.GEOMETRY, "seq_len", "condition"):
         setattr(args, field, saved[field])
-    model = DFModel(analysis.config_from_args(saved))
+    model = DeltaModel(analysis.config_from_args(saved))
     model.load_state_dict(payload["state"])
     del payload
     gc.collect()

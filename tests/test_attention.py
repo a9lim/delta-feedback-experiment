@@ -135,7 +135,7 @@ def test_prefix_cache_reads_every_valid_key_and_excludes_unused_tail(device):
 
 @CUDA_ONLY
 def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
-    from delta_feedback_experiment.model import DFModel
+    from delta_feedback_experiment.model import DeltaModel
 
     torch.manual_seed(314)
     cfg = condition_config(
@@ -149,8 +149,8 @@ def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
         intermediate=64,
         max_seq_len=257,
     )
-    checkpointed = DFModel(cfg).cuda().train()
-    reference = DFModel(cfg).cuda().train()
+    checkpointed = DeltaModel(cfg).cuda().train()
+    reference = DeltaModel(cfg).cuda().train()
     reference.load_state_dict(checkpointed.state_dict())
     checkpointed.grad_checkpoint = True
     reference.grad_checkpoint = False

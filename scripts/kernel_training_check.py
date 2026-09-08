@@ -22,7 +22,7 @@ from kernel_qualification import revision
 import delta_feedback_experiment
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DFModel, iterate_fused
+from delta_feedback_experiment.model import DeltaModel, iterate_fused
 from delta_feedback_experiment.optim import build_optimizers
 from delta_feedback_experiment.train import (
     CudaEvalRunner,
@@ -37,7 +37,7 @@ from delta_feedback_experiment.train import (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="/data/df/tokens")
+    parser.add_argument("--data-dir", default="/data/delta/tokens")
     parser.add_argument("--updates", type=int, default=12)
     parser.add_argument("--label", default="current")
     parser.add_argument("--gemm-backends")
@@ -118,7 +118,7 @@ def run(options) -> None:
     saved = analysis.saved_args(payload)
     for field in (*analysis.GEOMETRY, "seq_len", "condition"):
         setattr(args, field, saved[field])
-    model = DFModel(analysis.config_from_args(saved))
+    model = DeltaModel(analysis.config_from_args(saved))
     model.load_state_dict(payload["state"])
     del payload
     gc.collect()

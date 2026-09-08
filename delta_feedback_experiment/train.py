@@ -32,7 +32,7 @@ from transformer_experiments.schedule import Schedule
 from .data import TokenData, read_meta
 from .model import (
     CONDITION_LETTERS,
-    DFModel,
+    DeltaModel,
     condition_config,
     iterate_fused,
     multipass,
@@ -116,7 +116,7 @@ def condition(value: str) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        "delta train", description="Train one condition of the DF family."
+        "delta train", description="Train one condition of the delta family."
     )
     parser.add_argument("tag", type=runs.validate_run_tag, help="run tag")
     parser.add_argument(
@@ -294,7 +294,7 @@ def micro_draws(
     return prefix_out, jitter_out
 
 
-def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
+def automatic_checkpoint(model: DeltaModel, n_passes: int, args, device) -> bool:
     """Measured internal activation policy for the screen."""
     if device.type != "cuda":
         return False
@@ -381,7 +381,7 @@ class CudaGraphTrainer:
     autograd gradient marks the remaining vectors and small matrices.
     """
 
-    def __init__(self, model: DFModel, optimizers, args, schedule: Schedule):
+    def __init__(self, model: DeltaModel, optimizers, args, schedule: Schedule):
         self.model = model
         self.optimizers = optimizers
         self.args = args
@@ -625,7 +625,7 @@ class CapturedEval:
 class CudaEvalRunner:
     """No-grad validation graphs sharing the trainer's private memory pool."""
 
-    def __init__(self, model: DFModel, args, pool):
+    def __init__(self, model: DeltaModel, args, pool):
         self.model = model
         self.args = args
         self.device = next(model.parameters()).device
@@ -724,7 +724,7 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
 
 @torch.no_grad()
 def evaluate(
-    model: DFModel,
+    model: DeltaModel,
     data_val: TokenData,
     args,
     device,
@@ -757,7 +757,7 @@ def evaluate(
 
 
 @torch.no_grad()
-def route_summary(model: DFModel, data_val: TokenData, args, device) -> list[dict]:
+def route_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[dict]:
     """Per-site routing observables from one validation microbatch."""
     if not model.cfg.routing_active:
         return []
@@ -964,7 +964,7 @@ def train(argv: list[str] | None = None) -> dict:
         raise ValueError(f"schedule needs {needed} rows, stream has {data_train.rows}")
 
     torch.manual_seed(args.seed)
-    model = DFModel(
+    model = DeltaModel(
         condition_config(
             args.condition,
             vocab_size=args.vocab_size,

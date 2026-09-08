@@ -1,6 +1,6 @@
 """delta-feedback-experiment: a nursery for a small recurrent model organism.
 
-One ``DFModel`` family, addressed by condition letters: ``a`` for the
+One ``DeltaModel`` family, addressed by condition letters: ``a`` for the
 PKDA/gated-GQA hybrid trunk, ``r`` for MHDB block-delta reads, ``f`` for FBT
 latent feedback between token columns, ``l`` for the tied-depth loop. See
 docs/architecture.md for the model and docs/design.md for the recipe.
@@ -17,7 +17,7 @@ from pathlib import Path
 # train subprocesses without pretending it is a source artifact. PyTorch sets
 # its own default under /tmp as soon as an earlier torch.compile user imports;
 # replace that ephemeral default while retaining any durable operator setting.
-_configured_cache = os.environ.get("DF_INDUCTOR_CACHE_DIR") or os.environ.get(
+_configured_cache = os.environ.get("DELTA_INDUCTOR_CACHE_DIR") or os.environ.get(
     "TORCHINDUCTOR_CACHE_DIR"
 )
 _temporary_roots = {

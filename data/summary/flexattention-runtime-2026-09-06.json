@@ -11,14 +11,14 @@
   },
   "baseline": [
     {
-      "snapshot": "runs/screen-df-full-s1.pt.10745",
+      "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
       "revisions": {
         "experiment": "4547d8e81d56be58f8e7d6affecf5e581b21c452",
         "fla": "a9e1d05d7ef25604987af56f514e1fd2629cc504",
         "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
       },
       "inputs": {
-        "data_dir": "/data/df/tokens",
+        "data_dir": "/data/delta/tokens",
         "first_row": 100000,
         "first_randomness_step": 9000,
         "data_seed": 0,
@@ -188,7 +188,7 @@
   },
   "candidate": [
     {
-      "snapshot": "runs/screen-df-full-s1.pt.10745",
+      "snapshot": "runs/screen-delta-arf-s1-highLR.pt.10745",
       "runtime": {
         "torch": "2.14.0+cu132",
         "cuda": "13.2",
@@ -207,7 +207,7 @@
         "cce": "1324ecfbac7f3b04a00e5d0d2679b65f4968b63d"
       },
       "inputs": {
-        "data_dir": "/data/df/tokens",
+        "data_dir": "/data/delta/tokens",
         "first_row": 100000,
         "first_randomness_step": 9000,
         "data_seed": 0,

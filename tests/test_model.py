@@ -1,4 +1,4 @@
-"""Offline invariants for the DF model family (CPU, tiny config).
+"""Offline invariants for the delta model family (CPU, tiny config).
 
 These are the architecture contract's checkable claims: transient-read routing
 keeps the stream telescoping, zero-init routing is uniform, the payload
@@ -16,7 +16,7 @@ import torch
 from delta_feedback_experiment.model import (
     BASE_NORMAL_INIT_STD,
     CONDITION_LETTERS,
-    DFModel,
+    DeltaModel,
     KVCache,
     condition_config,
     iterate_fused,
@@ -46,9 +46,9 @@ BUILDABLE = ("", "a", "r", "f", "ar", "af", "rf", "arf")
 """Every buildable condition: the subsets of ``arf`` in canonical order."""
 
 
-def tiny(condition: str, seed: int = 0) -> DFModel:
+def tiny(condition: str, seed: int = 0) -> DeltaModel:
     torch.manual_seed(seed)
-    return DFModel(condition_config(condition, **TINY)).eval()
+    return DeltaModel(condition_config(condition, **TINY)).eval()
 
 
 def tokens(batch=2, length=16, seed=1, vocab=97):
@@ -81,7 +81,7 @@ def test_condition_grammar():
     assert looped.loop and looped.hybrid
     assert looped.routing_active and looped.feedback_active
     with pytest.raises(NotImplementedError, match="not built"):
-        DFModel(looped)
+        DeltaModel(looped)
 
 
 def test_condition_flags():
@@ -119,7 +119,7 @@ def test_condition_flags():
     assert screen.pkda_heads * screen.pkda_head_dim * 3 == screen.dim * 5
     assert screen.routing_heads == 4
     assert screen.norm_eps == 1e-6
-    assert DFModel(hybrid).blocks[0].attn.norm_eps == hybrid.norm_eps
+    assert DeltaModel(hybrid).blocks[0].attn.norm_eps == hybrid.norm_eps
 
 
 def test_letters_only_add_parameters():
@@ -160,7 +160,7 @@ def test_screen_param_count():
     }
     with torch.device("meta"):
         for condition, (total, active_non_embedding) in expected.items():
-            model = DFModel(condition_config(condition))
+            model = DeltaModel(condition_config(condition))
             count = sum(parameter.numel() for parameter in model.parameters())
             assert count == total
             assert count - model.embed_tokens.weight.numel() == active_non_embedding
@@ -468,7 +468,7 @@ def test_single_head_routing_and_unknown_letters_are_rejected():
         condition_config("arra", **TINY)
     cfg = condition_config("ar", **(TINY | {"kv_heads": 1}))
     with pytest.raises(ValueError, match="at least two"):
-        DFModel(cfg)
+        DeltaModel(cfg)
     with pytest.raises(ValueError, match="block size"):
         condition_config("ar", **(TINY | {"routing_block_size": 0}))
 
@@ -504,7 +504,7 @@ def test_block_sources_and_current_partial_labels():
 def test_four_layer_block_boundaries():
     config = TINY | {"layers": 9}
     torch.manual_seed(0)
-    model = DFModel(condition_config("ar", **config)).eval()
+    model = DeltaModel(condition_config("ar", **config)).eval()
     out = model.forward_column(model.embed_tokens(tokens()), want_weights=True)
     assert out.source_names == ("seed", "block0", "block1", "block2")
     assert out.route_source_names["L4.attn"] == ("null", "seed", "block0")

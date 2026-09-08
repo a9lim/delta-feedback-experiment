@@ -3,16 +3,15 @@
 This page is the distilled current picture of the specimens. It is rewritten
 as the picture changes; the dated detail behind it is in
 [journal.md](journal.md), and the numbers below come from the 2026-09-08
-analysis of the two paired lowLR runs unless stated otherwise.
+analysis of the paired `ar` and `arf` runs unless stated otherwise.
 
 ## Specimens
 
 | Run | Condition | Recipe | NorMuonH lr | val | val_fused | Where |
 |---|---|---|---:|---:|---:|---|
-| `screen-df-mhdb-s1-lowLR` | `ar` | default (one pass throughout) | 6e-3 | 3.069 | | Jobe |
-| `screen-df-full-s1-lowLR` | `arf` | `--feedback-start 0 --three-pass 1` | 6e-3 | 3.076 | 3.077 | Jobe |
-| `screen-df-full-s1` | `arf` | `--feedback-start 0 --three-pass 1` | 2e-2 | 3.113 | 3.113 | Jobe |
-| `screen-df-s1` | `arf` | 75/22/3 pass mixture, earlier trainer contract | 1e-2 | 3.098 | 3.122 | Mac (step 6700 snapshot) |
+| `screen-delta-ar-s1` | `ar` | default (one pass throughout) | 6e-3 | 3.069 | | Jobe |
+| `screen-delta-arf-s1` | `arf` | `--feedback-start 0 --three-pass 1` | 6e-3 | 3.076 | 3.077 | Jobe |
+| `screen-delta-arf-s1-highLR` | `arf` | `--feedback-start 0 --three-pass 1` | 2e-2 | 3.113 | 3.113 | Jobe |
 
 All are seed 1, data seed 0, 10,745 steps, 320 rows of 1,024 predictions per
 step, on the same rows. The three-pass-always `arf` runs spend 10.56B
@@ -72,7 +71,7 @@ That is the opposite of an opaque cross-column channel.
 
 ## Downstream
 
-Both lowLR specimens beat the 300B-token `pythia-160m` on the educational and
+Both 6e-3 specimens beat the 300B-token `pythia-160m` on the educational and
 science-flavored zero-shot tasks (ARC-Easy by 8–9 points, HellaSwag by 4,
 OpenBookQA by 5) and trail it badly on LAMBADA (30 against 35 accuracy), which
 is fiction and long-range. `ar` against `arf` Standard is indistinguishable

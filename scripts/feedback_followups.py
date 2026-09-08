@@ -13,7 +13,7 @@
   the fused-pass loss on fresh training rows, per parameter family.
 
 Usage:
-    python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+    python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 """
 
 from __future__ import annotations

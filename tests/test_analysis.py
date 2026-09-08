@@ -8,7 +8,7 @@ from transformer_experiments import checkpoints
 
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.model import (
-    DFModel,
+    DeltaModel,
     condition_config,
     multipass,
     multipass_loss,
@@ -33,7 +33,7 @@ TINY = {
 
 def snapshot(tmp_path, condition="arf", seed=3):
     torch.manual_seed(seed)
-    model = DFModel(condition_config(condition, max_seq_len=17, **TINY))
+    model = DeltaModel(condition_config(condition, max_seq_len=17, **TINY))
     args = SimpleNamespace(
         condition=condition, seed=seed, seq_len=16, tag="tiny", **TINY
     )
@@ -58,31 +58,6 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
         want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
         got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
     assert torch.equal(want, got)
-
-
-def test_load_checkpoint_translates_named_arms(tmp_path):
-    """Snapshots before v24 recorded the condition as an arm name."""
-    assert analysis.NAMED_ARMS == {
-        "vanilla": "",
-        "base": "a",
-        "mhdb": "ar",
-        "fbt": "af",
-        "df": "arf",
-    }
-    model, path = snapshot(tmp_path)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["version"] = 23
-    del payload["args"]["condition"]
-    payload["args"]["arm"] = "df"
-    legacy = tmp_path / "legacy.pt.5"
-    checkpoints.write_payload(legacy, payload)
-    loaded, saved = analysis.load_checkpoint(legacy, "cpu")
-    assert saved["condition"] == "arf" and "arm" not in saved
-    assert loaded.cfg.condition == "arf"
-    assert torch.equal(
-        loaded.state_dict()["payload_router.null"],
-        model.state_dict()["payload_router.null"],
-    )
 
 
 def test_token_ce_matches_sequence_ce(tmp_path):

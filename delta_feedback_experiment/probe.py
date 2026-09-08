@@ -16,14 +16,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def cuda_gate() -> None:
-    """Capture and replay every default DF mode at full screen geometry."""
+    """Capture and replay every default delta mode at full screen geometry."""
     from torch._dynamo.utils import counters
     from transformer_experiments import checkpoints
 
     from .cuda_kernels import bespoke_route
     from .cuda_kernels import triton as route_triton
     from .model import (
-        DFModel,
+        DeltaModel,
         KVCache,
         _ClassifierShadow,
         _fixed_cce_z,
@@ -448,7 +448,7 @@ def cuda_gate() -> None:
             max_seq_len=16,
         )
         torch.manual_seed(0)
-        decode_model = DFModel(decode_cfg).cuda().eval()
+        decode_model = DeltaModel(decode_cfg).cuda().eval()
         decode_tokens = torch.randint(0, 1000, (2, 12), device="cuda")
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             full = decode_model.forward_column(
@@ -508,7 +508,7 @@ def cuda_gate() -> None:
     probe_validation = _ProbeValidation()
     torch.manual_seed(args.seed)
     model = (
-        DFModel(
+        DeltaModel(
             condition_config(
                 "arf",
                 vocab_size=args.vocab_size,

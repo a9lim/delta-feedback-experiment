@@ -50,7 +50,7 @@ across `a`. Two conditions trained with the same seed and data seed therefore
 see the same rows in the same order with the same keyed feedback draws, and
 can be compared token by token.
 
-`l` is reserved: it parses, `ModelConfig.loop` records it, and `DFModel`
+`l` is reserved: it parses, `ModelConfig.loop` records it, and `DeltaModel`
 refuses to build it until the loop exists. At one core iteration `arfl` is
 exactly `arf`.
 
@@ -201,9 +201,8 @@ The specimens so far used the default recipe (`ar`) and
 ### Checkpoints and queue
 
 Snapshots use checkpoint contract v24, and only v24 resumes; v16 through v23
-stay readable for evaluation and forks. Snapshots before v24 recorded the
-condition as an arm name, `vanilla`, `base`, `mhdb`, `fbt`, or `df`, which the
-loader reads as `""`, `a`, `ar`, `af`, or `arf`. A snapshot holds the model, both
+stay readable for evaluation and forks. Every snapshot records its condition
+as letters. A snapshot holds the model, both
 optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,

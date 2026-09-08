@@ -4,12 +4,40 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-08 — The operator is `delta`, and the specimens are named for their conditions
+
+The console script `df` is now `delta`, which also stops shadowing the
+disk-free command. The run tags follow the letters: `screen-delta-ar-s1`,
+`screen-delta-arf-s1`, and `screen-delta-arf-s1-highLR`. NorMuonH `6e-3` is the
+default, so it is the `2e-2` run that carries an LR suffix. The compiled token
+store on Jobe is `/data/delta/tokens`.
+
+The three Jobe specimens were rewritten in place: each snapshot now records its
+`condition`, its new tag, and the new store path, and its run log records
+`condition=` where it recorded `arm=`. With no arm-named artifact left, the
+loader's `NAMED_ARMS` translation and its counterpart in `training_curves.py`
+are gone; `saved_args` reads `condition` and nothing else. The snapshots keep
+their v22/v23 contract versions, which is what their state is.
+
+Deleted: the Mac's three snapshots, which were contract v1, v4, and v5 and so
+already below the v16 surface. One of them was the earlier `arf` run on the
+75/22/3 pass mixture, whose row leaves [findings.md](findings.md); its numbers
+survive in the 2026-09-02 and 2026-09-08 entries below, where it is now the
+earlier Mac `arf` run rather than a tag. Its logs and its `fused-`/`route-`
+figure directories went with it.
+
+Also renamed: `DFModel` to `DeltaModel`, `DFScorer` to `DeltaScorer`,
+`DELTA_INDUCTOR_CACHE_DIR` for the durable Inductor cache, and `delta-loop` for
+the tied-depth design. Figure directories took the new tags and their JSON
+records were rewritten, but the PNGs keep the old tags in their titles until
+they are regenerated. Nothing was trained.
+
 ## 2026-09-08 — Conditions become letters
 
 The five named arms are replaced by a modular condition string: one letter per
 change from the plain RoPE GQA decoder, `a` for the PKDA/gated-GQA trunk, `r`
 for MHDB reads, `f` for FBT feedback, and `l` reserved for the tied-depth loop
-(it parses, `DFModel` refuses it). `vanilla`, `base`, `mhdb`, `fbt`, and `df`
+(it parses, `DeltaModel` refuses it). `vanilla`, `base`, `mhdb`, `fbt`, and `df`
 are now `""`, `a`, `ar`, `af`, and `arf`; the specimens are `ar` and `arf`
 runs. Every subset of `arf` builds, so `r`, `f`, and `rf` on the plain trunk
 exist for the first time (screen counts in [design.md](design.md#conditions)).
@@ -19,27 +47,27 @@ old run logs. `compare_arms.py` is now `compare_conditions.py` and writes
 `compare_conditions.json`. Nothing was trained; the letter grammar is the
 ground for the `l` design that follows.
 
-## 2026-09-08 — `mhdb` against full-feedback `df`: what the feedback package changed inside
+## 2026-09-08 — `ar` against full-feedback `arf`: what the feedback package changed inside
 
 Two completed runs on Jobe, paired by construction (seed 1, data
 seed 0, identical rows and schedule, NorMuonH `6e-3`, 10,745 steps):
 
-| run | arm | passes | pass-tokens | s/step | val (32 rows) | val_fused |
+| run | condition | passes | pass-tokens | s/step | val (32 rows) | val_fused |
 |---|---|---|---:|---:|---:|---:|
-| `screen-df-mhdb-s1-lowLR` | `mhdb` | 1 throughout | 3.52B | 4.9 | 3.069 | — |
-| `screen-df-full-s1-lowLR` | `df` | 3 from step 0 | 10.56B | 14.2 | 3.076 | 3.077 |
+| `screen-delta-ar-s1` | `ar` | 1 throughout | 3.52B | 4.9 | 3.069 | — |
+| `screen-delta-arf-s1` | `arf` | 3 from step 0 | 10.56B | 14.2 | 3.076 | 3.077 |
 
-The `df` run is the fresh-run form of the question left open on 2026-09-02:
+The `arf` run is the fresh-run form of the question left open on 2026-09-02:
 does the FBT benefit form when the fused mode is trained densely from the
 start? It is the recipe variant `--feedback-start 0 --three-pass 1`, and equal
 steps here are 3x the compute. Everything below is one paired observation plus
 same-checkpoint interventions on the final snapshots. Scripts:
-`scripts/compare_arms.py`, `weight_divergence.py`, `fused_diagnostics.py`,
+`scripts/compare_conditions.py`, `weight_divergence.py`, `fused_diagnostics.py`,
 `entry_sweeps.py`, `feedback_followups.py`, `payload_swap.py`,
 `route_report.py`, `training_curves.py`, `analysis_figures.py`; records and
-figures under `figures/curves-mhdb-vs-df-full-lowLR/`,
-`figures/compare-screen-df-mhdb-s1-lowLR-vs-screen-df-full-s1-lowLR/`,
-`figures/weights-…/`, `figures/fused-screen-df-full-s1-lowLR/`, and
+figures under `figures/curves-ar-vs-arf/`,
+`figures/compare-screen-delta-ar-s1-vs-screen-delta-arf-s1/`,
+`figures/weights-…/`, `figures/fused-screen-delta-arf-s1/`, and
 `figures/route-…/` (ignored); run logs copied to `logs/`.
 
 ### The gap is small and mostly a small-sample draw
@@ -49,10 +77,10 @@ to the third decimal):
 
 | predictor | CE | difference | s.e. |
 |---|---:|---:|---:|
-| `mhdb` pass 1 | 2.8862 | | |
-| `df` pass 1 | 2.8887 | +0.0025 vs `mhdb` | 0.0013 |
-| `df` fused (prefix 1) | 2.8899 | +0.0012 vs `df` pass 1 | 0.0006 |
-| `df` fused, second iteration | 2.8915 | +0.0016 vs fused | |
+| `ar` pass 1 | 2.8862 | | |
+| `arf` pass 1 | 2.8887 | +0.0025 vs `ar` | 0.0013 |
+| `arf` fused (prefix 1) | 2.8899 | +0.0012 vs `arf` pass 1 | 0.0006 |
+| `arf` fused, second iteration | 2.8915 | +0.0016 vs fused | |
 
 Top-1 accuracy is 42.92% for both pass-1 predictors. The per-step pass-1
 training loss on identical rows (exact pairing, EMA 300) was +0.0054 for the
@@ -62,9 +90,9 @@ real, small, and largest while the fused mode is forming.
 
 ### The two arms differ like two seeds
 
-KL(`mhdb` ‖ `df` pass 1) is 0.215 nats, argmax agreement 77.6%, per-token CE
+KL(`ar` ‖ `arf` pass 1) is 0.215 nats, argmax agreement 77.6%, per-token CE
 correlation 0.972; a split-validated 50/50 probability mixture of the two
-gains 0.049 nats. Within `df`, KL(pass 1 ‖ fused) is 0.039, agreement 89.4%,
+gains 0.049 nats. Within `arf`, KL(pass 1 ‖ fused) is 0.039, agreement 89.4%,
 mixture gain 0.011. In weight space every shared trunk matrix sits 85–87°
 from the paired initialization and 87° from its twin in the other run
 (cosine 0.06–0.08; total-update cosine about 0.5), while norms, router
@@ -73,8 +101,8 @@ cosine 0.77. Under fixed-radius normalized updates the two trajectories
 separate like different seeds, so the +0.0025 is a mean shift riding on a
 ±0.24 interquartile per-token spread and no per-token difference is
 attributable to the package. Conditioning on the reference's own loss shows
-the expected regression toward the mean (`df` looks better exactly where
-`mhdb` is worst, and worse where `mhdb` is confident); that panel is an
+the expected regression toward the mean (`arf` looks better exactly where
+`ar` is worst, and worse where `ar` is confident); that panel is an
 artifact of the conditioning, so the tables condition on the reference's
 entropy and on token frequency instead.
 
@@ -85,9 +113,9 @@ bins are flat within noise.
 
 ### Dense exposure closed the fused deficit and formed no benefit
 
-Against `screen-df-s1` (75/22/3 recipe, +0.024 fused gap):
+Against the earlier Mac `arf` run (75/22/3 recipe, +0.024 fused gap):
 
-| diagnostic | `screen-df-s1` | `screen-df-full-s1-lowLR` |
+| diagnostic | earlier Mac `arf` run | `screen-delta-arf-s1` |
 |---|---:|---:|
 | fused − pass 1 | +0.024 | +0.0012 |
 | KL(pass 1 ‖ fused) / argmax agreement | 0.057 / 87.5% | 0.039 / 89.4% |
@@ -110,7 +138,7 @@ mixture gain of 0.011 is the whole complementary information.
 
 ### Mechanism: the first cell cancels the fused seed, the rest runs plain
 
-On the same tokens, `df`'s fused pass differs from its plain pass almost only
+On the same tokens, `arf`'s fused pass differs from its plain pass almost only
 in cell 0. The fused seed enters at 23x the plain seed's RMS (0.85 against
 0.04); the first completed block delta then changes by 3.7x its own RMS and is
 orthogonal to its plain-pass self (cosine −0.02, CKA 0.57, RMS 0.76 ≈ the
@@ -121,9 +149,9 @@ compute what they compute on a plain pass. Between the two arms the same
 sources have CKA 0.92 (block 0), 0.81 (block 1), 0.95 (block 2 and `h_top`)
 on plain passes: the middle cell is where the two trainings diverged most.
 
-Routing is consistent with that: `df`'s early MLP sites read the null on
-both passes (L1–L3.mlp 0.78–0.89, L4.attn 0.84–0.90) where `mhdb`'s read the
-partial and seed (0.44–0.75); on the fused pass `df`'s L0.mlp reads the fused
+Routing is consistent with that: `arf`'s early MLP sites read the null on
+both passes (L1–L3.mlp 0.78–0.89, L4.attn 0.84–0.90) where `ar`'s read the
+partial and seed (0.44–0.75); on the fused pass `arf`'s L0.mlp reads the fused
 seed at 0.86, and the top attention sites switch from block 0 to the seed
 (L9/L10/L11.attn seed mass 0.25/0.23/0.00 → 0.39/0.38/0.53), a direct read of
 the previous column's state just before the readout. The payload router's
@@ -156,7 +184,7 @@ pre-norm input is 15% at the median (36% at p90, up from 8% / 15%).
    payload is the readout basis and the seed decodes the token at 98%. That is
    the opposite of an opaque cross-column channel. The 2026-09-02 decision
    tree's "redesign the entry" branch is the one this selects; whether to
-   take it, and whether the `mhdb` run doubles as the reference `mhdb`
+   take it, and whether the `ar` run doubles as the reference `ar`
    specimen, are a9's calls.
 
 ### Downstream zero-shot tasks
@@ -173,7 +201,7 @@ SciQ (75.4 / 67.7 against 74.1 / 66.8) and LAMBADA perplexity (37.3 against
 (35.4 against 32.8), unresolved. Records:
 `figures/downstream-<tag>/downstream_<mode>.json`, comparisons beside them.
 
-| task (metric) | pythia-160m | `mhdb` | `df` Standard | `df` Fused |
+| task (metric) | pythia-160m | `ar` | `arf` Standard | `arf` Fused |
 |---|---:|---:|---:|---:|
 | HellaSwag (acc_norm) | 30.3 | 34.6 ± 0.5 | 34.8 | 35.2 |
 | ARC-Easy (acc_norm) | 39.6 | 47.4 ± 1.0 | 48.8 | 48.3 |
@@ -192,22 +220,22 @@ long-range: FineWeb-Edu at 3.5B tokens, in one line. ARC-Challenge and
 WinoGrande are at chance for every model, and BoolQ is below the 62.2%
 majority class for every model.
 
-**`mhdb` against `df` Standard, paired on identical documents.** Accuracy
+**`ar` against `arf` Standard, paired on identical documents.** Accuracy
 differs by less than two standard errors on every task except BoolQ (+2.1 ±
-0.6) and SciQ (+2.1 ± 1.0); `df` leads on seven of nine, which is weak
+0.6) and SciQ (+2.1 ± 1.0); `arf` leads on seven of nine, which is weak
 evidence in itself. The gold-continuation log-probability rises by 0.4–0.9
 nats per document on ARC, BoolQ, SciQ and PIQA, but the shift over *all*
-choices is the same size: `df` assigns more mass to short answers after
+choices is the same size: `arf` assigns more mass to short answers after
 `Answer:`, a prompt-format calibration difference. The discriminative margin
 (gold minus best distractor) moves by less than 0.05 nats on every task but
 BoolQ (+0.13 ± 0.02) and SciQ (+0.15 ± 0.05), and the BoolQ margin is a pure
-"yes" bias: `df` answers yes on 94.7% of documents against `mhdb`'s 86.7%
+"yes" bias: `arf` answers yes on 94.7% of documents against `ar`'s 86.7%
 (62.2% are yes), so the margin rises +0.58 on yes-gold and falls −0.60 on
 no-gold documents. Downstream, then, the arms are indistinguishable at this
 resolution apart from a calibration idiosyncrasy of the kind two seeds also
 show.
 
-**`df` Standard against `df` Fused, paired within one model.** This pairing
+**`arf` Standard against `arf` Fused, paired within one model.** This pairing
 resolves far smaller effects, and the fused pass is not a no-op downstream:
 
 | task | acc diff | gold logp | all choices | margin |
@@ -280,8 +308,7 @@ Repo notes: checkpoint-analysis helpers now live in
 `delta_feedback_experiment.analysis` (loader, trainer numerics, per-token
 losses, fused inputs; `tests/test_analysis.py`), the September-2 scratch
 scripts were promoted to `scripts/` under the names above with a shared
-`scripts/figstyle.py`, and their raw outputs moved to
-`figures/fused-screen-df-s1/raw/`. The downstream suite is the workspace
+`scripts/figstyle.py`. The downstream suite is the workspace
 module `transformer_experiments.downstream` (pinned Hub revisions, a scorer
 protocol, paired comparison, an HF reference scorer); this experiment's
 scorer is `scripts/downstream_eval.py`.

@@ -35,7 +35,7 @@ reinstalling. CUDA GQA uses compiled PyTorch FlexAttention; the external
 `flash-attn` package is not used. Machine-wide constraints own Torch itself.
 The first `delta probe` performs the fixed-shape Inductor search and preserves
 its generated artifacts at `~/.cache/delta-feedback/torchinductor`; later
-probes and training processes reuse that cache. Set `DF_INDUCTOR_CACHE_DIR` only when
+probes and training processes reuse that cache. Set `DELTA_INDUCTOR_CACHE_DIR` only when
 the durable cache belongs elsewhere.
 
 Install the exact data-build stack on any staging host that materializes the
@@ -55,16 +55,16 @@ Foreground training and queueing are alternative ways to run a condition.
 delta probe
 
 # Materialize the canonical 57B stream from pinned HF dataset/tokenizer commits.
-delta tokenize --out /data/df/tokens
+delta tokenize --out /data/delta/tokens
 
 # Run or queue one condition: letters from arfl in any order, empty for the
 # plain RoPE GQA decoder (`delta train --help` lists the letters).
 delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
-  --data-dir /data/df/tokens
+  --data-dir /data/delta/tokens
 delta queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
-  --data-dir /data/df/tokens
+  --data-dir /data/delta/tokens
 delta queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
-  --data-dir /data/df/tokens
+  --data-dir /data/delta/tokens
 
 # Inspect and control the detached queue.
 delta status
@@ -112,35 +112,35 @@ index](../figures/README.md) maps them.
 
 ```bash
 # Routing: per-site/group source mass, entropy, query geometry (any r).
-python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 
 # Payload enrichment swaps (r with f): trained router, top-only, uniform, forced source.
-python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
-python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens --head 2
+python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens --head 2
 
 # Fused pass against pass 1 on one feedback snapshot: position, surprise, and
 # frequency structure, gate and seed statistics, self-composition.
-python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 
 # Entry interventions: gate temperature, seed scale, embedding bypass,
 # zero or foreign payload.
-python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 
 # Impulse response, payload-head ablation, split-validated ensemble, and
 # pass-1 versus fused-pass gradient alignment.
-python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 
 # Two checkpoints on the same rows: per-token loss structure, predictor
 # divergence, mixtures, residual-stream CKA, payload redundancy.
 python scripts/compare_conditions.py --reference runs/A.pt.STEP --feedback runs/B.pt.STEP \
-  --data-dir /data/df/tokens
+  --data-dir /data/delta/tokens
 
 # Paired weight-space divergence from the shared initialization (CPU).
 python scripts/weight_divergence.py runs/A.pt.STEP runs/B.pt.STEP
 
 # Continue a feedback snapshot with dense feedback passes (or --passes 1 as
 # the plain-only erosion control) at a fraction of the stable learning rate.
-python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/df/tokens \
+python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/delta/tokens \
   --steps 150 --passes 2 --out figures/fused-TAG/dense_all.json
 
 # Downstream zero-shot tasks (workspace `transformer_experiments.downstream`),

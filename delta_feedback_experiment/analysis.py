@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from transformer_experiments import checkpoints
 
-from .model import DFModel, ModelConfig, condition_config, shift_right
+from .model import DeltaModel, ModelConfig, condition_config, shift_right
 from .train import CONTRACT, pick_device
 
 GEOMETRY = (
@@ -38,19 +38,10 @@ GEOMETRY = (
 )
 """State-defining geometry fields a snapshot carries in its ``args``."""
 
-NAMED_ARMS = {"vanilla": "", "base": "a", "mhdb": "ar", "fbt": "af", "df": "arf"}
-"""The conditions that snapshots and run logs before v24 recorded as arm names."""
-
 
 def saved_args(payload: dict) -> dict:
-    """A snapshot's settings under the current field names, plus its ``step``.
-
-    Snapshots before v24 recorded the condition as a named arm; every reader
-    sees ``condition`` letters.
-    """
+    """A snapshot's settings, plus its ``step``."""
     saved = dict(payload["args"])
-    if "condition" not in saved:
-        saved["condition"] = NAMED_ARMS[saved.pop("arm")]
     saved["step"] = payload["step"]
     return saved
 
@@ -66,7 +57,7 @@ def config_from_args(saved: dict) -> ModelConfig:
 
 def load_checkpoint(
     path: str | Path, device: torch.device | str | None = None
-) -> tuple[DFModel, dict]:
+) -> tuple[DeltaModel, dict]:
     """Rebuild a snapshot's model for analysis.
 
     Returns the model in evaluation mode on ``device`` (auto-selected when
@@ -76,7 +67,7 @@ def load_checkpoint(
     """
     payload = checkpoints.read(path, CONTRACT, map_location="cpu")
     saved = saved_args(payload)
-    model = DFModel(config_from_args(saved))
+    model = DeltaModel(config_from_args(saved))
     model.load_state_dict(payload["state"])
     del payload
     resolved = pick_device(None if device is None else str(device))
@@ -93,7 +84,7 @@ def autocast(device: torch.device | str):
 
 
 def logprob_chunks(
-    model: DFModel, h_top: Tensor, chunk: int = 256
+    model: DeltaModel, h_top: Tensor, chunk: int = 256
 ) -> Iterator[tuple[int, Tensor]]:
     """Yield ``(start, log_softmax)`` over sequence chunks of the readout.
 
@@ -108,7 +99,7 @@ def logprob_chunks(
 
 
 @torch.no_grad()
-def token_ce(model: DFModel, h_top: Tensor, targets: Tensor, chunk: int = 256) -> Tensor:
+def token_ce(model: DeltaModel, h_top: Tensor, targets: Tensor, chunk: int = 256) -> Tensor:
     """Per-token cross-entropy ``[B, T]`` of a top state against its targets."""
     pieces = []
     for start, logprobs in logprob_chunks(model, h_top, chunk):
@@ -126,7 +117,7 @@ def plain_mask(length: int, prefix: int | Tensor, device) -> Tensor:
 
 
 def fused_inputs(
-    model: DFModel, e: Tensor, payload: Tensor, prefix: int | Tensor = 1
+    model: DeltaModel, e: Tensor, payload: Tensor, prefix: int | Tensor = 1
 ) -> Tensor:
     """The next pass's column input: plain prefix, FBT-fused suffix.
 

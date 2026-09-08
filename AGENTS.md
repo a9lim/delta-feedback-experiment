@@ -7,13 +7,13 @@ sandbox: train variants, look inside, change the recipe or the architecture,
 write down what happened. Nothing is pre-registered and no result needs to
 clear a gate before it can be used to decide what to try next.
 
-One `DFModel` family, addressed by condition letters: `a` swaps the plain RoPE
+One `DeltaModel` family, addressed by condition letters: `a` swaps the plain RoPE
 GQA trunk for the PKDA/gated-GQA hybrid, `r` adds MHDB block-delta reads, `f`
 adds FBT feedback between token columns, and `l` names the tied-depth loop
 that is specified and not built. `--condition arf` is the full built stack;
 the empty condition is the plain decoder. Three full-schedule specimens exist
-on Jobe (`screen-df-mhdb-s1-lowLR`, an `ar` run; `screen-df-full-s1` and
-`screen-df-full-s1-lowLR`, `arf` runs); the current read of what they show is
+on Jobe (`screen-delta-ar-s1`, an `ar` run; `screen-delta-arf-s1-highLR` and
+`screen-delta-arf-s1`, `arf` runs); the current read of what they show is
 in `docs/findings.md`.
 
 ## Documents
@@ -49,7 +49,7 @@ than keeping aliases or compatibility notes for hypothetical readers.
 These describe the code as it stands. Any of them can change; when one does,
 change it everywhere at once.
 
-- One `DFModel` and `CONDITION_LETTERS` define the family. A condition is the
+- One `DeltaModel` and `CONDITION_LETTERS` define the family. A condition is the
   canonical string `parse_condition` returns (letters in `arfl` order) and
   `ModelConfig.condition` renders it back; every subset of `arf` builds and
   `l` raises until the loop exists. Under `a` the trunk is
@@ -97,13 +97,12 @@ change it everywhere at once.
 
 - Telemetry, schedules, run/snapshot addressing, checkpoint staging, monitor
   serving, and spool orchestration come from the workspace root package.
-- Jobe is the single-GPU CUDA surface. Keep GPU jobs serial; the captured DF
+- Jobe is the single-GPU CUDA surface. Keep GPU jobs serial; the captured
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
   collection outside train/eval graph capture.
 - Snapshots are v24. Only v24 resumes; v16 through v23 stay readable for
-  evaluation and forks, and the loader translates their arm names
-  (`vanilla`, `base`, `mhdb`, `fbt`, `df`) into conditions.
+  evaluation and forks, and every specimen records its condition as letters.
 - Before touching Jobe, look at `delta status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker
   refreshes before the next job and runs the current checkout's probe.

@@ -1,4 +1,4 @@
-"""The DF model family: one trunk, one letter per change from the plain decoder.
+"""The delta model family: one trunk, one letter per change from the plain decoder.
 
 The architecture contract is ``docs/architecture.md``. Everything here is
 condition-agnostic model semantics: a condition is a string of letters from
@@ -834,7 +834,7 @@ then adds a second time.
 """
 
 
-class DFModel(nn.Module):
+class DeltaModel(nn.Module):
     """The full model; parents are deletions per the config flags."""
 
     def __init__(self, cfg: ModelConfig):
@@ -1294,7 +1294,7 @@ def shift_right(x: Tensor) -> Tensor:
 
 
 def multipass(
-    model: DFModel,
+    model: DeltaModel,
     tokens: Tensor,
     n_passes: int,
     *,
@@ -1466,7 +1466,7 @@ def _fixed_cce_z(
 
 
 def sequence_ce(
-    model: DFModel,
+    model: DeltaModel,
     h_top: Tensor,
     targets: Tensor,
     *,
@@ -1526,7 +1526,7 @@ def sequence_ce(
 
 
 def multipass_loss(
-    model: DFModel,
+    model: DeltaModel,
     tokens: Tensor,
     outs: list[ColumnOutput],
     *,
@@ -1557,7 +1557,7 @@ def multipass_loss(
 
 @torch.no_grad()
 def iterate_fused(
-    model: DFModel, tokens: Tensor, n_iters: int
+    model: DeltaModel, tokens: Tensor, n_iters: int
 ) -> list[dict[str, float]]:
     """The contraction diagnostic: iterated fully-fused prefill passes.
 
