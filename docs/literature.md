@@ -17,11 +17,11 @@ those roles to the organism.
 | Multi-head and Delta Attention Residuals | Grouped source selection and additive delta-source semantics | Addressable seed and block contributions, with a residual reconstruction identity |
 | Attention Residuals | Cumulative-state routing comparison | Clarifies how additive delta routing differs from replacing the residual read |
 | NorMuon / Hyperball / NAdam implementation | Matrix update direction, fixed realized radii, and semantic-scale optimization | A fixed training recipe across controls, with explicit parameter ownership |
-| Recurrent-depth language models | Prelude/tied-core/coda, iteration draw, and shared-cache ideas for the proposed `df-loop` | An iteration axis for `df-loop`, not built |
+| Recurrent-depth language models | Prelude/tied-core/coda, iteration draw, and shared-cache ideas for the `l` letter | An iteration axis, `l`, specified and not built |
 | Free Pause Tokens | Design comparison: separate persistent state from a read-only prediction stream | A candidate way to separate memory from prediction; assessed below |
 
 The local synthesis choices include the PKDA/GQA composition, four-layer MHDB
-source banks, routed enrichment of the `df` payload, exact optimizer partition,
+source banks, routed enrichment of the payload under `r` with `f`, exact optimizer partition,
 geometry, and paired training schedules. They are specified in
 [architecture.md](architecture.md) and [design.md](design.md). The loop's
 adoptions and replacements are recorded separately in
@@ -41,7 +41,7 @@ python -m transformer_experiments.references
 Keep the source index to mechanisms and methods used here or assessed for a
 design decision.
 
-## Free Pause Tokens and `df-loop`
+## Free Pause Tokens and the loop
 
 [Free Pause Tokens](https://arxiv.org/abs/2609.03807), Langford et al., v1,
 is indexed under that title; its HTML body is titled *Almost Free State

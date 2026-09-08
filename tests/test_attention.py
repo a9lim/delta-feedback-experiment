@@ -10,7 +10,7 @@ from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from delta_feedback_experiment.attention import causal_attention, prefix_attention
-from delta_feedback_experiment.model import KVCache, arm_config
+from delta_feedback_experiment.model import KVCache, condition_config
 
 CUDA_ONLY = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="FlexAttention requires CUDA qualification"
@@ -85,8 +85,8 @@ def test_causal_gqa_cannot_read_future_across_block_boundary():
 
 
 def _cache(device):
-    cfg = arm_config(
-        "vanilla",
+    cfg = condition_config(
+        "",
         vocab_size=97,
         dim=384,
         layers=1,
@@ -138,8 +138,8 @@ def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
     from delta_feedback_experiment.model import DFModel
 
     torch.manual_seed(314)
-    cfg = arm_config(
-        "vanilla",
+    cfg = condition_config(
+        "",
         vocab_size=97,
         dim=192,
         layers=1,

@@ -20,8 +20,9 @@ from gemm_backend_check import ada_target_workaround
 from kernel_qualification import revision
 
 import delta_feedback_experiment
+from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DFModel, arm_config, iterate_fused
+from delta_feedback_experiment.model import DFModel, iterate_fused
 from delta_feedback_experiment.optim import build_optimizers
 from delta_feedback_experiment.train import (
     CudaEvalRunner,
@@ -112,31 +113,12 @@ def run(options) -> None:
         )
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1)
-    args = build_parser().parse_args(["kernel-stability", "--arm", "df"])
+    args = build_parser().parse_args(["kernel-stability", "--condition", "arf"])
     payload = torch.load(options.snapshot, map_location="cpu", weights_only=False)
-    saved = payload["args"]
-    fields = (
-        "vocab_size",
-        "dim",
-        "layers",
-        "heads",
-        "kv_heads",
-        "head_dim",
-        "intermediate",
-        "pkda_heads",
-        "pkda_head_dim",
-        "pkda_conv_size",
-    )
-    for field in (*fields, "seq_len"):
+    saved = analysis.saved_args(payload)
+    for field in (*analysis.GEOMETRY, "seq_len", "condition"):
         setattr(args, field, saved[field])
-    args.arm = saved["arm"]
-    model = DFModel(
-        arm_config(
-            saved["arm"],
-            max_seq_len=args.seq_len + 1,
-            **{field: getattr(args, field) for field in fields},
-        )
-    )
+    model = DFModel(analysis.config_from_args(saved))
     model.load_state_dict(payload["state"])
     del payload
     gc.collect()

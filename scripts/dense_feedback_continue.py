@@ -69,12 +69,12 @@ def main() -> None:
     torch._dynamo.config.recompile_limit = 64
     torch.set_float32_matmul_precision("high")
     payload = checkpoints.read(args.snapshot, CONTRACT, map_location="cpu")
-    saved = payload["args"]
+    saved = analysis.saved_args(payload)
     run = SimpleNamespace(**saved)
     cfg = analysis.config_from_args(saved)
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if not cfg.feedback_active:
-        raise SystemExit("continuation needs an fbt or df snapshot")
+        raise SystemExit("continuation needs a snapshot of a condition with f")
     torch.manual_seed(saved["seed"])
     model = DFModel(cfg).to(device)
     optimizers = build_optimizers(model, lr_normuonh=saved["lr_normuonh"], lr_nadam=saved["lr_nadam"])

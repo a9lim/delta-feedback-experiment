@@ -4,7 +4,7 @@
   embeddings; the per-lag penalty after the block measures what a fused column
   writes into the mixer states that plain columns then read.  That boundary
   never occurs in training, so this is an out-of-distribution probe.
-* **Payload-head ablation** (`df` only): replace one routing head's payload
+* **Payload-head ablation** (routed payloads, `r` with `f`): replace one routing head's payload
   slice with the site null, or with another row's slice.
 * **Split-validated ensemble:** temperatures and a mixture weight for the
   pass-1 and fused predictors are chosen on the calibration rows and scored on
@@ -71,7 +71,7 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     if not model.cfg.feedback_active:
-        raise SystemExit("the follow-ups need an fbt or df snapshot")
+        raise SystemExit("the follow-ups need a snapshot of a condition with f")
     cfg = model.cfg
     run = SimpleNamespace(**saved)
     T = saved["seq_len"]

@@ -9,7 +9,7 @@ from the snapshots and logs; the commands are in
 |---|---|---|
 | `route-<tag>/` | `scripts/route_report.py` | Per-site/group source mass, entropy, query geometry |
 | `fused-<tag>/` | `scripts/fused_diagnostics.py`, `entry_sweeps.py`, `feedback_followups.py`, `payload_swap.py`, `dense_feedback_continue.py` | Fused-pass structure, entry interventions, impulse response, ablations, payload swaps |
-| `compare-<A>-vs-<B>/` | `scripts/compare_arms.py`, `analysis_figures.py` | Paired per-token loss structure, predictor divergence, CKA, payload redundancy, and the composed panels |
+| `compare-<A>-vs-<B>/` | `scripts/compare_conditions.py`, `analysis_figures.py` | Paired per-token loss structure, predictor divergence, CKA, payload redundancy, and the composed panels |
 | `weights-<A>-vs-<B>/` | `scripts/weight_divergence.py` | Angular movement of shared parameters |
 | `curves-<A>-vs-<B>/` | `scripts/training_curves.py` | Paired validation and training curves, matched compute, routing and contraction monitors |
 | `downstream-<tag>/` | `scripts/downstream_eval.py` | Zero-shot task records per mode, with paired comparisons beside them |

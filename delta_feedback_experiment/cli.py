@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 USAGE = """\
 df — delta-feedback experiment operator
 
-  df train TAG [FLAGS]      train one arm directly (see df train --help)
+  df train TAG [FLAGS]      train one condition directly (see df train --help)
   df tokenize [FLAGS]       build the fixed token stream (once)
   df probe                  run the offline invariant suite
   df queue TAG [FLAGS]      append a training job to the detached spool

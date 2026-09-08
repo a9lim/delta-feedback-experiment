@@ -301,8 +301,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 23
-    assert CONTRACT.resumable == frozenset({23})
+    assert CONTRACT.version == 24
+    assert CONTRACT.resumable == frozenset({24})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -311,11 +311,11 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
 
 
 def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
-    from delta_feedback_experiment.model import DFModel, arm_config
+    from delta_feedback_experiment.model import DFModel, condition_config
 
     model = DFModel(
-        arm_config(
-            "df",
+        condition_config(
+            "arf",
             vocab_size=97,
             dim=32,
             layers=4,
@@ -409,7 +409,7 @@ def test_optimizer_materialization_restores_fresh_nadam_state():
 def test_route_summary_reports_universal_nulls_and_payload_seed():
     from types import SimpleNamespace
 
-    from delta_feedback_experiment.model import DFModel, arm_config
+    from delta_feedback_experiment.model import DFModel, condition_config
 
     class Validation:
         rows = torch.randint(0, 97, (2, 12), generator=torch.Generator().manual_seed(3))
@@ -419,10 +419,10 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
             return rows.to(device) if device is not None else rows
 
     args = SimpleNamespace(eval_rows=2)
-    for arm in ("mhdb", "df"):
+    for condition in ("ar", "arf"):
         model = DFModel(
-            arm_config(
-                arm,
+            condition_config(
+                condition,
                 vocab_size=97,
                 dim=32,
                 layers=2,
@@ -446,13 +446,13 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
 
     from delta_feedback_experiment.model import (
         DFModel,
-        arm_config,
+        condition_config,
     )
     from delta_feedback_experiment.train import GraphSpec, execution_fields
 
     model = DFModel(
-        arm_config(
-            "base",
+        condition_config(
+            "a",
             vocab_size=97,
             dim=32,
             layers=4,
@@ -540,6 +540,17 @@ def test_optimizer_learning_rate_flags_are_independent():
     assert args.lr_nadam == 0.0002
 
 
+def test_condition_flag_canonicalizes_and_rejects_names():
+    assert build_parser().parse_args(["x"]).condition == ""
+    assert build_parser().parse_args(["x", "--condition", ""]).condition == ""
+    assert build_parser().parse_args(["x", "--condition", "fra"]).condition == "arf"
+    for name in ("vanilla", "base", "mhdb", "fbt", "df"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["x", "--condition", name])
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["x", "--arm", "df"])
+
+
 def test_fixed_warmup_steps_flag_is_removed():
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--warmup-steps", "200"])
@@ -624,15 +635,20 @@ def run(tmp_path, tag, extra):
     )
 
 
-@pytest.mark.parametrize("arm", ["vanilla", "base", "mhdb", "fbt", "df"])
-def test_tiny_run_completes(tmp_path, capsys, arm):
-    summary = run(tmp_path, f"t-{arm}", ["--arm", arm])
+@pytest.mark.parametrize(
+    "condition",
+    ["", "a", "r", "f", "ar", "af", "rf", "arf"],
+    ids=lambda condition: condition or "plain",
+)
+def test_tiny_run_completes(tmp_path, capsys, condition):
+    tag = f"t-{condition or 'plain'}"
+    summary = run(tmp_path, tag, ["--condition", condition])
     assert summary["step"] == 8
     assert np.isfinite(summary["loss"])
     assert np.isfinite(summary["val"])
-    if arm in ("fbt", "df"):
+    if "f" in condition:
         assert np.isfinite(summary["val_fused"])
-    snapshots = list((tmp_path / "runs").glob(f"t-{arm}.pt.*"))
+    snapshots = list((tmp_path / "runs").glob(f"{tag}.pt.*"))
     # Protected: feedback boundary (4), cooldown boundary (6), end (8).
     assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {4, 6, 8}
     step_records = [
@@ -648,10 +664,10 @@ def test_tiny_run_completes(tmp_path, capsys, arm):
 
 
 def test_resume_is_exact(tmp_path, capsys):
-    full = run(tmp_path, "full", ["--arm", "df"])
-    half = run(tmp_path, "half", ["--arm", "df", "--max-steps", "5"])
+    full = run(tmp_path, "full", ["--condition", "arf"])
+    half = run(tmp_path, "half", ["--condition", "fra", "--max-steps", "5"])
     assert half["step"] == 5
-    resumed = run(tmp_path, "half", ["--arm", "df", "--resume"])
+    resumed = run(tmp_path, "half", ["--condition", "arf", "--resume"])
     assert resumed["step"] == 8
     assert resumed["loss"] == full["loss"]
     assert resumed["val"] == full["val"]
@@ -663,9 +679,11 @@ def test_resume_is_exact(tmp_path, capsys):
 
 
 def test_resume_rejects_conflicting_exact_field(tmp_path):
-    run(tmp_path, "conf", ["--arm", "df", "--max-steps", "2"])
+    run(tmp_path, "conf", ["--condition", "arf", "--max-steps", "2"])
     with pytest.raises(ValueError, match="conflicts"):
-        run(tmp_path, "conf", ["--arm", "df", "--resume", "--dim", "64"])
+        run(tmp_path, "conf", ["--condition", "arf", "--resume", "--dim", "64"])
+    with pytest.raises(ValueError, match="conflicts"):
+        run(tmp_path, "conf", ["--condition", "ar", "--resume"])
 
 
 def rewrite_latest_version(tmp_path, tag, version):
@@ -676,26 +694,26 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", range(9, 23))
+@pytest.mark.parametrize("version", range(9, 24))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
-    run(tmp_path, tag, ["--arm", "vanilla", "--max-steps", "5"])
+    run(tmp_path, tag, ["--condition", "", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[23\\]"):
-        run(tmp_path, tag, ["--arm", "vanilla", "--resume"])
+    with pytest.raises(ValueError, match="resumable versions \\[24\\]"):
+        run(tmp_path, tag, ["--condition", "", "--resume"])
 
 
 def test_multipass_checkpoint_parity():
     """The guarded larger modes preserve plain-path loss and gradients."""
     from delta_feedback_experiment.model import (
         DFModel,
-        arm_config,
+        condition_config,
         multipass,
         multipass_loss,
     )
 
-    cfg = arm_config(
-        "df",
+    cfg = condition_config(
+        "arf",
         vocab_size=97,
         dim=32,
         layers=2,
@@ -730,11 +748,11 @@ def test_multipass_checkpoint_parity():
 
 
 def test_checkpoint_policy_is_internal_and_screen_measured():
-    from delta_feedback_experiment.model import DFModel, arm_config
+    from delta_feedback_experiment.model import DFModel, condition_config
 
     args = build_parser().parse_args(["x"])
     with torch.device("meta"):
-        model = DFModel(arm_config("df"))
+        model = DFModel(condition_config("arf"))
     assert not automatic_checkpoint(model, 2, args, torch.device("cuda"))
     assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
     args.micro_rows = 8

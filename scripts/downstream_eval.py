@@ -44,7 +44,7 @@ class DFScorer:
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         if mode != "standard" and not model.cfg.feedback_active:
-            raise ValueError(f"{mode} mode needs an fbt or df snapshot")
+            raise ValueError(f"{mode} mode needs a snapshot of a condition with f")
         if passes < 1:
             raise ValueError("passes must be positive")
         self.model = model
@@ -110,7 +110,7 @@ def main() -> None:
     suffix = f"{args.mode}{args.passes}" if args.mode != "standard" and args.passes > 1 else args.mode
     out_path = out_dir / f"downstream_{suffix}.json"
     meta = {
-        "snapshot": str(args.snapshot), "tag": tag, "arm": saved["arm"], "step": saved["step"], "mode": args.mode,
+        "snapshot": str(args.snapshot), "tag": tag, "condition": saved["condition"], "step": saved["step"], "mode": args.mode,
         "passes": scorer.passes,
         "tokenizer": CANONICAL_TOKENIZER, "tokenizer_revision": CANONICAL_TOKENIZER_REVISION,
         "device": str(scorer.device), "limit": args.limit, "batch_size": args.batch_size, "buckets": list(args.buckets),

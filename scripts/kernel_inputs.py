@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 import delta_feedback_experiment.model as model_module
+from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
 
 
@@ -24,26 +25,8 @@ def main() -> None:
     options.output.mkdir(parents=True, exist_ok=True)
     torch.set_float32_matmul_precision("high")
     payload = torch.load(options.snapshot, map_location="cpu", weights_only=False)
-    saved = payload["args"]
-    fields = (
-        "vocab_size",
-        "dim",
-        "layers",
-        "heads",
-        "kv_heads",
-        "head_dim",
-        "intermediate",
-        "pkda_heads",
-        "pkda_head_dim",
-        "pkda_conv_size",
-    )
-    model = model_module.DFModel(
-        model_module.arm_config(
-            saved["arm"],
-            max_seq_len=saved["seq_len"] + 1,
-            **{field: saved[field] for field in fields},
-        )
-    )
+    saved = analysis.saved_args(payload)
+    model = model_module.DFModel(analysis.config_from_args(saved))
     model.load_state_dict(payload["state"])
     del payload
     model.cuda().train()

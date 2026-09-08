@@ -1,9 +1,9 @@
-"""delta-feedback-experiment: MHDB x FBT on a PKDA/GGQA hybrid trunk.
+"""delta-feedback-experiment: a nursery for a small recurrent model organism.
 
-Does widening the depth axis (Multi-Head Delta Block routing) and the
-token-time axis (full-bandwidth latent feedback) of a transformer's compute
-lattice help complementarily or redundantly? See docs/architecture.md for the
-model and docs/design.md for the experiment.
+One ``DFModel`` family, addressed by condition letters: ``a`` for the
+PKDA/gated-GQA hybrid trunk, ``r`` for MHDB block-delta reads, ``f`` for FBT
+latent feedback between token columns, ``l`` for the tied-depth loop. See
+docs/architecture.md for the model and docs/design.md for the recipe.
 """
 
 from __future__ import annotations

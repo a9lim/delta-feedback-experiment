@@ -9,7 +9,7 @@ Layout under a data directory (default ``data/tokens``):
 The val slice comes first so the train stream can cover both
 screen budgets without ever touching held-out documents.  Rows are
 non-overlapping ``seq_len+1``-token windows addressed by a global row
-index, so batch ``step`` is the same bytes for every arm — the paired
+index, so batch ``step`` is the same bytes for every condition — the paired
 data order contract — and a resumed run addresses the identical rows.
 """
 

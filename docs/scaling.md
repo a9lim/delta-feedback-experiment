@@ -10,16 +10,16 @@ non-embedding parameter. Every feedback pass adds to compute.
 
 ## Longer training at the same size
 
-A fresh `{base, df}` pair on one 8xH100-80GB Prime node, both arms seed 1,
+A fresh `{a, arf}` pair on one 8xH100-80GB Prime node, both conditions seed 1,
 data seed 0, global row zero, 171,909 steps, 56,331,141,120 predicted tokens
 each, nothing loaded from Jobe.
 
-| Arm | Predicted tokens | Active-token ratio |
+| Condition | Predicted tokens | Active-token ratio |
 |---|---:|---:|
-| `base` | 56,331,141,120 | 403.55 |
-| `df` | 56,331,141,120 | 400.00 |
+| `a` | 56,331,141,120 | 403.55 |
+| `arf` | 56,331,141,120 | 400.00 |
 
-| Phase | Steps | Passes, feedback arms |
+| Phase | Steps | Passes, `arf` |
 |---|---:|---|
 | Warmup | 1–3,438 | one |
 | Stable heat | 3,439–137,527 | one through 128,932, then two or three |
@@ -47,7 +47,7 @@ run and FLA kernel constants swept; see
 
 ## Larger geometry
 
-The larger geometry is the hard-DF architecture in
+The larger geometry is `arf` as specified in
 [architecture.md](architecture.md) at six cells and width 1,536:
 1,335,420,192 parameters, 1,102,046,496 active non-embedding. Its budget is
 400 predicted tokens per active non-embedding parameter.
@@ -82,7 +82,7 @@ behavior, memory, and throughput at that geometry.
 
 ## Larger loop
 
-One `df-loop` run at the larger width with the screen's depth: three cells,
+One `arfl` run at the larger width with the screen's depth: three cells,
 one each for prelude, core, and coda, and a deeper draw.
 
 | Field | Value |
@@ -101,7 +101,7 @@ one each for prelude, core, and coda, and a deeper draw.
 | 12 SwiGLU channel mixers | 368,050,176 |
 | 9 PKDA mixers | 152,148,816 |
 | 3 gated global GQA mixers, including Q/K norms | 28,312,128 |
-| Hard-DF fusion | 4,718,592 |
+| FBT fusion, `f` | 4,718,592 |
 | Trunk, entry, and payload norms | 43,008 |
 | 24 within-column routers and one payload router | 115,200 |
 | **Total** | **786,761,616** |

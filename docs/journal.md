@@ -4,6 +4,21 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-08 — Conditions become letters
+
+The five named arms are replaced by a modular condition string: one letter per
+change from the plain RoPE GQA decoder, `a` for the PKDA/gated-GQA trunk, `r`
+for MHDB reads, `f` for FBT feedback, and `l` reserved for the tied-depth loop
+(it parses, `DFModel` refuses it). `vanilla`, `base`, `mhdb`, `fbt`, and `df`
+are now `""`, `a`, `ar`, `af`, and `arf`; the specimens are `ar` and `arf`
+runs. Every subset of `arf` builds, so `r`, `f`, and `rf` on the plain trunk
+exist for the first time (screen counts in [design.md](design.md#conditions)).
+Snapshots move to v24 with a `condition` field; the analysis loader translates
+the arm names in v16–v23 snapshots and `training_curves.py` translates them in
+old run logs. `compare_arms.py` is now `compare_conditions.py` and writes
+`compare_conditions.json`. Nothing was trained; the letter grammar is the
+ground for the `l` design that follows.
+
 ## 2026-09-08 — `mhdb` against full-feedback `df`: what the feedback package changed inside
 
 Two completed runs on Jobe, paired by construction (seed 1, data

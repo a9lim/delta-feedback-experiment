@@ -2,16 +2,17 @@
 
 This document defines the exact computation, state, initialization, and
 optimizer of the small model organism. The implemented family is one `DFModel`
-with the five arms in [design.md](design.md). Hard Delta Feedback (`df`)
-combines Preconditioned Kimi Delta Attention (PKDA), gated global GQA,
-Multi-Head Delta Block routing (MHDB), and Full-Bandwidth Transformer (FBT)
-feedback. The controls remove specified packages from that computation.
+addressed by the condition letters in [design.md](design.md): `a` for
+Preconditioned Kimi Delta Attention (PKDA) with gated global GQA, `r` for
+Multi-Head Delta Block routing (MHDB), and `f` for Full-Bandwidth Transformer
+(FBT) feedback. Hard Delta Feedback, `arf`, has all three; dropping a letter
+removes that package from the computation.
 
 The named states and source identities are the handles the analysis scripts
 use; [interpretability](interpretability.md) lists those scripts and
 [literature](literature.md) separates source mechanisms from local choices.
 MHDB is the project's block-source specialization of multi-head delta
-routing; `mhdb` is the code and arm name.
+routing; `block_routing` is the flag and `r` the letter.
 
 ## Geometry
 
@@ -35,17 +36,17 @@ implemented.
 | PKDA Q/K/V projection width | 1,280 | 2,560 |
 | PKDA convolution width | 4 | 4 |
 | RMSNorm epsilon, every norm site | `1e-6` | `1e-6` |
-| Explicit position encoding, hybrid arms | none | none |
+| Explicit position encoding under `a` | none | none |
 
-The hybrid token-mixing schedule is exactly:
+Under `a` the token-mixing schedule is exactly:
 
 ```text
 [PKDA, PKDA, PKDA, gated global GQA] × C
 ```
 
-Hybrid arms use no sliding-window attention, MLA, RoPE, or additive position
-embedding. PKDA carries token-mixer state, order, and recency; every fourth
-layer supplies a dense causal global read. The separate `vanilla` control uses
+The `a` trunk uses no sliding-window attention, MLA, RoPE, or additive
+position embedding. PKDA carries token-mixer state, order, and recency; every
+fourth layer supplies a dense causal global read. Without `a` the trunk is
 twelve RoPE GQA layers as specified in [design.md](design.md).
 
 One feedback column computes:
@@ -76,14 +77,14 @@ diagram's explicit payload edge.
 | Column seed | Current embedding or token-gated incoming payload; the actual residual origin |
 | Completed block deltas and current partial | Contributions within one column; MHDB reads them without replacing the residual identity |
 | `h_top` | Completed column state before final readout normalization |
-| Payload | Normalization of top state plus `df` enrichment, shifted to the next token column |
+| Payload | Normalization of top state plus routed enrichment under `r` with `f`, shifted to the next token column |
 | PKDA matrix, preconditioner, convolution history | Token-mixer memory, continued during decode and reset within each current Jacobi prefill pass |
 | GQA K/V | Visible-prefix cache for the global layers |
 
-Distinguish token-mixer recurrence from explicit payload feedback. `base` and
-`mhdb` still have PKDA recurrence. The current model has no tied-depth loop;
-that different state transition is specified in
-[depth-architecture.md](depth-architecture.md).
+Distinguish token-mixer recurrence from explicit payload feedback: every `a`
+condition has PKDA recurrence whether or not it has `f`. The current model has
+no tied-depth loop; that different state transition is the `l` letter,
+specified in [depth-architecture.md](depth-architecture.md).
 
 ## Residual shell
 
@@ -306,9 +307,9 @@ The payload is the value path and the current token controls the gate. There is
 no additive embedding bypass on a feedback position. Plain-prefix positions,
 pass-1 positions, and Standard decoding use `e_t` instead of the fused seed.
 
-Hard DF uses `u_t` as both the residual seed and the first non-null source for
-every within-column MHDB router. After the final cell, a dedicated `H`-group
-payload router reads its own null, the seed, and all `C` completed block
+With `r` as well, `u_t` is both the residual seed and the first non-null
+source for every within-column MHDB router, and after the final cell a
+dedicated `H`-group payload router reads its own null, the seed, and all `C` completed block
 deltas. The recurrent payload is:
 
 ```text
@@ -371,7 +372,7 @@ state. Its authoritative tied parameter and accumulated gradient remain FP32.
 
 ## NorMuonH and NAdam
 
-All implemented arms and the larger geometry use one optimizer recipe with two
+Every condition and the larger geometry use one optimizer recipe with two
 disjoint parameter groups: one NorMuonH group and one NAdam group. Their public
 controls are `--lr-normuonh` and `--lr-nadam`. No group uses weight decay.
 
@@ -459,9 +460,9 @@ the run.
 
 ## Parameter and cache accounting
 
-The small `df` organism has **257,514,792** parameters, of which
-**140,827,944** are active non-embedding parameters. The other arm counts are
-in [design.md](design.md#controlled-specimen-family). At 1,024 positions its
+The small `arf` organism has **257,514,792** parameters, of which
+**140,827,944** are active non-embedding parameters. The other conditions'
+counts are in [design.md](design.md#conditions). At 1,024 positions its
 three cells require about 10.37 MiB of token-mixer cache per sequence: about
 5.87 MiB for FP32 PKDA matrix/diagonal states and BF16 convolution histories,
 and 4.50 MiB for BF16 GQA K/V. Payload, logits, allocator overhead, and serving
@@ -478,7 +479,7 @@ The larger geometry has the following exact accounting.
 | 24 SwiGLU channel mixers | 736,100,352 |
 | 18 PKDA mixers | 304,297,632 |
 | 6 gated global GQA mixers, including Q/K norms | 56,624,256 |
-| Hard-DF fusion | 4,718,592 |
+| FBT fusion, `f` | 4,718,592 |
 | Trunk, entry, and payload norms | 79,872 |
 | 48 within-column routers and one payload router | 225,792 |
 | **Total** | **1,335,420,192** |

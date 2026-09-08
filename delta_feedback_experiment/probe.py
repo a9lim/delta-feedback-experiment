@@ -28,8 +28,8 @@ def cuda_gate() -> None:
         _ClassifierShadow,
         _fixed_cce_z,
         _route_sources,
-        arm_config,
         batch_vocab_order,
+        condition_config,
         iterate_fused,
         linear_cross_entropy,
     )
@@ -433,9 +433,9 @@ def cuda_gate() -> None:
     # Exercise causal FlexAttention and explicit GQA prefix-cache decoding.
     # BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
-    def decode_parity(arm: str, layers: int) -> float:
-        decode_cfg = arm_config(
-            arm,
+    def decode_parity(condition: str, layers: int) -> float:
+        decode_cfg = condition_config(
+            condition,
             vocab_size=1000,
             dim=128,
             layers=layers,
@@ -476,17 +476,19 @@ def cuda_gate() -> None:
         # independently gated projection and recurrence components remain
         # below their tighter bounds above.
         if relative >= 0.04:
-            raise AssertionError(f"{arm} cache parity drift: {relative:.4f}")
+            raise AssertionError(
+                f"{condition!r} cache parity drift: {relative:.4f}"
+            )
         del decode_model, decode_tokens, full, cache, prefill, pieces, incremental
         return relative
 
-    vanilla_decode_rel = decode_parity("vanilla", 3)
-    hybrid_decode_rel = decode_parity("base", 4)
+    plain_decode_rel = decode_parity("", 3)
+    hybrid_decode_rel = decode_parity("a", 4)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    args = build_parser().parse_args(["cuda-probe", "--arm", "df"])
+    args = build_parser().parse_args(["cuda-probe", "--condition", "arf"])
     schedule = build_schedule(args)
     torch.set_float32_matmul_precision("high")
 
@@ -507,8 +509,8 @@ def cuda_gate() -> None:
     torch.manual_seed(args.seed)
     model = (
         DFModel(
-            arm_config(
-                "df",
+            condition_config(
+                "arf",
                 vocab_size=args.vocab_size,
                 dim=args.dim,
                 layers=args.layers,
@@ -599,7 +601,7 @@ def cuda_gate() -> None:
     # captured train/eval bodies cannot expose by themselves.
     summary = route_summary(model, probe_validation, args, torch.device("cuda"))
     if not summary:
-        raise AssertionError("CUDA route summary is empty for the DF arm")
+        raise AssertionError("CUDA route summary is empty for the arf condition")
     trace = iterate_fused(model, probe_validation.batch(0, 2, "cuda"), n_iters=2)
     if any(
         not math.isfinite(record[key])
@@ -686,7 +688,7 @@ def cuda_gate() -> None:
         f"pkda_rel={pkda_value_rel:.4f} | "
         f"conv_rel={conv_rel:.4f} | "
         f"norm_gate_rel={norm_gate_rel:.4f} | "
-        f"decode_rel={vanilla_decode_rel:.4f}/{hybrid_decode_rel:.4f} | "
+        f"decode_rel={plain_decode_rel:.4f}/{hybrid_decode_rel:.4f} | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)
     )

@@ -14,9 +14,9 @@ which one it is indexed by.
 
 | Axis | State and transition | Status |
 |---|---|---|
-| Token-mixer memory | PKDA matrix, diagonal preconditioner, and convolution history advance along tokens; GQA retains prefix K/V | Every hybrid arm, including `base` |
-| Latent feedback | FBT transfers the previous column's payload through the current token's gate | `fbt` and `df`; Jacobi passes train it in parallel |
-| Tied depth | A shared core repeatedly updates one column's residual state | Specified in `df-loop`, not built |
+| Token-mixer memory | PKDA matrix, diagonal preconditioner, and convolution history advance along tokens; GQA retains prefix K/V | Every condition with `a`, whether or not it has `f` |
+| Latent feedback | FBT transfers the previous column's payload through the current token's gate | Every condition with `f`; Jacobi passes train it in parallel |
+| Tied depth | A shared core repeatedly updates one column's residual state | The `l` letter, specified and not built |
 
 In repeated-prefill diagnostics each pass recomputes its mixer states from
 zero and consumes the preceding pass's shifted payload. In sequential feedback
@@ -33,7 +33,7 @@ across generated tokens. The two execution modes can behave differently.
 | `scripts/fused_diagnostics.py` | Fused minus pass-1 loss by position, fused-in-token surprise, and token frequency; gate, seed-decodability, and scale statistics; a 30-iteration self-composition trace | Conditioning on a position's own pass-1 loss selects on noise; condition on entropy or frequency instead |
 | `scripts/entry_sweeps.py` | Gate temperature, fused-seed scale, embedding bypass, zero and foreign payloads at the FBT entry | Out-of-distribution perturbations of a co-adapted entry; they bound dependence |
 | `scripts/feedback_followups.py` | Fused-block impulse response, payload-head ablation, split-validated pass mixtures, pass-1 versus fused gradient alignment | The fused-then-plain boundary never occurs in training |
-| `scripts/compare_arms.py` | Two checkpoints on identical rows: per-token loss structure, predictor KL and agreement, mixtures, residual-stream CKA per source, payload redundancy with the readout | Paired runs differ like two seeds |
+| `scripts/compare_conditions.py` | Two checkpoints on identical rows: per-token loss structure, predictor KL and agreement, mixtures, residual-stream CKA per source, payload redundancy with the readout | Paired runs differ like two seeds |
 | `scripts/weight_divergence.py` | Angular movement of every shared parameter from the paired initialization and between two runs | Under fixed-radius updates angle says little about function |
 | `scripts/dense_feedback_continue.py` | Continued training of one snapshot with dense feedback passes or the plain-only control | A recipe intervention on a checkpoint |
 | `scripts/downstream_eval.py` | The workspace zero-shot suite in Standard, Soft, or Fused mode, with per-document records for paired comparison | Soft feeds back only along the scored continuation |
@@ -42,7 +42,7 @@ across generated tokens. The two execution modes can behave differently.
 | Trainer telemetry / `df watch` | Training health, validation, routing summaries, recurrent dynamics | Operational |
 | `df probe` and portable semantics | Numerical, causal, gradient, cache, and execution invariants | Engineering |
 
-Every script rebuilds the arm from a snapshot through
+Every script rebuilds the condition from a snapshot through
 `delta_feedback_experiment.analysis`, evaluates under the trainer's numerics
 (BF16 autocast on CUDA, classifier shadow prepared), and writes a JSON record
 beside its figures under `figures/<kind>-<tag>/`. Commands are in
@@ -101,7 +101,7 @@ and task behavior separate some of these; interventions separate the rest.
 The fixed-token self-composition trace is the first diagnostic; perturbation
 propagation, recovery, and dependence on history are natural follow-ons.
 
-`df-loop` adds iteration-indexed states and a shared core cache. Its
+The `l` letter adds iteration-indexed states and a shared core cache. Its
 two-channel sequence trace advances both the payload and the write bank, so
 the current payload-only trace does not test its dynamics. See
 [depth-architecture.md](depth-architecture.md).

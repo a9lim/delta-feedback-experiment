@@ -48,7 +48,7 @@ def main() -> None:
     device = next(model.parameters()).device
     cfg = model.cfg
     if not cfg.feedback_active or not cfg.routing_active:
-        raise SystemExit("the payload sweep needs the df payload router")
+        raise SystemExit("the payload sweep needs a routed payload: a condition with r and f")
     if args.head is not None and not 0 <= args.head < cfg.routing_heads:
         raise SystemExit(
             f"--head must be in [0, {cfg.routing_heads - 1}], got {args.head}"

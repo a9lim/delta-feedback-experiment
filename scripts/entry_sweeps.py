@@ -44,7 +44,7 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     if not model.cfg.feedback_active:
-        raise SystemExit("entry sweeps need an fbt or df snapshot")
+        raise SystemExit("entry sweeps need a snapshot of a condition with f")
     T = saved["seq_len"]
     tag = saved.get("tag", args.snapshot.stem)
     out_dir = args.out_dir or Path("figures") / f"fused-{tag}"

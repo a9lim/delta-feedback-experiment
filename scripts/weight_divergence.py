@@ -1,7 +1,7 @@
 """Weight-space divergence of two paired checkpoints from their shared initialization.
 
-The arms initialize the hybrid trunk byte-identically and factor
-modules pairwise from the same seed (design.md), so for every parameter both
+Paired conditions initialize their shared trunk byte-identically and
+letter-private modules pairwise from the same seed (design.md), so for every parameter both
 snapshots share, the script measures how far each run moved from ``W0``, how
 far apart the two ended, and how aligned their total updates are.  NorMuonH
 matrices live on a fixed Frobenius sphere, so their movement is purely angular

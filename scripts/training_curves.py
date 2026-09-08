@@ -26,6 +26,8 @@ import numpy as np
 import figstyle as fs
 import matplotlib.pyplot as plt
 
+from delta_feedback_experiment.analysis import NAMED_ARMS
+
 STEP_RE = re.compile(r"^(\w+)\s*\|")
 
 
@@ -46,7 +48,7 @@ def parse_log(path: Path) -> dict:
         if "step" in fields and "/" in fields["step"]:
             fields["step"] = int(fields["step"].split("/")[0])
         for k, v in list(fields.items()):
-            if k in ("site", "phase", "tag", "arm", "path", "kind", "device"):
+            if k in ("site", "phase", "tag", "condition", "arm", "path", "kind", "device"):
                 continue
             try:
                 fields[k] = float(v)
@@ -304,7 +306,7 @@ def main() -> None:
         entry = summary["runs"].setdefault(lab, {})
         entry.update(
             {
-                "arm": run["run"].get("arm"),
+                "condition": run["run"].get("condition", NAMED_ARMS.get(run["run"].get("arm"))),
                 "final_val": float(e["val"][-1]),
                 "final_val_fused": None if np.isnan(e["val_fused"][-1]) else float(e["val_fused"][-1]),
                 "steps": int(a["step"][-1]),

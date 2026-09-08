@@ -1,13 +1,15 @@
-"""The DF model family: one trunk with five exact arm configurations.
+"""The DF model family: one trunk, one letter per change from the plain decoder.
 
 The architecture contract is ``docs/architecture.md``. Everything here is
-arm-agnostic model semantics: the five arms are one class under
-:class:`ModelConfig` flags. The four factorial cells share the hybrid
-PKDA/gated-GQA trunk; the axes are MHDB and FBT. ``vanilla`` is the pure-GQA
-external trunk control.
+condition-agnostic model semantics: a condition is a string of letters from
+:data:`CONDITION_LETTERS`, each switching on one :class:`ModelConfig` flag
+over the plain twelve-layer RoPE GQA decoder (the empty condition). ``a``
+replaces the trunk with the PKDA/gated-GQA hybrid, ``r`` adds MHDB reads,
+``f`` adds FBT feedback, and ``l`` names the tied-depth loop that is specified
+and not built.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
-the trainer owns the shared streams that keep paired arms architecturally
-identical in everything but the flags.
+the trainer owns the shared streams that keep paired conditions
+architecturally identical in everything but the flags.
 
 Semantics worth naming because they are easy to get subtly wrong:
 
@@ -64,7 +66,41 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     _handle_eps = None
     compute_z_loss = None
 
-ARMS = ("vanilla", "base", "mhdb", "fbt", "df")
+CONDITION_LETTERS: dict[str, tuple[str, str]] = {
+    "a": (
+        "hybrid",
+        "Kimi Delta Attention: the [PKDA, PKDA, PKDA, gated global GQA] trunk",
+    ),
+    "r": (
+        "block_routing",
+        "MHDB residual reads of the seed and block deltas before every sublayer",
+    ),
+    "f": (
+        "feedback",
+        "full-bandwidth feedback: the FBT entry and a payload for the next column",
+    ),
+    "l": ("loop", "Huginn loop: the tied-depth core, specified and not built"),
+}
+"""Letter -> (``ModelConfig`` flag, one-line change), in canonical order."""
+
+
+def parse_condition(text: str) -> str:
+    """Canonicalize a condition string.
+
+    Each letter is one change from the plain decoder; letters may arrive in any
+    order and come back in :data:`CONDITION_LETTERS` order. The empty string is
+    the plain twelve-layer RoPE GQA decoder.
+    """
+    unknown = sorted(set(text) - set(CONDITION_LETTERS))
+    if unknown:
+        raise ValueError(
+            f"unknown condition letters {''.join(unknown)!r} in {text!r}; "
+            f"expected letters from {''.join(CONDITION_LETTERS)!r}"
+        )
+    if len(set(text)) != len(text):
+        raise ValueError(f"repeated letter in condition {text!r}")
+    return "".join(letter for letter in CONDITION_LETTERS if letter in text)
+
 
 BASE_NORMAL_INIT_STD = 0.02
 """Sampling scale retained for embeddings and NAdam-owned dense matrices."""
@@ -72,13 +108,12 @@ BASE_NORMAL_INIT_STD = 0.02
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Trunk geometry plus the two-axis arm flags.
+    """Trunk geometry plus one flag per condition letter.
 
-    Defaults are the screen geometry. ``vanilla`` uses the legacy
-    pure-GQA trunk; every other arm uses the 3:1 PKDA/gated-global-GQA hybrid.
-    Routing heads are not an independent knob: every routed arm uses one
-    contiguous feature group per KV head. The groups do not align to mixer
-    projections.
+    Defaults are the screen geometry and the plain RoPE GQA trunk; ``hybrid``
+    (``a``) is the 3:1 PKDA/gated-global-GQA hybrid. Routing heads are not an
+    independent knob: every routed condition uses one contiguous feature group
+    per KV head. The groups do not align to mixer projections.
     """
 
     vocab_size: int = 151936
@@ -98,13 +133,16 @@ class ModelConfig:
     """Exact MHDB cell width in transformer layers."""
 
     hybrid: bool = False
-    """Use [PKDA, PKDA, PKDA, gated global GQA] cells."""
+    """``a``: [PKDA, PKDA, PKDA, gated global GQA] cells instead of RoPE GQA."""
 
     block_routing: bool = False
-    """MHDB axis: multi-head block-delta routing before every sublayer."""
+    """``r``: multi-head block-delta routing before every sublayer."""
 
     feedback: bool = False
-    """FBT axis: gated entry plus a payload for the next column."""
+    """``f``: FBT gated entry plus a payload for the next column."""
+
+    loop: bool = False
+    """``l``: the tied-depth core of ``docs/depth-architecture.md``; not built."""
 
     def __post_init__(self) -> None:
         if self.routing_block_size < 1:
@@ -113,6 +151,15 @@ class ModelConfig:
             raise ValueError("PKDA head count and dimension must be positive")
         if self.pkda_conv_size < 1:
             raise ValueError("PKDA convolution width must be positive")
+
+    @property
+    def condition(self) -> str:
+        """The canonical letters of this configuration."""
+        return "".join(
+            letter
+            for letter, (flag, _) in CONDITION_LETTERS.items()
+            if getattr(self, flag)
+        )
 
     @property
     def routing_active(self) -> bool:
@@ -154,18 +201,11 @@ class ModelConfig:
         )
 
 
-def arm_config(arm: str, **overrides) -> ModelConfig:
-    """The named arm's configuration; overrides adjust instantiated geometry."""
-    flags = {
-        "vanilla": {},
-        "base": {"hybrid": True},
-        "mhdb": {"hybrid": True, "block_routing": True},
-        "fbt": {"hybrid": True, "feedback": True},
-        "df": {"hybrid": True, "block_routing": True, "feedback": True},
-    }
-    if arm not in flags:
-        raise ValueError(f"unknown arm {arm!r}; expected one of {ARMS}")
-    return replace(ModelConfig(**overrides), **flags[arm])
+def condition_config(condition: str, **overrides) -> ModelConfig:
+    """The configuration a condition string names; overrides adjust geometry."""
+    letters = parse_condition(condition)
+    flags = {flag: letter in letters for letter, (flag, _) in CONDITION_LETTERS.items()}
+    return replace(ModelConfig(**overrides), **flags)
 
 
 class RMSNorm(nn.Module):
@@ -337,7 +377,7 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Dense GQA: RoPE for vanilla, NoPE plus sigmoid gate in the hybrid."""
+    """Dense GQA: RoPE on the plain trunk, NoPE plus sigmoid gate under ``a``."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -388,7 +428,7 @@ class Attention(nn.Module):
         k = self.k_norm(k)
         if self.use_rope:
             if cos is None or sin is None:
-                raise ValueError("vanilla GQA requires rotary position tables")
+                raise ValueError("RoPE GQA requires rotary position tables")
             q = apply_rope(q, cos, sin)
             k = apply_rope(k, cos, sin)
         if cache is not None and length > 1 and cache.pos != 0:
@@ -766,7 +806,7 @@ class ColumnOutput:
     """Top-of-stack residual stream [B, T, D], pre final norm."""
 
     payload: Tensor | None
-    """What rides to the next column (feedback arms), [B, T, D]."""
+    """What rides to the next column (conditions with ``f``), [B, T, D]."""
 
     route_weights: dict[str, Tensor]
     """Site → per-head softmax weights [N, B, T, H], when requested."""
@@ -799,6 +839,11 @@ class DFModel(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
+        if cfg.loop:
+            raise NotImplementedError(
+                "the l condition (tied-depth loop) is specified in "
+                "docs/depth-architecture.md and not built"
+            )
         self.cfg = cfg
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
@@ -807,7 +852,7 @@ class DFModel(nn.Module):
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         # Capture the exact common-trunk initialization boundary before
         # constructing any factor-specific random matrices. Restoring it below
-        # keeps every shared parameter byte-identical across arms.
+        # keeps every shared parameter byte-identical across conditions.
         common_init_state = torch.random.get_rng_state()
         self.attention_gates = nn.ModuleList(
             nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
@@ -859,8 +904,8 @@ class DFModel(nn.Module):
     def _init_factor_linears(linears: Iterable[nn.Linear], seed: int) -> None:
         """Initialize one factor from its own seed-stable random stream.
 
-        Conditional factor modules must not shift common initialization, and
-        the same factor must initialize identically in its parent and DF cell.
+        Letter-private modules must not shift common initialization, and the
+        same letter must initialize identically in every condition that has it.
         Models are constructed on CPU (or meta for accounting) before moving to
         an execution device, so one local CPU generator is authoritative.
         """
@@ -1231,10 +1276,11 @@ class DFModel(nn.Module):
         want_weights: bool = False,
     ) -> ColumnOutput:
         """Decode one column: tokens [B, 1], payload [B, 1, D] from the
-        previous column (None for Standard decoding and non-feedback arms)."""
+        previous column (None for Standard decoding and conditions without
+        ``f``)."""
         e = self.embed_tokens(tokens)
         if payload is not None and not self.cfg.feedback_active:
-            raise ValueError("a feedback-free arm cannot consume a payload")
+            raise ValueError("a condition without f cannot consume a payload")
         x = self.fuse(payload, e) if payload is not None else e
         return self.forward_column(x, cache=cache, want_weights=want_weights)
 
@@ -1256,7 +1302,7 @@ def multipass(
     jitter: Tensor | None = None,
     want_weights: bool = False,
 ) -> list[ColumnOutput]:
-    """The arm-agnostic Jacobi multi-pass forward.
+    """The condition-agnostic Jacobi multi-pass forward.
 
     tokens [B, T+1] is one stored row: the model executes its first T
     positions, which are exactly the positions that predict tokens 1..T.
@@ -1267,12 +1313,12 @@ def multipass(
     stored-row width and its first T columns are added to the carried
     payload before shifting, so the keyed draw is independent of how many
     positions execute.  Both are pre-drawn by the caller — the shared
-    randomness contract lives in the trainer, not here.  Non-feedback
-    arms simply take n_passes=1.
+    randomness contract lives in the trainer, not here.  Conditions
+    without ``f`` simply take n_passes=1.
     """
     cfg = model.cfg
     if n_passes > 1 and not cfg.feedback_active:
-        raise ValueError("multi-pass batches require a feedback-bearing arm")
+        raise ValueError("multi-pass batches require a condition with f")
     e = model.embed_tokens(tokens[:, :-1])
     out = model.forward_column(
         e, want_weights=want_weights, need_payload=n_passes > 1 or want_weights
@@ -1523,7 +1569,7 @@ def iterate_fused(
     """
     cfg = model.cfg
     if not cfg.feedback_active:
-        raise ValueError("the contraction diagnostic needs a feedback-bearing arm")
+        raise ValueError("the contraction diagnostic needs a condition with f")
     # This is part of the standing training monitor, so CUDA must follow the
     # same BF16 activation path as captured training and evaluation, which
     # preserves the numerical contract and reuses the captured block

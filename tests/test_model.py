@@ -7,20 +7,22 @@ prefix mixin degenerates to pass 1, and cached sequential decoding equals
 the exact recurrence computed by full recomputation.
 """
 
+import itertools
 import math
 
 import pytest
 import torch
 
 from delta_feedback_experiment.model import (
-    ARMS,
     BASE_NORMAL_INIT_STD,
+    CONDITION_LETTERS,
     DFModel,
     KVCache,
-    arm_config,
+    condition_config,
     iterate_fused,
     multipass,
     multipass_loss,
+    parse_condition,
     shift_right,
 )
 from delta_feedback_experiment.pkda import PreconditionedKDA, _PackedControlSplit
@@ -40,9 +42,13 @@ TINY = {
 }
 
 
-def tiny(arm: str, seed: int = 0) -> DFModel:
+BUILDABLE = ("", "a", "r", "f", "ar", "af", "rf", "arf")
+"""Every buildable condition: the subsets of ``arf`` in canonical order."""
+
+
+def tiny(condition: str, seed: int = 0) -> DFModel:
     torch.manual_seed(seed)
-    return DFModel(arm_config(arm, **TINY)).eval()
+    return DFModel(condition_config(condition, **TINY)).eval()
 
 
 def tokens(batch=2, length=16, seed=1, vocab=97):
@@ -57,74 +63,111 @@ def forward(model, toks, **kwargs):
 # -- structure -----------------------------------------------------------------
 
 
-def test_arm_flags():
-    vanilla = arm_config("vanilla", **TINY)
-    assert not vanilla.routing_active
-    assert not vanilla.feedback_active
-    assert not vanilla.gated_attention
-    assert not vanilla.hybrid
-    base = arm_config("base", **TINY)
-    assert base.hybrid and base.gated_attention
-    assert not base.routing_active and not base.feedback_active
-    assert base.is_pkda_layer(0) and not base.is_pkda_layer(3)
-    mhdb = arm_config("mhdb", **TINY)
-    assert mhdb.routing_active
-    assert not mhdb.feedback_active
-    assert mhdb.gated_attention
-    assert mhdb.routing_heads == TINY["kv_heads"]
-    assert mhdb.routing_block_size == 4
-    fbt = arm_config("fbt", **TINY)
-    assert fbt.gated_entry
-    assert not fbt.routing_active
-    assert fbt.gated_attention
-    df = arm_config("df", **TINY)
-    assert df.gated_entry
-    assert df.routing_active
-    assert df.gated_attention
+def test_condition_grammar():
+    """One letter per change from the plain decoder; any order in, canonical
+    order out; the configuration renders its own letters back."""
+    assert tuple(CONDITION_LETTERS) == ("a", "r", "f", "l")
+    assert parse_condition("") == ""
+    assert parse_condition("fra") == "arf"
+    assert parse_condition("lfra") == "arfl"
+    for text in ("dar", "mhdb", "df", "vanilla", "aa", "arfx"):
+        with pytest.raises(ValueError, match="condition"):
+            parse_condition(text)
+    for count in range(5):
+        for letters in itertools.combinations("lfra", count):
+            text = "".join(letters)
+            assert condition_config(text, **TINY).condition == parse_condition(text)
+    looped = condition_config("arfl", **TINY)
+    assert looped.loop and looped.hybrid
+    assert looped.routing_active and looped.feedback_active
+    with pytest.raises(NotImplementedError, match="not built"):
+        DFModel(looped)
 
-    screen = arm_config("base")
+
+def test_condition_flags():
+    plain = condition_config("", **TINY)
+    assert not plain.routing_active
+    assert not plain.feedback_active
+    assert not plain.gated_attention
+    assert not plain.hybrid
+    hybrid = condition_config("a", **TINY)
+    assert hybrid.hybrid and hybrid.gated_attention
+    assert not hybrid.routing_active and not hybrid.feedback_active
+    assert hybrid.is_pkda_layer(0) and not hybrid.is_pkda_layer(3)
+    routed = condition_config("ar", **TINY)
+    assert routed.routing_active
+    assert not routed.feedback_active
+    assert routed.gated_attention
+    assert routed.routing_heads == TINY["kv_heads"]
+    assert routed.routing_block_size == 4
+    fed = condition_config("af", **TINY)
+    assert fed.gated_entry
+    assert not fed.routing_active
+    assert fed.gated_attention
+    full = condition_config("arf", **TINY)
+    assert full.gated_entry
+    assert full.routing_active
+    assert full.gated_attention
+    # Letters compose independently of the trunk letter.
+    plain_routed_fed = condition_config("rf", **TINY)
+    assert plain_routed_fed.routing_active and plain_routed_fed.feedback_active
+    assert not plain_routed_fed.hybrid and not plain_routed_fed.gated_attention
+
+    screen = condition_config("a")
     assert screen.intermediate * 6 == screen.dim * 26
     assert screen.pkda_heads == 10
     assert screen.pkda_heads * screen.pkda_head_dim * 3 == screen.dim * 5
     assert screen.routing_heads == 4
     assert screen.norm_eps == 1e-6
-    assert DFModel(base).blocks[0].attn.norm_eps == base.norm_eps
+    assert DFModel(hybrid).blocks[0].attn.norm_eps == hybrid.norm_eps
 
 
-def test_parents_are_deletions():
-    """Every parent's parameter set is a strict subset of DF's."""
-    names = {arm: {name for name, _ in tiny(arm).named_parameters()} for arm in ARMS}
-    assert names["base"] < names["mhdb"] < names["df"]
-    assert names["base"] < names["fbt"] < names["df"]
-    # The union misses exactly the payload router, which needs both axes.
-    assert names["df"] - (names["mhdb"] | names["fbt"]) == {
-        "payload_router.query",
-        "payload_router.key_norm.weight",
-        "payload_router.null",
+def test_letters_only_add_parameters():
+    """On either trunk, adding letters adds parameters: a condition's names are
+    a strict subset of every condition that has its letters and more."""
+    names = {
+        condition: {name for name, _ in tiny(condition).named_parameters()}
+        for condition in BUILDABLE
     }
-    for arm in ("mhdb", "df"):
-        assert any("null" in name for name in names[arm])
-    assert not any("blocks.0.attn.q_proj" in name for name in names["vanilla"])
+    for small in BUILDABLE:
+        for large in BUILDABLE:
+            same_trunk = ("a" in small) == ("a" in large)
+            if small != large and set(small) < set(large) and same_trunk:
+                assert names[small] < names[large], (small, large)
+    # The union of r and f misses exactly the payload router, which needs both.
+    for trunk in ("", "a"):
+        assert names[trunk + "rf"] - (names[trunk + "r"] | names[trunk + "f"]) == {
+            "payload_router.query",
+            "payload_router.key_norm.weight",
+            "payload_router.null",
+        }
+    for condition in ("r", "ar", "rf", "arf"):
+        assert any("null" in name for name in names[condition])
+    assert not any("blocks.0.attn.q_proj" in name for name in names[""])
+    assert not any("attention_gates" in name for name in names["rf"])
 
 
 def test_screen_param_count():
     expected = {
-        "vanilla": (229_954_560, 113_267_712),
-        "base": (256_275_240, 139_588_392),
-        "mhdb": (256_330_536, 139_643_688),
-        "fbt": (257_457_192, 140_770_344),
-        "df": (257_514_792, 140_827_944),
+        "": (229_954_560, 113_267_712),
+        "r": (230_009_856, 113_323_008),
+        "f": (231_136_512, 114_449_664),
+        "rf": (231_194_112, 114_507_264),
+        "a": (256_275_240, 139_588_392),
+        "ar": (256_330_536, 139_643_688),
+        "af": (257_457_192, 140_770_344),
+        "arf": (257_514_792, 140_827_944),
     }
     with torch.device("meta"):
-        for arm, (total, active_non_embedding) in expected.items():
-            model = DFModel(arm_config(arm))
+        for condition, (total, active_non_embedding) in expected.items():
+            model = DFModel(condition_config(condition))
             count = sum(parameter.numel() for parameter in model.parameters())
             assert count == total
             assert count - model.embed_tokens.weight.numel() == active_non_embedding
 
 
 def test_large_projections_are_persistently_packed():
-    model = tiny("df")
+    model = tiny("arf")
     pkda = model.blocks[0].attn
     attention = model.blocks[3].attn
     mlp = model.blocks[0].mlp
@@ -180,27 +223,34 @@ def test_packed_control_split_preserves_forward_and_backward():
     assert torch.equal(actual.grad, expected.grad)
 
 
-def test_factorial_initialization_is_paired_by_semantic_factor():
-    models = {arm: tiny(arm, seed=17) for arm in ARMS}
-    states = {arm: model.state_dict() for arm, model in models.items()}
-
-    # The four hybrid cells share one byte-identical trunk. Conditional MHDB
-    # and FBT modules cannot advance its initialization stream.
-    for name, value in states["base"].items():
-        for arm in ("mhdb", "fbt", "df"):
-            assert torch.equal(value, states[arm][name]), (arm, name)
-
-    # Each intervention package is also paired between its parent and DF.
-    for layer in range(TINY["layers"]):
-        for kind in ("attn", "mlp"):
-            null = f"blocks.{layer}.{kind}_router.null"
-            assert torch.equal(states["mhdb"][null], states["df"][null])
-    for name in ("fuse_value.weight", "fuse_gate.weight"):
-        assert torch.equal(states["fbt"][name], states["df"][name])
+def test_initialization_pairs_across_conditions_by_letter():
+    """Conditions on the same trunk share every common parameter
+    byte-identically: the trunk from the common stream, and each letter's
+    private modules from that letter's own seeded stream, which never
+    advances the common one."""
+    states = {
+        condition: tiny(condition, seed=17).state_dict() for condition in BUILDABLE
+    }
+    for left in BUILDABLE:
+        for right in BUILDABLE:
+            if ("a" in left) != ("a" in right):
+                continue
+            for name in states[left].keys() & states[right].keys():
+                assert torch.equal(states[left][name], states[right][name]), (
+                    left,
+                    right,
+                    name,
+                )
+    # The two trunks consume the common stream differently, so names they
+    # both have do not pair across the trunk letter.
+    assert not torch.equal(
+        states[""]["blocks.0.mlp.gate_up_proj.weight"],
+        states["a"]["blocks.0.mlp.gate_up_proj.weight"],
+    )
 
 
 def test_normuonh_matrices_use_inverse_sqrt_fan_in_initialization():
-    model = tiny("df", seed=23)
+    model = tiny("arf", seed=23)
 
     def rms(weight):
         return weight.detach().square().mean().sqrt().item()
@@ -232,7 +282,7 @@ def test_normuonh_matrices_use_inverse_sqrt_fan_in_initialization():
 def test_classifier_shadow_is_derived_and_preserves_master_gradients():
     from delta_feedback_experiment.model import _ClassifierShadow
 
-    model = tiny("df")
+    model = tiny("arf")
     assert model._classifier_shadow is None
     assert model.classifier_for_loss() is model.embed_tokens.weight
     assert not any("classifier_shadow" in name for name in model.state_dict())
@@ -274,7 +324,7 @@ def test_sink_linear_accumulates_segment_gradients_in_place():
 
 
 def test_gradient_sinks_bind_every_large_projection_and_unbind_cleanly():
-    model = tiny("df").train()
+    model = tiny("arf").train()
     buffers = {p: torch.zeros_like(p) for p in model.parameters()}
     bound = model.bind_gradient_sinks(buffers)
     names = {name for name, p in model.named_parameters() if p in bound}
@@ -308,7 +358,7 @@ def test_tied_embedding_sink_accumulates_both_gradient_paths_in_place():
     classifier adds its BF16 gradient directly; autograd sees no gradient."""
     from delta_feedback_experiment.model import _ClassifierShadow, _EmbeddingSink
 
-    model = tiny("df").train()
+    model = tiny("arf").train()
     weight = model.embed_tokens.weight
     toks = tokens()
     sink = torch.zeros_like(weight)
@@ -331,7 +381,7 @@ def test_tied_embedding_sink_accumulates_both_gradient_paths_in_place():
 
 
 def test_zero_gqa_gate_halves_the_ungated_attention_branch():
-    model = tiny("base")
+    model = tiny("a")
     attention = model.blocks[3].attn
     gate_weight = model.attention_gates[0].weight
     x = torch.randn(2, 7, TINY["dim"])
@@ -347,19 +397,19 @@ def test_zero_gqa_gate_halves_the_ungated_attention_branch():
 
 def test_zero_init_routing_uniform():
     """Zero-init queries route uniformly, including over every null."""
-    for arm in ("mhdb", "df"):
-        out = forward(tiny(arm), tokens(), want_weights=True)
+    for condition in ("ar", "arf"):
+        out = forward(tiny(condition), tokens(), want_weights=True)
         assert out.route_source_names["L0.attn"] == ("null", "seed")
         for site, weights in out.route_weights.items():
             n = weights.shape[0]
             assert weights.shape[-1] == TINY["kv_heads"]
             assert torch.allclose(weights, torch.full_like(weights, 1.0 / n)), (
-                f"{arm} {site}"
+                f"{condition} {site}"
             )
 
 
 def test_algebraic_router_matches_normalized_reference_in_fp32():
-    model = tiny("mhdb")
+    model = tiny("ar")
     router = model.blocks[2].mlp_router
     with torch.no_grad():
         router.query.normal_()
@@ -383,7 +433,7 @@ def test_algebraic_router_matches_normalized_reference_in_fp32():
 
 
 def test_routing_heads_can_select_different_sources():
-    model = tiny("mhdb")
+    model = tiny("ar")
     router = model.blocks[2].mlp_router
     source0 = torch.zeros(1, 1, TINY["dim"])
     source1 = torch.zeros_like(source0)
@@ -399,7 +449,7 @@ def test_routing_heads_can_select_different_sources():
 
 
 def test_null_value_follows_activation_dtype_with_fp32_gradient():
-    model = tiny("mhdb").train()
+    model = tiny("ar").train()
     router = model.blocks[0].attn_router
     source = torch.randn(1, 3, TINY["dim"], dtype=torch.bfloat16)
     routed, _ = router([source], [None], False)
@@ -409,25 +459,25 @@ def test_null_value_follows_activation_dtype_with_fp32_gradient():
     assert router.null.grad.dtype == torch.float32
 
 
-def test_single_head_routing_and_unknown_arm_are_rejected():
-    with pytest.raises(ValueError, match="unknown arm"):
-        arm_config("dar", **TINY)
-    with pytest.raises(ValueError, match="unknown arm"):
-        arm_config("mhdar", **TINY)
-    with pytest.raises(ValueError, match="unknown arm"):
-        arm_config("df_soft", **TINY)
-    cfg = arm_config("mhdb", **(TINY | {"kv_heads": 1}))
+def test_single_head_routing_and_unknown_letters_are_rejected():
+    with pytest.raises(ValueError, match="unknown condition letters 'd'"):
+        condition_config("dar", **TINY)
+    with pytest.raises(ValueError, match="unknown condition letters 'bdhm'"):
+        condition_config("mhdb", **TINY)
+    with pytest.raises(ValueError, match="repeated letter"):
+        condition_config("arra", **TINY)
+    cfg = condition_config("ar", **(TINY | {"kv_heads": 1}))
     with pytest.raises(ValueError, match="at least two"):
         DFModel(cfg)
     with pytest.raises(ValueError, match="block size"):
-        arm_config("mhdb", **(TINY | {"routing_block_size": 0}))
+        condition_config("ar", **(TINY | {"routing_block_size": 0}))
 
 
 def test_telescoping():
     """The stream is exactly seed + Σdeltas at the top — transient-read
     routing never leaks into the residual stream."""
-    for arm in ("mhdb", "df"):
-        model = tiny(arm)
+    for condition in ("ar", "arf"):
+        model = tiny(condition)
         # Sharpen every query so routing is far from uniform — the identity
         # must hold because of *semantics*, not because routing is ~0.
         with torch.no_grad():
@@ -438,11 +488,11 @@ def test_telescoping():
         stream_seed = out.sources[out.n_seeds - 1]  # x is always the last seed
         deltas = out.sources[out.n_seeds :]
         rebuilt = stream_seed + torch.stack(deltas).sum(0)
-        assert torch.allclose(out.h_top, rebuilt, atol=1e-5), arm
+        assert torch.allclose(out.h_top, rebuilt, atol=1e-5), condition
 
 
 def test_block_sources_and_current_partial_labels():
-    model = tiny("df")
+    model = tiny("arf")
     out = forward(model, tokens(), want_weights=True)
     assert out.source_names == ("seed", "block0")
     assert out.route_source_names["L0.attn"] == ("null", "seed")
@@ -454,7 +504,7 @@ def test_block_sources_and_current_partial_labels():
 def test_four_layer_block_boundaries():
     config = TINY | {"layers": 9}
     torch.manual_seed(0)
-    model = DFModel(arm_config("mhdb", **config)).eval()
+    model = DFModel(condition_config("ar", **config)).eval()
     out = model.forward_column(model.embed_tokens(tokens()), want_weights=True)
     assert out.source_names == ("seed", "block0", "block1", "block2")
     assert out.route_source_names["L4.attn"] == ("null", "seed", "block0")
@@ -476,7 +526,7 @@ def test_four_layer_block_boundaries():
 
 def test_payload_init_matches_bare_top_state():
     """The null-plus-complete decomposition is collinear with h at init."""
-    model = tiny("df")
+    model = tiny("arf")
     out = forward(model, tokens())
     n_sources = 1 + (len(out.sources) - out.n_seeds + 1)
     expected = model.payload_norm(out.h_top * (1 + 1 / n_sources))
@@ -488,7 +538,7 @@ def test_payload_init_matches_bare_top_state():
         atol=3e-3,
     )
 
-    model = tiny("fbt")
+    model = tiny("af")
     out = forward(model, tokens())
     assert torch.allclose(out.payload, model.payload_norm(out.h_top), atol=1e-6)
 
@@ -497,7 +547,7 @@ def test_payload_init_matches_bare_top_state():
 
 
 def test_multipass_k1_is_plain_forward():
-    model = tiny("df")
+    model = tiny("arf")
     toks = tokens()
     single = multipass(model, toks, 1)
     plain = forward(model, toks[:, :-1])
@@ -509,8 +559,8 @@ def test_multipass_k1_is_plain_forward():
 def test_multipass_matches_the_causally_equivalent_full_row_forward():
     """Executing only the T input positions of a T+1 row is the same
     function: the dropped final column never fed a loss or a payload."""
-    for arm in ("df", "fbt", "base"):
-        model = tiny(arm)
+    for condition in ("arf", "af", "a"):
+        model = tiny(condition)
         toks = tokens()
         prefix = torch.ones((2, toks.shape[0]), dtype=torch.long) * 3
         jitter = torch.randn((2, *toks.shape, TINY["dim"])) * 0.02
@@ -540,30 +590,30 @@ def test_multipass_matches_the_causally_equivalent_full_row_forward():
                 )
             )
         for out, full in zip(outs, ref, strict=True):
-            assert torch.allclose(out.h_top, full.h_top[:, :-1], atol=1e-5), arm
+            assert torch.allclose(out.h_top, full.h_top[:, :-1], atol=1e-5), condition
         ref_total, _ = multipass_loss(
             model, toks, [type(o)(**{**vars(o), "h_top": o.h_top[:, :-1]}) for o in ref]
         )
-        assert torch.allclose(total, ref_total, atol=1e-5), arm
+        assert torch.allclose(total, ref_total, atol=1e-5), condition
 
 
 def test_all_plain_prefix_degenerates_to_pass1():
     """A feedback pass whose prefix covers the whole sequence reproduces
     pass 1 exactly — the mixin's boundary semantics."""
-    for arm in ("df", "fbt"):
-        model = tiny(arm)
+    for condition in ("arf", "af"):
+        model = tiny(condition)
         toks = tokens()
         length = toks.shape[1]
         prefix = torch.full((1, toks.shape[0]), length)
         outs = multipass(model, toks, 2, prefix_lens=prefix)
-        assert torch.allclose(outs[1].h_top, outs[0].h_top, atol=1e-6), arm
+        assert torch.allclose(outs[1].h_top, outs[0].h_top, atol=1e-6), condition
 
 
 def test_multipass_token_causality():
     """Changing token t leaves every pass's outputs at positions < t
     unchanged: the Jacobi shift preserves causality."""
-    for arm in ("df",):
-        model = tiny(arm)
+    for condition in ("arf",):
+        model = tiny(condition)
         toks = tokens()
         length = toks.shape[1]
         prefix = torch.ones((2, toks.shape[0]), dtype=torch.long)
@@ -576,11 +626,11 @@ def test_multipass_token_causality():
                 out.h_top[:, : length // 2],
                 out_edited.h_top[:, : length // 2],
                 atol=1e-5,
-            ), arm
+            ), condition
 
 
 def test_multipass_loss_shape():
-    model = tiny("df")
+    model = tiny("arf")
     toks = tokens()
     prefix = torch.ones((2, toks.shape[0]), dtype=torch.long)
     outs = multipass(model, toks, 3, prefix_lens=prefix)
@@ -591,7 +641,7 @@ def test_multipass_loss_shape():
 
 
 def test_multipass_loss_accepts_a_device_side_z_coefficient():
-    model = tiny("df")
+    model = tiny("arf")
     toks = tokens()
     prefix = torch.ones((1, toks.shape[0]), dtype=torch.long)
     outs = multipass(model, toks, 2, prefix_lens=prefix)
@@ -600,10 +650,10 @@ def test_multipass_loss_accepts_a_device_side_z_coefficient():
     assert torch.equal(float_total, tensor_total)
 
 
-def test_multipass_rejects_feedback_free_arms():
+def test_multipass_rejects_conditions_without_f():
     with pytest.raises(ValueError):
         multipass(
-            tiny("vanilla"),
+            tiny(""),
             tokens(),
             2,
             prefix_lens=torch.ones((1, 2), dtype=torch.long),
@@ -611,7 +661,7 @@ def test_multipass_rejects_feedback_free_arms():
 
 
 def test_gradients_reach_the_feedback_machinery():
-    model = tiny("df").train()
+    model = tiny("arf").train()
     toks = tokens()
     prefix = torch.ones((2, toks.shape[0]), dtype=torch.long)
     jitter = torch.zeros((2, *toks.shape, TINY["dim"]))
@@ -651,9 +701,9 @@ def reference_decode(model, toks, prompt_len):
 
 def test_cached_feedback_decode_matches_exact_recurrence():
     """Sequential cached stepping equals the recurrence computed by full
-    recomputation — the train/decode parity invariant, per feedback arm."""
-    for arm in ("fbt", "df"):
-        model = tiny(arm)
+    recomputation — the train/decode parity invariant, per feedback condition."""
+    for condition in ("af", "arf"):
+        model = tiny(condition)
         cfg = model.cfg
         toks = tokens(batch=2, length=12)
         prompt_len = 5
@@ -673,14 +723,14 @@ def test_cached_feedback_decode_matches_exact_recurrence():
         reference = reference_decode(model, toks, prompt_len)
         # Parallel and single-column attention accumulate FP32 products in
         # different orders; keep the bound tight relative to O(1) activations.
-        assert torch.allclose(stepped, reference, atol=5e-5), arm
+        assert torch.allclose(stepped, reference, atol=5e-5), condition
 
 
 def test_cached_standard_decode_matches_full_forward():
     """Standard decoding (no feedback) through the cache equals one full
-    parallel forward, on every arm."""
-    for arm in ARMS:
-        model = tiny(arm)
+    parallel forward, on every condition."""
+    for condition in BUILDABLE:
+        model = tiny(condition)
         toks = tokens(batch=2, length=10)
         full = forward(model, toks)
 
@@ -689,11 +739,12 @@ def test_cached_standard_decode_matches_full_forward():
         pieces = [prefill.h_top]
         for t in range(4, toks.shape[1]):
             pieces.append(model.step(toks[:, t : t + 1], None, cache).h_top)
-        assert torch.allclose(torch.cat(pieces, dim=1), full.h_top, atol=3e-5), arm
+        stepped = torch.cat(pieces, dim=1)
+        assert torch.allclose(stepped, full.h_top, atol=3e-5), condition
 
 
 def test_hybrid_cache_owns_only_global_kv_and_fixed_pkda_states():
-    model = tiny("base")
+    model = tiny("a")
     toks = tokens(batch=2, length=5)
     cache = KVCache(model.cfg, batch=2, device=toks.device, dtype=torch.float32)
     model.forward_column(model.embed_tokens(toks), cache=cache)
@@ -706,7 +757,7 @@ def test_hybrid_cache_owns_only_global_kv_and_fixed_pkda_states():
 
 
 def test_contraction_diagnostic_runs():
-    model = tiny("df")
+    model = tiny("arf")
     records = iterate_fused(model, tokens(batch=2, length=12), n_iters=3)
     assert len(records) == 3
     assert all(

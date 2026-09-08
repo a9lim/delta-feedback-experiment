@@ -2,7 +2,7 @@
 
 Each input is optional; the script draws whatever it is given:
 
-    --compare   compare_arms.json         (scripts/compare_arms.py)
+    --compare   compare_conditions.json   (scripts/compare_conditions.py)
     --weights   weight_divergence.json    (scripts/weight_divergence.py)
     --fused     fused_diagnostics.json    (scripts/fused_diagnostics.py)
     --entry     entry_sweeps.json         (scripts/entry_sweeps.py)
@@ -12,7 +12,7 @@ Each input is optional; the script draws whatever it is given:
     --downstream-modes standard.json soft.json fused.json ...   (paired gains against the first file)
 
 Usage:
-    python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms.json \\
+    python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_conditions.json \\
         --fused figures/fused-B/fused_diagnostics.json --out-dir figures/compare-A-vs-B
 
 Every panel is observational or a same-checkpoint intervention; none is a

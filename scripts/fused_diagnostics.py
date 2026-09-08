@@ -1,6 +1,6 @@
-"""Same-checkpoint structure of the fused pass against pass 1 on a feedback arm.
+"""Same-checkpoint structure of the fused pass against pass 1 on a feedback snapshot.
 
-Held-out diagnostics on one `fbt` or `df` snapshot:
+Held-out diagnostics on one snapshot of a condition with `f`:
 
 * per-position fused penalty under the eval convention (prefix 1), a plain
   prefix of 512, a training-style random prefix, a second fused iteration,
@@ -95,14 +95,14 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     if not model.cfg.feedback_active:
-        raise SystemExit("the fused diagnostics need an fbt or df snapshot")
+        raise SystemExit("the fused diagnostics need a snapshot of a condition with f")
     cfg = model.cfg
     T = saved["seq_len"]
     tag = saved.get("tag", args.snapshot.stem)
     out_dir = args.out_dir or Path("figures") / f"fused-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data = TokenData.load(args.data_dir, "val", T)
-    print(f"loaded {args.snapshot} arm={saved['arm']} rows={args.rows}", flush=True)
+    print(f"loaded {args.snapshot} condition={saved['condition']!r} rows={args.rows}", flush=True)
 
     val_tokens = data.read(0, data.rows * (T + 1))
     counts = np.bincount(val_tokens, minlength=cfg.vocab_size).astype(np.float64)
@@ -200,7 +200,7 @@ def main() -> None:
         K[k] = K[k].astype(np.float64)
     pos = K["pos"]
     d = K["ce2"] - K["ce1"]
-    report: dict = {"snapshot": str(args.snapshot), "arm": saved["arm"], "rows": args.rows, "tokens": int(pos.size)}
+    report: dict = {"snapshot": str(args.snapshot), "condition": saved["condition"], "rows": args.rows, "tokens": int(pos.size)}
     n32 = 32 * T
     m512 = pos >= 512
     mr = pos >= K["prefix_r"]

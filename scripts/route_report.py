@@ -1,6 +1,6 @@
 """Dissect a trained snapshot's routing: what each router learned.
 
-Rebuilds the arm's model from a checkpoint and reads its routing components,
+Rebuilds the condition's model from a checkpoint and reads its routing components,
 the per-layer attention readers, the per-layer MLP readers, and the payload
 router, two ways:
 
@@ -8,7 +8,7 @@ router, two ways:
   temperature since keys are RMS-normed; pairwise cosines say whether sites
   learned a shared reading direction);
 - empirically: per-head mean routing distributions over held-out rows, on the
-  plain pass and, for feedback arms, on a fused pass (prefix length 1, the
+  plain pass and, for feedback conditions, on a fused pass (prefix length 1, the
   training eval convention), plus entropy and cross-head Jensen-Shannon
   divergence.
 
@@ -64,7 +64,7 @@ def collect(model, data_val, device, rows: int, micro: int):
         n = batch.shape[0]
         prefix = torch.ones((1, n), dtype=torch.long, device=device)
         with analysis.autocast(device):
-            # Non-feedback arms have only the plain pass to read.
+            # Conditions without f have only the plain pass to read.
             outs = multipass(
                 model,
                 batch,
@@ -159,14 +159,14 @@ def main() -> None:
     device = next(model.parameters()).device
     cfg = model.cfg
     if not cfg.routing_active:
-        raise SystemExit("the route report needs an mhdb or df snapshot")
+        raise SystemExit("the route report needs a snapshot of a condition with r")
     layers = cfg.layers
     tag = saved.get("tag", args.snapshot.stem)
     out_dir = args.out_dir or Path("figures") / f"route-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     passes = (0, 1) if cfg.feedback_active else (0,)
     pass_titles = {0: "pass 1 (plain)", 1: "pass 2 (fused)"}
-    print(f"# {tag} — {saved['arm']}, {layers} layers, dim {cfg.dim}, device {device}")
+    print(f"# {tag} — condition {saved['condition']!r}, {layers} layers, dim {cfg.dim}, device {device}")
 
     # -- static: query geometry ------------------------------------------------
     queries, null_rms, labels = [], [], []
@@ -213,7 +213,7 @@ def main() -> None:
         f"\n{'site':<10}{'|q|':>7}{'nullRMS':>9}   "
         "pass head H_mean  maxT  H_tok head-JS  top sources"
     )
-    report = {"snapshot": str(args.snapshot), "arm": saved["arm"], "rows": args.rows, "sites": {},
+    report = {"snapshot": str(args.snapshot), "condition": saved["condition"], "rows": args.rows, "sites": {},
               "query_norms": dict(zip(labels, norms.tolist())), "query_cosine": cosine.tolist(), "labels": labels,
               "null_rms": dict(zip(labels, [float(v) for v in null_rms])),
               "source_rms": {f"p{p + 1}": dict(zip(final_source_names[p], rms.tolist())) for p, rms in norms_by_pass.items()}}

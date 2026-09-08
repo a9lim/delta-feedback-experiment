@@ -1,49 +1,62 @@
-# Growing recipe: arms, data, schedule, evaluation
+# Growing recipe: conditions, data, schedule, evaluation
 
-This page describes how a specimen is grown: the five arms and how they pair,
-the small geometry, the token stream, the optimizer batch, the feedback
+This page describes how a specimen is grown: the condition letters and how
+conditions pair, the small geometry, the token stream, the optimizer batch, the feedback
 passes, the learning-rate schedule, and the numbers we look at afterwards.
 [Architecture](architecture.md) owns the equations;
 [interpretability](interpretability.md) owns the analysis scripts;
 [scaling](scaling.md) keeps the longer and larger recipes.
 
-## Arms
+## Conditions
 
-`DFModel` has five arms. The four hybrid arms share one trunk and vary two
-packages:
+A condition is a string of letters from `arfl`, each one change from the
+plain twelve-layer RoPE GQA decoder. `parse_condition` accepts the letters in
+any order and returns them in that order; the empty string is the plain
+decoder, and `ModelConfig.condition` renders a configuration's letters back.
 
-- **MHDB:** transient grouped reads of the seed and block deltas within a
-  column, plus routed enrichment of the payload in `df`.
-- **FBT:** token-gated latent payload transfer between token columns.
+| Letter | Change | `ModelConfig` flag |
+|---|---|---|
+| `a` | Kimi Delta Attention: `[PKDA, PKDA, PKDA, gated global GQA] x 3`, NoPE, in place of RoPE GQA | `hybrid` |
+| `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
+| `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
+| `l` | Huginn loop: the tied-depth core of [depth-architecture.md](depth-architecture.md); specified, not built | `loop` |
 
-| Arm | MHDB | FBT | Parameters | Active non-embedding |
-|---|---:|---:|---:|---:|
-| `base` | no | no | 256,275,240 | 139,588,392 |
-| `mhdb` | yes | no | 256,330,536 | 139,643,688 |
-| `fbt` | no | yes | 257,457,192 | 140,770,344 |
-| `df` | yes | yes | 257,514,792 | 140,827,944 |
-| `vanilla` | no | no | 229,954,560 | 113,267,712 |
+Every subset of `arf` builds. At the screen geometry:
 
-`vanilla` is a separate twelve-layer RoPE GQA decoder for a whole-trunk
-contrast. The other four share PKDA/GQA, so even `base` has recurrent mixer
-memory. `mhdb` seeds from the plain embedding and emits no payload; `fbt`
-emits `payload_norm(h_top)`; `df` uses the fused seed as an MHDB source and
-enriches its payload with routed sources.
+| Condition | Parameters | Active non-embedding |
+|---|---:|---:|
+| `""` (plain) | 229,954,560 | 113,267,712 |
+| `r` | 230,009,856 | 113,323,008 |
+| `f` | 231,136,512 | 114,449,664 |
+| `rf` | 231,194,112 | 114,507,264 |
+| `a` | 256,275,240 | 139,588,392 |
+| `ar` | 256,330,536 | 139,643,688 |
+| `af` | 257,457,192 | 140,770,344 |
+| `arf` | 257,514,792 | 140,827,944 |
 
-Pairing is built in. The hybrid trunk initializes byte-identically across
-`base`, `mhdb`, `fbt`, and `df` for a given seed; MHDB parameters pair across
-`mhdb` and `df`, FBT parameters across `fbt` and `df`. Factor-private modules
-draw from their own deterministic streams and never advance the common one.
-`vanilla` keeps its own initialization and state layout. Two arms trained
-with the same seed and data seed therefore see the same rows in the same
-order with the same keyed feedback draws, and can be compared token by token.
+`arf` is the full built stack. `a` alone already has recurrent mixer memory.
+`r` without `f` seeds from the plain embedding and emits no payload; `f`
+without `r` emits `payload_norm(h_top)`; `r` with `f` uses the fused seed as a
+routing source and enriches the payload with routed sources. The specimens so
+far are `ar` and `arf` runs.
 
-The tied-depth [`df-loop`](depth-architecture.md) is specified and not built.
-At `r = 1` it is exactly `df`.
+Pairing is built in. Two conditions on the same trunk letter initialize every
+parameter they share byte-identically for a given seed: the trunk from the
+common stream, and each letter's private modules (`a`'s attention gates, `f`'s
+fusion matrices) from that letter's own deterministic stream, which never
+advances the common one; routers initialize to zero. The plain trunk and the
+`a` trunk consume the common stream differently, so parameters do not pair
+across `a`. Two conditions trained with the same seed and data seed therefore
+see the same rows in the same order with the same keyed feedback draws, and
+can be compared token by token.
+
+`l` is reserved: it parses, `ModelConfig.loop` records it, and `DFModel`
+refuses to build it until the loop exists. At one core iteration `arfl` is
+exactly `arf`.
 
 ## Geometry
 
-The four hybrid arms are:
+Under `a` the trunk is:
 
 ```text
 [PKDA, PKDA, PKDA, gated global GQA] x 3
@@ -56,7 +69,7 @@ The four hybrid arms are:
 | Layers / four-layer cells | 12 / 3 |
 | SwiGLU intermediate width | 3,328 |
 | Context / predictions per row | 1,024 |
-| Vanilla RoPE theta | 1,000,000 |
+| RoPE theta, plain trunk | 1,000,000 |
 | GQA query / KV heads / head width | 8 / 4 / 96 |
 | PKDA Q/K/V heads / head width | 10 / 128 |
 | PKDA Q/K/V projection width | 1,280 |
@@ -67,10 +80,10 @@ The four hybrid arms are:
 Relative to the larger geometry in `architecture.md`, the screen halves the
 residual, SwiGLU, and PKDA projection widths (`768 / 3,328 / 1,280` against
 `1,536 / 6,656 / 2,560`), so the 10-by-128 PKDA geometry keeps the Kimi `5/3`
-recurrent-projection ratio. Hybrid global layers are dense causal NoPE gated
-GQA. `vanilla` keeps twelve bias-free RoPE GQA layers with packed QKV,
-per-head Q/K RMSNorm, and no attention-output gate. MHDB has four groups
-because its groups follow the global KV-head count.
+recurrent-projection ratio. The global layers under `a` are dense causal NoPE
+gated GQA. Without `a` the trunk is twelve bias-free RoPE GQA layers with
+packed QKV, per-head Q/K RMSNorm, and no attention-output gate. MHDB has four
+groups because its groups follow the global KV-head count.
 
 ## Data
 
@@ -113,14 +126,14 @@ Every optimizer update sees 327,680 predicted tokens:
 | Prime screen | 8 ranks x 4 rows x 10 accumulation microsteps |
 | Larger geometry | 8 ranks x 1 row x 8,192 predictions x 5 accumulation microsteps |
 
-All arms use the NorMuonH/NAdam partition in [architecture.md](architecture.md).
+Every condition uses the NorMuonH/NAdam partition in [architecture.md](architecture.md).
 After all microbatches have accumulated, the single global FP32 gradient
 vector is clipped to L2 norm 10.0 before both optimizer steps; telemetry
 reports the pre-clip norm.
 
 ### Feedback passes
 
-Feedback arms train with parallel Jacobi passes over a full sequence. Pass 1
+Conditions with `f` train with parallel Jacobi passes over a full sequence. Pass 1
 is ordinary teacher forcing with plain embeddings. Every later pass:
 
 1. takes the preceding pass's payload without detaching it;
@@ -151,7 +164,7 @@ occupies `round(cooldown_frac * steps)` updates with multiplier `1 - sqrt(u)`
 for local progress `u`, reaching zero at the last step. Defaults are 0.02 and
 0.20. The default 10,745-step Jobe schedule:
 
-| Phase | Steps | Passes, feedback arms |
+| Phase | Steps | Passes with `f` |
 |---|---:|---|
 | Warmup | 1–215 | one |
 | Stable heat | 216–8,596 | one through 8,059, then two or three |
@@ -161,17 +174,17 @@ The feedback boundary is `round(feedback_start * steps)`, independent of the
 learning-rate phases, and defaults to three quarters of the schedule. After
 it every step draws three passes with probability `three_pass = 0.12` and two
 otherwise, which targets a 75% / 22% / 3% pass mixture over the run and 1.28
-expected pass-tokens per predicted token. Non-feedback arms use one pass
+expected pass-tokens per predicted token. Conditions without `f` use one pass
 throughout.
 
 The run is 3,520,921,600 predicted tokens: 25.0–25.2 per active non-embedding
-parameter for the hybrid arms, 31.1 for `vanilla`.
+parameter with `a`, 30.7–31.1 without.
 
 ### Knobs
 
 | Flag | Default | What it changes |
 |---|---:|---|
-| `--arm` | | one of the five arms |
+| `--condition` | `""` | letters from `arfl` in any order; empty is the plain decoder |
 | `--steps`, `--batch-rows` | 10,745, 320 | schedule length and optimizer batch; the 25x recipe |
 | `--seed`, `--data-seed` | | initialization pairing and the keyed data/feedback streams |
 | `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the two group learning rates |
@@ -182,13 +195,15 @@ parameter for the hybrid arms, 31.1 for `vanilla`.
 | `--max-steps` | | caps this invocation without changing the schedule |
 | `--resume` | | continues a tag from its latest v23 snapshot |
 
-The specimens so far used the default recipe (`mhdb`) and
-`--feedback-start 0 --three-pass 1` (`df`); see [findings.md](findings.md).
+The specimens so far used the default recipe (`ar`) and
+`--feedback-start 0 --three-pass 1` (`arf`); see [findings.md](findings.md).
 
 ### Checkpoints and queue
 
-Snapshots use checkpoint contract v23, and only v23 resumes; v16 through v22
-stay readable for evaluation and forks. A snapshot holds the model, both
+Snapshots use checkpoint contract v24, and only v24 resumes; v16 through v23
+stay readable for evaluation and forks. Snapshots before v24 recorded the
+condition as an arm name, `vanilla`, `base`, `mhdb`, `fbt`, or `df`, which the
+loader reads as `""`, `a`, `ar`, `af`, or `arf`. A snapshot holds the model, both
 optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,
@@ -205,7 +220,7 @@ an active child, and the worker refreshes before the next job.
 ### Language-model numbers
 
 Every evaluation point reports pass-1 held-out cross-entropy as `val`.
-Feedback arms also report `val_fused`, a second pass with plain-prefix
+Conditions with `f` also report `val_fused`, a second pass with plain-prefix
 length 1. Decoding has three modes:
 
 - **Standard:** one plain prompt prefill, no feedback during decode.
@@ -213,21 +228,23 @@ length 1. Decoding has three modes:
   token.
 - **Fused:** an additional fused prompt pass, then the same feedback decode.
 
-### Comparing arms
+### Comparing conditions
 
-For validation loss `L`, gain over `base` is `G_A = L_base - L_A` and the
-interaction of the two packages is:
+For validation loss `L`, a letter's gain is the paired difference between a
+condition with it and the same condition without it, and two letters interact
+by the difference of their gains. On the `a` trunk, with `G_x = L_a - L_x`:
 
 ```text
-I = G_df - G_mhdb - G_fbt = L_mhdb + L_fbt - L_df - L_base
+I = G_arf - G_ar - G_af = L_ar + L_af - L_arf - L_a
 ```
 
 Positive `I` is superadditive loss reduction. Computed on paired checkpoints
-by mode; `L_vanilla - L_base` is the whole-trunk contrast. Report parameters,
-predicted tokens, and pass-tokens with every number; a matched-compute view
-compares at equal cumulative pass-tokens. The full two-seed, five-arm screen
-is the natural complete comparison and has not been run; it is one option
-among several for what to train next, not a prerequisite.
+by mode; writing `plain` for the empty condition, `L_plain - L_a` is the
+whole-trunk contrast. Report parameters, predicted tokens, and pass-tokens
+with every number; a matched-compute view compares at equal cumulative
+pass-tokens. The full two-seed screen over the `a` conditions and the plain
+decoder is the natural complete comparison and has not been run; it is one
+option among several for what to train next, not a prerequisite.
 
 ### Downstream tasks
 

@@ -7,17 +7,17 @@ analysis of the two paired lowLR runs unless stated otherwise.
 
 ## Specimens
 
-| Run | Arm | Recipe | NorMuonH lr | val | val_fused | Where |
+| Run | Condition | Recipe | NorMuonH lr | val | val_fused | Where |
 |---|---|---|---:|---:|---:|---|
-| `screen-df-mhdb-s1-lowLR` | `mhdb` | default (one pass throughout) | 6e-3 | 3.069 | | Jobe |
-| `screen-df-full-s1-lowLR` | `df` | `--feedback-start 0 --three-pass 1` | 6e-3 | 3.076 | 3.077 | Jobe |
-| `screen-df-full-s1` | `df` | `--feedback-start 0 --three-pass 1` | 2e-2 | 3.113 | 3.113 | Jobe |
-| `screen-df-s1` | `df` | 75/22/3 pass mixture, earlier trainer contract | 1e-2 | 3.098 | 3.122 | Mac (step 6700 snapshot) |
+| `screen-df-mhdb-s1-lowLR` | `ar` | default (one pass throughout) | 6e-3 | 3.069 | | Jobe |
+| `screen-df-full-s1-lowLR` | `arf` | `--feedback-start 0 --three-pass 1` | 6e-3 | 3.076 | 3.077 | Jobe |
+| `screen-df-full-s1` | `arf` | `--feedback-start 0 --three-pass 1` | 2e-2 | 3.113 | 3.113 | Jobe |
+| `screen-df-s1` | `arf` | 75/22/3 pass mixture, earlier trainer contract | 1e-2 | 3.098 | 3.122 | Mac (step 6700 snapshot) |
 
 All are seed 1, data seed 0, 10,745 steps, 320 rows of 1,024 predictions per
-step, on the same rows. The three-pass-always `df` runs spend 10.56B
-pass-tokens against `mhdb`'s 3.52B; steps are matched data, not matched
-compute. Only the `mhdb` run coincides with the current defaults.
+step, on the same rows. The three-pass-always `arf` runs spend 10.56B
+pass-tokens against `ar`'s 3.52B; steps are matched data, not matched
+compute. Only the `ar` run coincides with the current defaults.
 
 ## The channel as trained
 
@@ -35,7 +35,7 @@ compute. Only the `mhdb` run coincides with the current defaults.
   the payload is 0.978. The token is recoverable from the fused seed (ridge R²
   0.78, nearest-embedding hit 98%). The gate's token-dependent share of the
   pre-norm entry input is 15% at the median, 36% at p90.
-- **Routing.** Early MLP sites read the null (0.78–0.89) where `mhdb`'s read
+- **Routing.** Early MLP sites read the null (0.78–0.89) where `ar`'s read
   the partial and seed; on the fused pass L0.mlp reads the fused seed at 0.86
   and the top attention sites shift mass from block 0 to the seed. The payload
   router's head 0 reads block 0 on pass 1 and the seed on pass 2; one head
@@ -58,27 +58,27 @@ That is the opposite of an opaque cross-column channel.
   tokens; training three passes from step 0 shrank it to +0.0012 with the same
   signature at three to ten times smaller amplitude. No fused benefit formed
   on FineWeb tokens.
-- **The plain-mode tax is small.** `df` pass 1 is +0.0025 ± 0.0013 nats worse
-  than `mhdb` on the same rows at 3x the pass-tokens. On the paired training
+- **The plain-mode tax is small.** `arf` pass 1 is +0.0025 ± 0.0013 nats worse
+  than `ar` on the same rows at 3x the pass-tokens. On the paired training
   trace the tax is +0.0054 over the first 37% of the schedule, about zero
   through the second half of the heat, and +0.0013 in the cooldown.
-- **Two paired runs differ like two seeds.** KL(`mhdb` ‖ `df` pass 1) is
+- **Two paired runs differ like two seeds.** KL(`ar` ‖ `arf` pass 1) is
   0.215 nats, argmax agreement 77.6%; every shared trunk matrix sits 85–87°
   from its paired initialization and 87° from its twin. Per-token differences
   between two runs are not attributable to a package.
 - **NorMuonH 2e-2 is too hot.** The same recipe at 2e-2 finished 0.037 nats
   worse than at 6e-3, with its paired pass-1 training loss running 0.22 above
-  `mhdb` through the second half of the heat. 6e-3 is now the default.
+  `ar` through the second half of the heat. 6e-3 is now the default.
 
 ## Downstream
 
 Both lowLR specimens beat the 300B-token `pythia-160m` on the educational and
 science-flavored zero-shot tasks (ARC-Easy by 8–9 points, HellaSwag by 4,
 OpenBookQA by 5) and trail it badly on LAMBADA (30 against 35 accuracy), which
-is fiction and long-range. `mhdb` against `df` Standard is indistinguishable
+is fiction and long-range. `ar` against `arf` Standard is indistinguishable
 apart from a yes-bias on BoolQ.
 
-Within `df`, Fused against Standard on identical documents: LAMBADA +1.47 ±
+Within `arf`, Fused against Standard on identical documents: LAMBADA +1.47 ±
 0.36 accuracy, HellaSwag margin +0.16 ± 0.02 nats, and 0.05–0.3 nats less
 probability on every short answer after a QA prompt. The gain is front-loaded:
 a second fused prefill pass gives nothing more. Soft mode (feedback only along
@@ -97,8 +97,9 @@ through the payload and cancel the rest. Candidate moves, none chosen:
 - Land the previous column's state somewhere the current column cannot cancel
   in one cell, for example at a core entry with the FBT gate kept at the pass
   entry.
-- Build [`df-loop`](depth-architecture.md) so within-column refinement exists
-  and persists across columns through the payload and a shared core cache.
+- Build the `l` letter ([depth-architecture.md](depth-architecture.md)) so
+  within-column refinement exists and persists across columns through the
+  payload and a shared core cache.
 - Split a persistent state stream from a read-only prediction stream
-  ([literature](literature.md#free-pause-tokens-and-df-loop)).
+  ([literature](literature.md#free-pause-tokens-and-the-loop)).
 - Add a task that needs cross-column latent state.

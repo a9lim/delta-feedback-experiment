@@ -18,7 +18,7 @@ tables are binned on the *reference* model's loss and entropy; read the
 ``d_fused_df1`` column as a genuine independent conditioning.
 
 Usage:
-    python scripts/compare_arms.py --reference runs/A.pt.10745 --feedback runs/B.pt.10745 \\
+    python scripts/compare_conditions.py --reference runs/A.pt.10745 --feedback runs/B.pt.10745 \\
         --data-dir /data/df/tokens
 """
 
@@ -83,8 +83,8 @@ def ridge_r2(x: torch.Tensor, y: torch.Tensor, lam_scale: float = 1e-3) -> float
 @torch.no_grad()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("--reference", type=Path, required=True, help="reference snapshot (any arm; its pass 1 is used)")
-    parser.add_argument("--feedback", type=Path, required=True, help="feedback snapshot (fbt or df)")
+    parser.add_argument("--reference", type=Path, required=True, help="reference snapshot (any condition; its pass 1 is used)")
+    parser.add_argument("--feedback", type=Path, required=True, help="feedback snapshot (a condition with f)")
     parser.add_argument("--data-dir", default="data/tokens")
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--calib-rows", type=int, default=64, help="leading rows used to choose mixture weights")
@@ -99,7 +99,7 @@ def main() -> None:
     fb, saved_fb = analysis.load_checkpoint(args.feedback, args.device)
     device = next(fb.parameters()).device
     if not fb.cfg.feedback_active:
-        raise SystemExit("--feedback must be an fbt or df snapshot")
+        raise SystemExit("--feedback must be a snapshot of a condition with f")
     if saved_ref["seq_len"] != saved_fb["seq_len"]:
         raise SystemExit("the two snapshots have different sequence lengths")
     cfg = fb.cfg
@@ -108,7 +108,7 @@ def main() -> None:
     out_dir = args.out_dir or Path("figures") / f"compare-{tag_ref}-vs-{tag_fb}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data = TokenData.load(args.data_dir, "val", T)
-    print(f"reference={args.reference} ({saved_ref['arm']}) feedback={args.feedback} ({saved_fb['arm']}) rows={args.rows}", flush=True)
+    print(f"reference={args.reference} ({saved_ref['condition']!r}) feedback={args.feedback} ({saved_fb['condition']!r}) rows={args.rows}", flush=True)
 
     val_tokens = data.read(0, data.rows * (T + 1))
     counts = np.bincount(val_tokens, minlength=cfg.vocab_size).astype(np.float64)
@@ -254,8 +254,8 @@ def main() -> None:
     d_d2_d3 = K["ce_d3"] - K["ce_d2"]
     se = lambda x: float(np.std(x) / math.sqrt(x.size))
     report: dict = {
-        "reference": str(args.reference), "feedback": str(args.feedback), "reference_arm": saved_ref["arm"],
-        "feedback_arm": saved_fb["arm"], "rows": args.rows, "calib_rows": args.calib_rows, "tokens": int(pos.size),
+        "reference": str(args.reference), "feedback": str(args.feedback), "reference_condition": saved_ref["condition"],
+        "feedback_condition": saved_fb["condition"], "rows": args.rows, "calib_rows": args.calib_rows, "tokens": int(pos.size),
         "labels": {"m": f"{tag_ref} pass 1", "d1": f"{tag_fb} pass 1", "d2": f"{tag_fb} fused", "d3": f"{tag_fb} fused, iteration 2"},
     }
     report["means"] = {
@@ -379,7 +379,7 @@ def main() -> None:
         "mean": float(K["gate_mean"][m].mean()), "token_mean_quantiles": quantiles(K["gate_mean"][m]),
         "logit_rms_quantiles": quantiles(K["gate_logit_rms"][m]),
     }
-    out_path = out_dir / "compare_arms.json"
+    out_path = out_dir / "compare_conditions.json"
     out_path.write_text(json.dumps(report, indent=2) + "\n")
 
     M = report["means"]

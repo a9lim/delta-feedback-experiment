@@ -41,20 +41,22 @@ previous token's latent payload + current token embedding
                    next latent payload
 ```
 
-One `DFModel` implements five arms, so any two can be trained on identical
-rows from paired initializations and compared:
+One `DFModel` implements the whole family. A condition is a string of
+letters, each one change from the plain twelve-layer RoPE GQA decoder, so any
+two conditions can be trained on identical rows from paired initializations
+and compared:
 
-| Arm | What it has |
+| Letter | Change |
 |---|---|
-| `base` | The PKDA/GQA trunk, no MHDB, no FBT |
-| `mhdb` | Depth routing, no latent feedback |
-| `fbt` | Latent feedback, no depth routing |
-| `df` | Both, with routed payload enrichment |
-| `vanilla` | A plain twelve-layer RoPE GQA decoder, for a whole-trunk contrast |
+| `a` | Kimi Delta Attention: the `[PKDA, PKDA, PKDA, gated global GQA]` trunk replaces RoPE GQA |
+| `r` | MHDB residual reads of the seed and block deltas before every sublayer; with `f`, a routed payload |
+| `f` | Full-bandwidth feedback: the FBT entry and a payload for the next column |
+| `l` | Huginn loop: a tied-depth core, [specified](docs/depth-architecture.md) and not built |
 
-The [architecture page](docs/architecture.md) has the exact equations,
-geometry, and optimizer. A tied-depth variant,
-[`df-loop`](docs/depth-architecture.md), is specified and waiting to be built.
+`--condition arf` is the full built stack; `ar` and `af` each drop one
+package; `a` is the bare hybrid trunk; the empty condition is the plain
+decoder. The [architecture page](docs/architecture.md) has the exact
+equations, geometry, and optimizer.
 
 ## What "ready" looks like
 
@@ -75,9 +77,9 @@ hitting them is the job of the recipe and the architecture.
 ## Where things stand
 
 Three full-schedule specimens exist on Jobe, all seed 1 on the same rows:
-an `mhdb` run on the default recipe, and two `df` runs trained with three
+an `ar` run on the default recipe, and two `arf` runs trained with three
 feedback passes on every step from step 0, at two NorMuonH learning rates.
-An older `df` run on the 75/22/3 pass mixture and an earlier trainer contract
+An older `arf` run on the 75/22/3 pass mixture and an earlier trainer contract
 sits on the Mac.
 
 The current read, from [findings](docs/findings.md): the channel as trained is
@@ -94,9 +96,10 @@ Directions on the bench, none decided:
 - Redesign the entry so the previous column's state lands somewhere the
   current column cannot simply cancel, for example at a core entry rather than
   the seed.
-- Build the tied core in [`df-loop`](docs/depth-architecture.md) so
-  computation can refine within a column and persist across columns through
-  two trained channels.
+- Build the `l` letter, the tied core in
+  [depth-architecture.md](docs/depth-architecture.md), so computation can
+  refine within a column and persist across columns through two trained
+  channels.
 - Separate a persistent state stream from a read-only prediction stream, the
   Free Pause Tokens idea assessed in [literature](docs/literature.md).
 - Give the model a task that needs the channel, rather than hoping FineWeb
@@ -104,7 +107,7 @@ Directions on the bench, none decided:
 
 ## Start here
 
-- [design.md](docs/design.md): the arms, geometry, data, schedule, feedback
+- [design.md](docs/design.md): the conditions, geometry, data, schedule, feedback
   passes, evaluation modes, and the knobs on the recipe.
 - [architecture.md](docs/architecture.md): the exact model, state, and
   optimizer.

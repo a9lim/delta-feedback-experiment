@@ -2,7 +2,7 @@
 
 Analysis must reproduce the trainer's numbers before it interprets a
 checkpoint, so everything here is the trainer's own convention: the snapshot
-loader rebuilds the arm from the saved state-defining arguments, evaluation
+loader rebuilds the condition from the saved state-defining arguments, evaluation
 runs under the same BF16 autocast the captured CUDA evaluation uses (FP32 on
 portable devices), per-token cross-entropies read the tied readout through
 ``final_norm``, and fused inputs are built exactly as ``multipass`` builds
@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from transformer_experiments import checkpoints
 
-from .model import DFModel, ModelConfig, arm_config, shift_right
+from .model import DFModel, ModelConfig, condition_config, shift_right
 from .train import CONTRACT, pick_device
 
 GEOMETRY = (
@@ -38,11 +38,27 @@ GEOMETRY = (
 )
 """State-defining geometry fields a snapshot carries in its ``args``."""
 
+NAMED_ARMS = {"vanilla": "", "base": "a", "mhdb": "ar", "fbt": "af", "df": "arf"}
+"""The conditions that snapshots and run logs before v24 recorded as arm names."""
+
+
+def saved_args(payload: dict) -> dict:
+    """A snapshot's settings under the current field names, plus its ``step``.
+
+    Snapshots before v24 recorded the condition as a named arm; every reader
+    sees ``condition`` letters.
+    """
+    saved = dict(payload["args"])
+    if "condition" not in saved:
+        saved["condition"] = NAMED_ARMS[saved.pop("arm")]
+    saved["step"] = payload["step"]
+    return saved
+
 
 def config_from_args(saved: dict) -> ModelConfig:
-    """The arm configuration a snapshot's saved arguments describe."""
-    return arm_config(
-        saved["arm"],
+    """The configuration a snapshot's saved arguments describe."""
+    return condition_config(
+        saved["condition"],
         max_seq_len=saved["seq_len"] + 1,
         **{field: saved[field] for field in GEOMETRY if field in saved},
     )
@@ -59,8 +75,7 @@ def load_checkpoint(
     state is dropped; use ``checkpoints.restore`` to continue training.
     """
     payload = checkpoints.read(path, CONTRACT, map_location="cpu")
-    saved = dict(payload["args"])
-    saved["step"] = payload["step"]
+    saved = saved_args(payload)
     model = DFModel(config_from_args(saved))
     model.load_state_dict(payload["state"])
     del payload

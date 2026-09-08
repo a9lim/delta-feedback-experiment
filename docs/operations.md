@@ -48,7 +48,7 @@ uv pip install -e '.[data-build]'
 ## Operate
 
 Choose the command for the intended action; `TAG` and `STEP` are placeholders.
-Foreground training and queueing are alternative ways to run an arm.
+Foreground training and queueing are alternative ways to run a condition.
 
 ```bash
 # Portable invariant suite; includes the full CUDA gate on a CUDA host.
@@ -57,10 +57,13 @@ df probe
 # Materialize the canonical 57B stream from pinned HF dataset/tokenizer commits.
 df tokenize --out /data/df/tokens
 
-# Run or queue one arm.
-df train example-df-s1 --arm df --seed 1 --data-seed 0 \
+# Run or queue one condition: letters from arfl in any order, empty for the
+# plain RoPE GQA decoder (`df train --help` lists the letters).
+df train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
   --data-dir /data/df/tokens
-df queue example-df-s1 --arm df --seed 1 --data-seed 0 \
+df queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
+  --data-dir /data/df/tokens
+df queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
   --data-dir /data/df/tokens
 
 # Inspect and control the detached queue.
@@ -83,33 +86,34 @@ live`, which stops only the active run and preserves the pending queue.
 The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024
 predictions per row: 3,520,921,600 predicted tokens. Linear warmup occupies the
 first 2% of updates and the `1 - sqrt(u)` cooldown occupies the final 20%.
-Feedback starts independently at three quarters of the schedule; feedback arms
-draw two or three passes on every later step. Every arm sees the same addressed
-token rows; feedback arms also share deterministic pass, prefix, and jitter
-streams. The global FP32 gradient is clipped to norm 10.0 before the shared
+Feedback starts independently at three quarters of the schedule; conditions
+with `f` draw two or three passes on every later step. Every condition sees the
+same addressed token rows; conditions with `f` also share deterministic pass,
+prefix, and jitter streams. The global FP32 gradient is clipped to norm 10.0 before the shared
 NorMuonH/NAdam update. NorMuonH uses a `6e-3` stable rate; every NAdam-owned
 parameter, including the tied embedding/readout, uses `3e-4`. Both sides apply
 their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v23, and only v23 is resumable. V16–v22
-remain readable for evaluation and forks. Protected snapshots persist at the
+Snapshots use checkpoint contract v24, and only v24 is resumable. V16–v23
+remain readable for evaluation and forks; they recorded the condition as an
+arm name, which the analysis loader translates. Protected snapshots persist at the
 cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
 limits the current invocation without changing the schedule.
 
 ## Inspect a checkpoint
 
-Every analysis script rebuilds the arm from a snapshot through
+Every analysis script rebuilds the condition from a snapshot through
 `delta_feedback_experiment.analysis`, evaluates under the trainer's numerics
 (BF16 autocast on CUDA), and writes a JSON record beside its figures under
 `figures/<kind>-<tag>/`. Those directories stay ignored; the [figure
 index](../figures/README.md) maps them.
 
 ```bash
-# Routing: per-site/group source mass, entropy, query geometry (mhdb or df).
+# Routing: per-site/group source mass, entropy, query geometry (any r).
 python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 
-# Payload enrichment swaps (df): trained router, top-only, uniform, forced source.
+# Payload enrichment swaps (r with f): trained router, top-only, uniform, forced source.
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens --head 2
 
@@ -127,7 +131,7 @@ python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 
 # Two checkpoints on the same rows: per-token loss structure, predictor
 # divergence, mixtures, residual-stream CKA, payload redundancy.
-python scripts/compare_arms.py --reference runs/A.pt.STEP --feedback runs/B.pt.STEP \
+python scripts/compare_conditions.py --reference runs/A.pt.STEP --feedback runs/B.pt.STEP \
   --data-dir /data/df/tokens
 
 # Paired weight-space divergence from the shared initialization (CPU).
@@ -148,7 +152,7 @@ python -m transformer_experiments.downstream --compare \
 
 # Figures: training dynamics from run logs, and panels from the JSON records.
 python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
-python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms.json \
+python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_conditions.json \
   --weights figures/weights-A-vs-B/weight_divergence.json \
   --fused figures/fused-B/fused_diagnostics.json --entry figures/fused-B/entry_sweeps.json \
   --followups figures/fused-B/feedback_followups.json --swap figures/fused-B/payload_swap.json \

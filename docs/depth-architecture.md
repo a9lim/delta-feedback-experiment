@@ -1,12 +1,14 @@
-# Depth-recurrent architecture (`df-loop`)
+# The `l` letter: a tied-depth loop
 
-This document specifies `df-loop`, a candidate next organism: the small model
-with a weight-tied recurrent core, so that repeated within-column computation
-exists to look at. It is specified and not built; the list at the end is what
-building it touches. Where this document and [architecture.md](architecture.md)
-both speak, this one describes the loop arm only.
+This document specifies the `l` condition letter and its full-stack condition
+`arfl`, a candidate next organism: the small model with a weight-tied
+recurrent core, so that repeated within-column computation exists to look at.
+The letter parses today and `DFModel` refuses to build it; the list at the end
+is what building it touches. Where this document and
+[architecture.md](architecture.md) both speak, this one describes the loop
+only.
 
-`df-loop` combines two recurrences on one hybrid trunk:
+`arfl` combines two recurrences on the `a` trunk:
 
 - **Vertical.** A tied four-layer core is iterated `r` times per column, with
   `r` drawn per optimizer step. Recurrent-depth language models supply the
@@ -23,22 +25,22 @@ The tied core adds a second axis of recurrence: what changes within a column
 as the same weights are reused, what an intervention at a particular iteration
 does, and which information is newly computed versus carried. The horizontal
 payload and the shared cache let that computation persist across tokens
-through two trained channels instead of one. The current `df` channel turned
+through two trained channels instead of one. The current `arf` channel turned
 out token-legible ([findings.md](findings.md)); a core that refines a column
 over several iterations before the payload is emitted is one candidate way to
 give the channel something to carry. The shared cache, the source-bank
 changes, and the tied depth are a package, and at `r = 1` the loop is exactly
-`df`, so the pieces can be switched on separately. Every iteration-indexed
+`arf`, so the pieces can be switched on separately. Every iteration-indexed
 trace says whether its index is core depth, Jacobi pass number, or token
 position.
 
 ## Geometry
 
-The loop arm keeps the screen geometry in [design.md](design.md) (width 768,
+The loop keeps the screen geometry in [design.md](design.md) (width 768,
 twelve unique layers, three cells, vocabulary 151,936) and reinterprets the
 three cells:
 
-| Field | `df-loop` value |
+| Field | `arfl` value |
 |---|---:|
 | Prelude `P` | one cell, layers 0–3 |
 | Recurrent core `R` | one cell, layers 4–7, weight-tied across iterations |
@@ -46,17 +48,17 @@ three cells:
 | Iterations per column `r` | drawn per step, `1 ≤ r ≤ 8` |
 | Mean iteration rate `r_mean` | 4 |
 | Compute depth per pass | `4 + 4r + 4` layers, `2 + r` cells |
-| Unique parameters | identical to `df` |
+| Unique parameters | identical to `arf` |
 
 Every cell is `[PKDA, PKDA, PKDA, gated global GQA]` with the mixer, gate,
 routing-group, and precision contracts of `architecture.md`. At `r = 1` the
-column executes the same twelve layers as `df` with the same parameters and the
-same source banks; plain positions then coincide with `df` exactly, and fused
-positions differ from `df` only by the shared mixing defined below.
+column executes the same twelve layers as `arf` with the same parameters and the
+same source banks; plain positions then coincide with `arf` exactly, and fused
+positions differ from `arf` only by the shared mixing defined below.
 
 A `k`-pass batch at iteration count `r` costs `k (2 + r)` cell evaluations per
-predicted token. Results report **cell-tokens** beside pass-tokens: `df` spends
-three cell-tokens per pass-token, `df-loop` spends `2 + r`.
+predicted token. Results report **cell-tokens** beside pass-tokens: `arf` spends
+three cell-tokens per pass-token, `arfl` spends `2 + r`.
 
 ## Column
 
@@ -108,7 +110,7 @@ for all `r` iterations, so the core is one cell of `4r` layers whose partial
 accumulates across iterations. There is no adapter and no random initial state:
 the seed and prelude delta are re-readable at every iteration through the
 routers. At a fused position the token enters only through the FBT gate, as in
-`df`; a plain position seeds from the embedding itself.
+`arf`; a plain position seeds from the embedding itself.
 
 ## Residual shell in the core
 
@@ -151,8 +153,8 @@ one so that the uncapped mean of `r` is `r_mean`. Under the cap:
 | expected layers per pass | 23.5 |
 | expected cells per pass | 5.88 |
 
-The draw comes from its own keyed sub-stream of the data seed and step, so `df`
-and `df-loop` share byte-identical pass-count, prefix, and jitter draws.
+The draw comes from its own keyed sub-stream of the data seed and step, so `arf`
+and `arfl` share byte-identical pass-count, prefix, and jitter draws.
 Realized `r` is logged per step and enters the cell-token total.
 
 Evaluation and decoding use one fixed `r` for the prompt passes and the entire
@@ -180,7 +182,7 @@ bank is a cell's bank:
 The core partial is `h - core_entry`, the core's progress since the prelude
 output, accumulated across iterations rather than reset at each; `Delta_R` is
 its value at core exit. The core's bank therefore has the shape and meaning of
-a `df` second-cell bank at every iteration, and the tied routers answer one
+a `arf` second-cell bank at every iteration, and the tied routers answer one
 stationary question rather than one per iteration index. Every bank's non-null
 sources reconstruct the current residual exactly, as in `architecture.md`, so
 the uniform zero-query mixture stays collinear with the residual and pass-1
@@ -198,7 +200,7 @@ added to the residual before the norm, so an unmasked zero source at logit zero
 would take softmax mass `1 / (S + 1)` from the live sources, `S` the sum of
 their exponentiated scores, and shrink the routed term relative to `h` once the
 query has trained. Router weights, values, and gradients at `r = 1` must match
-`df` exactly, and the telemetry labels the slot `core_partial`.
+`arf` exactly, and the telemetry labels the slot `core_partial`.
 
 ## Input injection and column start
 
@@ -206,10 +208,10 @@ The recurrent-depth decoder computes `e = P(x)`, draws a random state `s_0`,
 iterates `s_i = R(e, s_(i-1))` where `R` opens with an adapter that maps the
 concatenation of the state and `e` back to the residual width once per
 iteration, and reads out `C(s_r)`. Its warm start is an inference-only
-substitution of the previous token's `s_r` for the noise. `df-loop` realizes
+substitution of the previous token's `s_r` for the noise. `arfl` realizes
 each piece differently:
 
-| Recurrent-depth decoder | `df-loop` |
+| Recurrent-depth decoder | `arfl` |
 |---|---|
 | injected input `e = P(x)` | `seed + Delta_P`, the prelude output |
 | adapter on `[s; e]`, once per iteration | router reads of seed and `Delta_P` at all eight core sites |
@@ -240,7 +242,7 @@ Two expressivity gaps against the adapter are known and accepted:
   restart costs anything is what the warm-start sweep measures.
 
 Landing the payload at the core entry instead would move the horizontal
-channel for the whole family and break `r = 1` parity with `df`. That is the
+channel for the whole family and break `r = 1` parity with `arf`. That is the
 entry-redesign branch in [findings.md](findings.md), a different design rather
 than a loop variant, and is not specified here.
 
@@ -389,7 +391,7 @@ case, plus the no-grad evaluation graphs at `r = r_mean`. Preparation therefore
 costs about six times today's capture. Autograd sums the tied gradients inside
 the captured step; no per-cell graph composition is used.
 
-`df-loop` pairs with `df`: byte-identical initialization of every shared
+`arfl` pairs with `arf`: byte-identical initialization of every shared
 parameter, the same stream, row order, schedule, and pass-count, prefix, and
 jitter draws. The `r` draw is the only additional randomness.
 
@@ -399,12 +401,12 @@ jitter draws. The `r` draw is the only additional randomness.
 `val_fused` is a second pass with plain-prefix length 1 at `r = r_mean`, so
 every position but the first is fused. Both report cell-tokens.
 
-`df-loop - df` at equal steps is a **matched-data** contrast on the complete
+`arfl - arf` at equal steps is a **matched-data** contrast on the complete
 loop package: vertical depth, the shared cache, and the changed source banks
 together, at unequal compute. A matched-compute view compares checkpoints or
 curves at equal cumulative cell-tokens or measured device-time; equal
-pass-tokens are never matched compute for this arm. Depth alone is not
-attributable without an unrouted loop arm.
+pass-tokens are never matched compute for this condition. Depth alone is not
+attributable without the unrouted loop, `afl`.
 
 Two stability traces go with any loop run:
 
@@ -440,7 +442,7 @@ scale, and the task can all limit a zero-shot intervention.
 
 ## Parameter, cache, and cost accounting
 
-`df-loop` has exactly the parameters of `df`: 257,514,792 total and 140,827,944
+`arfl` has exactly the parameters of `arf`: 257,514,792 total and 140,827,944
 active non-embedding.
 
 Per sequence at 1,024 context, one cell's mixer cache is
@@ -461,16 +463,16 @@ scan intermediates on a card whose qualified pool already reserves
 23.0 GiB; measure it in stages before capturing graphs.
 
 Jobe step times are estimates, not measurements. The anchor is the measured
-14.21 s three-pass `df` step in the short
+14.21 s three-pass `arf` step in the short
 [runtime qualification](runtime-qualification.md), approximated conservatively
 as `k x (1.3 s + 0.30 s per layer evaluation)` per step, with block
 checkpointing adding one third to the layer term. At the expected `E[r] =
 3.88`:
 
-| Arm | One pass | Two passes | Three passes | Mean step | Full schedule |
+| Condition | One pass | Two passes | Three passes | Mean step | Full schedule |
 |---|---:|---:|---:|---:|---:|
-| `df` | 5.0 s | 9.9 s | 14.9 s | 6.3 s | ~19 h |
-| `df-loop` | 10.8 s | 21.7 s | 32.5 s | 13.9 s | ~41 h |
+| `arf` | 5.0 s | 9.9 s | 14.9 s | 6.3 s | ~19 h |
+| `arfl` | 10.8 s | 21.7 s | 32.5 s | 13.9 s | ~41 h |
 
 The model assigns no cost to the bank-side scan, the write bank, the two-piece
 attention merge, the new backward, or the second mixer evaluation on feedback
@@ -491,7 +493,8 @@ The wider loop budget and geometry are in [scaling.md](scaling.md#larger-loop).
 
 ## Not in this specification
 
-Left out: loop variants of `base`, `mhdb`, or `fbt`; truncated backpropagation;
+Left out: `l` on any condition but `arf` (`al`, `arl`, `afl`, and the
+plain-trunk loops parse and are unspecified); truncated backpropagation;
 branch-output or residual-state norms in the core; a random or learned initial
 core state; an untrained warm start anywhere but the warm-start sweep; a raw
 embedding path into the core; a payload landing at the core entry, which is a
@@ -503,24 +506,24 @@ reference.
 
 ## Building it
 
-Adding `df-loop` touches the following together:
+Building `l` touches the following together:
 
-- `ARMS` gains `df-loop`; `ModelConfig` gains the core recurrence, `r_mean`,
-  and `r_max`; `ColumnOutput` gains the write bank and `forward_column` takes a
-  per-position plain mask and a previous bank; `AGENTS.md` and `README.md` gain
-  the new arm.
-- A checkpoint contract beyond v23 with `r_mean`, `r_max`, and the `r`
+- `ModelConfig.loop` gains the core recurrence, `r_mean`, and `r_max`, and
+  `DFModel` stops refusing it; `ColumnOutput` gains the write bank and
+  `forward_column` takes a per-position plain mask and a previous bank;
+  `AGENTS.md` and `README.md` mark `l` built.
+- A checkpoint contract beyond v24 with `r_mean`, `r_max`, and the `r`
   sub-stream as state-defining fields; realized `r` and cell-tokens in the run
   log.
 - The workspace FLA fork gains the fused-position PKDA operator, forward and
   backward; the gated GQA layer gains the two-piece merge; the router gains the
   presence mask. `df probe` checks each against its portable oracle and checks
-  `r = 1` value, weight, and gradient parity with `df`.
+  `r = 1` value, weight, and gradient parity with `arf`.
 - A staged memory measurement before any graph work: eager `r = 1`, eager
   `r_max`, three-pass backward at `r_max`, then the captured `(k, r)` graph
   family; allocated and reserved memory reported separately, and the pool
   reservation recorded.
-- `design.md` adds `df-loop` to the arm table, cell-tokens and the matched-data
+- `design.md` adds the `l` counts to the condition table, cell-tokens and the matched-data
   versus matched-compute definitions to the accounting, `r = r_mean` to the
   evaluation section, and the two-channel sequence trace in place of the
-  payload-only iteration for loop arms.
+  payload-only iteration for loop conditions.

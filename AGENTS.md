@@ -7,21 +7,25 @@ sandbox: train variants, look inside, change the recipe or the architecture,
 write down what happened. Nothing is pre-registered and no result needs to
 clear a gate before it can be used to decide what to try next.
 
-The five arms `{base, mhdb, fbt, df, vanilla}` of one `DFModel` are the knobs.
-Three full-schedule specimens exist on Jobe (`screen-df-mhdb-s1-lowLR`,
-`screen-df-full-s1`, `screen-df-full-s1-lowLR`); the current read of what
-they show is in `docs/findings.md`.
+One `DFModel` family, addressed by condition letters: `a` swaps the plain RoPE
+GQA trunk for the PKDA/gated-GQA hybrid, `r` adds MHDB block-delta reads, `f`
+adds FBT feedback between token columns, and `l` names the tied-depth loop
+that is specified and not built. `--condition arf` is the full built stack;
+the empty condition is the plain decoder. Three full-schedule specimens exist
+on Jobe (`screen-df-mhdb-s1-lowLR`, an `ar` run; `screen-df-full-s1` and
+`screen-df-full-s1-lowLR`, `arf` runs); the current read of what they show is
+in `docs/findings.md`.
 
 ## Documents
 
 - [README.md](README.md): what we are growing, what ready looks like, where
   things stand, and the doc map.
-- [docs/design.md](docs/design.md): arms, geometry, data, schedule, feedback
+- [docs/design.md](docs/design.md): conditions, geometry, data, schedule, feedback
   passes, evaluation modes, and the recipe knobs.
 - [docs/architecture.md](docs/architecture.md): the exact model, state,
   initialization, and optimizer, with the small and the larger geometry.
-- [docs/depth-architecture.md](docs/depth-architecture.md): the tied-depth
-  `df-loop`, specified and unbuilt.
+- [docs/depth-architecture.md](docs/depth-architecture.md): the `l` letter,
+  the tied-depth loop, specified and unbuilt.
 - [docs/interpretability.md](docs/interpretability.md): the analysis scripts,
   what each shows, and the shape of the future study.
 - [docs/findings.md](docs/findings.md): the distilled current picture of the
@@ -45,10 +49,13 @@ than keeping aliases or compatibility notes for hypothetical readers.
 These describe the code as it stands. Any of them can change; when one does,
 change it everywhere at once.
 
-- One `DFModel` and the five `ARMS` define the family. Every hybrid arm is
-  `[PKDA, PKDA, PKDA, gated global GQA] x 3`; `vanilla` is twelve-layer RoPE
-  GQA. The larger geometry in `architecture.md` is the same architecture at
-  six cells and width 1,536.
+- One `DFModel` and `CONDITION_LETTERS` define the family. A condition is the
+  canonical string `parse_condition` returns (letters in `arfl` order) and
+  `ModelConfig.condition` renders it back; every subset of `arf` builds and
+  `l` raises until the loop exists. Under `a` the trunk is
+  `[PKDA, PKDA, PKDA, gated global GQA] x 3`; without `a` it is twelve-layer
+  RoPE GQA. The larger geometry in `architecture.md` is the same architecture
+  at six cells and width 1,536.
 - PKDA runs the literal recurrence on CPU/MPS and the workspace FLA fork's
   chunk and recurrent kernels on CUDA, with FP32 recurrent-matrix and
   preconditioner boundaries. CUDA training does not fall back to the
@@ -59,8 +66,10 @@ change it everywhere at once.
   full-width RMS key statistics, raw values, and one softmax per contiguous
   feature group, with `kv_heads` groups. Routing is a transient pre-norm read
   and leaves the telescoping residual identity intact.
-- Hard DF seeds the column with the FBT payload-value/token-gate fusion and
-  emits `payload_norm(h_top + route(null, seed, block deltas))`.
+- `f` seeds a fused position with the FBT payload-value/token-gate fusion and
+  emits `payload_norm(h_top)`; with `r` as well, the fused seed is the first
+  non-null routing source and the payload is
+  `payload_norm(h_top + route(null, seed, block deltas))`.
 - Feedback passes are causal and differentiable across passes; the payload is
   never detached.
 - NorMuonH owns ordinary hidden matrices, initialized `Normal(0, 1/sqrt(d_in))`
@@ -71,14 +80,14 @@ change it everywhere at once.
 
 ## Useful bookkeeping
 
-- Arms trained with the same seed and data seed share tokenizer, stream, row
-  order, schedule, optimizer, batch geometry, and keyed feedback randomness;
-  hybrid trunk weights pair byte-identically across the four factorial arms
-  and factor-private weights pair across a parent and `df`. Two such runs can
-  be compared token by token.
+- Conditions trained with the same seed and data seed share tokenizer, stream,
+  row order, schedule, optimizer, batch geometry, and keyed feedback
+  randomness; conditions on the same trunk letter pair every parameter they
+  share byte-identically, each letter's private weights from that letter's own
+  stream. Two such runs can be compared token by token.
 - A `k`-pass batch costs `k` transformer evaluations. Report pass-tokens
   beside predicted tokens; equal steps are matched data, not matched compute.
-- Pass-1 validation is the common number. Feedback arms also report the fused
+- Pass-1 validation is the common number. Conditions with `f` also report the fused
   number and the self-composition trace.
 - Independently trained runs differ like two seeds even when paired, so a
   small per-token difference between two runs is a mean shift on a wide
@@ -92,8 +101,9 @@ change it everywhere at once.
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
   collection outside train/eval graph capture.
-- Snapshots are v23. Only v23 resumes; v16 through v22 stay readable for
-  evaluation and forks.
+- Snapshots are v24. Only v24 resumes; v16 through v23 stay readable for
+  evaluation and forks, and the loader translates their arm names
+  (`vanilla`, `base`, `mhdb`, `fbt`, `df`) into conditions.
 - Before touching Jobe, look at `df status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker
   refreshes before the next job and runs the current checkout's probe.

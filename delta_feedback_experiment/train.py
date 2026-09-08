@@ -1,13 +1,13 @@
-"""One arm's training run under the binding recipe.
+"""One condition's training run under the binding recipe.
 
 The loop is a pure function of (init seed, data seed, step): data rows
 are step-addressed slices of the fixed stream, feedback randomness
 (pass counts, prefix lengths, jitter) derives from keyed generators
 rather than ambient RNG state, and the WSD schedule is the shared
 :class:`Schedule` addressed by cumulative step.  That is what makes a
-resumed invocation bit-identical to an uninterrupted one and every arm's
-batches the same bytes (the paired-comparison contract; arms must share
-``data_seed``, ``batch_rows``, and ``micro_rows``).
+resumed invocation bit-identical to an uninterrupted one and every
+condition's batches the same bytes (the paired-comparison contract; paired
+runs must share ``data_seed``, ``batch_rows``, and ``micro_rows``).
 
 Operational layer — telemetry records, immutable ``runs``-addressed
 snapshots, resume reconciliation — comes from ``transformer_experiments``.
@@ -31,12 +31,13 @@ from transformer_experiments.schedule import Schedule
 
 from .data import TokenData, read_meta
 from .model import (
-    ARMS,
+    CONDITION_LETTERS,
     DFModel,
-    arm_config,
+    condition_config,
     iterate_fused,
     multipass,
     multipass_loss,
+    parse_condition,
 )
 from .optim import (
     DEFAULT_NADAM_LR,
@@ -47,14 +48,14 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=23, resumable=frozenset({23}), surface_version=16
+    version=24, resumable=frozenset({24}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 10.0
 """Global FP32 gradient-norm ceiling shared by every run."""
 
 EXACT_FIELDS = (
-    "arm",
+    "condition",
     "seed",
     "data_seed",
     "seq_len",
@@ -106,18 +107,38 @@ def probability(value: str) -> float:
     return parsed
 
 
+def condition(value: str) -> str:
+    try:
+        return parse_condition(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        "df train", description="Train one arm of the DF factorial."
+        "df train", description="Train one condition of the DF family."
     )
     parser.add_argument("tag", type=runs.validate_run_tag, help="run tag")
-    parser.add_argument("--arm", choices=ARMS, default="vanilla")
+    parser.add_argument(
+        "--condition",
+        type=condition,
+        default="",
+        metavar="LETTERS",
+        help=(
+            "one letter per change from the plain RoPE GQA decoder, in any order "
+            "(default: none, the plain decoder): "
+            + "; ".join(
+                f"{letter} = {change}"
+                for letter, (_, change) in CONDITION_LETTERS.items()
+            )
+        ),
+    )
     parser.add_argument("--seed", type=int, default=1, help="init seed")
     parser.add_argument(
         "--data-seed",
         type=int,
         default=0,
-        help="shared randomness stream; identical across paired arms",
+        help="shared randomness stream; identical across paired conditions",
     )
     parser.add_argument("--data-dir", default="data/tokens")
     parser.add_argument("--out-dir", default="runs")
@@ -220,12 +241,12 @@ def mix(*parts: int) -> int:
 
 
 def feedback_boundary(args, total: int) -> int:
-    """Last one-pass step; feedback arms draw k > 1 on every later step."""
+    """Last one-pass step; feedback conditions draw k > 1 on every later step."""
     return round(args.feedback_start * total)
 
 
 def draw_passes(args, step: int, total: int) -> int:
-    """The step's pass count — shared across every feedback-bearing arm.
+    """The step's pass count — shared across every condition with ``f``.
 
     Before the boundary every step is one pass. After it there are no
     one-pass steps at all: each step draws three passes with probability
@@ -254,7 +275,7 @@ def micro_draws(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(prefix_lens [k-1, n], jitter [k-1, n, seq_len+1, dim]) for one
     microbatch, keyed by (data seed, step, first global row) — identical
-    across arms for any run sharing the batch geometry."""
+    across conditions for any run sharing the batch geometry."""
     if generator is None:
         generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
     generator.manual_seed(mix(args.data_seed, step, first_row))
@@ -709,7 +730,7 @@ def evaluate(
     device,
     graph_runner: CudaEvalRunner | None = None,
 ) -> dict[str, float]:
-    """Paired val losses: pass-1 always; one fused pass on feedback arms."""
+    """Paired val losses: pass-1 always; one fused pass on feedback conditions."""
     if graph_runner is not None:
         return graph_runner.run(data_val)
     model.eval()
@@ -944,8 +965,8 @@ def train(argv: list[str] | None = None) -> dict:
 
     torch.manual_seed(args.seed)
     model = DFModel(
-        arm_config(
-            args.arm,
+        condition_config(
+            args.condition,
             vocab_size=args.vocab_size,
             dim=args.dim,
             layers=args.layers,
