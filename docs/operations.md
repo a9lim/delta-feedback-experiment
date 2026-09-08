@@ -102,20 +102,60 @@ registered schedule.
 
 ## Inspect a checkpoint
 
+Every analysis script rebuilds the arm from a snapshot through
+`delta_feedback_experiment.analysis`, evaluates under the trainer's numerics
+(BF16 autocast on CUDA), and writes a JSON record beside its figures under
+`figures/<kind>-<tag>/`. Those directories stay ignored; promote a result with
+its record under the [evidence rules](interpretability.md#deliverables-and-acceptance).
+
 ```bash
+# Routing: per-site/group source mass, entropy, query geometry (mhdb or df).
 python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+
+# Payload enrichment swaps (df): trained router, top-only, uniform, forced source.
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens --head 2
+
+# Fused pass against pass 1 on one feedback snapshot: position, surprise, and
+# frequency structure, gate and seed statistics, self-composition.
+python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+
+# Entry interventions: gate temperature, seed scale, embedding bypass,
+# zero or foreign payload.
+python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+
+# Impulse response, payload-head ablation, split-validated ensemble, and
+# pass-1 versus fused-pass gradient alignment.
+python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+
+# Two checkpoints on the same rows: per-token loss structure, predictor
+# divergence, mixtures, residual-stream CKA, payload redundancy.
+python scripts/compare_arms.py --reference runs/A.pt.STEP --feedback runs/B.pt.STEP \
+  --data-dir /data/df/tokens
+
+# Paired weight-space divergence from the shared initialization (CPU).
+python scripts/weight_divergence.py runs/A.pt.STEP runs/B.pt.STEP
+
+# Continue a feedback snapshot with dense feedback passes (or --passes 1 as
+# the plain-only erosion control) at a fraction of the stable learning rate.
+python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/df/tokens \
+  --steps 150 --passes 2 --out figures/fused-TAG/dense_all.json
+
+# Figures: training dynamics from run logs, and panels from the JSON records.
+python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
+python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms.json \
+  --weights figures/weights-A-vs-B/weight_divergence.json \
+  --fused figures/fused-B/fused_diagnostics.json --entry figures/fused-B/entry_sweeps.json \
+  --followups figures/fused-B/feedback_followups.json --swap figures/fused-B/payload_swap.json \
+  --out-dir figures/compare-A-vs-B
 ```
 
-The route report writes figures and prints routing summaries. The payload sweep
-prints held-out losses for the trained router, top-only, uniform, and
-forced-source enrichment; `--head` restricts source replacement to one routing
-group. Use a `df` checkpoint for the payload sweep. These tools are diagnostic
-starting points, not a complete causal-analysis or learned-monitor suite.
-Record the exact checkpoint, data rows, device, precision, and command with any
-retained output. The shared analysis environment supplies Matplotlib for the
-route report.
+These tools are same-checkpoint diagnostics and paired observations, not a
+complete causal-analysis or learned-monitor suite. Payload and entry swaps
+perturb a co-adapted pathway, so they bound what the trained model depends on
+rather than what an alternative design would achieve. Record the exact
+checkpoint, data rows, device, precision, and command with any retained output.
+The shared analysis environment supplies Matplotlib.
 
 `df watch` shows training health, validation, and recurrence diagnostics. It is
 an operational monitor; it does not classify hidden reasoning or establish that

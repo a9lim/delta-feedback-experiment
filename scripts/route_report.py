@@ -1,64 +1,40 @@
 """Dissect a trained snapshot's routing: what each router learned.
 
-Rebuilds the arm's model from a checkpoint and reads its three routing
-components — the per-layer attn readers, the per-layer mlp readers, and
-the payload router — two ways:
+Rebuilds the arm's model from a checkpoint and reads its routing components,
+the per-layer attention readers, the per-layer MLP readers, and the payload
+router, two ways:
 
 - statically: query-vector geometry (norms set the effective softmax
-  temperature since keys are RMS-normed; pairwise cosines say whether
-  sites learned a shared reading direction);
+  temperature since keys are RMS-normed; pairwise cosines say whether sites
+  learned a shared reading direction);
 - empirically: per-head mean routing distributions over held-out rows, on the
-  plain pass and on a fused pass (prefix length 1, the training eval
-  convention), plus entropy and cross-head Jensen-Shannon divergence.
+  plain pass and, for feedback arms, on a fused pass (prefix length 1, the
+  training eval convention), plus entropy and cross-head Jensen-Shannon
+  divergence.
 
-Writes figures under figures/route-TAG/ and prints a per-site table.
+Writes ``route_report.json`` and figures under ``figures/route-TAG/`` and
+prints a per-site table.
 
 Usage:
-    python scripts/route_report.py runs/jobe-df-s1.pt.10745
+    python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/df/tokens
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
+import json
 import math
 from pathlib import Path
 
+import figstyle as fs
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib import colors
-from transformer_experiments import checkpoints
 
+from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DFModel, arm_config, multipass
-from delta_feedback_experiment.train import CONTRACT, pick_device
-
-GEOMETRY = (
-    "vocab_size",
-    "dim",
-    "layers",
-    "heads",
-    "kv_heads",
-    "head_dim",
-    "intermediate",
-    "seq_len",
-)
-
-
-def load_model(path: Path, device) -> tuple[DFModel, dict]:
-    payload = checkpoints.read(path, CONTRACT, map_location="cpu")
-    saved = payload["args"]
-    cfg = arm_config(
-        saved["arm"],
-        max_seq_len=saved["seq_len"] + 1,
-        **{f: saved[f] for f in GEOMETRY if f != "seq_len"},
-    )
-    model = DFModel(cfg)
-    model.load_state_dict(payload["state"])
-    model = model.to(device).eval()
-    model.refresh_shadows()
-    return model, saved
+from delta_feedback_experiment.model import multipass
 
 
 def site_names(layers: int) -> list[str]:
@@ -70,11 +46,10 @@ def collect(model, data_val, device, rows: int, micro: int):
     """Routing statistics per (pass, site) over `rows` val rows.
 
     Returns (mean weights [N,H], per-head token stats {max, H_tok},
-    normalized cross-head JS) keyed by
-    (pass, site).  Mean weights say *which* sources a site reads; the
-    per-token mean max and mean normalized entropy say whether that read
-    is static wiring (sharp and identical everywhere) or token-dependent
-    (sharp per token, varied across tokens).
+    normalized cross-head JS) keyed by (pass, site).  Mean weights say
+    *which* sources a site reads; the per-token mean max and mean normalized
+    entropy say whether that read is static wiring (sharp and identical
+    everywhere) or token-dependent (sharp per token, varied across tokens).
     """
     sums: dict[tuple[int, str], torch.Tensor] = {}
     stats: dict[tuple[int, str], torch.Tensor] = {}
@@ -83,18 +58,12 @@ def collect(model, data_val, device, rows: int, micro: int):
     final_source_names: dict[int, tuple[str, ...]] = {}
     route_source_names: dict[tuple[int, str], tuple[str, ...]] = {}
     counted = 0
-    # Match the trainer's evaluation numerics: BF16 activations on CUDA.
-    autocast = (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if device.type == "cuda"
-        else contextlib.nullcontext()
-    )
     feedback = model.cfg.feedback_active
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
         n = batch.shape[0]
         prefix = torch.ones((1, n), dtype=torch.long, device=device)
-        with autocast:
+        with analysis.autocast(device):
             # Non-feedback arms have only the plain pass to read.
             outs = multipass(
                 model,
@@ -153,12 +122,12 @@ def entropy(weights: np.ndarray) -> float:
 def site_matrix(means, route_names, cfg, passes=(0, 1)):
     """[site, source] mean-weight matrices per pass and head; NaN = absent.
 
-    Columns cover the union of null, standing, completed-block, and
-    current-partial labels.  Each row is placed by label rather than source
-    position because the bank changes at block boundaries.
+    Columns cover the union of null, seed, completed-block, and current-partial
+    labels.  Each row is placed by label rather than source position because
+    the bank changes at block boundaries.
     """
     sites = site_names(cfg.layers)
-    columns = ["null", "prev", "seed"]
+    columns = ["null", "seed"]
     columns += [f"block{i}" for i in range(cfg.routing_blocks)]
     columns += [f"partial{i}" for i in range(cfg.routing_blocks)]
     column_index = {name: index for index, name in enumerate(columns)}
@@ -177,21 +146,26 @@ def site_matrix(means, route_names, cfg, passes=(0, 1)):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("route report")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("--data-dir", default="data/tokens")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    device = pick_device(args.device)
-    model, saved = load_model(args.snapshot, device)
+    model, saved = analysis.load_checkpoint(args.snapshot, args.device)
+    device = next(model.parameters()).device
     cfg = model.cfg
+    if not cfg.routing_active:
+        raise SystemExit("the route report needs an mhdb or df snapshot")
     layers = cfg.layers
     tag = saved.get("tag", args.snapshot.stem)
-    out_dir = Path("figures") / f"route-{tag}"
+    out_dir = args.out_dir or Path("figures") / f"route-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    passes = (0, 1) if cfg.feedback_active else (0,)
+    pass_titles = {0: "pass 1 (plain)", 1: "pass 2 (fused)"}
     print(f"# {tag} — {saved['arm']}, {layers} layers, dim {cfg.dim}, device {device}")
 
     # -- static: query geometry ------------------------------------------------
@@ -223,7 +197,7 @@ def main() -> None:
         final_source_names,
         route_source_names,
     ) = collect(model, data_val, device, args.rows, args.micro_rows)
-    sites, columns, matrices = site_matrix(means, route_source_names, cfg)
+    sites, columns, matrices = site_matrix(means, route_source_names, cfg, passes)
 
     # The routed values are raw (only keys are normed), so source scale
     # matters for what a read actually adds.
@@ -235,24 +209,33 @@ def main() -> None:
         )
         print(f"  p{p + 1}: {shown}")
 
-    # Console table: per site, per pass — mean-distribution entropy,
-    # per-token mean max / entropy, and top-3 sources.
     print(
         f"\n{'site':<10}{'|q|':>7}{'nullRMS':>9}   "
         "pass head H_mean  maxT  H_tok head-JS  top sources"
     )
+    report = {"snapshot": str(args.snapshot), "arm": saved["arm"], "rows": args.rows, "sites": {},
+              "query_norms": dict(zip(labels, norms.tolist())), "query_cosine": cosine.tolist(), "labels": labels,
+              "null_rms": dict(zip(labels, [float(v) for v in null_rms])),
+              "source_rms": {f"p{p + 1}": dict(zip(final_source_names[p], rms.tolist())) for p, rms in norms_by_pass.items()}}
     for label, norm, null_scale in zip(labels, norms, null_rms, strict=True):
-        for p in (0, 1):
+        for p in passes:
             key = (p, label)
             if key not in means:
                 continue
+            local = route_source_names[p, label]
+            report["sites"].setdefault(label, {})[f"p{p + 1}"] = {
+                "sources": list(local),
+                "mean_weights": means[key].T.tolist(),
+                "per_head_max": stats[key][:, 0].tolist(),
+                "per_head_token_entropy": stats[key][:, 1].tolist(),
+                "head_js": divergences[key],
+            }
             for route_head in range(cfg.routing_heads):
                 w = means[key][:, route_head]
                 max_t, h_tok = stats[key][route_head]
-                local = route_source_names[p, label]
                 top = sorted(zip(local, w), key=lambda t: -t[1])[:3]
                 shown = "  ".join(f"{n}={v:.3f}" for n, v in top)
-                first_row = ((0, label) not in means or p == 0) and route_head == 0
+                first_row = p == passes[0] and route_head == 0
                 site = (
                     f"{label:<10}{norm:>7.2f}{null_scale:>9.3f}"
                     if first_row
@@ -263,6 +246,7 @@ def main() -> None:
                     f"{site}   p{p + 1}   h{route_head:<2}  {entropy(w):5.3f}  "
                     f"{max_t:.3f}  {h_tok:.3f}   {js}   {shown}"
                 )
+    (out_dir / "route_report.json").write_text(json.dumps(report, indent=2) + "\n")
 
     # -- figures ---------------------------------------------------------------
     norm_map = colors.PowerNorm(
@@ -272,59 +256,56 @@ def main() -> None:
     )
     fig, axes = plt.subplots(
         cfg.routing_heads,
-        2,
-        figsize=(15, 3.1 * cfg.routing_heads),
+        len(passes),
+        figsize=(7.5 * len(passes), 3.1 * cfg.routing_heads),
         sharex=True,
         sharey=True,
         squeeze=False,
         constrained_layout=True,
     )
     for route_head in range(cfg.routing_heads):
-        for p, title in ((0, "pass 1 (plain)"), (1, "pass 2 (fused)")):
-            ax = axes[route_head, p]
+        for column, p in enumerate(passes):
+            ax = axes[route_head, column]
             image = ax.imshow(
-                matrices[p, route_head], aspect="auto", cmap="viridis", norm=norm_map
+                matrices[p, route_head], aspect="auto", cmap=fs.SEQUENTIAL, norm=norm_map
             )
+            ax.grid(False)
             ax.set_yticks(range(len(sites)), sites, fontsize=7)
-            ax.set_title(f"head {route_head}, {title}", fontsize=10)
-            if p == 0:
+            ax.set_title(f"head {route_head}, {pass_titles[p]}", fontsize=10)
+            if column == 0:
                 ax.set_ylabel("reading site")
             if route_head == cfg.routing_heads - 1:
-                ax.set_xticks(
-                    range(len(columns)),
-                    columns,
-                    fontsize=7,
-                    rotation=90,
-                )
+                ax.set_xticks(range(len(columns)), columns, fontsize=7, rotation=90)
                 ax.set_xlabel("MHDB source")
     fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
     fig.suptitle(f"{tag}: MHDB read maps", fontsize=12)
-    fig.savefig(out_dir / "site-routing.png", dpi=150)
+    fs.save(fig, out_dir / "site-routing.png")
 
     if (0, "payload") in means:
         fig, axes = plt.subplots(
-            2, 1, figsize=(11, 5.5), sharex=True, constrained_layout=True
+            len(passes), 1, figsize=(11, 2.75 * len(passes)), sharex=True, constrained_layout=True, squeeze=False
         )
-        payload_max = max(means[(0, "payload")].max(), means[(1, "payload")].max())
-        for ax, p, title in zip(axes, (0, 1), ("pass 1 (plain)", "pass 2 (fused)")):
+        payload_max = max(means[(p, "payload")].max() for p in passes)
+        for ax, p in zip(axes[:, 0], passes):
             image = ax.imshow(
                 means[(p, "payload")].T,
                 aspect="auto",
-                cmap="viridis",
+                cmap=fs.SEQUENTIAL,
                 vmin=0,
                 vmax=payload_max,
             )
+            ax.grid(False)
             ax.set_yticks(range(cfg.routing_heads), range(cfg.routing_heads))
             ax.set_ylabel("routing head")
-            ax.set_title(title)
+            ax.set_title(pass_titles[p])
         payload_names = route_source_names[0, "payload"]
-        axes[-1].set_xticks(
+        axes[-1, 0].set_xticks(
             range(len(payload_names)), payload_names, fontsize=7, rotation=90
         )
-        axes[-1].set_xlabel("payload source")
+        axes[-1, 0].set_xlabel("payload source")
         fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
         fig.suptitle(f"{tag}: MHDB payload — what rides to the next column")
-        fig.savefig(out_dir / "payload-routing.png", dpi=150)
+        fs.save(fig, out_dir / "payload-routing.png")
 
     fig, (ax_norm, ax_cos) = plt.subplots(
         1, 2, figsize=(11, 4.2), width_ratios=(1, 1.2), constrained_layout=True
@@ -332,23 +313,24 @@ def main() -> None:
     depth = np.arange(layers)
     attn_norms = [norms[labels.index(f"L{i}.attn")] for i in depth]
     mlp_norms = [norms[labels.index(f"L{i}.mlp")] for i in depth]
-    ax_norm.plot(depth, attn_norms, "o-", label="attn reader")
-    ax_norm.plot(depth, mlp_norms, "s-", label="mlp reader")
+    ax_norm.plot(depth, attn_norms, "o-", color=fs.BLUE, label="attn reader")
+    ax_norm.plot(depth, mlp_norms, "s-", color=fs.ORANGE, label="mlp reader")
     if "payload" in labels:
         ax_norm.axhline(
-            norms[labels.index("payload")], color="C2", lw=1, ls=":", label="payload"
+            norms[labels.index("payload")], color=fs.AQUA, lw=1, ls=":", label="payload"
         )
     ax_norm.set_xlabel("layer")
     ax_norm.set_ylabel("|query|")
     ax_norm.set_title("query norms (softmax sharpness)", fontsize=10)
-    ax_norm.legend(fontsize=8)
-    image = ax_cos.imshow(cosine, cmap="RdBu_r", vmin=-1, vmax=1)
+    ax_norm.legend()
+    image = ax_cos.imshow(cosine, cmap=fs.DIVERGING, vmin=-1, vmax=1)
+    ax_cos.grid(False)
     ax_cos.set_xticks(range(len(labels)), labels, fontsize=6, rotation=90)
     ax_cos.set_yticks(range(len(labels)), labels, fontsize=6)
     ax_cos.set_title("query cosine similarity", fontsize=10)
     fig.colorbar(image, ax=ax_cos, shrink=0.9)
     fig.suptitle(f"{tag}: router query geometry", fontsize=12)
-    fig.savefig(out_dir / "query-geometry.png", dpi=150)
+    fs.save(fig, out_dir / "query-geometry.png")
     print(f"\nfigures -> {out_dir}/")
 
 

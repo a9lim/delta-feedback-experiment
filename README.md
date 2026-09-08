@@ -71,8 +71,9 @@ column. It is specified but unimplemented and is not a sixth registered arm.
 ## Current status
 
 The repository has a single `DFModel`, deterministic single-process training,
-portable semantics, a qualified Jobe CUDA path, route reports, payload-source
-interventions, and recurrent stability diagnostics. No completed comparison
+portable semantics, a qualified Jobe CUDA path, route reports, paired
+checkpoint comparisons, payload and entry interventions, and recurrent
+stability diagnostics. No completed comparison
 under the current screen contract or accepted scientific finding is recorded.
 Existing diagnostic checkpoints can support explicitly scoped exploratory
 analysis; they do not constitute the registered factorial.

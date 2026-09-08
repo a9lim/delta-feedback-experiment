@@ -1,56 +1,41 @@
 """Counterfactual payload sweep: what should ride to the next column?
 
-Forces the MHDB payload enrichment to each null, seed, or completed-block source
-in turn (plus none / uniform), either across all heads or in one selected head,
-and measures fused val loss under the training eval convention (one fused pass,
-prefix length 1).  Answers whether the trained router's choice is a family
-preference, a specific peak, or a no-op.
+Forces the MHDB payload enrichment to each null, seed, or completed-block
+source in turn (plus none / uniform), either across all heads or in one
+selected head, and measures fused val loss under the training eval convention
+(one fused pass, prefix length 1).  Answers whether the trained router's choice
+is a family preference, a specific peak, or a no-op.
 
 Caveat: the fuse/entry weights co-adapted to the *trained* payload, so
-alternatives are handicapped — read the landscape's shape (which family
-helps, which hurts, how peaked), not absolute gaps.
+alternatives are handicapped: read the landscape's shape (which family helps,
+which hurts, how peaked), not absolute gaps.
 
 Usage:
-    python scripts/payload_swap.py runs/jobe-df-s1.pt.10745
-    python scripts/payload_swap.py runs/jobe-df-s1.pt.10745 --head 2
+    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens
+    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/df/tokens --head 2
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
+import json
 from pathlib import Path
 
 import torch
-from transformer_experiments import checkpoints
 
+from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import (
-    DFModel,
-    arm_config,
-    multipass,
-    multipass_loss,
-)
-from delta_feedback_experiment.train import CONTRACT, pick_device
-
-GEOMETRY = (
-    "vocab_size",
-    "dim",
-    "layers",
-    "heads",
-    "kv_heads",
-    "head_dim",
-    "intermediate",
-)
+from delta_feedback_experiment.model import multipass, multipass_loss
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser("payload swap")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("--data-dir", default="data/tokens")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--out-dir", type=Path, default=None)
     parser.add_argument(
         "--head",
         type=int,
@@ -59,35 +44,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    device = pick_device(args.device)
-    payload = checkpoints.read(args.snapshot, CONTRACT, map_location="cpu")
-    saved = payload["args"]
-    cfg = arm_config(
-        saved["arm"],
-        max_seq_len=saved["seq_len"] + 1,
-        **{f: saved[f] for f in GEOMETRY},
-    )
+    model, saved = analysis.load_checkpoint(args.snapshot, args.device)
+    device = next(model.parameters()).device
+    cfg = model.cfg
     if not cfg.feedback_active or not cfg.routing_active:
         raise SystemExit("the payload sweep needs the df payload router")
     if args.head is not None and not 0 <= args.head < cfg.routing_heads:
         raise SystemExit(
             f"--head must be in [0, {cfg.routing_heads - 1}], got {args.head}"
         )
-    model = DFModel(cfg)
-    model.load_state_dict(payload["state"])
-    model = model.to(device).eval()
-    # CUDA cross-entropy reads the BF16 classifier shadow that the trainer
-    # refreshes after every update; analysis must prepare it once itself.
-    model.refresh_shadows()
+    tag = saved.get("tag", args.snapshot.stem)
+    out_dir = args.out_dir or Path("figures") / f"fused-{tag}"
+    out_dir.mkdir(parents=True, exist_ok=True)
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
-
-    # The CUDA loss path reads BF16 operands, exactly like the trainer's
-    # captured evaluation; portable devices stay in FP32.
-    autocast = (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if device.type == "cuda"
-        else contextlib.nullcontext()
-    )
 
     @torch.no_grad()
     def losses() -> tuple[float, float]:
@@ -98,7 +67,7 @@ def main() -> None:
                 first, min(args.micro_rows, args.rows - first), device
             )
             prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
-            with autocast:
+            with analysis.autocast(device):
                 outs = multipass(model, rows, 2, prefix_lens=prefix)
                 _, per_pass = multipass_loss(model, rows, outs)
             sums[0] += per_pass[0].item()
@@ -108,18 +77,22 @@ def main() -> None:
 
     names = ["null", "seed"] + [f"block{i}" for i in range(cfg.routing_blocks)]
     val, fused = losses()
+    report = {"snapshot": str(args.snapshot), "rows": args.rows, "head": args.head,
+              "pass1": val, "trained_router": fused}
     print(f"trained router : val={val:.4f}  fused={fused:.4f}")
 
     trained_forward = model.payload_router.forward
     model.payload_router.forward = lambda sources, masks, want: (None, None)
-    print(f"h_top only     : fused={losses()[1]:.4f}")
+    report["h_top_only"] = losses()[1]
+    print(f"h_top only     : fused={report['h_top_only']:.4f}")
     model.payload_router.forward = lambda sources, masks, want: (
         torch.stack([model.payload_router.null.expand_as(sources[0]), *sources]).mean(
             0
         ),
         None,
     )
-    print(f"uniform        : fused={losses()[1]:.4f}")
+    report["uniform"] = losses()[1]
+    print(f"uniform        : fused={report['uniform']:.4f}")
 
     def selected_source(sources, index):
         if index == 0:
@@ -150,10 +123,15 @@ def main() -> None:
             model.payload_router.forward = force_one_head
         results.append((name, losses()[1]))
         print(f"force {name:<4}     : fused={results[-1][1]:.4f}", flush=True)
+    report["forced"] = dict(results)
 
     print("\nsorted:")
     for name, value in sorted(results, key=lambda t: t[1]):
         print(f"  {name:<4} {value:.4f}")
+    suffix = "" if args.head is None else f"_head{args.head}"
+    out_path = out_dir / f"payload_swap{suffix}.json"
+    out_path.write_text(json.dumps(report, indent=2) + "\n")
+    print(f"wrote {out_path}")
 
 
 if __name__ == "__main__":
