@@ -1,9 +1,8 @@
 # Operating the model organism
 
-Use this page to reproduce training and inspect checkpoints. The research
-purpose and current study are in [design.md](design.md); the analysis protocol
-is in [interpretability.md](interpretability.md). Training creates specimens
-for that work. A completed job is not itself a mechanistic result.
+Use this page to train specimens and inspect checkpoints. The recipe is in
+[design.md](design.md); the analysis scripts are in
+[interpretability.md](interpretability.md).
 
 Commands below run from this repository unless they explicitly change
 directory. Before using Jobe, inspect `df status`, the active log, and GPU
@@ -94,19 +93,17 @@ their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
 Snapshots use checkpoint contract v23, and only v23 is resumable. V16–v22
-remain readable for evaluation and forks. Reading an older diagnostic snapshot
-does not make it a member of the current registered comparison. Protected
-snapshots persist at the cooldown boundary, the feedback boundary, and the end
-of the run. `--max-steps` limits the current invocation without changing the
-registered schedule.
+remain readable for evaluation and forks. Protected snapshots persist at the
+cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
+limits the current invocation without changing the schedule.
 
 ## Inspect a checkpoint
 
 Every analysis script rebuilds the arm from a snapshot through
 `delta_feedback_experiment.analysis`, evaluates under the trainer's numerics
 (BF16 autocast on CUDA), and writes a JSON record beside its figures under
-`figures/<kind>-<tag>/`. Those directories stay ignored; promote a result with
-its record under the [evidence rules](interpretability.md#deliverables-and-acceptance).
+`figures/<kind>-<tag>/`. Those directories stay ignored; the [figure
+index](../figures/README.md) maps them.
 
 ```bash
 # Routing: per-site/group source mass, entropy, query geometry (mhdb or df).
@@ -158,15 +155,9 @@ python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms
   --out-dir figures/compare-A-vs-B
 ```
 
-These tools are same-checkpoint diagnostics and paired observations, not a
-complete causal-analysis or learned-monitor suite. Payload and entry swaps
-perturb a co-adapted pathway, so they bound what the trained model depends on
-rather than what an alternative design would achieve. Record the exact
-checkpoint, data rows, device, precision, and command with any retained output.
-The shared analysis environment supplies Matplotlib.
+Payload and entry swaps perturb a co-adapted pathway, so they bound what the
+trained model depends on rather than what an alternative design would achieve.
+Record the checkpoint, data rows, device, precision, and command with any
+output you keep. The shared analysis environment supplies Matplotlib.
 
-`df watch` shows training health, validation, and recurrence diagnostics. It is
-an operational monitor; it does not classify hidden reasoning or establish that
-internal computation is understood. See
-[interpretability.md](interpretability.md) for the separate monitoring research
-objective.
+`df watch` shows training health, validation, and recurrence diagnostics.

@@ -1,124 +1,101 @@
 # AGENTS.md
 
-This repository develops a small recurrent model organism for interpretability.
-It synthesizes already-published mechanisms so we can inspect latent
-computation, test causal explanations, and develop methods for monitoring
-models capable of opaque reasoning. Capabilities serve task acquisition and
-experimental usefulness; advancing the capabilities frontier is not the goal.
+This repository grows a small recurrent language model with a latent channel
+between token columns, so that a later interpretability study has an organism
+worth studying. The organism is not the object of study yet. This is a
+sandbox: train variants, look inside, change the recipe or the architecture,
+write down what happened. Nothing is pre-registered and no result needs to
+clear a gate before it can be used to decide what to try next.
 
-The implemented five-arm pretraining study produces controlled specimens:
-`{base, mhdb, fbt, df}` is the primary factorial and pure-GQA `vanilla` is the
-external trunk control. No completed comparison under the current screen
-contract or accepted scientific finding is recorded. Diagnostic checkpoints may
-support explicitly scoped exploratory analysis with original provenance. Do not
-present the organism as already exhibiting understood reasoning or validated
-monitoring, or infer live Jobe availability from documentation.
+The five arms `{base, mhdb, fbt, df, vanilla}` of one `DFModel` are the knobs.
+Three full-schedule specimens exist on Jobe (`screen-df-mhdb-s1-lowLR`,
+`screen-df-full-s1`, `screen-df-full-s1-lowLR`); the current read of what
+they show is in `docs/findings.md`.
 
 ## Documents
 
-- [README.md](README.md) is the research purpose, organism overview, and entry point.
-- [docs/design.md](docs/design.md) owns the controlled study, data, schedules,
-  evaluation, evidence, and research decision gates.
-- [docs/interpretability.md](docs/interpretability.md) owns behavioral,
-  tracing, causal-intervention, and monitoring protocols and implementation status.
-- [docs/architecture.md](docs/architecture.md) is the sole model, state,
-  parameter, and optimizer contract, with small and optional larger geometry.
-- [docs/depth-architecture.md](docs/depth-architecture.md) specifies the
-  unimplemented `df-loop`; it is not registered until its adoption list lands.
-- [docs/operations.md](docs/operations.md) owns operator commands;
-  [docs/runtime-qualification.md](docs/runtime-qualification.md) owns numerical
-  and execution qualification.
-- [docs/scaling.md](docs/scaling.md) preserves optional longer/larger recipes,
-  gated on a named interpretability need, implementation, and spend approval.
-- [docs/literature.md](docs/literature.md) maps published components to the
-  organism; [references/refs.yaml](references/refs.yaml) owns primary-source roles.
-- [docs/findings.md](docs/findings.md) and [figures/README.md](figures/README.md)
-  hold accepted scientific findings and their figures.
-- [docs/journal.md](docs/journal.md) is disposable active scratch space.
+- [README.md](README.md): what we are growing, what ready looks like, where
+  things stand, and the doc map.
+- [docs/design.md](docs/design.md): arms, geometry, data, schedule, feedback
+  passes, evaluation modes, and the recipe knobs.
+- [docs/architecture.md](docs/architecture.md): the exact model, state,
+  initialization, and optimizer, with the small and the larger geometry.
+- [docs/depth-architecture.md](docs/depth-architecture.md): the tied-depth
+  `df-loop`, specified and unbuilt.
+- [docs/interpretability.md](docs/interpretability.md): the analysis scripts,
+  what each shows, and the shape of the future study.
+- [docs/findings.md](docs/findings.md): the distilled current picture of the
+  specimens. [docs/journal.md](docs/journal.md): dated working notes.
+- [docs/operations.md](docs/operations.md): operator commands.
+  [docs/runtime-qualification.md](docs/runtime-qualification.md): the CUDA
+  execution path and its numerical evidence.
+- [docs/scaling.md](docs/scaling.md): longer and larger recipes, worked out
+  but not scheduled.
+- [docs/literature.md](docs/literature.md) and
+  [references/refs.yaml](references/refs.yaml): sources and departures.
+- [figures/README.md](figures/README.md): the figure directories.
 
-Keep active documentation current-only. Remove superseded configurations,
-chronology, compatibility aliases, speculative extensions, and unearned claims.
-Update code, tests, CLI help, and all affected documents together when a
-contract changes.
+Keep the docs current-only: they describe what the code does and what we have
+seen, not the history of either. When a contract changes, update code, tests,
+CLI help, and the affected pages together. Delete superseded material rather
+than keeping aliases or compatibility notes for hypothetical readers.
 
-## Nonnegotiable model contract
+## How the model fits together
 
-- One `DFModel` and the five exact `ARMS` define the family. Do not add parallel
-  implementations or aliases.
-- Every hybrid screen arm is exactly
+These describe the code as it stands. Any of them can change; when one does,
+change it everywhere at once.
+
+- One `DFModel` and the five `ARMS` define the family. Every hybrid arm is
   `[PKDA, PKDA, PKDA, gated global GQA] x 3`; `vanilla` is twelve-layer RoPE
-  GQA. The optional larger reference is the corresponding six-cell hard-DF
-  architecture in `architecture.md`; it is not the project objective.
-- PKDA uses the literal portable recurrence off CUDA and the workspace FLA
-  fork's chunk and recurrent kernels on CUDA. Recurrent matrix and
-  preconditioner boundaries are FP32. Never silently use the sequential
-  fallback for CUDA training.
-- MHDB sources are the actual column seed, completed four-layer block deltas,
-  and at most one current-cell partial. Individual branch deltas are not
-  sources. Every site prepends its own learned zero-initialized null.
-- Each router uses a zero-initialized width-`D` query, full-width RMS key
-  statistics, raw values, and one source softmax per contiguous feature group;
-  the group count equals `kv_heads`. Routing is a transient pre-norm read and
-  never changes the telescoping residual identity.
-- Hard DF uses the FBT asymmetric payload-value/token-gate fusion as its MHDB
-  seed. Its payload normalizes the sum of the top state and a routed mixture over
-  the null, seed, and completed block deltas.
-- Multi-pass feedback stays causal and differentiable across passes. Never
-  detach the payload to solve memory pressure.
-- NorMuonH owns ordinary hidden matrices and uses the released NorMuon
-  Nesterov blend before orthogonalization. Its matrices initialize from
-  `Normal(0, 1/sqrt(d_in))`; their realized initial Frobenius radii remain fixed.
-  NAdam owns semantic-scale gates, embeddings, norms, routing parameters, PKDA
-  controls, convolutions, and vectors in one parameter group. No group uses
-  weight decay. Clip the global FP32 gradient to norm 10.0 immediately before
+  GQA. The larger geometry in `architecture.md` is the same architecture at
+  six cells and width 1,536.
+- PKDA runs the literal recurrence on CPU/MPS and the workspace FLA fork's
+  chunk and recurrent kernels on CUDA, with FP32 recurrent-matrix and
+  preconditioner boundaries. CUDA training does not fall back to the
+  sequential path.
+- MHDB sources are the column seed, the completed four-layer block deltas, and
+  at most one current-cell partial; every site prepends its own learned
+  zero-initialized null. Routers use a zero-initialized width-`D` query,
+  full-width RMS key statistics, raw values, and one softmax per contiguous
+  feature group, with `kv_heads` groups. Routing is a transient pre-norm read
+  and leaves the telescoping residual identity intact.
+- Hard DF seeds the column with the FBT payload-value/token-gate fusion and
+  emits `payload_norm(h_top + route(null, seed, block deltas))`.
+- Feedback passes are causal and differentiable across passes; the payload is
+  never detached.
+- NorMuonH owns ordinary hidden matrices, initialized `Normal(0, 1/sqrt(d_in))`
+  with fixed realized Frobenius radii; NAdam owns gates, embeddings, norms,
+  routing parameters, PKDA controls, convolutions, and vectors in one group.
+  No weight decay. The global FP32 gradient is clipped to norm 10.0 before
   both steps.
 
-## Evidence discipline
+## Useful bookkeeping
 
-- Registered arms share tokenizer, stream, row order, schedule, optimizer,
-  batch geometry, and keyed feedback randomness. Hybrid trunk weights are
-  paired across all four factorial cells; factor-private weights pair across
-  their parent and `df`.
-- Report exact parameters, predicted tokens, and pass-tokens. A `k`-pass batch
-  costs `k` transformer evaluations; equal steps are not matched compute.
-- Attribute MHDB, FBT, and their interaction only on the Jobe factorial.
-  Prime's `{base, df}` pair tests the complete package only. Report
-  `vanilla - base` separately as a whole-trunk contrast.
-- Pass-1 validation is the common metric. Feedback arms also report the fused
-  metric and contraction trace. Routing summaries are diagnostics, not wins.
-- Training-effect claims require completed registered comparisons. A scoped
-  same-checkpoint causal finding requires reproducible interventions, controls,
-  and held-out confirmation; it does not require an architecture win.
-- Routing weights and decodable features do not establish causal importance.
-  Empirical settling does not prove contraction, reasoning, or safe behavior.
-  The training dashboard is not a validated monitor of hidden computation.
-- Monitoring claims need an independent target, declared observation budget,
-  held-out evaluation, calibration/error reporting, and shift tests. Treat
-  transfer to larger reasoning models as a separate empirical question.
-- Prefer the smallest specimen that answers the question. Useful null or
-  negative results can qualify; capabilities improvements alone do not.
-  Keep engineering qualification separate from scientific findings.
+- Arms trained with the same seed and data seed share tokenizer, stream, row
+  order, schedule, optimizer, batch geometry, and keyed feedback randomness;
+  hybrid trunk weights pair byte-identically across the four factorial arms
+  and factor-private weights pair across a parent and `df`. Two such runs can
+  be compared token by token.
+- A `k`-pass batch costs `k` transformer evaluations. Report pass-tokens
+  beside predicted tokens; equal steps are matched data, not matched compute.
+- Pass-1 validation is the common number. Feedback arms also report the fused
+  number and the self-composition trace.
+- Independently trained runs differ like two seeds even when paired, so a
+  small per-token difference between two runs is a mean shift on a wide
+  spread. Same-checkpoint interventions resolve much finer effects.
 
-## Runtime and scale boundary
+## Runtime and Jobe
 
-- Import telemetry, schedules, run/snapshot addressing, checkpoint staging,
-  monitor serving, and spool orchestration from the workspace root package.
-- Jobe is the authoritative single-GPU CUDA surface. Keep screen jobs serial;
-  the qualified DF graph pool reserves about 23.0 GiB. See
-  `docs/runtime-qualification.md` for the PyTorch 2.14 / CUDA 13.2 evidence.
-  Keep cyclic Python garbage collection outside train/eval graph capture.
-  New snapshots are v23;
-  only v23 resumes, and v16-v22 stay readable for evaluation and forks.
-- Before operating Jobe, inspect `df status`, the active log, and GPU ownership.
-  The queue stores arguments rather than Git state; a worker refreshes before
-  the next job and runs the current checkout's probe.
-- The implemented local program is the two-seed 25x Jobe screen plus a fresh
-  single-process 400x schedule. Prime DDP and the exact larger reference remain gated
-  on pinned direct-HF data materialization with byte-checksum parity,
-  distributed parity, durable artifacts, memory/throughput, checkpoint
-  portability, and restart tests.
-- Larger runs require a named interpretability question that the smaller
-  specimen cannot resolve. The larger reference also requires an admissible
-  Jobe factorial, a fresh Prime `{base, df}` result, stable long-horizon
-  recurrence, the exact implementation gate, and explicit spend confirmation
-  from a9. A useful small organism is a valid endpoint.
+- Telemetry, schedules, run/snapshot addressing, checkpoint staging, monitor
+  serving, and spool orchestration come from the workspace root package.
+- Jobe is the single-GPU CUDA surface. Keep GPU jobs serial; the captured DF
+  graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
+  the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
+  collection outside train/eval graph capture.
+- Snapshots are v23. Only v23 resumes; v16 through v22 stay readable for
+  evaluation and forks.
+- Before touching Jobe, look at `df status`, the active log, and GPU
+  ownership. The queue stores arguments rather than Git state; a worker
+  refreshes before the next job and runs the current checkout's probe.
+- Prime DDP and the larger reference are worked out in `docs/scaling.md` but
+  not implemented. Prime time is real money; a9 decides when to spend it.

@@ -1,38 +1,32 @@
 # delta-feedback-experiment
 
-We are developing a small recurrent **model organism for interpretability**: a
-miniature language model whose latent computation we can analyze, inspect, and
-intervene on. The goal is to better understand and eventually monitor models
-that reason through internal states whose computation is opaque to us.
-Capabilities matter insofar as the organism needs meaningful behavior to study.
-Advancing the capabilities frontier is not this research's objective.
+This is a nursery for a small recurrent language model with a latent channel
+between token columns. The eventual goal is a **model organism**: a model of
+roughly 250M parameters whose cross-token latent computation is real enough,
+and opaque enough, to be worth studying with interpretability and monitoring
+methods. That study is future work with its own design. This repository is
+where the organism gets grown: train variants, look inside, change the recipe
+or the architecture, repeat.
 
-The architecture synthesizes already-published work on latent feedback,
-recurrent memory, and depth routing. We are assembling an experimental object,
-not claiming a new frontier architecture or reproducing any one paper's
-results. The intended contribution is a reproducible organism, causal
-explanations of its behavior, and monitoring methods tested against those
-explanations.
+Nothing here is pre-registered. Runs are experiments in the ordinary sense of
+trying things. [The journal](docs/journal.md) records what we saw as we went,
+[findings](docs/findings.md) keeps the distilled current picture, and the
+rest of the docs describe what the code does today.
 
-## What we want to understand
+## What we are growing
 
-- What information survives in recurrent state, and how is it transformed?
-- When does later behavior depend on the payload, mixer memory, or depth routes?
-- Does repeated computation preserve, refine, overwrite, or destabilize state?
-- Can a monitor detect a specific internal change before it appears in outputs,
-  and does that detection survive controlled interventions and held-out tasks?
+The model is a decoder with three kinds of recurrence available to it:
 
-Readable activations and routing plots are starting points. Understanding
-requires interventions that predictably change behavior. A monitor requires an
-independently defined target and measured errors. Neither lower loss nor a
-decaying state-update norm demonstrates interpretable reasoning.
-
-## The organism
-
-The implemented model is a 230–258M-parameter decoder family that can be
-trained and examined on one RTX 4090. “Small” is relative to frontier models:
-this is still a substantial pretraining workload, and smaller diagnostic
-geometries are useful for implementation checks.
+- **Token-mixer memory.** Preconditioned Kimi Delta Attention (PKDA) layers
+  carry a recurrent matrix state along the token axis; every fourth layer is a
+  gated global GQA read over the whole prefix.
+- **Latent feedback across columns.** The Full-Bandwidth Transformer (FBT)
+  entry fuses the previous token column's payload with the current token
+  embedding, so a column can receive computation the previous column finished
+  after it emitted its token.
+- **Depth routing.** Multi-Head Delta Block routing (MHDB) lets every sublayer
+  read the column seed and the completed four-layer block deltas, and lets the
+  outgoing payload be a routed mixture of them instead of just the top state.
 
 ```text
 previous token's latent payload + current token embedding
@@ -47,61 +41,82 @@ previous token's latent payload + current token embedding
                    next latent payload
 ```
 
-PKDA supplies recurrent token-mixer memory; GQA supplies periodic full-prefix
-reads. FBT carries a latent payload across token columns. MHDB makes the seed
-and block contributions addressable inside a column and in the outgoing `df`
-payload. These are concrete places to observe and perturb computation; their
-presence does not make their learned contents interpretable.
+One `DFModel` implements five arms, so any two can be trained on identical
+rows from paired initializations and compared:
 
-The five arms provide controls for studying those mechanisms:
-
-| Arm | Role |
+| Arm | What it has |
 |---|---|
-| `base` | Common PKDA/GQA trunk, with neither MHDB nor FBT |
-| `mhdb` | Depth routing without latent feedback |
-| `fbt` | Latent feedback without depth routing |
-| `df` | Both, including routed payload enrichment |
-| `vanilla` | Separate pure-GQA whole-trunk control |
+| `base` | The PKDA/GQA trunk, no MHDB, no FBT |
+| `mhdb` | Depth routing, no latent feedback |
+| `fbt` | Latent feedback, no depth routing |
+| `df` | Both, with routed payload enrichment |
+| `vanilla` | A plain twelve-layer RoPE GQA decoder, for a whole-trunk contrast |
 
-`base` already has PKDA recurrence. The factorial isolates the MHDB and FBT
-packages; it does not compare all recurrence against none. The proposed
-[`df-loop`](docs/depth-architecture.md) adds a tied core iterated within each
-column. It is specified but unimplemented and is not a sixth registered arm.
+The [architecture page](docs/architecture.md) has the exact equations,
+geometry, and optimizer. A tied-depth variant,
+[`df-loop`](docs/depth-architecture.md), is specified and waiting to be built.
 
-## Current status
+## What "ready" looks like
 
-The repository has a single `DFModel`, deterministic single-process training,
-portable semantics, a qualified Jobe CUDA path, route reports, paired
-checkpoint comparisons, payload and entry interventions, and recurrent
-stability diagnostics. No completed comparison
-under the current screen contract or accepted scientific finding is recorded.
-Existing diagnostic checkpoints can support explicitly scoped exploratory
-analysis; they do not constitute the registered factorial.
+The organism is ready for a real experiment when its latent channel has
+properties worth studying rather than properties we would have to assume:
 
-The next work is to build and characterize reproducible specimens, establish
-behavior that causally uses recurrent state, and develop the analysis and
-monitoring protocol. There is no registered reasoning benchmark or validated
-hidden-state monitor yet. The model has not been shown to be a faithful proxy
-for opaque reasoning in larger systems.
+- The payload carries something the token stream and the mixer caches do not,
+  so later behavior changes when it is perturbed.
+- That content is not simply a re-encoding of the emitted token or the readout
+  state. A channel the tokenizer could reconstruct is not opaque.
+- Repeated application of the feedback map settles instead of drifting or
+  blowing up, so trajectories can be traced.
+- Some behavior, ideally an externally scored task, depends on the channel.
 
-The primary training recipe is a two-seed, five-arm Jobe screen. Longer
-training and larger geometries are [optional references](docs/scaling.md),
-gated on a specific interpretability need, implementation qualification, and
-spend approval. A useful organism at the current size is a successful endpoint.
+These are growth targets. Measuring them is the job of the analysis scripts;
+hitting them is the job of the recipe and the architecture.
+
+## Where things stand
+
+Three full-schedule specimens exist on Jobe, all seed 1 on the same rows:
+an `mhdb` run on the default recipe, and two `df` runs trained with three
+feedback passes on every step from step 0, at two NorMuonH learning rates.
+An older `df` run on the 75/22/3 pass mixture and an earlier trainer contract
+sits on the Mac.
+
+The current read, from [findings](docs/findings.md): the channel as trained is
+live, stable, and harmless, and it is token-legible. The first cell decodes
+the fused seed back onto the plain representation and the rest of the column
+runs as it would on a plain pass; the payload is linearly the readout state
+and the token is recoverable from the fused seed at 98%. A second fused
+prefill pass buys a small gain on long-range continuation and nothing on
+FineWeb tokens. That is the opposite of an opaque channel, which tells us what
+to grow next.
+
+Directions on the bench, none decided:
+
+- Redesign the entry so the previous column's state lands somewhere the
+  current column cannot simply cancel, for example at a core entry rather than
+  the seed.
+- Build the tied core in [`df-loop`](docs/depth-architecture.md) so
+  computation can refine within a column and persist across columns through
+  two trained channels.
+- Separate a persistent state stream from a read-only prediction stream, the
+  Free Pause Tokens idea assessed in [literature](docs/literature.md).
+- Give the model a task that needs the channel, rather than hoping FineWeb
+  induces one.
 
 ## Start here
 
-Read the [research design](docs/design.md) and [interpretability
-program](docs/interpretability.md) for the questions, controls, deliverables,
-and evidence rules. The [architecture](docs/architecture.md) defines the exact
-state and computation; the [literature map](docs/literature.md) explains the
-source roles and synthesis.
-
-For installation, data materialization, training, queue control, and analysis
-commands, use [operations](docs/operations.md). Run `df probe` before training.
-Jobe's qualified graph pool reserves about 23 GiB, so GPU work stays serial;
-[runtime qualification](docs/runtime-qualification.md) records its evidence.
-
-[Findings](docs/findings.md) contains accepted scientific results,
-[figures](figures/README.md) indexes their figures, and [the
-journal](docs/journal.md) holds disposable working notes.
+- [design.md](docs/design.md): the arms, geometry, data, schedule, feedback
+  passes, evaluation modes, and the knobs on the recipe.
+- [architecture.md](docs/architecture.md): the exact model, state, and
+  optimizer.
+- [interpretability.md](docs/interpretability.md): the analysis scripts,
+  what each one shows, and the shape of the future study.
+- [operations.md](docs/operations.md): install, tokenize, train, queue,
+  inspect. Run `df probe` before training; Jobe's captured graph pool reserves
+  about 23 GiB, so GPU work stays serial.
+- [runtime-qualification.md](docs/runtime-qualification.md): the CUDA
+  execution path and its numerical evidence.
+- [scaling.md](docs/scaling.md): longer and larger recipes, worked out but
+  not scheduled.
+- [literature.md](docs/literature.md) and
+  [references/refs.yaml](references/refs.yaml): where each mechanism comes from
+  and what we changed.

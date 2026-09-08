@@ -1,7 +1,7 @@
 [project]
 name = "delta-feedback-experiment"
 version = "0.4.0"
-description = "A small recurrent model organism for interpretability and latent-computation monitoring."
+description = "A small recurrent language model with a latent cross-token channel, grown as a model organism for a future interpretability study."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "CC-BY-SA-4.0"

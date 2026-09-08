@@ -6,7 +6,7 @@ Layout under a data directory (default ``data/tokens``):
     val.bin              the held-out slice — the stream's first tokens
     train.0000.bin ...   uint32 shards, one contiguous stream
 
-The val slice comes first so the train stream can cover both registered
+The val slice comes first so the train stream can cover both
 screen budgets without ever touching held-out documents.  Rows are
 non-overlapping ``seq_len+1``-token windows addressed by a global row
 index, so batch ``step`` is the same bytes for every arm — the paired

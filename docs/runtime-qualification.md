@@ -1,16 +1,14 @@
-# Runtime qualification for faithful experiments
+# Runtime qualification
 
-Interpretability results depend on the measured computation matching the
-trained computation. This page records the maintained execution contract and
-its engineering evidence. Passing it establishes numerical and operational
-coherence; it does not establish a learned mechanism, useful reasoning, or a
-validated monitor.
+Analysis depends on the measured computation matching the trained
+computation. This page records the CUDA execution path and its engineering
+evidence.
 
 The committed qualification records dated 2026-09-06 cover Jobe's RTX 4090 with
 PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and standard GIL-enabled CPython
-3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. These records are
-evidence for their exact sources and inputs, not live machine status. Hopper
-remains unqualified until the same relevant gates run there.
+3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. These records describe
+their exact sources and inputs, not live machine status. Hopper has not been
+through the same checks.
 
 ## Evidence records
 
@@ -30,7 +28,6 @@ attention, all four train/eval graphs, replay, optimizer state and radius
 invariants, post-capture reporting, and checkpoint staging. Capture peaked at
 13.85 GiB allocated and 23.01 GiB reserved. One/two/three-pass microbatch
 replay took 53.4/107.7/161.9 ms. Keep GPU work serial on Jobe's 24 GiB card.
-Cache-size arithmetic is not a substitute for this measured training envelope.
 
 ## Maintained execution contract
 
@@ -71,7 +68,8 @@ analysis. CUDA training uses the same equations through the following path:
   update, with BF16 keyed jitter written directly into graph inputs.
 - NorMuonH shape-bucket compilation including packing, update, and state
   writeback; ordinary per-parameter checkpoint state with no persistent packed
-  duplicate. NAdam and global FP32 clipping follow [architecture.md](architecture.md).
+  duplicate. NAdam and global FP32 clipping follow
+  [architecture.md](architecture.md).
 - Activation checkpointing above the measured work threshold, preserving the
   full feedback graph, and asynchronous pinned-host snapshot staging with
   atomic background writes.
@@ -80,12 +78,12 @@ Inductor artifacts live at `~/.cache/delta-feedback/torchinductor` by default.
 The first probe performs the fixed-shape search; later processes reuse it. Set
 `DF_INDUCTOR_CACHE_DIR` only to relocate that durable cache. Run the probe on
 the exact source and hardware before a training job; compilation and graph
-capture are part of the experiment's reproducibility boundary.
+capture are part of what gets reproduced.
 
 For analysis, prepare the classifier shadow and use the model's activation
 precision. The maintained route and payload scripts do this. New hooks or
-portable replays must reproduce the relevant baseline before their changed
-outputs can be attributed to a scientific intervention.
+portable replays reproduce the relevant baseline first, so that a changed
+output is attributable to the change.
 
 ## Short-update evidence and its limits
 
@@ -105,9 +103,8 @@ artifact. Timing excludes the first update.
 The largest update-loss difference was 0.000118, the largest gradient-norm
 relative difference 0.98%, and final pass-one/fused validation differences
 0.000128/0.000160. Both eight-pass traces remained finite. Combined capture
-peaked at 13.83 GiB allocated and 22.91 GiB reserved. These small sequential
-samples show a modest observed throughput change, not long-run training parity
-or a scientific result about the architecture.
+peaked at 13.83 GiB allocated and 22.91 GiB reserved. These are small
+sequential samples: a modest throughput change, not long-run parity.
 
 The separate optimizer comparison reduced warmed NorMuonH time from 62.15 to
 50.43 ms. In the profiled clipping/optimizer/shadow/zeroing interval, launches
@@ -120,8 +117,8 @@ sides, the same checkpoint and rows, and pass counts `1,1,1,2,2,3`. Candidate
 one/two/three-pass update medians were 4.741/9.470/14.209 s. Maximum
 update-loss difference was 0.000277 and gradient-norm relative difference
 0.229%. The record contains the baseline stack and full traces. It does not
-isolate FlexAttention's contribution or establish long-run training
-equivalence. The distinct Python 3.13 gate is recorded separately.
+isolate FlexAttention's contribution. The distinct Python 3.13 gate is recorded
+separately.
 
 ## Backend constraints
 
@@ -135,13 +132,13 @@ off because its small measured gain did not justify the numerical change.
 
 NVGEMM is a diagnostic option through `kernel-bench`, not a training backend.
 The record documents candidate selection and compilation failures on Ada; it
-does not support adopting that backend. Hardware or kernel changes need fresh
-qualification before any scientific comparison relies on them.
+does not support adopting that backend. Re-run the probe after hardware or
+kernel changes.
 
 ## Reproduce a diagnostic
 
 Run GPU checks serially after inspecting live status, the active log, and GPU
-ownership. The snapshot below is an engineering input, not a registered result.
+ownership.
 
 ```bash
 python scripts/kernel_training_check.py runs/screen-df-full-s1.pt.10745 --updates 18
@@ -153,5 +150,5 @@ python scripts/gemm_backend_check.py --backends ATEN,TRITON --output-dir tmp/gem
 Use the optimization record's exact baseline revision and explicit variant
 flags for a paired reproduction. Trained-input and full-gradient checks also
 live in `scripts/kernel_inputs.py` and `scripts/kernel_qualification.py`. A new
-intervention must preserve relevant numerical, cache, and state-boundary
-invariants even when the original training runtime has passed all gates.
+intervention keeps the numerical, cache, and state-boundary invariants the
+probe checks.

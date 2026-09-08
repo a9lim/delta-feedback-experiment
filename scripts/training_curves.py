@@ -4,7 +4,7 @@ Parses the trainer's telemetry (`step`, `eval`, `route`, `contract`,
 `schedule`, `run` lines) and draws validation curves, paired differences
 against a reference run, matched-compute curves, exponentially smoothed
 training losses (including the per-step paired pass-1 difference, which is
-exact because registered runs share every row), gradient norms, routing
+exact because paired runs share every row), gradient norms, routing
 trajectories per site, and the repeated-fused-prefill monitor.
 
 Usage:

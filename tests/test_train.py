@@ -501,7 +501,7 @@ def test_build_schedule_screen_shape():
     assert schedule.heat_end == 8596
 
 
-def test_registered_fresh_screen_budgets_match_active_parameter_ratios():
+def test_fresh_screen_budgets_match_active_parameter_ratios():
     tokens_per_step = 320 * 1024
     df_active_non_embedding = 140_827_944
     trials = {25: 10_745, 400: 171_909}

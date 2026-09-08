@@ -74,7 +74,7 @@ BASE_NORMAL_INIT_STD = 0.02
 class ModelConfig:
     """Trunk geometry plus the two-axis arm flags.
 
-    Defaults are the registered screen geometry. ``vanilla`` uses the legacy
+    Defaults are the screen geometry. ``vanilla`` uses the legacy
     pure-GQA trunk; every other arm uses the 3:1 PKDA/gated-global-GQA hybrid.
     Routing heads are not an independent knob: every routed arm uses one
     contiguous feature group per KV head. The groups do not align to mixer
@@ -533,7 +533,7 @@ class Router(nn.Module):
     A learnable zero-init null vector is always prepended.  Its key is
     rmsnorm(0)=0, so its logit is exactly zero at init and routing mass on it
     initially adds nothing. The primitive retains an optional source-presence
-    mask for kernel parity, although every registered screen source is present.
+    mask for kernel parity, although every screen source is present.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -738,7 +738,7 @@ _compiled_block = torch.compile(
     _attention_block,
     fullgraph=True,
     dynamic=False,
-    # The graph shapes are fixed by the registered screen. The probe performs
+    # The graph shapes are fixed by the screen geometry. The probe performs
     # the expensive search once and later processes reuse its durable cache;
     # the outer trainer, rather than Inductor, owns CUDA capture.
     mode=INDUCTOR_MODE,

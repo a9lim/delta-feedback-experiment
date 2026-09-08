@@ -1,18 +1,15 @@
 # Literature and synthesis
 
-This organism assembles mechanisms from already-published papers and released
-implementations. The research aim is a small system on which to develop
-interpretability and monitoring methods. We do not claim that combining the
-components advances the capabilities frontier, that source-paper gains carry
-over, or that this is a numerical reproduction of any one source model.
+The organism assembles mechanisms from published papers and released
+implementations. It is a synthesis rather than a reproduction of any one
+source model, and source-paper gains are not assumed to carry over.
 
 [references/refs.yaml](../references/refs.yaml) is the machine-readable primary
 source index. Its entries identify the papers and implementation references,
 the exact roles used here, and deliberate departures. The map below connects
-those roles to the experimental object; the interpretability motivations are
-this project's design rationale, not results established by the source papers.
+those roles to the organism.
 
-| Source family | Role in the organism | Why it is useful to study |
+| Source family | Role in the organism | Why it is here |
 |---|---|---|
 | Full-Bandwidth Transformer | Asymmetric payload-value/token-gate entry, latent feedback, Jacobi training, and recipe lineage | A named latent channel across token columns, with plain and fused execution modes |
 | Kimi Linear / Preconditioned DeltaNet | PKDA recurrence, short convolution, preconditioner, and recurrent-state boundaries | Explicit token-mixer memory that can be distinguished from the FBT payload |
@@ -20,8 +17,8 @@ this project's design rationale, not results established by the source papers.
 | Multi-head and Delta Attention Residuals | Grouped source selection and additive delta-source semantics | Addressable seed and block contributions, with a residual reconstruction identity |
 | Attention Residuals | Cumulative-state routing comparison | Clarifies how additive delta routing differs from replacing the residual read |
 | NorMuon / Hyperball / NAdam implementation | Matrix update direction, fixed realized radii, and semantic-scale optimization | A fixed training recipe across controls, with explicit parameter ownership |
-| Recurrent-depth language models | Prelude/tied-core/coda, iteration draw, and shared-cache ideas for the proposed `df-loop` | A future iteration-level experimental surface; not implemented in current arms |
-| Free Pause Tokens | Design comparison: separate persistent state from a read-only prediction stream | A possible control for memory versus immediate prediction; not adopted or implemented |
+| Recurrent-depth language models | Prelude/tied-core/coda, iteration draw, and shared-cache ideas for the proposed `df-loop` | An iteration axis for `df-loop`, not built |
+| Free Pause Tokens | Design comparison: separate persistent state from a read-only prediction stream | A candidate way to separate memory from prediction; assessed below |
 
 The local synthesis choices include the PKDA/GQA composition, four-layer MHDB
 source banks, routed enrichment of the `df` payload, exact optimizer partition,
@@ -30,10 +27,9 @@ geometry, and paired training schedules. They are specified in
 adoptions and replacements are recorded separately in
 [depth-architecture.md](depth-architecture.md#sources).
 
-Source precedent motivates a component. Local numerical tests establish that we
-implemented the chosen equations. Controlled behavioral and causal studies must
-establish what the trained organism actually does. These are separate kinds of
-evidence; none substitutes for the others.
+Source precedent motivates a component; the probe checks that we implemented
+the chosen equations; what the trained organism does with them is what the
+analysis scripts are for.
 
 Fetched paper Markdown/PDF files are regenerable and ignored. From the
 workspace reference workflow, use:
@@ -42,10 +38,8 @@ workspace reference workflow, use:
 python -m transformer_experiments.references
 ```
 
-Keep the source index focused on mechanisms and methods actually used or
-explicitly assessed for a design decision. Add new
-interpretability references when a method is selected, with its adopted
-protocol and limits; a reading list is not an implemented analysis pipeline.
+Keep the source index to mechanisms and methods used here or assessed for a
+design decision.
 
 ## Free Pause Tokens and `df-loop`
 
@@ -53,7 +47,6 @@ protocol and limits; a reading list is not an implemented analysis pipeline.
 is indexed under that title; its HTML body is titled *Almost Free State
 Prediction Separation*. The local full text is regenerated with
 `python -m transformer_experiments.references langford2026-free-pause-tokens`.
-This assessment does not change the loop specification or register an arm.
 
 The paper's ordinary state stream writes per-layer K/V. A second stream starts
 each position from one learned vector, shares backbone weights, reads state
@@ -87,7 +80,7 @@ boundary. Under fixed token replay, changing that stream could affect the
 current logits while leaving future state, payload, and cache unchanged. Free
 generation would still propagate the change through the emitted token.
 
-### Candidate integration, not an adopted contract
+### Candidate integration
 
 First isolate separation at `r = 1`, before combining it with variable depth:
 
@@ -120,12 +113,11 @@ First isolate separation at `r = 1`, before combining it with variable depth:
 
 Use paired continuations from the same checkpoint and data position, comparing
 ordinary DF with the declared split at matched tokens and measured device-time;
-report actual FLOPs and stream/cell evaluations separately. Add a matched
-extra-compute control before attributing a gain to separation. The research
-deliverable should include fixed-token prediction interventions, state/payload
+report actual FLOPs and stream/cell evaluations separately, with a matched
+extra-compute control before attributing a gain to separation. The
+interesting analyses are fixed-token prediction interventions, state/payload
 interventions with held-out behavioral witnesses, and checks of which future
-paths change. Existing registered screen results would remain separate from
-these exploratory continuations.
+paths change.
 
 Only then consider a recurrent prediction core over a fixed state bank. That
 would combine the paper's separation with Huginn-style iteration and simplify

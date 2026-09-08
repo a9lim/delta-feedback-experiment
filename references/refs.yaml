@@ -1,6 +1,5 @@
 # Published mechanisms and explicit design comparisons for the recurrent model organism.
-# Roles and departures are explained in docs/literature.md; source results
-# do not establish local capabilities or interpretability findings. Fetched Markdown/PDF copies
+# Roles and departures are explained in docs/literature.md. Fetched Markdown/PDF copies
 # are regenerable and remain untracked:
 #   python -m transformer_experiments.references
 references:
@@ -31,7 +30,7 @@ references:
       cadence, fixed 128-dimensional key/value heads, and the width-1,536
       scaling-law point with 20 heads. Its scaling convention reports active
       parameters without embedding parameters. The small organism and optional
-      larger reference keep the KDA substrate and cadence inside PKDA but use
+      larger geometry keep the KDA substrate and cadence inside PKDA but use
       dense global GQA instead of MLA.
 
   - url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json
@@ -51,8 +50,8 @@ references:
       stable log-space squash onto [1/x, x], chunkwise and recurrent forms, and
       language-model evidence at 340M and 1B. It supplies the preconditioner,
       not the screen's head-count rule: the screen uses 10-by-128 to preserve
-      the larger reference Kimi prior's 5/3 recurrent projection ratio. Both
-      scales use the registered x=1.5 PKDA parameterization rather than
+      the larger geometry Kimi prior's 5/3 recurrent projection ratio. Both
+      scales use the x=1.5 PKDA parameterization rather than
       unpreconditioned KDA.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/layers/precond_kda.py
@@ -62,7 +61,7 @@ references:
       projections and initialization, bounded preconditioner, auxiliary A-state
       cache, chunkwise training kernel, and fused-recurrent decoding kernel
       that the small implementation reproduces and qualifies and the optional
-      larger reference specifies. Its output norm defaults to epsilon 1e-5;
+      larger geometry specifies. Its output norm defaults to epsilon 1e-5;
       this experiment deliberately uses its unified model-wide epsilon 1e-6
       instead.
 
@@ -96,7 +95,7 @@ references:
       The released Qwen3-Next attention implementation projects a gate beside
       each query-head coordinate and applies its sigmoid elementwise to the
       concatenated attention output before the output projection. Every hybrid
-      screen arm and the optional larger reference adopt this gate; only the
+      screen arm and the larger geometry adopt this gate; only the
       external screen `vanilla` control remains ungated.
 
   - arxiv: "2608.08888"
@@ -173,7 +172,6 @@ references:
       Prediction Separation. Defines weight-shared state and prediction
       streams, prediction-only queries over state keys/values without
       prediction writes, and optional shared gated FFNs and late phasing.
-      A design comparison for df-loop, not an adopted component: it separates
-      persistent memory from prediction but does not supply recurrent depth.
-      The B200 latency and training-cost results do not qualify our PKDA/GQA
-      implementation. See docs/literature.md for the integration assessment.
+      A design comparison for df-loop: it separates persistent memory from
+      prediction but does not supply recurrent depth. See docs/literature.md
+      for the integration assessment.

@@ -1,11 +1,11 @@
 """Same-checkpoint intervention: continue a feedback snapshot with dense feedback passes.
 
 Restores the snapshot (model and both optimizer states) and trains every step
-with ``k`` feedback passes on fresh rows past the registered schedule at a
+with ``k`` feedback passes on fresh rows past the schedule at a
 small constant learning rate, tracking ``val`` and ``val_fused`` under the
 run's evaluation convention.  ``--passes 1`` is the plain-only control that
 measures erosion of the fused mode; ``--trainable fusion`` restricts updates to
-the FBT interface.  This is not a registered arm; the output is a JSON trace.
+the FBT interface.  The output is a JSON trace.
 
 Usage:
     python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/df/tokens \\
@@ -107,7 +107,7 @@ def main() -> None:
 
     t_start = time.time()
     for i in range(1, args.steps + 1):
-        step = start_step + i  # fresh rows: the registered schedule never reached these
+        step = start_step + i  # fresh rows: the schedule never reached these
         scale = args.lr_scale * min(1.0, i / max(args.warmup, 1))
         for optimizer in optimizers:
             for group in optimizer.param_groups:

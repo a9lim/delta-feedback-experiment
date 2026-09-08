@@ -7,21 +7,20 @@ combines Preconditioned Kimi Delta Attention (PKDA), gated global GQA,
 Multi-Head Delta Block routing (MHDB), and Full-Bandwidth Transformer (FBT)
 feedback. The controls remove specified packages from that computation.
 
-The purpose of this synthesis is to create an object we can inspect and
-intervene on. Named states and source identities provide experimental access;
-they do not establish that the learned representations are understood.
-[Interpretability](interpretability.md) defines the research protocol and
-[literature](literature.md) distinguishes source mechanisms from local choices.
-MHDB is the project's block-source specialization of multi-head delta routing;
-`mhdb` remains the code and arm name.
+The named states and source identities are the handles the analysis scripts
+use; [interpretability](interpretability.md) lists those scripts and
+[literature](literature.md) separates source mechanisms from local choices.
+MHDB is the project's block-source specialization of multi-head delta
+routing; `mhdb` is the code and arm name.
 
 ## Geometry
 
-The small organism is the default research surface. The larger column preserves
-an exact optional reference geometry; distributed training at that geometry is
-not runnable or qualified. Its use is subject to [scaling gates](scaling.md).
+The small organism is what we train. The larger column is the same
+architecture at six cells and width 1,536, with its budget worked out in
+[scaling.md](scaling.md); distributed training at that geometry is not
+implemented.
 
-| Field | Small organism | Optional larger reference |
+| Field | Small organism | Larger geometry |
 |---|---:|---:|
 | Vocabulary, Qwen3 tokenizer | 151,936 | 151,936 |
 | Residual width `D` | 768 | 1,536 |
@@ -67,9 +66,8 @@ previous payload p_(t-1) --------------+                  |
 
 On pass 1 and in Standard decoding the seed is the token embedding. The readout
 uses `final_norm(h_top)`; the outgoing payload has its own routing and
-normalization. Inspecting either one does not substitute for inspecting the
-other. The mixer caches are additional state paths outside this diagram's
-explicit payload edge.
+normalization. The mixer caches are additional state paths outside this
+diagram's explicit payload edge.
 
 ## State boundaries for analysis
 
@@ -118,7 +116,7 @@ Each PKDA layer is a Kimi Delta Attention recurrence with the stable diagonal
 apply-to-key preconditioner from Preconditioned DeltaNet. The model width does
 not constrain its recurrent projection width: the small organism uses 10 heads
 by 128 coordinates, or 1,280 projected coordinates, at residual width 768. The
-larger reference doubles the head count and residual width, preserving the
+larger geometry doubles the head count and residual width, preserving the
 projection ratio.
 
 ### Projection and controls
@@ -219,7 +217,7 @@ Full-sequence and prefill CUDA execution use compiled PyTorch FlexAttention
 with a shared causal block mask and native GQA. Cached decoding writes BF16 K/V
 explicitly, then attends only to the valid prefix; a one-token query sees every
 key in that prefix. Only the global layers own KV storage: three at small
-scale, six in the larger reference. The external `flash-attn` extension is not
+scale, six in the larger geometry. The external `flash-attn` extension is not
 required.
 
 ## Multi-Head Delta Block routing
@@ -288,7 +286,7 @@ the following RMSNorm makes routed pass-1 reads functionally inert up to its
 epsilon.
 
 The deepest within-column site and the payload router each see at most `C + 2`
-sources: five at small scale, eight in the larger reference. The former has
+sources: five at small scale, eight in the larger geometry. The former has
 null, seed, `C - 1` completed cells, and one live partial; the latter has null,
 seed, and all `C` completed cells.
 
@@ -373,7 +371,7 @@ state. Its authoritative tied parameter and accumulated gradient remain FP32.
 
 ## NorMuonH and NAdam
 
-All implemented arms and the larger reference use one optimizer recipe with two
+All implemented arms and the larger geometry use one optimizer recipe with two
 disjoint parameter groups: one NorMuonH group and one NAdam group. Their public
 controls are `--lr-normuonh` and `--lr-nadam`. No group uses weight decay.
 
@@ -470,11 +468,9 @@ and 4.50 MiB for BF16 GQA K/V. Payload, logits, allocator overhead, and serving
 metadata are additional. This is decode-state accounting, not training memory;
 Jobe's captured training graph pool reserves about 23 GiB.
 
-### Optional larger reference accounting
+### Larger geometry accounting
 
-The larger reference retains the following exact specification. These counts
-are a gate for its eventual implementation, not a requirement for a useful
-interpretability organism.
+The larger geometry has the following exact accounting.
 
 | Component | Parameters |
 |---|---:|
@@ -488,12 +484,12 @@ interpretability organism.
 | **Total** | **1,335,420,192** |
 | **Active non-embedding** | **1,102,046,496** |
 
-The active non-embedding count is the denominator for the larger reference data
+The active non-embedding count is the denominator for the larger geometry data
 budget. Relative to unpreconditioned KDA, PKDA's two width-to-head projections
 and three learned per-head vectors add 61,500 parameters per PKDA layer, or
 1,107,000 total. The six GGQA gates add 14,155,776 weights.
 
-At a full 8,192-token prompt, one sequence's registered token-mixer cache is:
+At a full 8,192-token prompt, one sequence's token-mixer cache is:
 
 | Cache | Size |
 |---|---:|
@@ -504,6 +500,5 @@ At a full 8,192-token prompt, one sequence's registered token-mixer cache is:
 | **Token-mixer total** | **167.467 MiB** |
 
 This excludes allocator overhead, the width-1,536 payload, logits, and serving
-metadata. The instantiated implementation must reproduce the parameter count,
-state shapes, and cache continuation semantics before the larger reference can
-pass its implementation gate.
+metadata. An implementation at this geometry reproduces these parameter counts,
+state shapes, and cache continuation semantics.

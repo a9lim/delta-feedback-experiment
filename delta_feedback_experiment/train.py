@@ -51,7 +51,7 @@ CONTRACT = checkpoints.CheckpointContract(
 )
 
 GRAD_CLIP_NORM = 10.0
-"""Global FP32 gradient-norm ceiling shared by every registered run."""
+"""Global FP32 gradient-norm ceiling shared by every run."""
 
 EXACT_FIELDS = (
     "arm",
@@ -274,7 +274,7 @@ def micro_draws(
 
 
 def automatic_checkpoint(model: DFModel, n_passes: int, args, device) -> bool:
-    """Measured internal activation policy for the registered screen."""
+    """Measured internal activation policy for the screen."""
     if device.type != "cuda":
         return False
     cfg = model.cfg

@@ -1,6 +1,6 @@
 """Weight-space divergence of two paired checkpoints from their shared initialization.
 
-Registered arms initialize the hybrid trunk byte-identically and factor
+The arms initialize the hybrid trunk byte-identically and factor
 modules pairwise from the same seed (design.md), so for every parameter both
 snapshots share, the script measures how far each run moved from ``W0``, how
 far apart the two ended, and how aligned their total updates are.  NorMuonH

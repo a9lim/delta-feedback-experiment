@@ -1,15 +1,12 @@
 # Working journal
 
-Use this page for disposable hypotheses, measurements, and unresolved
-interpretations. Identify diagnostic checkpoints by their original contracts;
-do not relabel them as current registered runs. Promote a result only with its
-controls and artifacts under [the evidence
-rules](interpretability.md#deliverables-and-acceptance). Git history retains
-superseded working notes.
+Dated working notes: hypotheses, measurements, and readings as they happened.
+Newer entries supersede older ones; the distilled picture lives in
+[findings.md](findings.md). Git history keeps what gets cut.
 
 ## 2026-09-08 — `mhdb` against full-feedback `df`: what the feedback package changed inside
 
-Two completed diagnostic runs on Jobe, paired by construction (seed 1, data
+Two completed runs on Jobe, paired by construction (seed 1, data
 seed 0, identical rows and schedule, NorMuonH `6e-3`, 10,745 steps):
 
 | run | arm | passes | pass-tokens | s/step | val (32 rows) | val_fused |
@@ -19,14 +16,13 @@ seed 0, identical rows and schedule, NorMuonH `6e-3`, 10,745 steps):
 
 The `df` run is the fresh-run form of the question left open on 2026-09-02:
 does the FBT benefit form when the fused mode is trained densely from the
-start? It is a recipe variant (`--feedback-start 0 --three-pass 1`), not a
-registered arm, and equal steps here are 3x the compute. Nothing below is a
-training-effect claim; it is one paired observation plus same-checkpoint
-interventions on the final snapshots. Scripts: `scripts/compare_arms.py`,
-`weight_divergence.py`, `fused_diagnostics.py`, `entry_sweeps.py`,
-`feedback_followups.py`, `payload_swap.py`, `route_report.py`,
-`training_curves.py`, `analysis_figures.py`; records and figures under
-`figures/curves-mhdb-vs-df-full-lowLR/`,
+start? It is the recipe variant `--feedback-start 0 --three-pass 1`, and equal
+steps here are 3x the compute. Everything below is one paired observation plus
+same-checkpoint interventions on the final snapshots. Scripts:
+`scripts/compare_arms.py`, `weight_divergence.py`, `fused_diagnostics.py`,
+`entry_sweeps.py`, `feedback_followups.py`, `payload_swap.py`,
+`route_report.py`, `training_curves.py`, `analysis_figures.py`; records and
+figures under `figures/curves-mhdb-vs-df-full-lowLR/`,
 `figures/compare-screen-df-mhdb-s1-lowLR-vs-screen-df-full-s1-lowLR/`,
 `figures/weights-…/`, `figures/fused-screen-df-full-s1-lowLR/`, and
 `figures/route-…/` (ignored); run logs copied to `logs/`.
@@ -145,8 +141,8 @@ pre-norm input is 15% at the median (36% at p90, up from 8% / 15%).
    payload is the readout basis and the seed decodes the token at 98%. That is
    the opposite of an opaque cross-column channel. The 2026-09-02 decision
    tree's "redesign the entry" branch is the one this selects; whether to
-   take it, and whether the `mhdb` run's coincidence with the current
-   defaults makes it a registered specimen, are decisions for a9.
+   take it, and whether the `mhdb` run doubles as the reference `mhdb`
+   specimen, are a9's calls.
 
 ### Downstream zero-shot tasks
 
@@ -214,13 +210,13 @@ resolves far smaller effects, and the fused pass is not a no-op downstream:
 The fused pass predicts LAMBADA's last word better (+1.5 points at four
 standard errors, 208 documents gained against 132 lost) and discriminates
 HellaSwag endings better (+0.16 nats of margin over 29-token continuations,
-+0.005 per token), while it lowers the probability of every short answer
-after a QA prompt by 0.05–0.3 nats with no change in margin. So the +0.0012
-mean gap on FineWeb tokens is a net of a small benefit on long-range,
-narrative continuation and a small calibration cost on out-of-distribution
-answer formats. That is the first downstream behavior that separates the two
-modes; it is a paired observation on one checkpoint, not a causal account of
-the channel, and it has to be replicated across seeds before it is more.
++0.005 per token), while it lowers the probability of every short answer after
+a QA prompt by 0.05–0.3 nats with no change in margin. So the +0.0012 mean gap
+on FineWeb tokens is a net of a small benefit on long-range, narrative
+continuation and a small calibration cost on out-of-distribution answer
+formats. That is the first downstream behavior that separates the two modes; it
+is a paired observation on one checkpoint, and a second seed would say whether
+it is general.
 
 **More fused passes.** FBT reports that further prefill passes keep helping
 with diminishing returns. Here the first pass is the whole effect:
