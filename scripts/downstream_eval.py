@@ -2,17 +2,22 @@
 
 Uses the workspace's ``transformer_experiments.downstream`` tasks (pinned Hub
 revisions, harness-identical prompts) with this model's own scorer: one plain
-column pass (Standard) or a plain pass followed by a fully fused pass with
-plain-prefix length 1 (Fused), the same modes ``val`` and ``val_fused`` report; ``--passes k``
-iterates the fused prefill ``k`` times, each consuming the previous pass's
-payload, and scores the last pass.  Batches are padded to a few bucket lengths
+column pass (Standard), a plain pass followed by a fully fused pass with
+plain-prefix length 1 (Fused, the mode ``val_fused`` reports), or a plain pass
+followed by a fused pass whose plain prefix is each item's context, so only the
+scored continuation receives feedback (Soft, the Jacobi form of feedback
+decoding: exact for the first continuation token, and for the first ``k``
+tokens after ``k`` passes).  ``--passes k`` iterates the feedback pass ``k``
+times, each consuming the previous pass's payload, and scores the last pass.
+Batches are padded to a few bucket lengths
 so the compiled blocks see few shapes.  Writes ``downstream_<mode>.json``
-(``downstream_fused<k>.json`` for ``k > 1``) under ``figures/downstream-<tag>/``;
+(``downstream_<mode><k>.json`` for ``k > 1``) under ``figures/downstream-<tag>/``;
 compare two runs with ``python -m transformer_experiments.downstream --compare``.
 
 Usage:
     python scripts/downstream_eval.py runs/TAG.pt.STEP --mode standard
     python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused --passes 2
+    python scripts/downstream_eval.py runs/TAG.pt.STEP --mode soft
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from transformer_experiments import downstream
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import CANONICAL_TOKENIZER, CANONICAL_TOKENIZER_REVISION
 
-MODES = ("standard", "fused")
+MODES = ("standard", "fused", "soft")
 
 
 class DFScorer:
@@ -38,13 +43,13 @@ class DFScorer:
     def __init__(self, model, mode: str, passes: int = 1):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
-        if mode == "fused" and not model.cfg.feedback_active:
-            raise ValueError("fused mode needs an fbt or df snapshot")
+        if mode != "standard" and not model.cfg.feedback_active:
+            raise ValueError(f"{mode} mode needs an fbt or df snapshot")
         if passes < 1:
             raise ValueError("passes must be positive")
         self.model = model
         self.mode = mode
-        self.passes = passes if mode == "fused" else 0
+        self.passes = passes if mode != "standard" else 0
         self.device = next(model.parameters()).device
 
     @torch.no_grad()
@@ -54,9 +59,14 @@ class DFScorer:
         with analysis.autocast(self.device):
             e = model.embed_tokens(ids)
             out = model.forward_column(e, need_payload=self.passes > 0)
+            if self.mode == "soft":
+                # Plain context, feedback along the scored continuation only.
+                prefix = torch.tensor([start for start, _ in spans], device=self.device)
+            else:
+                prefix = 1
             for i in range(self.passes):
                 out = model.forward_column(
-                    analysis.fused_inputs(model, e, out.payload, 1), need_payload=i < self.passes - 1
+                    analysis.fused_inputs(model, e, out.payload, prefix), need_payload=i < self.passes - 1
                 )
             weight = model.embed_tokens.weight
             head = lambda h: F.linear(model.final_norm(h), weight.to(h.dtype))
@@ -67,7 +77,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("--mode", choices=MODES, default="standard")
-    parser.add_argument("--passes", type=int, default=1, help="fused prefill iterations in fused mode")
+    parser.add_argument("--passes", type=int, default=1, help="feedback passes in fused or soft mode")
     parser.add_argument("--tasks", nargs="*", default=list(downstream.DEFAULT_TASKS))
     parser.add_argument("--limit", type=int, default=None, help="documents per task (smoke tests)")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -97,7 +107,7 @@ def main() -> None:
         progress=lambda line: print(f"  [{time.time() - started:6.0f}s] {line}", flush=True),
     )
     print("\n" + downstream.format_table(results))
-    suffix = f"{args.mode}{args.passes}" if args.mode == "fused" and args.passes > 1 else args.mode
+    suffix = f"{args.mode}{args.passes}" if args.mode != "standard" and args.passes > 1 else args.mode
     out_path = out_dir / f"downstream_{suffix}.json"
     meta = {
         "snapshot": str(args.snapshot), "tag": tag, "arm": saved["arm"], "step": saved["step"], "mode": args.mode,

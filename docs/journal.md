@@ -239,6 +239,32 @@ the third changes almost nothing, the downstream face of the self-composition
 trace: the map contracts by the second iteration to a fixed point a hair
 below the first pass. Front-loaded, as in FBT; not continuing.
 
+**Soft against Fused: where the gain comes from.** `--mode soft` runs the
+feedback pass with the plain prefix set to each item's context, so only the
+scored continuation receives feedback (exact Soft decoding for the first
+continuation token; a second pass makes the second exact and changed nothing:
+pooled +0.04 ± 0.03, LAMBADA +0.0000 ± 0.0002 nats).
+
+| paired on identical documents | pooled acc | LAMBADA acc | LAMBADA gold logp | HellaSwag margin |
+|---|---:|---:|---:|---:|
+| Standard → Soft | −0.00 ± 0.04 | −0.02 ± 0.04 | +0.0006 ± 0.0011 | +0.114 ± 0.020 |
+| Soft → Fused | +0.19 ± 0.10 | +1.49 ± 0.36 | +0.032 ± 0.009 | +0.045 ± 0.012 |
+| Standard → Fused | +0.42 ± 0.12 | +1.47 ± 0.36 | +0.033 ± 0.009 | +0.160 ± 0.022 |
+
+On LAMBADA the feedback transition itself is worth nothing: Soft equals
+Standard to four decimals (3 documents flip each way), and the whole +1.5
+points appears only when the context is re-processed under its own top
+states. On HellaSwag about 70% of the margin gain survives with a plain
+context, so there the feedback along the 29-token continuation is what
+discriminates the endings. The cross-column channel as trained is a
+per-position depth extension: it helps when the token being scored has
+already been fused into (a continuation) or when the context has been
+(fused prefill), and a single transition into a fresh position carries
+nothing usable. That is the sharpest behavioral statement about the channel
+so far, and it is consistent with cell 0 cancelling the seed: what survives
+the cancellation is what the second pass computed, not what the payload
+carried.
+
 Repo notes: checkpoint-analysis helpers now live in
 `delta_feedback_experiment.analysis` (loader, trainer numerics, per-token
 losses, fused inputs; `tests/test_analysis.py`), the September-2 scratch
