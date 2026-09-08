@@ -3,14 +3,16 @@
 Uses the workspace's ``transformer_experiments.downstream`` tasks (pinned Hub
 revisions, harness-identical prompts) with this model's own scorer: one plain
 column pass (Standard) or a plain pass followed by a fully fused pass with
-plain-prefix length 1 (Fused), the same modes ``val`` and ``val_fused`` report.
-Batches are padded to a few bucket lengths so the compiled blocks see few
-shapes.  Writes ``downstream_<mode>.json`` under ``figures/downstream-<tag>/``;
+plain-prefix length 1 (Fused), the same modes ``val`` and ``val_fused`` report; ``--passes k``
+iterates the fused prefill ``k`` times, each consuming the previous pass's
+payload, and scores the last pass.  Batches are padded to a few bucket lengths
+so the compiled blocks see few shapes.  Writes ``downstream_<mode>.json``
+(``downstream_fused<k>.json`` for ``k > 1``) under ``figures/downstream-<tag>/``;
 compare two runs with ``python -m transformer_experiments.downstream --compare``.
 
 Usage:
     python scripts/downstream_eval.py runs/TAG.pt.STEP --mode standard
-    python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused --tasks hellaswag lambada_openai
+    python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused --passes 2
 """
 
 from __future__ import annotations
@@ -33,13 +35,16 @@ MODES = ("standard", "fused")
 class DFScorer:
     """Continuation scores from a DFModel column pass under the trainer's numerics."""
 
-    def __init__(self, model, mode: str):
+    def __init__(self, model, mode: str, passes: int = 1):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
         if mode == "fused" and not model.cfg.feedback_active:
             raise ValueError("fused mode needs an fbt or df snapshot")
+        if passes < 1:
+            raise ValueError("passes must be positive")
         self.model = model
         self.mode = mode
+        self.passes = passes if mode == "fused" else 0
         self.device = next(model.parameters()).device
 
     @torch.no_grad()
@@ -48,9 +53,11 @@ class DFScorer:
         ids = ids.to(self.device)
         with analysis.autocast(self.device):
             e = model.embed_tokens(ids)
-            out = model.forward_column(e, need_payload=self.mode == "fused")
-            if self.mode == "fused":
-                out = model.forward_column(analysis.fused_inputs(model, e, out.payload, 1), need_payload=False)
+            out = model.forward_column(e, need_payload=self.passes > 0)
+            for i in range(self.passes):
+                out = model.forward_column(
+                    analysis.fused_inputs(model, e, out.payload, 1), need_payload=i < self.passes - 1
+                )
             weight = model.embed_tokens.weight
             head = lambda h: F.linear(model.final_norm(h), weight.to(h.dtype))
             return downstream.span_scores(out.h_top, ids, spans, head)
@@ -60,6 +67,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("--mode", choices=MODES, default="standard")
+    parser.add_argument("--passes", type=int, default=1, help="fused prefill iterations in fused mode")
     parser.add_argument("--tasks", nargs="*", default=list(downstream.DEFAULT_TASKS))
     parser.add_argument("--limit", type=int, default=None, help="documents per task (smoke tests)")
     parser.add_argument("--batch-size", type=int, default=16)
@@ -76,7 +84,7 @@ def main() -> None:
     tag = saved.get("tag", args.snapshot.stem)
     out_dir = args.out_dir or Path("figures") / f"downstream-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    scorer = DFScorer(model, args.mode)
+    scorer = DFScorer(model, args.mode, args.passes)
     started = time.time()
     results = downstream.run(
         args.tasks,
@@ -89,9 +97,11 @@ def main() -> None:
         progress=lambda line: print(f"  [{time.time() - started:6.0f}s] {line}", flush=True),
     )
     print("\n" + downstream.format_table(results))
-    out_path = out_dir / f"downstream_{args.mode}.json"
+    suffix = f"{args.mode}{args.passes}" if args.mode == "fused" and args.passes > 1 else args.mode
+    out_path = out_dir / f"downstream_{suffix}.json"
     meta = {
         "snapshot": str(args.snapshot), "tag": tag, "arm": saved["arm"], "step": saved["step"], "mode": args.mode,
+        "passes": scorer.passes,
         "tokenizer": CANONICAL_TOKENIZER, "tokenizer_revision": CANONICAL_TOKENIZER_REVISION,
         "device": str(scorer.device), "limit": args.limit, "batch_size": args.batch_size, "buckets": list(args.buckets),
     }

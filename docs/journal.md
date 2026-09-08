@@ -222,6 +222,23 @@ answer formats. That is the first downstream behavior that separates the two
 modes; it is a paired observation on one checkpoint, not a causal account of
 the channel, and it has to be replicated across seeds before it is more.
 
+**More fused passes.** FBT reports that further prefill passes keep helping
+with diminishing returns. Here the first pass is the whole effect:
+
+| paired on identical documents | pooled acc gain | LAMBADA acc | HellaSwag margin |
+|---|---:|---:|---:|
+| Standard → fused ×1 | +0.42 ± 0.12 | +1.47 ± 0.36 | +0.160 ± 0.022 |
+| Standard → fused ×2 | +0.36 ± 0.13 | +1.30 ± 0.37 | +0.146 ± 0.023 |
+| Standard → fused ×3 | +0.38 ± 0.13 | +1.16 ± 0.37 | +0.145 ± 0.023 |
+| fused ×1 → ×2 | −0.07 ± 0.06 | −0.17 ± 0.17 | −0.014 ± 0.006 |
+| fused ×2 → ×3 | +0.04 ± 0.04 | −0.14 ± 0.12 | −0.001 ± 0.003 |
+
+The second pass lowers the gold log-probability on every task but SciQ
+(HellaSwag −0.034 ± 0.005, PIQA −0.100 ± 0.012, LAMBADA −0.005 ± 0.003) and
+the third changes almost nothing, the downstream face of the self-composition
+trace: the map contracts by the second iteration to a fixed point a hair
+below the first pass. Front-loaded, as in FBT; not continuing.
+
 Repo notes: checkpoint-analysis helpers now live in
 `delta_feedback_experiment.analysis` (loader, trainer numerics, per-token
 losses, fused inputs; `tests/test_analysis.py`), the September-2 scratch

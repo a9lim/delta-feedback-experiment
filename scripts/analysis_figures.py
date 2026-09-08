@@ -9,6 +9,7 @@ Each input is optional; the script draws whatever it is given:
     --followups feedback_followups.json   (scripts/feedback_followups.py)
     --swap      payload_swap.json         (scripts/payload_swap.py)
     --downstream A.json B.json ...        (scripts/downstream_eval.py; one bar group per run)
+    --downstream-passes standard.json fused.json fused2.json ...   (paired gains against the first file)
 
 Usage:
     python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms.json \\
@@ -359,6 +360,37 @@ def downstream_figures(paths: list[Path], labels: list[str] | None, out_dir: Pat
     fs.save(fig, out_dir / "downstream-tasks.png")
 
 
+def downstream_passes_figure(paths: list[Path], out_dir: Path) -> None:
+    """Paired accuracy gain over the first file (Standard) as fused passes accumulate."""
+    from transformer_experiments import downstream as ds
+
+    runs = [ds.from_json(json.loads(p.read_text())) for p in paths]
+    passes = list(range(len(runs)))
+    comparisons = [ds.compare(runs[0], r) for r in runs[1:]]
+    tasks = sorted(comparisons[0])
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+    ax = axes[0]
+    pooled = [ds.pooled(c) for c in comparisons]
+    ax.errorbar(passes, [0.0] + [100 * p["diff"] for p in pooled], yerr=[0.0] + [100 * p["se"] for p in pooled], fmt="o-", color=FB2, capsize=3, label="pooled over tasks (inverse-variance)")
+    for t, col in (("lambada_openai", fs.MAGENTA), ("hellaswag", fs.YELLOW)):
+        if t in tasks:
+            key = ds.headline_metric(comparisons[0][t])
+            ax.errorbar(passes, [0.0] + [100 * c[t][key]["diff"] for c in comparisons], yerr=[0.0] + [100 * c[t][key]["se"] for c in comparisons], fmt="s--", color=col, lw=1.2, capsize=3, label=f"{t} ({key})")
+    fs.zero_line(ax)
+    ax.set_xticks(passes, ["standard"] + [f"fused ×{k}" for k in passes[1:]])
+    ax.set(title="Accuracy gain over Standard, paired on identical documents", ylabel="accuracy points (±1 s.e.)")
+    ax.legend()
+    ax = axes[1]
+    for i, t in enumerate(tasks):
+        vals = [0.0] + [c[t]["gold_logprob"]["diff"] for c in comparisons]
+        ax.plot(passes, vals, "o-" if i < len(fs.SERIES) else "s--", color=fs.SERIES[i % len(fs.SERIES)], lw=1.2, ms=3, label=t)
+    fs.zero_line(ax)
+    ax.set_xticks(passes, ["standard"] + [f"fused ×{k}" for k in passes[1:]])
+    ax.set(title="Gold-continuation log-probability shift over Standard", ylabel="nats per document")
+    ax.legend(fontsize=7, ncols=2)
+    fs.save(fig, out_dir / "downstream-passes.png")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--compare", type=Path)
@@ -369,11 +401,14 @@ def main() -> None:
     parser.add_argument("--swap", type=Path)
     parser.add_argument("--downstream", type=Path, nargs="*")
     parser.add_argument("--downstream-labels", nargs="*")
+    parser.add_argument("--downstream-passes", type=Path, nargs="*")
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     if args.downstream:
         downstream_figures(args.downstream, args.downstream_labels, args.out_dir)
+    if args.downstream_passes:
+        downstream_passes_figure(args.downstream_passes, args.out_dir)
     for path, fn in ((args.compare, compare_figures), (args.weights, weight_figures), (args.fused, fused_figures),
                      (args.entry, entry_figures), (args.followups, followup_figures), (args.swap, swap_figures)):
         if path is not None:
