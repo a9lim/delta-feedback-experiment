@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         metavar="LETTERS",
         help=(
-            "one letter per change from the plain RoPE GQA decoder, in any order "
+            "one letter per change from the plain gated GQA decoder, in any order "
             "(default: none, the plain decoder): "
             + "; ".join(
                 f"{letter} = {change}"

@@ -10,13 +10,14 @@ passes, the learning-rate schedule, and the numbers we look at afterwards.
 ## Conditions
 
 A condition is a string of letters from `arfl`, each one change from the
-plain twelve-layer RoPE GQA decoder. `parse_condition` accepts the letters in
-any order and returns them in that order; the empty string is the plain
-decoder, and `ModelConfig.condition` renders a configuration's letters back.
+plain twelve-layer gated NoPE GQA decoder. `parse_condition` accepts the
+letters in any order and returns them in that order; the empty string is the
+plain decoder, and `ModelConfig.condition` renders a configuration's letters
+back.
 
 | Letter | Change | `ModelConfig` flag |
 |---|---|---|
-| `a` | Kimi Delta Attention: `[PKDA, PKDA, PKDA, gated global GQA] x 3`, NoPE, in place of RoPE GQA | `hybrid` |
+| `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA] x 3` | `hybrid` |
 | `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
 | `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
 | `l` | Huginn loop: the tied-depth core of [depth-architecture.md](depth-architecture.md); specified, not built | `loop` |
@@ -25,10 +26,10 @@ Every subset of `arf` builds. At the screen geometry:
 
 | Condition | Parameters | Active non-embedding |
 |---|---:|---:|
-| `""` (plain) | 229,954,560 | 113,267,712 |
-| `r` | 230,009,856 | 113,323,008 |
-| `f` | 231,136,512 | 114,449,664 |
-| `rf` | 231,194,112 | 114,507,264 |
+| `""` (plain) | 237,032,448 | 120,345,600 |
+| `r` | 237,087,744 | 120,400,896 |
+| `f` | 238,214,400 | 121,527,552 |
+| `rf` | 238,272,000 | 121,585,152 |
 | `a` | 256,275,240 | 139,588,392 |
 | `ar` | 256,330,536 | 139,643,688 |
 | `af` | 257,457,192 | 140,770,344 |
@@ -42,9 +43,9 @@ far are `ar` and `arf` runs.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every
 parameter they share byte-identically for a given seed: the trunk from the
-common stream, and each letter's private modules (`a`'s attention gates, `f`'s
-fusion matrices) from that letter's own deterministic stream, which never
-advances the common one; routers initialize to zero. The plain trunk and the
+common stream, the attention gates from their own deterministic stream, and
+`f`'s fusion matrices from `f`'s own, neither of which advances the common
+one; routers initialize to zero. The plain trunk and the
 `a` trunk consume the common stream differently, so parameters do not pair
 across `a`. Two conditions trained with the same seed and data seed therefore
 see the same rows in the same order with the same keyed feedback draws, and
@@ -56,7 +57,7 @@ exactly `arf`.
 
 ## Geometry
 
-Under `a` the trunk is:
+The trunk is twelve gated NoPE GQA layers; under `a` it is:
 
 ```text
 [PKDA, PKDA, PKDA, gated global GQA] x 3
@@ -69,7 +70,7 @@ Under `a` the trunk is:
 | Layers / four-layer cells | 12 / 3 |
 | SwiGLU intermediate width | 3,328 |
 | Context / predictions per row | 1,024 |
-| RoPE theta, plain trunk | 1,000,000 |
+| Explicit position encoding | none |
 | GQA query / KV heads / head width | 8 / 4 / 96 |
 | PKDA Q/K/V heads / head width | 10 / 128 |
 | PKDA Q/K/V projection width | 1,280 |
@@ -80,9 +81,9 @@ Under `a` the trunk is:
 Relative to the larger geometry in `architecture.md`, the screen halves the
 residual, SwiGLU, and PKDA projection widths (`768 / 3,328 / 1,280` against
 `1,536 / 6,656 / 2,560`), so the 10-by-128 PKDA geometry keeps the Kimi `5/3`
-recurrent-projection ratio. The global layers under `a` are dense causal NoPE
-gated GQA. Without `a` the trunk is twelve bias-free RoPE GQA layers with
-packed QKV, per-head Q/K RMSNorm, and no attention-output gate. MHDB has four
+recurrent-projection ratio. Every dense attention layer, the fourth of each
+cell under `a` and all twelve without it, is bias-free causal NoPE GQA with
+packed QKV, per-head Q/K RMSNorm, and a sigmoid output gate. MHDB has four
 groups because its groups follow the global KV-head count.
 
 ## Data

@@ -7,10 +7,10 @@ sandbox: train variants, look inside, change the recipe or the architecture,
 write down what happened. Nothing is pre-registered and no result needs to
 clear a gate before it can be used to decide what to try next.
 
-One `DeltaModel` family, addressed by condition letters: `a` swaps the plain RoPE
-GQA trunk for the PKDA/gated-GQA hybrid, `r` adds MHDB block-delta reads, `f`
-adds FBT feedback between token columns, and `l` names the tied-depth loop
-that is specified and not built. `--condition arf` is the full built stack;
+One `DeltaModel` family, addressed by condition letters: `a` makes three of
+every four attention layers PKDA, `r` adds MHDB block-delta reads, `f` adds
+FBT feedback between token columns, and `l` names the tied-depth loop that is
+specified and not built. `--condition arf` is the full built stack;
 the empty condition is the plain decoder. Three full-schedule specimens exist
 on Jobe (`screen-delta-ar-s1`, an `ar` run; `screen-delta-arf-s1-highLR` and
 `screen-delta-arf-s1`, `arf` runs); the current read of what they show is
@@ -52,10 +52,10 @@ change it everywhere at once.
 - One `DeltaModel` and `CONDITION_LETTERS` define the family. A condition is the
   canonical string `parse_condition` returns (letters in `arfl` order) and
   `ModelConfig.condition` renders it back; every subset of `arf` builds and
-  `l` raises until the loop exists. Under `a` the trunk is
-  `[PKDA, PKDA, PKDA, gated global GQA] x 3`; without `a` it is twelve-layer
-  RoPE GQA. The larger geometry in `architecture.md` is the same architecture
-  at six cells and width 1,536.
+  `l` raises until the loop exists. Every dense attention layer is gated NoPE
+  GQA. Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x 3`;
+  without `a` it is twelve such layers. The larger geometry in
+  `architecture.md` is the same architecture at six cells and width 1,536.
 - PKDA runs the literal recurrence on CPU/MPS and the workspace FLA fork's
   chunk and recurrent kernels on CUDA, with FP32 recurrent-matrix and
   preconditioner boundaries. CUDA training does not fall back to the

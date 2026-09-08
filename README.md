@@ -42,13 +42,13 @@ previous token's latent payload + current token embedding
 ```
 
 One `DeltaModel` implements the whole family. A condition is a string of
-letters, each one change from the plain twelve-layer RoPE GQA decoder, so any
-two conditions can be trained on identical rows from paired initializations
-and compared:
+letters, each one change from the plain twelve-layer gated NoPE GQA decoder,
+so any two conditions can be trained on identical rows from paired
+initializations and compared:
 
 | Letter | Change |
 |---|---|
-| `a` | Kimi Delta Attention: the `[PKDA, PKDA, PKDA, gated global GQA]` trunk replaces RoPE GQA |
+| `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA]` cells |
 | `r` | MHDB residual reads of the seed and block deltas before every sublayer; with `f`, a routed payload |
 | `f` | Full-bandwidth feedback: the FBT entry and a payload for the next column |
 | `l` | Huginn loop: a tied-depth core, [specified](docs/depth-architecture.md) and not built |

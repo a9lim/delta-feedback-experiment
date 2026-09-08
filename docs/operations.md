@@ -58,7 +58,7 @@ delta probe
 delta tokenize --out /data/delta/tokens
 
 # Run or queue one condition: letters from arfl in any order, empty for the
-# plain RoPE GQA decoder (`delta train --help` lists the letters).
+# plain gated GQA decoder (`delta train --help` lists the letters).
 delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
   --data-dir /data/delta/tokens
 delta queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
@@ -97,8 +97,7 @@ their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
 Snapshots use checkpoint contract v24, and only v24 is resumable. V16–v23
-remain readable for evaluation and forks; they recorded the condition as an
-arm name, which the analysis loader translates. Protected snapshots persist at the
+remain readable for evaluation and forks. Protected snapshots persist at the
 cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
 limits the current invocation without changing the schedule.
 

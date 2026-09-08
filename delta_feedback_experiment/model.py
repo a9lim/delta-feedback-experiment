@@ -3,10 +3,10 @@
 The architecture contract is ``docs/architecture.md``. Everything here is
 condition-agnostic model semantics: a condition is a string of letters from
 :data:`CONDITION_LETTERS`, each switching on one :class:`ModelConfig` flag
-over the plain twelve-layer RoPE GQA decoder (the empty condition). ``a``
-replaces the trunk with the PKDA/gated-GQA hybrid, ``r`` adds MHDB reads,
-``f`` adds FBT feedback, and ``l`` names the tied-depth loop that is specified
-and not built.
+over the plain twelve-layer gated NoPE GQA decoder (the empty condition).
+``a`` replaces three of every four attention layers with PKDA, ``r`` adds MHDB
+reads, ``f`` adds FBT feedback, and ``l`` names the tied-depth loop that is
+specified and not built.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired conditions
 architecturally identical in everything but the flags.
@@ -69,7 +69,7 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "a": (
         "hybrid",
-        "Kimi Delta Attention: the [PKDA, PKDA, PKDA, gated global GQA] trunk",
+        "Kimi Delta Attention: PKDA in three of every four attention layers",
     ),
     "r": (
         "block_routing",
@@ -89,7 +89,7 @@ def parse_condition(text: str) -> str:
 
     Each letter is one change from the plain decoder; letters may arrive in any
     order and come back in :data:`CONDITION_LETTERS` order. The empty string is
-    the plain twelve-layer RoPE GQA decoder.
+    the plain twelve-layer gated NoPE GQA decoder.
     """
     unknown = sorted(set(text) - set(CONDITION_LETTERS))
     if unknown:
@@ -110,9 +110,9 @@ BASE_NORMAL_INIT_STD = 0.02
 class ModelConfig:
     """Trunk geometry plus one flag per condition letter.
 
-    Defaults are the screen geometry and the plain RoPE GQA trunk; ``hybrid``
-    (``a``) is the 3:1 PKDA/gated-global-GQA hybrid. Routing heads are not an
-    independent knob: every routed condition uses one contiguous feature group
+    Defaults are the screen geometry and the plain trunk of twelve gated NoPE
+    GQA layers; ``hybrid`` (``a``) makes three of every four of them PKDA.
+    Routing heads are not an independent knob: every routed condition uses one contiguous feature group
     per KV head. The groups do not align to mixer projections.
     """
 
@@ -127,13 +127,12 @@ class ModelConfig:
     pkda_head_dim: int = 128
     pkda_conv_size: int = 4
     max_seq_len: int = 1024
-    rope_theta: float = 1e6
     norm_eps: float = 1e-6
     routing_block_size: int = 4
     """Exact MHDB cell width in transformer layers."""
 
     hybrid: bool = False
-    """``a``: [PKDA, PKDA, PKDA, gated global GQA] cells instead of RoPE GQA."""
+    """``a``: [PKDA, PKDA, PKDA, gated global GQA] cells instead of all-GQA."""
 
     block_routing: bool = False
     """``r``: multi-head block-delta routing before every sublayer."""
@@ -166,11 +165,6 @@ class ModelConfig:
         return self.block_routing
 
     @property
-    def gated_attention(self) -> bool:
-        """Every global attention layer in the hybrid trunk is gated."""
-        return self.hybrid
-
-    @property
     def routing_heads(self) -> int:
         """The authoritative MHDB scaling rule: H equals KV-head count."""
         return self.kv_heads
@@ -194,6 +188,7 @@ class ModelConfig:
 
     @property
     def global_attention_layers(self) -> tuple[int, ...]:
+        """Dense gated GQA layers: every fourth under ``a``, otherwise all."""
         if not self.hybrid:
             return tuple(range(self.layers))
         return tuple(
@@ -274,26 +269,6 @@ class ResidualEmbedding(nn.Embedding):
         if out.is_cuda and torch.is_autocast_enabled("cuda"):
             return out.to(torch.bfloat16)
         return out
-
-
-# -- rotary positions ----------------------------------------------------------
-
-
-def rope_tables(cfg: ModelConfig, device, dtype=torch.float32) -> tuple[Tensor, Tensor]:
-    """(cos, sin) tables [max_seq_len, head_dim], HF half-rotation convention."""
-    half = cfg.head_dim // 2
-    inv_freq = cfg.rope_theta ** (-torch.arange(0, half, device=device).float() / half)
-    angles = torch.outer(torch.arange(cfg.max_seq_len, device=device).float(), inv_freq)
-    angles = torch.cat([angles, angles], dim=-1)
-    return angles.cos().to(dtype), angles.sin().to(dtype)
-
-
-def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    """Rotate q or k [B, H, T, hd] by position tables [T, hd]."""
-    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
-    half = x.shape[-1] // 2
-    rotated = torch.cat([-x[..., half:], x[..., :half]], dim=-1)
-    return x * cos + rotated * sin
 
 
 # -- kv cache ------------------------------------------------------------------
@@ -377,12 +352,11 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Dense GQA: RoPE on the plain trunk, NoPE plus sigmoid gate under ``a``."""
+    """Dense causal NoPE GQA with a sigmoid output gate, in every condition."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.use_rope = not cfg.hybrid
         self.q_size = cfg.heads * cfg.head_dim
         self.kv_size = cfg.kv_heads * cfg.head_dim
         self.qkv_proj = nn.Linear(cfg.dim, self.q_size + 2 * self.kv_size, bias=False)
@@ -398,39 +372,26 @@ class Attention(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cos: Tensor | None,
-        sin: Tensor | None,
-        gate_weight: Tensor | None,
+        gate_weight: Tensor,
         cache: KVCache | None,
         layer: int,
         attention_mask=None,
     ) -> Tensor:
         batch, length, _ = x.shape
         cfg = self.cfg
-        if gate_weight is not None:
-            # One GEMM produces Q/K/V and the gate logits; the gate keeps its
-            # own parameter, optimizer group, and checkpoint name.
-            q, k, v, gate_logits = sink_linear(
-                x,
-                (self.qkv_proj.weight, gate_weight),
-                (self.qkv_sink, self.gate_sink),
-                self.qkv_shadow,
-            ).split((self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1)
-        else:
-            gate_logits = None
-            q, k, v = sink_linear(
-                x, (self.qkv_proj.weight,), (self.qkv_sink,), self.qkv_shadow
-            ).split((self.q_size, self.kv_size, self.kv_size), dim=-1)
+        # One GEMM produces Q/K/V and the gate logits; the gate keeps its own
+        # parameter, optimizer group, and checkpoint name.
+        q, k, v, gate_logits = sink_linear(
+            x,
+            (self.qkv_proj.weight, gate_weight),
+            (self.qkv_sink, self.gate_sink),
+            self.qkv_shadow,
+        ).split((self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1)
         q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
         k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        if self.use_rope:
-            if cos is None or sin is None:
-                raise ValueError("RoPE GQA requires rotary position tables")
-            q = apply_rope(q, cos, sin)
-            k = apply_rope(k, cos, sin)
         if cache is not None and length > 1 and cache.pos != 0:
             raise ValueError("multi-column append to a non-empty cache")
         causal = cache is None or length > 1
@@ -453,8 +414,7 @@ class Attention(nn.Module):
                 enable_gqa=cfg.heads != cfg.kv_heads,
             ).transpose(1, 2)
         out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
-        if gate_logits is not None:
-            out = out * torch.sigmoid(gate_logits)
+        out = out * torch.sigmoid(gate_logits)
         return sink_linear(out, (self.o_proj.weight,), (self.o_sink,), self.o_shadow)
 
 
@@ -656,9 +616,7 @@ class Block(nn.Module):
         self.layer = layer
         self.is_pkda = cfg.is_pkda_layer(layer)
         self.global_gate_index = (
-            cfg.global_attention_layers.index(layer)
-            if cfg.hybrid and not self.is_pkda
-            else None
+            None if self.is_pkda else cfg.global_attention_layers.index(layer)
         )
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.mlp_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -694,8 +652,6 @@ class Block(nn.Module):
         self,
         h: Tensor,
         block_start: Tensor | None,
-        cos: Tensor | None,
-        sin: Tensor | None,
         cache: KVCache | None,
         gate_weight: Tensor | None,
         want_weights: bool,
@@ -728,7 +684,7 @@ class Block(nn.Module):
                 cache.update_pkda(self.layer, state, a_state, conv_state)
         else:
             mixed = self.attn(
-                normalized, cos, sin, gate_weight, cache, self.layer, attention_mask
+                normalized, gate_weight, cache, self.layer, attention_mask
             )
         a = self.branch_scale * mixed
         h = h + a
@@ -742,18 +698,10 @@ class Block(nn.Module):
         return h, a, m, h - start, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, mask, *sources):
+def _block_for_checkpoint(block, h, block_start, gate_weight, mask, *sources):
     """Pure checkpoint wrapper; immutable mask geometry is a per-call input."""
     h, a, m, delta, _, _ = block(
-        h,
-        block_start,
-        cos,
-        sin,
-        None,
-        gate_weight,
-        False,
-        *sources,
-        attention_mask=mask,
+        h, block_start, None, gate_weight, False, *sources, attention_mask=mask
     )
     return h, a, m, delta
 
@@ -762,16 +710,12 @@ def _block_for_checkpoint(block, h, block_start, cos, sin, gate_weight, mask, *s
 # cache on the code object and, when it recompiles, evaluates every earlier
 # entry's guards against the current call to log the reason; one family's
 # guards name attributes the other family's mixer does not have.
-def _attention_block(block, h, block_start, cos, sin, gate_weight, mask, *sources):
-    return _block_for_checkpoint(
-        block, h, block_start, cos, sin, gate_weight, mask, *sources
-    )
+def _attention_block(block, h, block_start, gate_weight, mask, *sources):
+    return _block_for_checkpoint(block, h, block_start, gate_weight, mask, *sources)
 
 
-def _pkda_block(block, h, block_start, cos, sin, gate_weight, mask, *sources):
-    return _block_for_checkpoint(
-        block, h, block_start, cos, sin, gate_weight, mask, *sources
-    )
+def _pkda_block(block, h, block_start, gate_weight, mask, *sources):
+    return _block_for_checkpoint(block, h, block_start, gate_weight, mask, *sources)
 
 
 _compiled_block = torch.compile(
@@ -851,14 +795,13 @@ class DeltaModel(nn.Module):
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         # Capture the exact common-trunk initialization boundary before
-        # constructing any factor-specific random matrices. Restoring it below
-        # keeps every shared parameter byte-identical across conditions.
+        # constructing the attention gates and the letter-private matrices,
+        # which draw from their own streams. Restoring it below keeps every
+        # shared parameter byte-identical across conditions.
         common_init_state = torch.random.get_rng_state()
         self.attention_gates = nn.ModuleList(
             nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
-            for _ in range(
-                len(cfg.global_attention_layers) if cfg.gated_attention else 0
-            )
+            for _ in cfg.global_attention_layers
         )
         self.fuse_value_sink: Tensor | None = None
         self.fuse_gate_sink: Tensor | None = None
@@ -874,7 +817,6 @@ class DeltaModel(nn.Module):
             self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
             if cfg.routing_active:
                 self.payload_router = Router(cfg)
-        self._rope: tuple[Tensor, Tensor] | None = None
         self.grad_checkpoint = False
         """Runtime switch: checkpoint each block during training forwards."""
         torch.random.set_rng_state(common_init_state)
@@ -902,12 +844,13 @@ class DeltaModel(nn.Module):
 
     @staticmethod
     def _init_factor_linears(linears: Iterable[nn.Linear], seed: int) -> None:
-        """Initialize one factor from its own seed-stable random stream.
+        """Initialize one module family from its own seed-stable random stream.
 
-        Letter-private modules must not shift common initialization, and the
-        same letter must initialize identically in every condition that has it.
-        Models are constructed on CPU (or meta for accounting) before moving to
-        an execution device, so one local CPU generator is authoritative.
+        The attention gates and the letter-private FBT matrices never advance
+        the common trunk stream, so a module initializes identically in every
+        condition that has it. Models are constructed on CPU (or meta for
+        accounting) before moving to an execution device, so one local CPU
+        generator is authoritative.
         """
         generator = torch.Generator().manual_seed(seed % ((1 << 63) - 1))
         for linear in linears:
@@ -929,12 +872,6 @@ class DeltaModel(nn.Module):
                 parameter.mul_(target_std / BASE_NORMAL_INIT_STD)
 
     # -- pieces ----------------------------------------------------------------
-
-    def rope(self, device, start: int, length: int) -> tuple[Tensor, Tensor]:
-        if self._rope is None or self._rope[0].device != device:
-            self._rope = rope_tables(self.cfg, device)
-        cos, sin = self._rope
-        return cos[start : start + length], sin[start : start + length]
 
     def fuse(self, payload: Tensor, e: Tensor) -> Tensor:
         """FBT entry: u = rmsnorm(W_U p ⊙ σ(W_G rmsnorm(e))) (Appendix C)."""
@@ -1049,18 +986,12 @@ class DeltaModel(nn.Module):
                     attn.output_gate_shadow, attn.output_gate_up.weight
                 )
             else:
+                gate = self.attention_gates[block.global_gate_index].weight
                 attn.qkv_sink = sink(attn.qkv_proj.weight)
+                attn.gate_sink = sink(gate)
                 attn.o_sink = sink(attn.o_proj.weight)
+                attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight, gate)
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-                if block.global_gate_index is not None:
-                    gate = self.attention_gates[block.global_gate_index].weight
-                    attn.gate_sink = sink(gate)
-                    attn.qkv_shadow = shadow(
-                        attn.qkv_shadow, attn.qkv_proj.weight, gate
-                    )
-                else:
-                    attn.gate_sink = None
-                    attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight)
         if self.cfg.gated_entry:
             self.fuse_value_sink = sink(self.fuse_value.weight)
             self.fuse_gate_sink = sink(self.fuse_gate.weight)
@@ -1131,10 +1062,6 @@ class DeltaModel(nn.Module):
         by ``T`` exactly once.
         """
         cfg = self.cfg
-        start = cache.pos if cache is not None else 0
-        cos, sin = (
-            (None, None) if cfg.hybrid else self.rope(x.device, start, x.shape[1])
-        )
         # Mask construction belongs outside fullgraph block compilation. The
         # same immutable geometry is reused by all global layers and passes.
         attention_mask = (
@@ -1190,8 +1117,6 @@ class DeltaModel(nn.Module):
                     block,
                     h,
                     entry,
-                    cos,
-                    sin,
                     gate_weight,
                     mask,
                     *passed,
@@ -1199,15 +1124,11 @@ class DeltaModel(nn.Module):
                     preserve_rng_state=False,
                 )
             elif h.is_cuda and cache is None and not want_weights:
-                h, _a, _m, delta = block_fn(
-                    block, h, entry, cos, sin, gate_weight, mask, *passed
-                )
+                h, _a, _m, delta = block_fn(block, h, entry, gate_weight, mask, *passed)
             else:
                 h, _a, _m, delta, w_attn, w_mlp = block(
                     h,
                     entry,
-                    cos,
-                    sin,
                     cache,
                     gate_weight,
                     want_weights,

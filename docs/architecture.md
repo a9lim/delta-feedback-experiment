@@ -3,10 +3,10 @@
 This document defines the exact computation, state, initialization, and
 optimizer of the small model organism. The implemented family is one `DeltaModel`
 addressed by the condition letters in [design.md](design.md): `a` for
-Preconditioned Kimi Delta Attention (PKDA) with gated global GQA, `r` for
-Multi-Head Delta Block routing (MHDB), and `f` for Full-Bandwidth Transformer
-(FBT) feedback. Hard Delta Feedback, `arf`, has all three; dropping a letter
-removes that package from the computation.
+Preconditioned Kimi Delta Attention (PKDA) in three of every four layers, `r`
+for Multi-Head Delta Block routing (MHDB), and `f` for Full-Bandwidth
+Transformer (FBT) feedback. Hard Delta Feedback, `arf`, has all three;
+dropping a letter removes that package from the computation.
 
 The named states and source identities are the handles the analysis scripts
 use; [interpretability](interpretability.md) lists those scripts and
@@ -36,18 +36,20 @@ implemented.
 | PKDA Q/K/V projection width | 1,280 | 2,560 |
 | PKDA convolution width | 4 | 4 |
 | RMSNorm epsilon, every norm site | `1e-6` | `1e-6` |
-| Explicit position encoding under `a` | none | none |
+| Explicit position encoding | none | none |
 
-Under `a` the token-mixing schedule is exactly:
+Every dense attention layer is gated causal NoPE GQA. Under `a` the
+token-mixing schedule is exactly:
 
 ```text
 [PKDA, PKDA, PKDA, gated global GQA] × C
 ```
 
-The `a` trunk uses no sliding-window attention, MLA, RoPE, or additive
-position embedding. PKDA carries token-mixer state, order, and recency; every
-fourth layer supplies a dense causal global read. Without `a` the trunk is
-twelve RoPE GQA layers as specified in [design.md](design.md).
+No condition uses sliding-window attention, MLA, RoPE, or an additive position
+embedding. Under `a`, PKDA carries token-mixer state, order, and recency, and
+every fourth layer supplies a dense causal global read. Without `a` all `L`
+layers are that dense read, and position is whatever the causal mask lets the
+model infer.
 
 One feedback column computes:
 
@@ -199,7 +201,8 @@ during decoding.
 
 ## Gated global GQA
 
-The fourth layer of every cell is dense causal NoPE GQA. For pre-normalized
+Every dense attention layer, the fourth of each cell under `a` and every
+layer without it, is causal NoPE GQA with an output gate. For pre-normalized
 input `x`, a packed bias-free projection produces Q/K/V, Q and K receive
 per-head RMSNorm, and a separate bias-free projection produces one gate
 coordinate per query-head output coordinate:
@@ -217,9 +220,9 @@ weights. It is distinct from every PKDA control and from the FBT entry gate.
 Full-sequence and prefill CUDA execution use compiled PyTorch FlexAttention
 with a shared causal block mask and native GQA. Cached decoding writes BF16 K/V
 explicitly, then attends only to the valid prefix; a one-token query sees every
-key in that prefix. Only the global layers own KV storage: three at small
-scale, six in the larger geometry. The external `flash-attn` extension is not
-required.
+key in that prefix. Only the dense attention layers own KV storage: under `a`,
+three at small scale and six in the larger geometry; without `a`, every layer.
+The external `flash-attn` extension is not required.
 
 ## Multi-Head Delta Block routing
 

@@ -88,30 +88,29 @@ def test_condition_flags():
     plain = condition_config("", **TINY)
     assert not plain.routing_active
     assert not plain.feedback_active
-    assert not plain.gated_attention
     assert not plain.hybrid
+    # Every dense layer is gated NoPE GQA; a only decides which layers are dense.
+    assert plain.global_attention_layers == tuple(range(TINY["layers"]))
     hybrid = condition_config("a", **TINY)
-    assert hybrid.hybrid and hybrid.gated_attention
+    assert hybrid.hybrid
     assert not hybrid.routing_active and not hybrid.feedback_active
     assert hybrid.is_pkda_layer(0) and not hybrid.is_pkda_layer(3)
+    assert hybrid.global_attention_layers == (3,)
     routed = condition_config("ar", **TINY)
     assert routed.routing_active
     assert not routed.feedback_active
-    assert routed.gated_attention
     assert routed.routing_heads == TINY["kv_heads"]
     assert routed.routing_block_size == 4
     fed = condition_config("af", **TINY)
     assert fed.gated_entry
     assert not fed.routing_active
-    assert fed.gated_attention
     full = condition_config("arf", **TINY)
     assert full.gated_entry
     assert full.routing_active
-    assert full.gated_attention
     # Letters compose independently of the trunk letter.
     plain_routed_fed = condition_config("rf", **TINY)
     assert plain_routed_fed.routing_active and plain_routed_fed.feedback_active
-    assert not plain_routed_fed.hybrid and not plain_routed_fed.gated_attention
+    assert not plain_routed_fed.hybrid
 
     screen = condition_config("a")
     assert screen.intermediate * 6 == screen.dim * 26
@@ -144,15 +143,18 @@ def test_letters_only_add_parameters():
     for condition in ("r", "ar", "rf", "arf"):
         assert any("null" in name for name in names[condition])
     assert not any("blocks.0.attn.q_proj" in name for name in names[""])
-    assert not any("attention_gates" in name for name in names["rf"])
+    # Every dense attention layer owns a gate: all four on the plain trunk,
+    # the cell's fourth layer under a.
+    assert sum("attention_gates" in name for name in names["rf"]) == TINY["layers"]
+    assert sum("attention_gates" in name for name in names["arf"]) == 1
 
 
 def test_screen_param_count():
     expected = {
-        "": (229_954_560, 113_267_712),
-        "r": (230_009_856, 113_323_008),
-        "f": (231_136_512, 114_449_664),
-        "rf": (231_194_112, 114_507_264),
+        "": (237_032_448, 120_345_600),
+        "r": (237_087_744, 120_400_896),
+        "f": (238_214_400, 121_527_552),
+        "rf": (238_272_000, 121_585_152),
         "a": (256_275_240, 139_588_392),
         "ar": (256_330_536, 139_643_688),
         "af": (257_457_192, 140_770_344),
@@ -381,14 +383,31 @@ def test_tied_embedding_sink_accumulates_both_gradient_paths_in_place():
 
 
 def test_zero_gqa_gate_halves_the_ungated_attention_branch():
-    model = tiny("a")
-    attention = model.blocks[3].attn
-    gate_weight = model.attention_gates[0].weight
+    """``o = W_o(sigmoid(W_g x) * GQA(q, k, v))``: a zero gate is a factor 1/2,
+    on the plain trunk's second layer here, and no position tables anywhere."""
+    model = tiny("")
+    cfg = model.cfg
+    attention = model.blocks[1].attn
+    gate_weight = model.attention_gates[1].weight
     x = torch.randn(2, 7, TINY["dim"])
+
+    def heads(t, n):
+        return t.view(2, 7, n, cfg.head_dim).transpose(1, 2)
+
     with torch.no_grad():
         gate_weight.zero_()
-        ungated = attention(x, None, None, None, None, 3)
-        gated = attention(x, None, None, gate_weight, None, 3)
+        gated = attention(x, gate_weight, None, 1)
+        q, k, v = attention.qkv_proj(x).split(
+            (attention.q_size, attention.kv_size, attention.kv_size), dim=-1
+        )
+        z = torch.nn.functional.scaled_dot_product_attention(
+            attention.q_norm(heads(q, cfg.heads)),
+            attention.k_norm(heads(k, cfg.kv_heads)),
+            heads(v, cfg.kv_heads),
+            is_causal=True,
+            enable_gqa=cfg.heads != cfg.kv_heads,
+        )
+        ungated = attention.o_proj(z.transpose(1, 2).reshape(2, 7, -1))
     assert torch.allclose(gated, 0.5 * ungated, atol=1e-6)
 
 

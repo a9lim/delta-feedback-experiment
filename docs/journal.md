@@ -4,6 +4,27 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-08 — The plain trunk is gated NoPE GQA
+
+Every dense attention layer is now the same layer: bias-free causal GQA with
+per-head Q/K RMSNorm, no position encoding, and a sigmoid output gate. The
+empty condition is twelve of them; `a` replaces three of every four with PKDA
+and nothing else, so `a` isolates the mixer swap and every non-`a` condition
+gets the gate and NoPE the same way. RoPE is gone from the code along with
+`rope_theta`; a plain-trunk model infers position from the causal mask alone,
+which is the known-viable but usually slightly weaker NoPE baseline for a
+pure-attention decoder.
+
+The attention gates keep their own seeded stream. They are no longer
+`a`-private, but that stream is what the Jobe specimens initialized from, so
+`a` conditions initialize exactly as before and a new `a`, `af`, or `arf` run
+at seed 1 still pairs with `screen-delta-ar-s1`. The plain conditions gain
+7,077,888 gate parameters (screen counts in
+[design.md](design.md#conditions)). The `a` specimens' snapshots are
+untouched and still load. No plain-trunk snapshot exists, so the contract
+stays v24; one written before this change would fail on its missing gate keys
+rather than silently read as the new trunk. Nothing was trained.
+
 ## 2026-09-08 — The operator is `delta`, and the specimens are named for their conditions
 
 The console script `df` is now `delta`, which also stops shadowing the
