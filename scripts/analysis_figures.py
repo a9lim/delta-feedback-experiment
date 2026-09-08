@@ -8,6 +8,7 @@ Each input is optional; the script draws whatever it is given:
     --entry     entry_sweeps.json         (scripts/entry_sweeps.py)
     --followups feedback_followups.json   (scripts/feedback_followups.py)
     --swap      payload_swap.json         (scripts/payload_swap.py)
+    --downstream A.json B.json ...        (scripts/downstream_eval.py; one bar group per run)
 
 Usage:
     python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms.json \\
@@ -333,6 +334,31 @@ def swap_figures(report: dict, out_dir: Path) -> None:
     fs.save(fig, out_dir / ("payload-swap.png" if head is None else f"payload-swap-head{head}.png"))
 
 
+CHANCE = {"hellaswag": 0.25, "arc_easy": 0.25, "arc_challenge": 0.25, "piqa": 0.5, "winogrande": 0.5, "boolq": 0.5,
+          "openbookqa": 0.25, "sciq": 0.25, "lambada_openai": 0.0}
+
+
+def downstream_figures(paths: list[Path], labels: list[str] | None, out_dir: Path) -> None:
+    runs = [json.loads(p.read_text()) for p in paths]
+    labels = labels or [f"{r['meta'].get('tag', p.stem)} {r['meta'].get('mode', '')}".strip() for r, p in zip(runs, paths)]
+    tasks = [t for t in runs[0]["tasks"] if all(t in r["tasks"] for r in runs)]
+    metric_of = {t: ("acc_norm" if "acc_norm" in runs[0]["tasks"][t]["metrics"] else "acc") for t in tasks}
+    fig, ax = plt.subplots(figsize=(1.35 * len(tasks) + 2, 4.2), constrained_layout=True)
+    x = np.arange(len(tasks))
+    w = 0.8 / len(runs)
+    for i, (run, label) in enumerate(zip(runs, labels)):
+        means = [run["tasks"][t]["metrics"][metric_of[t]]["mean"] for t in tasks]
+        ses = [run["tasks"][t]["metrics"][metric_of[t]]["se"] for t in tasks]
+        ax.bar(x + (i - (len(runs) - 1) / 2) * w, means, w, yerr=ses, color=fs.SERIES[i % len(fs.SERIES)], ecolor=fs.MUTED, capsize=2, label=label)
+    for j, t in enumerate(tasks):
+        if CHANCE.get(t, 0) > 0:
+            ax.plot([j - 0.42, j + 0.42], [CHANCE[t]] * 2, color=fs.MUTED, lw=1, ls=":")
+    ax.set_xticks(x, [f"{t}\n({metric_of[t]})" for t in tasks], fontsize=8)
+    ax.set(title="Downstream zero-shot tasks (dotted: chance; bars ±1 s.e.)", ylabel="accuracy", ylim=(0, 1))
+    ax.legend()
+    fs.save(fig, out_dir / "downstream-tasks.png")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--compare", type=Path)
@@ -341,9 +367,13 @@ def main() -> None:
     parser.add_argument("--entry", type=Path)
     parser.add_argument("--followups", type=Path)
     parser.add_argument("--swap", type=Path)
+    parser.add_argument("--downstream", type=Path, nargs="*")
+    parser.add_argument("--downstream-labels", nargs="*")
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    if args.downstream:
+        downstream_figures(args.downstream, args.downstream_labels, args.out_dir)
     for path, fn in ((args.compare, compare_figures), (args.weights, weight_figures), (args.fused, fused_figures),
                      (args.entry, entry_figures), (args.followups, followup_figures), (args.swap, swap_figures)):
         if path is not None:

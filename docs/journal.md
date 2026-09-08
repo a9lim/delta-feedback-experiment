@@ -148,9 +148,86 @@ pre-norm input is 15% at the median (36% at p90, up from 8% / 15%).
    take it, and whether the `mhdb` run's coincidence with the current
    defaults makes it a registered specimen, are decisions for a9.
 
+### Downstream zero-shot tasks
+
+The same two snapshots on the workspace's pinned nine-task suite
+(`scripts/downstream_eval.py`; harness prompts, `acc_norm` by character
+length, batch 16, buckets 128–1024), with `EleutherAI/pythia-160m` (300B
+tokens) scored by the same code as an anchor. The plumbing reproduces
+EleutherAI's published pythia-160m harness numbers to within about one
+standard error on ARC-Easy (43.6 / 39.6 against 43.5 / 39.7), ARC-Challenge
+(19.5 / 23.6 against 18.8 / 23.3), PIQA (62.3 / 61.9 against 62.7 / 61.6),
+SciQ (75.4 / 67.7 against 74.1 / 66.8) and LAMBADA perplexity (37.3 against
+38.1); WinoGrande sits 1.8 points low and LAMBADA accuracy 2.6 points high
+(35.4 against 32.8), unresolved. Records:
+`figures/downstream-<tag>/downstream_<mode>.json`, comparisons beside them.
+
+| task (metric) | pythia-160m | `mhdb` | `df` Standard | `df` Fused |
+|---|---:|---:|---:|---:|
+| HellaSwag (acc_norm) | 30.3 | 34.6 ± 0.5 | 34.8 | 35.2 |
+| ARC-Easy (acc_norm) | 39.6 | 47.4 ± 1.0 | 48.8 | 48.3 |
+| ARC-Challenge (acc_norm) | 23.6 | 26.3 ± 1.3 | 26.6 | 26.0 |
+| PIQA (acc_norm) | 61.9 | 63.7 ± 1.1 | 63.4 | 64.0 |
+| WinoGrande (acc) | 51.3 | 50.0 ± 1.4 | 51.2 | 50.7 |
+| BoolQ (acc) | 56.5 | 59.1 ± 0.9 | 61.1 | 61.7 |
+| OpenBookQA (acc_norm) | 26.8 | 31.8 ± 2.1 | 31.8 | 32.0 |
+| SciQ (acc_norm) | 67.7 | 68.7 ± 1.5 | 69.8 | 69.3 |
+| LAMBADA (acc / ppl) | 35.4 / 37.3 | 29.9 / 56.9 | 30.5 / 58.1 | 32.0 / 56.2 |
+
+Both specimens beat the 300B-token pythia-160m on the educational and
+science-flavored tasks (ARC-Easy by 8–9 points, HellaSwag by 4, OpenBookQA by
+5, SciQ by 1–2) and trail it badly on LAMBADA, which is fiction and
+long-range: FineWeb-Edu at 3.5B tokens, in one line. ARC-Challenge and
+WinoGrande are at chance for every model, and BoolQ is below the 62.2%
+majority class for every model.
+
+**`mhdb` against `df` Standard, paired on identical documents.** Accuracy
+differs by less than two standard errors on every task except BoolQ (+2.1 ±
+0.6) and SciQ (+2.1 ± 1.0); `df` leads on seven of nine, which is weak
+evidence in itself. The gold-continuation log-probability rises by 0.4–0.9
+nats per document on ARC, BoolQ, SciQ and PIQA, but the shift over *all*
+choices is the same size: `df` assigns more mass to short answers after
+`Answer:`, a prompt-format calibration difference. The discriminative margin
+(gold minus best distractor) moves by less than 0.05 nats on every task but
+BoolQ (+0.13 ± 0.02) and SciQ (+0.15 ± 0.05), and the BoolQ margin is a pure
+"yes" bias: `df` answers yes on 94.7% of documents against `mhdb`'s 86.7%
+(62.2% are yes), so the margin rises +0.58 on yes-gold and falls −0.60 on
+no-gold documents. Downstream, then, the arms are indistinguishable at this
+resolution apart from a calibration idiosyncrasy of the kind two seeds also
+show.
+
+**`df` Standard against `df` Fused, paired within one model.** This pairing
+resolves far smaller effects, and the fused pass is not a no-op downstream:
+
+| task | acc diff | gold logp | all choices | margin |
+|---|---:|---:|---:|---:|
+| LAMBADA | +1.47 ± 0.36 | +0.033 ± 0.009 | | |
+| HellaSwag (acc_norm) | +0.39 ± 0.19 | +0.232 ± 0.018 | +0.105 ± 0.009 | +0.160 ± 0.022 |
+| PIQA | +1.03 ± 0.54 | +0.050 ± 0.042 | +0.038 | +0.025 ± 0.031 |
+| OpenBookQA | +0.40 ± 0.85 | +0.119 ± 0.043 | +0.079 | +0.019 ± 0.048 |
+| BoolQ | +0.61 ± 0.28 | −0.107 ± 0.006 | −0.108 | +0.002 ± 0.004 |
+| ARC-Easy | −0.17 ± 0.50 | −0.070 ± 0.016 | −0.056 | −0.012 ± 0.016 |
+| SciQ | −0.30 ± 0.59 | −0.332 ± 0.019 | −0.300 | −0.040 ± 0.020 |
+| ARC-Challenge | −0.34 ± 0.57 | −0.042 ± 0.027 | −0.043 | +0.026 ± 0.027 |
+| WinoGrande | −0.47 ± 1.11 | −0.020 ± 0.020 | −0.022 | +0.005 ± 0.013 |
+
+The fused pass predicts LAMBADA's last word better (+1.5 points at four
+standard errors, 208 documents gained against 132 lost) and discriminates
+HellaSwag endings better (+0.16 nats of margin over 29-token continuations,
++0.005 per token), while it lowers the probability of every short answer
+after a QA prompt by 0.05–0.3 nats with no change in margin. So the +0.0012
+mean gap on FineWeb tokens is a net of a small benefit on long-range,
+narrative continuation and a small calibration cost on out-of-distribution
+answer formats. That is the first downstream behavior that separates the two
+modes; it is a paired observation on one checkpoint, not a causal account of
+the channel, and it has to be replicated across seeds before it is more.
+
 Repo notes: checkpoint-analysis helpers now live in
 `delta_feedback_experiment.analysis` (loader, trainer numerics, per-token
 losses, fused inputs; `tests/test_analysis.py`), the September-2 scratch
 scripts were promoted to `scripts/` under the names above with a shared
 `scripts/figstyle.py`, and their raw outputs moved to
-`figures/fused-screen-df-s1/raw/`.
+`figures/fused-screen-df-s1/raw/`. The downstream suite is the workspace
+module `transformer_experiments.downstream` (pinned Hub revisions, a scorer
+protocol, paired comparison, an HF reference scorer); this experiment's
+scorer is `scripts/downstream_eval.py`.

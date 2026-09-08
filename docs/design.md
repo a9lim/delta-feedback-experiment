@@ -285,6 +285,20 @@ arms also report `val_fused`, a second pass with plain-prefix length 1.
 No-feedback arms retain their Standard metric when a factorial table is shown
 for Soft or Fused mode. Modes are never mixed inside one effect estimate.
 
+### Downstream tasks
+
+`scripts/downstream_eval.py` scores a snapshot on the workspace's pinned
+zero-shot suite (HellaSwag, ARC-Easy/Challenge, PIQA, WinoGrande, BoolQ,
+OpenBookQA, SciQ, LAMBADA) with the evaluation harness's prompts and
+normalization, in Standard mode or a feedback arm's Fused mode. Report accuracy
+with its standard error and compare arms pairwise on identical documents; the
+paired gold-continuation log-probability difference resolves smaller effects
+than accuracy does. These numbers characterize what a specimen can do and
+anchor it against published models of similar size. At screen scale their
+resolution is a few accuracy points, so they cannot adjudicate the factorial's
+sub-0.01-nat validation effects, and they are not behavioral evidence about
+the recurrent channel unless a task is shown to depend on it.
+
 ### Factorial effects
 
 For validation loss `L`, where lower is better, define gain over `base`:

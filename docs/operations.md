@@ -141,6 +141,14 @@ python scripts/weight_divergence.py runs/A.pt.STEP runs/B.pt.STEP
 python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/df/tokens \
   --steps 150 --passes 2 --out figures/fused-TAG/dense_all.json
 
+# Downstream zero-shot tasks (workspace `transformer_experiments.downstream`),
+# in Standard mode or the Fused mode of a feedback snapshot; compare two runs
+# pairwise with the workspace command.
+python scripts/downstream_eval.py runs/TAG.pt.STEP --mode standard
+python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused
+python -m transformer_experiments.downstream --compare \
+  figures/downstream-A/downstream_standard.json figures/downstream-B/downstream_standard.json
+
 # Figures: training dynamics from run logs, and panels from the JSON records.
 python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
 python scripts/analysis_figures.py --compare figures/compare-A-vs-B/compare_arms.json \
