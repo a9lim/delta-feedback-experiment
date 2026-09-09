@@ -40,7 +40,6 @@ PKDA_INTERMEDIATES = (
     "Aqk",
     "Akk",
     "w",
-    "u",
     "kg",
     "v_new",
     "h",
@@ -48,8 +47,15 @@ PKDA_INTERMEDIATES = (
     "ac_atk",
     "a_atk",
     "sa_atk",
+    "qg",
+    "g_cum",
 )
-"""What the recurrence hands its own backward, in the order it is carried."""
+"""What the recurrence hands its own backward, in the order it is carried.
+
+The fork's forward stores the gated query ``qg`` from its output kernel and
+keeps ``g_cum``, the FP32 chunk-local gate cumsum, so the backward relaunches
+neither; ``u`` is never read by a backward that keeps these and is dropped.
+"""
 
 
 def fla_ops_available() -> bool:
@@ -68,7 +74,6 @@ def _intermediate_meta(
         ((batch, length, heads, CHUNK_SIZE), activation),  # Aqk
         ((batch, length, heads, CHUNK_SIZE), activation),  # Akk
         ((batch, length, heads, key_dim), activation),  # w
-        ((batch, length, heads, value_dim), activation),  # u
         ((batch, length, heads, key_dim), activation),  # kg
         ((batch, length, heads, value_dim), activation),  # v_new
         ((batch, chunks, heads, key_dim, value_dim), activation),  # h
@@ -76,6 +81,8 @@ def _intermediate_meta(
         ((batch, chunks, heads, key_dim), torch.float32),  # ac_atk
         ((batch, chunks, heads, key_dim), torch.float32),  # a_atk
         ((batch, chunks, heads), torch.float32),  # sa_atk
+        ((batch, length, heads, key_dim), activation),  # qg
+        ((batch, length, heads, key_dim), torch.float32),  # g_cum
     )
 
 
@@ -290,6 +297,7 @@ def pkda_recurrence(
         ac_atk,
         a_atk,
         sa_atk,
+        qg,
     ) = chunk_precond_kda_fwd(
         q=q,
         k=k,
@@ -312,10 +320,12 @@ def pkda_recurrence(
         eps=squash_eps,
         log_atk_scale=log_atk_scale,
         transpose_state_layout=False,
+        output_qg=True,
     )
     if final_state is not None or at is not None:
         raise RuntimeError("the stateless PKDA recurrence returned a final state")
-    saved = [Aqk, Akk, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk]
+    del u
+    saved = [Aqk, Akk, w, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg, cumulative]
     _check_intermediates(saved, q, v)
     return o.to(q.dtype), saved
 
@@ -375,7 +385,7 @@ def _pkda_recurrence_backward(
     the autocast state its forward saw, which the surrounding training loop
     leaves disabled by the time ``backward`` is called.
     """
-    Aqk, Akk, w, u, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk = saved
+    Aqk, Akk, w, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg, cumulative = saved
     q, k, v, g = q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous()
     g_atk, beta_atk, beta = (
         g_atk.contiguous(),
@@ -387,16 +397,6 @@ def _pkda_recurrence_backward(
         enabled=autocast_dtype is not None,
         dtype=autocast_dtype or torch.bfloat16,
     ):
-        cumulative = kda_gate_chunk_cumsum(
-            g=g,
-            A_log=A_log,
-            chunk_size=CHUNK_SIZE,
-            scale=RCP_LN2,
-            dt_bias=dt_bias,
-            cu_seqlens=None,
-            chunk_indices=None,
-            lower_bound=None,
-        )
         # The gate backward absorbs the chunk-local reverse cumsum whenever its
         # row tiles cannot straddle a chunk boundary, exactly as FLA decides it.
         defer_dg_cumsum = q.shape[1] % CHUNK_SIZE == 0
@@ -428,7 +428,6 @@ def _pkda_recurrence_backward(
                 disable_recompute=True,
                 defer_dg_cumsum=defer_dg_cumsum,
                 w=w,
-                u=u,
                 kg=kg,
                 v_new=v_new,
                 h=h,
@@ -437,6 +436,7 @@ def _pkda_recurrence_backward(
                 ac_atk=ac_atk,
                 a_atk=a_atk,
                 sa_atk=sa_atk,
+                qg=qg,
             )
         )
         dg, dA_log, ddt_bias = kda_gate_bwd(
