@@ -114,10 +114,14 @@ cost on the cards there. The arithmetic is in `scaling.md`: 2.15e21 FLOPs,
 1.34x a single 400x run. Calibration: after seven speed rounds the screen
 runs at 60–70% of the 4090's dense BF16 peak on Jobe, so the estimate takes
 40% on Hopper and Blackwell untuned, 50% on Ampere, and 60% on the Ada cards
-whose kernels are already the tuned ones. That gives about 1,500 GPU-hours
-on H100 SXM, 3,800 on A100, 3,000 on L40S, 5,500 on L40 or RTX 6000 Ada,
-7,700 on A6000, and 3,400 on RTX PRO 6000 if its BF16 rate with FP32
-accumulation is the full 503 TF. At the day's market prices from an
+whose kernels are already the tuned ones. Refined the same evening with bandwidth in the model, since about a third of
+a step at the bridge scales with memory bandwidth rather than tensor rate:
+the loop's ladder is about 1,500 GPU-hours on H100 SXM, 3,600 on A100,
+3,900 on L40S, whose tensor rate is twice the L40's on the same 864 GB/s,
+5,500 on L40 or RTX 6000 Ada, 7,500 on A6000, and 3,200 on RTX PRO 6000 if
+its BF16 rate with FP32 accumulation is the full 503 TF; the `arf` ladder is
+about half of each. The 100x rung of the loop on an 8xL40S node is about
+three and a half days as a continuation, the flat partner under two. At the day's market prices from an
 aggregator, Prime's own marketplace could not be fetched, every card lands
 between about $2.3k and $7k for the loop's ladder, H100 SXM cheapest at
 $2.3–3.8k and fastest at eight days on one node, the `arf` partner about
