@@ -119,6 +119,16 @@ change it everywhere at once.
 
 - Telemetry, schedules, run/snapshot addressing, checkpoint staging, monitor
   serving, and spool orchestration come from the workspace root package.
+- BF16 CUDA causal training/prefill uses native PyTorch Flash SDPA; FP32
+  diagnostics use math, and cached single-query decode uses FlexAttention over
+  its valid prefix. No external `flash-attn` package is used.
+- Projection gradients accumulate into persistent FP32 banks: PKDA Q/K/V and
+  dense QKV/gate each share a contiguous allocation with disjoint parameter
+  views, so their backward uses one packed GEMM. Optimizer state stays separate.
+- Above the raw activation budget, checkpointing inside each compiled block
+  saves native Flash outputs and projections whose output width is at most
+  six times their input width. Expanded MLP gate/up activations and PKDA
+  forward auxiliaries are reconstructed. Every pass remains differentiable.
 - Jobe is the single-GPU CUDA surface. Keep GPU jobs serial; the captured
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage

@@ -52,10 +52,11 @@ analysis. CUDA training uses the same equations through the following path:
   instead of fifteen joined by breaks at FLA's disabled entry points. Each
   forward asserts the metadata its fake promises. Cached decode calls FLA
   directly.
-- Compiled native FlexAttention with causal masks shared across layers and
-  passes. Cached decode writes BF16 K/V and exposes only the valid prefix.
-  Global Q/K/V and gate projections share a GEMM. No external `flash-attn`
-  package or FlashAttention-4 backend is part of this runtime.
+- Compiled native PyTorch SDPA with GQA for causal training and prefill:
+  BF16/FP16 explicitly selects Flash, while FP32 diagnostics select math.
+  The backend scope is inside the compiled region and restores the caller's
+  preferences. Cached decode retains compiled FlexAttention, writing BF16 K/V
+  and exposing only the valid prefix. No external `flash-attn` package is used.
 - Triton MHDB routing with site-local nulls, raw values, a source softmax per
   group, and full-width RMS coupling in backward. Each compiled block emits
   its distance from the cell entry for the current/completed delta bank.
@@ -70,8 +71,12 @@ analysis. CUDA training uses the same equations through the following path:
   returns an ordinary gradient and the bank adds it; the gate compares the two
   accumulations on the same model.
 - Persistent FP32 projection/embedding gradient sinks and address-stable BF16
-  weight shadows refreshed once per optimizer update. Shadows are runtime
-  operands, not additional learned or checkpointed state.
+  weight shadows refreshed once per optimizer update. PKDA Q/K/V gradients
+  share one contiguous allocation, as do each dense layer's QKV and gate
+  gradients. The parameter gradients are disjoint row views, so one backward
+  GEMM accumulates each packed projection directly into its bank. Parameters,
+  clipping, and optimizer state remain per-parameter; no duplicate gradient
+  or checkpoint state is added. Shadows are runtime operands.
 - Workspace cut-cross-entropy with BF16 operands, capture-safe preprocessing,
   differentiable log-partition for z-loss, ascending mean-logit vocabulary
   tiling, and backward filtering equivalent to its late-filter decision.
@@ -100,9 +105,15 @@ analysis. CUDA training uses the same equations through the following path:
   writeback; ordinary per-parameter checkpoint state with no persistent packed
   duplicate. NAdam and global FP32 clipping follow
   [architecture.md](architecture.md).
-- Activation checkpointing above the measured work threshold, preserving the
-  full feedback graph, and asynchronous pinned-host snapshot staging with
-  atomic background writes.
+- Selective activation checkpointing above the measured work threshold.
+  The checkpoint wrapper is inside full-block compilation so AOTAutograd
+  retains native Flash-attention outputs and `mm`/`addmm` outputs whose width
+  is at most six times their input width. The screen's packed PKDA Q/K/V
+  projection fits that bound; its expanded MLP gate/up projection does not.
+  Expanded MLP values, PKDA forward auxiliaries, and other recomputable
+  activations are reconstructed. The raw-work threshold is unchanged, and
+  all feedback passes and core iterations remain differentiable. Snapshot
+  staging is asynchronous to pinned host memory, with atomic background writes.
 
 Inductor artifacts live at `~/.cache/delta-feedback/torchinductor` by default.
 The first probe performs the fixed-shape search; later processes reuse it. Set
@@ -194,13 +205,19 @@ separately.
 
 ## Backend constraints
 
-Causal row-safety hints and forward-only contiguous-block hints are enabled.
-Backward keeps indexed traversal: a 1,025-position prefill can have
-noncontiguous partial query-block lists, and a global contiguous hint produced
-large gradient errors. The scoped hint had zero output/gradient drift against
-plain FlexAttention in that case. At production `high` matrix precision,
-component timing showed no material isolated screen gain. `PRESCALE_QK` stays
-off because its small measured gain did not justify the numerical change.
+Causal BF16/FP16 execution explicitly selects the native Flash SDPA backend;
+unsupported Flash inputs fail instead of choosing another kernel. FP32
+reference diagnostics select math. Cached single-query decoding uses
+FlexAttention with no causal mask, because every key in the valid prefix is
+visible to that query. Its cache tests poison unwritten storage and exercise
+prefixes across kernel boundaries.
+
+`scripts/attention_check.py` compares the production path against diagnostic
+FlexAttention variants at one 4,096-token row, eight query heads, four KV
+heads, and head dimension 96. It uses normalized BF16 Q/K and the projection's
+strided V layout, checks output and Q/K/V gradient differences, and alternates
+variant order when timing captured forward/backward work. FlexAttention's
+prescaling and mask hints are comparison options, not training settings.
 
 NVGEMM is a diagnostic option through `kernel-bench`, not a training backend.
 The record documents candidate selection and compilation failures on Ada; it
@@ -214,8 +231,8 @@ ownership.
 
 ```bash
 python scripts/kernel_training_check.py runs/screen-delta-arf-s1-highLR.pt.10745 --updates 18
-python scripts/attention_check.py --length 1024
-python scripts/attention_check.py --length 1025
+python scripts/attention_check.py
+python scripts/attention_check.py --length 4097
 python scripts/gemm_backend_check.py --backends ATEN,TRITON --output-dir tmp/gemm-base
 ```
 

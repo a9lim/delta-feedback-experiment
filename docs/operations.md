@@ -31,8 +31,10 @@ uv pip install -e '.[cuda]'
 CCE and FLA install editable from the workspace forks under `../vendor/`
 through `tool.uv.sources` in `pyproject.toml`, so the root repository's
 submodule pointers are their only pin and kernel edits there are live without
-reinstalling. CUDA GQA uses compiled PyTorch FlexAttention; the external
-`flash-attn` package is not used. Machine-wide constraints own Torch itself.
+reinstalling. BF16 CUDA training and prefill use PyTorch's native Flash SDPA
+with GQA; FP32 diagnostics use its math backend. Cached single-token decoding
+uses compiled FlexAttention over the valid prefix. The external `flash-attn`
+package is not used. Machine-wide constraints own Torch itself.
 The first `delta probe` performs the fixed-shape Inductor search and preserves
 its generated artifacts at `~/.cache/delta-feedback/torchinductor`; later
 probes and training processes reuse that cache. Set `DELTA_INDUCTOR_CACHE_DIR` only when

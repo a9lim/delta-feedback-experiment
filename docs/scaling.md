@@ -177,8 +177,11 @@ microbatches peak at 13.33 GiB raw at `r = 1` and 4.08 GiB checkpointed at
 `r = 8`; the one-pass microbatch at `r = 8` peaks at 13.70 GiB raw. The
 trainer's activation policy counts executed layers, `8 + 4r` per pass at the
 screen, against a measured raw budget of forty layer-passes (ten cells: one
-pass through `r = 8`, two passes through `r = 3`), and checkpoints every
-mode deeper than that. Replay per microbatch, in milliseconds:
+pass through `r = 8`, two passes through `r = 3`). Deeper modes use selective
+checkpointing: compiled blocks save native Flash-attention outputs and
+projection outputs no wider than six times their inputs. Expanded MLP gate/up
+outputs and PKDA forward auxiliaries are reconstructed; the raw-work threshold
+is unchanged. The linked staging record's replay per microbatch, in milliseconds:
 
 | Passes \ `r` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -187,8 +190,9 @@ mode deeper than that. Replay per microbatch, in milliseconds:
 | 3 | 205.2 | 313.4 | 376.0 | 438.8 | 501.5 | 564.1 | 626.7 | 690.3 |
 
 One pass costs one cell, 15.8 ms, per iteration all the way to the cap. The
-jumps at `r = 4` for two passes and `r = 2` for three are where checkpointing
-switches on and recomputes each block once. At the schedule's realized draws
+jumps at `r = 4` for two passes and `r = 2` for three mark the activation
+budget boundary. This staging record predates selective storage inside the
+compiled blocks. At the schedule's realized draws
 a step's replay averages 14.4, 33.9, and 54.6 s at one, two, and three
 passes. One 4,096-token row replays 26% slower than the four 1,024-token
 rows it replaced for the flat column at `r = 1`, 15% slower at `r = 8`, and
@@ -355,8 +359,8 @@ The flagship is `arf` at six cells and width 1,536, with a budget of 400
 predicted tokens per active non-embedding parameter. The execution target is
 replicated DDP over eight H100 80GB GPUs with BF16 autocast, FP32 parameters
 and optimizer state, no tensor, pipeline, context, or parameter sharding,
-every block activation-checkpointed on every pass, and payload and source-bank
-graphs kept differentiable. Building it means reproducing the parameter and
+selective activation checkpointing in every block on every pass, and payload
+and source-bank graphs kept differentiable. Building it means reproducing the parameter and
 compute accounting below, PKDA parity across the portable, chunk, and
 recurrent paths, cache continuation, gated-GQA parity, MHDB source
 identities, optimizer partition and radius invariants, distributed row

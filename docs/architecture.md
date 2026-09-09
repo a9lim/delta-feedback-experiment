@@ -200,12 +200,14 @@ The gate acts on the concatenated attention result before the output projection
 and residual-branch scaling. It does not change attention logits or softmax
 weights. It is distinct from every PKDA control and from the FBT entry gate.
 
-Full-sequence and prefill CUDA execution use compiled PyTorch FlexAttention
-with a shared causal block mask and native GQA. Cached decoding writes BF16 K/V
-explicitly, then attends only to the valid prefix; a one-token query sees every
-key in that prefix. Only the dense attention layers own KV storage: one per
-cell under `a`, every layer without it. The external `flash-attn` extension is
-not required.
+Full-sequence and prefill CUDA execution use compiled PyTorch SDPA with
+native GQA. BF16 and FP16 explicitly select its built-in Flash backend; FP32
+diagnostics explicitly select math. The backend choice is scoped inside the
+compiled region and restores the caller's preferences. Cached decoding writes
+BF16 K/V explicitly, then uses compiled FlexAttention over the valid prefix;
+a one-token query sees every key in that prefix. Only the dense attention
+layers own KV storage: one per cell under `a`, every layer without it. The
+external `flash-attn` extension is not required.
 
 ## Letter r: Multi-Head Delta Block routing
 
@@ -588,7 +590,7 @@ plain prefix. It is the only channel between columns besides the mixer caches.
 Mixing is **same-depth** at every position: at core iteration `i` a position
 reads earlier positions' iteration-`i` writes of the current pass. Each
 iteration is one more full-sequence evaluation of the same core cells, so the
-PKDA chunk operator, FlexAttention, and the router run unchanged; a PKDA state
+PKDA chunk operator, causal GQA, and the router run unchanged; a PKDA state
 at iteration `i` starts from zero and advances across the pass's token order
 exactly as it does for a pass today. Plain and fused positions differ only in
 their seed, as in `arf`.
@@ -616,10 +618,15 @@ log-partition penalty applies unchanged.
 
 Backpropagation is complete: every iteration of every pass is in the graph.
 The trainer's activation policy counts executed layers per pass against a
-measured raw budget, and block-level checkpointing switches on for every mode
-deeper than that budget; the budget and the measured costs are in
-[scaling.md](scaling.md#cost-of-the-loop-at-the-screen). Truncated
-backpropagation through the last iterations is excluded.
+measured raw budget. Deeper modes use selective checkpointing inside the
+compiled blocks: native Flash-attention outputs and projection GEMM outputs
+whose width is at most six times their input width are saved. This includes
+the screen's packed PKDA Q/K/V projection but excludes its expanded MLP
+gate/up output. Those expanded MLP values, PKDA forward auxiliaries, and other
+reconstructible activations are recomputed for backward. The checkpoint wrapper is compiled together with the
+block so the compiler sees this per-operation storage policy. The budget and
+measured costs are in [scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
+Every iteration remains differentiable.
 
 Optimizer ownership follows the partition below: the tied core's matrices are
 NorMuonH parameters whose gradients sum across iterations and passes, with one
@@ -840,6 +847,14 @@ for the PKDA matrix and diagonal boundary states. Cut cross-entropy reads an
 address-stable BF16 classifier shadow that is refreshed from the tied embedding
 once after every optimizer update and is neither a parameter nor checkpoint
 state. Its authoritative tied parameter and accumulated gradient remain FP32.
+
+Projection gradients also accumulate directly into persistent FP32 sinks.
+PKDA Q/K/V gradients occupy disjoint row views of one allocation; dense QKV
+and gate gradients share another. Each packed projection's backward writes
+one GEMM into that allocation, while its parameters and optimizer states
+remain separate. Each parameter view is clipped and updated once; the shared
+allocation adds no duplicate gradient or checkpoint state.
+
 The head's own classifier gradient reaches that FP32 gradient through a second
 address-stable BF16 buffer: every head call lock-adds into it, and the captured
 trainer adds it into the FP32 sink and clears it whenever another microbatch
