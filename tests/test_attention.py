@@ -107,14 +107,15 @@ def test_causal_gqa_bf16_forward_and_gradients_match_math(length):
     expected.backward(upstream.float())
     for tensor, reference in zip((query, key, value), reference_inputs, strict=True):
         assert torch.isfinite(tensor.grad).all()
-        # On Ada, both Flex and built-in Flash SDPA have 0.23--0.32% gradient
-        # L2 error against FP32 math. Cancellation near zero reaches 0.0076
-        # absolute error, so combine an absolute floor with a tight L2 bound.
-        relative = (tensor.grad.float() - reference.grad).norm() / reference.grad.norm()
-        assert relative < 5e-3
-        torch.testing.assert_close(
-            tensor.grad.float(), reference.grad, rtol=3e-2, atol=1e-2
-        )
+        # BF16 cancellation can leave a large relative error near zero.
+        # Bound aggregate error and spikes relative to the gradient's scale;
+        # the compiled and eager Flash paths exhibit the same error here.
+        error = tensor.grad.float() - reference.grad
+        assert error.norm() / reference.grad.norm() < 5e-3
+        assert error.abs().max() / reference.grad.abs().max() < torch.finfo(
+            torch.bfloat16
+        ).eps
+
 
 
 @CUDA_ONLY
