@@ -52,6 +52,18 @@ and the decisions behind it:
   on Jobe. The trainer reports cell-tokens per second beside pass-tokens and
   logs the realized `r`.
 
+Two things the Jobe gate taught while landing. BF16 decode parity between
+the parallel forward and the stepped cache drifts with executed depth, not
+with the loop: the flat twelve-layer column already sits at 7% on the gate's
+small geometry where the four-layer case sits at 3.5%, and in FP32 every
+twelve-layer condition, loop included, sits at 0.17%; the loop's decode check
+runs in FP32. And the CUDA path's gradient is nondeterministic at 1.8%
+relative, the flat column against itself, because the head's lock-ordered
+BF16 accumulation reaches every parameter through the backward; the loop at
+`r = 1` sits exactly on that floor with an identical loss, so the gate
+measures the floor and holds the loop to it. Numbers in
+[runtime-qualification.md](runtime-qualification.md#the-loop).
+
 Nothing was trained.
 
 ## 2026-09-08 — The plain trunk is gated NoPE GQA

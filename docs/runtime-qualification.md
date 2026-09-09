@@ -86,6 +86,33 @@ precision. The maintained route and payload scripts do this. New hooks or
 portable replays reproduce the relevant baseline first, so that a changed
 output is attributable to the change.
 
+## The loop
+
+The CUDA gate checks the `l` letter three ways, all on 2026-09-08 with the
+runtime above:
+
+- **Cached decode through per-iteration core tracks.** On the gate's small
+  geometry (width 128, twelve layers, twelve positions) the full parallel
+  forward and the stepped decode differ, in FP32, by 0.17% relative for
+  `arfl` at two iterations, the same as the flat `a` and `arf` columns at
+  twelve layers. Under BF16 the same comparison drifts with executed depth:
+  3.5% for `a` at four layers, 6.9% for `a` and 7.6% for `arf` at twelve,
+  7.6% for `arfl` at one iteration and 8.7% at two, and 3.2% for the plain
+  GQA loop. The loop check therefore runs in FP32 with a 1% bound; the
+  four-layer BF16 checks keep their 4% bound.
+- **One iteration is the flat column.** At the screen geometry an eager
+  two-pass microbatch gives `arfl` at `r = 1` and `arf` the same loss to a
+  millionth. Their gradients differ by 1.78% relative, and `arf` against
+  itself differs by 1.78%: the head accumulates its BF16 gradient through
+  locks and that order reaches every parameter (embedding 1.84%, trunk
+  1.72%). The gate measures that floor and holds the loop to it.
+- **The iteration cap runs.** One eager one-pass microbatch at `r = 8`,
+  forward and backward under the trainer's activation policy, with its peak
+  allocation reported as `loop_cap_peak`.
+
+The captured `(pass count, r)` family is not part of the probe; it is
+measured by `scripts/loop_memory_stage.py` and captured again by each run.
+
 ## Short-update evidence and its limits
 
 The 18-update optimization comparison starts from the same diagnostic

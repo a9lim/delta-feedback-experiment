@@ -549,8 +549,11 @@ def cuda_gate() -> None:
 
     # At one iteration the loop is its unlooped condition: the same
     # parameters, banks, and compiled blocks. One eager two-pass microbatch at
-    # the screen geometry must give the same loss and gradients up to the
-    # head's nondeterministic BF16 accumulation order.
+    # the screen geometry must give the same loss and, up to the CUDA path's
+    # own nondeterminism, the same gradients. The head accumulates its BF16
+    # gradient through locks, and that order reaches every parameter through
+    # the backward: the flat column against itself differs by about 1.8%
+    # relative, so the floor is measured here and the loop is held to it.
     parity_rows = torch.randint(
         0,
         args.vocab_size,
@@ -559,7 +562,11 @@ def cuda_gate() -> None:
     ).cuda()
     parity_prefix = torch.full((1, 2), 7, dtype=torch.long, device="cuda")
     parity: dict[str, tuple[float, torch.Tensor]] = {}
-    for condition, iterations in (("arf", None), ("arfl", 1)):
+    for label, condition, iterations in (
+        ("arf", "arf", None),
+        ("arf again", "arf", None),
+        ("arfl", "arfl", 1),
+    ):
         parity_model = screen_model(condition)
         parity_model.refresh_shadows()
         with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -572,7 +579,7 @@ def cuda_gate() -> None:
             )
             parity_loss, _ = multipass_loss(parity_model, parity_rows, parity_outs)
         parity_loss.backward()
-        parity[condition] = (
+        parity[label] = (
             parity_loss.item(),
             torch.cat(
                 [
@@ -586,16 +593,18 @@ def cuda_gate() -> None:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
     (flat_loss, flat_grad), (loop_loss, loop_grad) = parity["arf"], parity["arfl"]
-    if not math.isclose(flat_loss, loop_loss, rel_tol=1e-3, abs_tol=1e-3):
+    if not math.isclose(flat_loss, loop_loss, rel_tol=1e-4, abs_tol=1e-4):
         raise AssertionError(
             f"arfl at r = 1 drifts from arf: loss {loop_loss} versus {flat_loss}"
         )
     if flat_grad.shape != loop_grad.shape:
         raise AssertionError("arfl at r = 1 has a different gradient surface than arf")
+    grad_floor = relative_error(parity["arf again"][1], flat_grad)
     loop_grad_rel = relative_error(loop_grad, flat_grad)
-    if loop_grad_rel >= 0.01:
+    if loop_grad_rel > 1.5 * grad_floor + 1e-3:
         raise AssertionError(
-            f"arfl at r = 1 drifts from arf: gradient rel {loop_grad_rel:.4f}"
+            f"arfl at r = 1 drifts from arf: gradient rel {loop_grad_rel:.4f} "
+            f"against a same-model floor of {grad_floor:.4f}"
         )
     del parity, flat_grad, loop_grad, parity_rows, parity_prefix
 
@@ -826,7 +835,7 @@ def cuda_gate() -> None:
         f"norm_gate_rel={norm_gate_rel:.4f} | "
         f"decode_rel={plain_decode_rel:.4f}/{hybrid_decode_rel:.4f}"
         f"/{loop_decode_rel:.4f} | "
-        f"loop_grad_rel={loop_grad_rel:.4f} | "
+        f"loop_grad_rel={loop_grad_rel:.4f}/floor={grad_floor:.4f} | "
         f"loop_cap_peak={loop_cap_peak:.2f}GiB | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)
