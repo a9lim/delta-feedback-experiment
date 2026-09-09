@@ -270,6 +270,18 @@ exercise of the distributed path and the middle rung of the ladder, screen
 pair at 56B tokens, bridge at 167B, flagship at 441B, on which a letter's
 gain can be seen to grow or shrink with scale before the flagship is rented.
 
+A ladder of ratios at the bridge by `--continue`, 25x to 100x to 200x to
+400x, restores each rung's feedback boundary and trains on: 40,688, 138,908,
+230,137, and 460,272 pass-steps counting the feedback phase at its expected
+2.12 passes, 870,005 in all, or 285B pass-tokens. For `arfl` at 7.5 GFLOPs
+per pass-token, the head once and the core cells `E[r]` times, that is about
+2.15e21 FLOPs, 1.34x a single 400x run and 0.74x four independent runs, for
+four finished specimens with cooldowns; the `arf` partner is about half. At
+40% of an H100's dense BF16 peak the loop's ladder is about 1,500 GPU-hours,
+eight days on one 8xH100 node once the distributed path exists, and its 25x
+rung alone is about 70 hours on a single H100, which the single-process
+trainer runs today.
+
 ## Longer training at the same size
 
 A fresh `{a, arf}` pair on one 8xH100-80GB Prime node, both conditions seed 1,

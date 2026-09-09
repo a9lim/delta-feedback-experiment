@@ -108,6 +108,22 @@ and 26,905 to 1,682 at the flagship; and a continuation of any run at or
 above 25x is now the longer run exactly, which the `continue` record reports
 as `exact`.
 
+a9 then asked, before building the distributed path, what an `arfl` bridge
+ladder on Prime, 25x to 100x to 200x to 400x by continuation, would take and
+cost on the cards there. The arithmetic is in `scaling.md`: 2.15e21 FLOPs,
+1.34x a single 400x run. Calibration: after seven speed rounds the screen
+runs at 60–70% of the 4090's dense BF16 peak on Jobe, so the estimate takes
+40% on Hopper and Blackwell untuned, 50% on Ampere, and 60% on the Ada cards
+whose kernels are already the tuned ones. That gives about 1,500 GPU-hours
+on H100 SXM, 3,800 on A100, 3,000 on L40S, 5,500 on L40 or RTX 6000 Ada,
+7,700 on A6000, and 3,400 on RTX PRO 6000 if its BF16 rate with FP32
+accumulation is the full 503 TF. At the day's market prices from an
+aggregator, Prime's own marketplace could not be fetched, every card lands
+between about $2.3k and $7k for the loop's ladder, H100 SXM cheapest at
+$2.3–3.8k and fastest at eight days on one node, the `arf` partner about
+half again. The price-per-hour of a card tracks its throughput closely
+enough that the choice is wall-clock and porting risk, not cost.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the
