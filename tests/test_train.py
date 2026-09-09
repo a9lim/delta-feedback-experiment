@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from delta_feedback_experiment import data as data_module
-from delta_feedback_experiment.cli import tokenize_command
+from delta_feedback_experiment.cli import stream_target, tokenize_command
 from delta_feedback_experiment.data import (
     CANONICAL_CONFIG,
     CANONICAL_DATA_PACKAGES,
@@ -254,7 +254,8 @@ def test_tokenize_writes_a_shuffled_prefix_with_provenance(tmp_path):
             assert tokens[start:end].tolist() == char_ids(text)
             assert meta["dumps"][record["dump"]] == dump
             seen.append(int(record["source"]))
-    assert meta["val_tokens"] >= 200 and meta["val_tokens"] + meta["train_tokens"] >= 600
+    assert meta["val_target"] == 200 >= meta["val_tokens"] > 150
+    assert meta["train_tokens"] >= 400 and meta["target_tokens"] == 600
     assert len(seen) == len(set(seen)) <= 60
     assert seen != sorted(seen)  # the stream is not in source order
     assert 45 not in seen  # file 1 row 5, the empty text, is never written
@@ -271,6 +272,9 @@ class FlakySource:
 
     def list_files(self):
         return self.inner.list_files()
+
+    def dumps(self):
+        return self.inner.dumps()
 
     def row_groups(self, path):
         return self.inner.row_groups(path)
@@ -349,6 +353,47 @@ def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
     assert captured["config"] == CANONICAL_CONFIG
     assert captured["revision"] == CANONICAL_DATASET_REVISION
     assert captured["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION
+    assert captured["extend"] is False
+
+
+def test_tokenize_continue_lands_on_the_fresh_build(tmp_path):
+    source = parquet_source(tmp_path / "source")
+    build(tmp_path / "grown", source)
+    fresh = build(tmp_path / "fresh", source, target_tokens=900)
+    with pytest.raises(ValueError, match="shuffle_seed"):
+        build(tmp_path / "grown", source, target_tokens=900, seed=4, extend=True)
+    grown = build(tmp_path / "grown", source, target_tokens=900, extend=True)
+    for split in ("val", "train"):
+        assert np.array_equal(stream(tmp_path / "grown", split), stream(tmp_path / "fresh", split))
+        assert np.array_equal(
+            TokenData.load(tmp_path / "grown", split, 1).docs,
+            TokenData.load(tmp_path / "fresh", split, 1).docs,
+        )
+    assert {k: v for k, v in grown.items() if k != "unused_selected"} == {
+        k: v for k, v in fresh.items() if k != "unused_selected"
+    }
+    assert not (tmp_path / "grown" / "parts").exists()
+    assert verify(tmp_path / "grown")["train"]["tokens"] == fresh["train_tokens"]
+    # A target the store already covers is a no-op.
+    assert build(tmp_path / "grown", source, target_tokens=700, extend=True) == grown
+
+
+def test_stream_target_rounds_the_schedule_up_to_a_billion():
+    assert stream_target("screen", 25, CANONICAL_VAL_TOKENS) == 4_000_000_000
+    assert stream_target("screen", 400, CANONICAL_VAL_TOKENS) == CANONICAL_TARGET_TOKENS
+    assert stream_target("bridge", 400, CANONICAL_VAL_TOKENS) == 167_000_000_000
+
+
+def test_tokenize_command_derives_the_target_from_a_scale(tmp_path, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(data_module, "tokenize", lambda out, **kw: captured.update(kw))
+    out = str(tmp_path / "tokens")
+    tokenize_command(["--out", out, "--scale", "screen", "--tokens-per-param", "25", "--continue"])
+    assert captured["target_tokens"] == 4_000_000_000 and captured["extend"] is True
+    with pytest.raises(SystemExit):
+        tokenize_command(["--out", out, "--scale", "screen"])
+    with pytest.raises(SystemExit):
+        tokenize_command(["--out", out, "--scale", "screen", "--tokens-per-param", "25", "--target", "1e9"])
 
 
 # -- optimizer -----------------------------------------------------------------

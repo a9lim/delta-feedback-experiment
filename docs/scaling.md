@@ -309,8 +309,8 @@ the compiled stream and run artifacts (the bridge ladder's 167B-token store
 is about 690 GB, the screen's 57B about 230 GB), attach it to a cheap
 compatible staging instance with a second scratch disk of the same size for
 the build's parts, install the `data-build` extra, and run
-`delta tokenize --target 167e9 --scratch SCRATCH --workers N` into the
-mounted path. The build reads all 1 TB of `sample-350BT` once, tokenizes the
+`delta tokenize --scale bridge --tokens-per-param 400 --scratch SCRATCH --workers N`
+into the mounted path. The build reads all 1 TB of `sample-350BT` once, tokenizes the
 selected half, and needs a few hours on a many-core instance. The resulting
 store is byte-identical to Jobe's over Jobe's length (`delta verify`, then
 compare `val.bin` and the shared shards by checksum); then detach the disk

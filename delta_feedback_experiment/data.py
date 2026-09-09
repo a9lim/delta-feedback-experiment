@@ -186,6 +186,8 @@ class Source(Protocol):
 
     def list_files(self) -> list[str]: ...
 
+    def dumps(self) -> list[str]: ...
+
     def row_groups(self, path: str) -> list[int]: ...
 
     def fetch(self, path: str) -> Path: ...
@@ -213,6 +215,16 @@ class HubSource:
             recursive=True,
         )
         return sorted(e.path for e in entries if e.path.endswith(".parquet"))
+
+    def dumps(self) -> list[str]:
+        """Every crawl of the dataset at this revision, the ``data/`` folders."""
+        from huggingface_hub import HfApi
+
+        entries = HfApi().list_repo_tree(
+            self.dataset, repo_type="dataset", path_in_repo="data", revision=self.revision
+        )
+        names = [e.path.split("/")[-1] for e in entries]
+        return sorted(name for name in names if "." not in name)
 
     def row_groups(self, path: str) -> list[int]:
         import pyarrow.parquet as pq
@@ -263,6 +275,15 @@ class LocalSource:
             str(p.relative_to(self.root)) for p in self.root.rglob("*.parquet")
         )
 
+    def dumps(self) -> list[str]:
+        import pyarrow.parquet as pq
+
+        names: set[str] = set()
+        for path in self.list_files():
+            column = pq.read_table(self.root / path, columns=["dump"]).column("dump")
+            names.update(column.unique().to_pylist())
+        return sorted(names)
+
     def row_groups(self, path: str) -> list[int]:
         import pyarrow.parquet as pq
 
@@ -277,12 +298,13 @@ class LocalSource:
 
 
 def index_source(source: Source) -> dict:
-    """The document universe: every file and its row-group row counts."""
+    """The document universe: every file's row-group row counts, and the
+    crawl names the sidecar's dump ids index, fixed before any text is read."""
     files = []
     for path in source.list_files():
         files.append({"path": path, "row_groups": source.row_groups(path)})
         telemetry.log("index", file=path, rows=sum(files[-1]["row_groups"]))
-    return {"files": files}
+    return {"files": files, "dumps": source.dumps()}
 
 
 def universe_size(index: dict) -> int:
@@ -325,10 +347,12 @@ class _Build:
     parts: Path
     seed: int
     universe: int
+    first: int
     selected: int
     bases: tuple[int, ...]
     row_groups: tuple[tuple[int, ...], ...]
     paths: tuple[str, ...]
+    dumps: tuple[str, ...]
 
 
 PART_DTYPE = np.dtype(
@@ -352,7 +376,7 @@ def _select_file(build: _Build, which: int) -> tuple[int, int]:
     local = build.source.fetch(path)
     tokens_path = build.parts / f"{which:04d}.tokens.bin"
     index_path = build.parts / f"{which:04d}.index.npy"
-    dumps: dict[str, int] = {}
+    crawl_ids = {name: i for i, name in enumerate(build.dumps)}
     records: list[tuple[int, int, int, int]] = []
     offset = docs = 0
     parquet = pq.ParquetFile(local)
@@ -366,7 +390,9 @@ def _select_file(build: _Build, which: int) -> tuple[int, int]:
             if table.num_rows != rows:
                 raise RuntimeError(f"{path}: row group {group} differs from the index")
             positions = shuffle(base + np.arange(rows, dtype=np.int64))
-            keep = np.nonzero(positions < build.selected)[0]
+            keep = np.nonzero(
+                (positions >= build.first) & (positions < build.selected)
+            )[0]
             base += rows
             if keep.size == 0:
                 continue
@@ -381,11 +407,11 @@ def _select_file(build: _Build, which: int) -> tuple[int, int]:
                 ids.append(eos)
                 array = np.asarray(ids, dtype=np.uint32)
                 array.tofile(out)
-                dump = dumps.setdefault(crawl, len(dumps))
-                records.append((int(position), offset, array.size, dump))
+                if crawl not in crawl_ids:
+                    raise RuntimeError(f"{path}: crawl {crawl!r} is not in the index")
+                records.append((int(position), offset, array.size, crawl_ids[crawl]))
                 offset += array.size
                 docs += 1
-    (build.parts / f"{which:04d}.dumps.json").write_text(json.dumps(list(dumps)))
     index = np.array(records, dtype=PART_DTYPE)
     staging = index_path.with_suffix(".npy.tmp")
     with staging.open("wb") as handle:  # np.save would append its own suffix
@@ -432,6 +458,21 @@ class _ShardWriter:
         self.in_shard = 0
         self.shards = 0
 
+    @classmethod
+    def continuing(cls, directory: Path, name: str, shard_tokens: int) -> _ShardWriter:
+        """A writer positioned after a finished split's shards, appending to
+        the last one while it is short of a whole shard."""
+        writer = cls(directory, name, shard_tokens)
+        shards = sorted(directory.glob(f"{name}.*.bin"))
+        sizes = [path.stat().st_size // 4 for path in shards]
+        writer.written = sum(sizes)
+        writer.shards = len(shards)
+        if shards and sizes[-1] < shard_tokens:
+            writer.shards -= 1
+            writer.handle = shards[-1].open("ab")
+            writer.in_shard = sizes[-1]
+        return writer
+
     def _open(self):
         if self.shard_tokens is None:
             path = self.directory / f"{self.name}.bin"
@@ -471,10 +512,16 @@ def _write(
     target_tokens: int,
     val_tokens: int,
     shuffle: Shuffle,
+    extend: bool,
 ) -> dict:
-    """Walk the selection in stream order into val.bin, shards, and sidecars."""
-    dump_names: list[str] = []
-    dump_ids: dict[str, int] = {}
+    """Walk the selection in stream order into val.bin, shards, and sidecars.
+
+    The held-out slice is the stream's first documents up to ``val_tokens``;
+    training then runs until it holds ``target_tokens - val_tokens`` tokens,
+    ending on a document boundary. Extending appends to a finished store's
+    train shards and sidecar under the same rule, so it lands on the bytes a
+    fresh build at the larger target would.
+    """
     indices, maps = [], []
     for which in range(n_files):
         index_path = parts / f"{which:04d}.index.npy"
@@ -483,19 +530,12 @@ def _write(
                 f"part {which} missing: the select stage is incomplete"
             )
         part = np.load(index_path)
-        local = json.loads((parts / f"{which:04d}.dumps.json").read_text())
-        remap = np.empty(len(local), dtype=np.int16)
-        for i, name in enumerate(local):
-            if name not in dump_ids:
-                dump_ids[name] = len(dump_names)
-                dump_names.append(name)
-            remap[i] = dump_ids[name]
         merged = np.empty(part.size, dtype=_MERGED_DTYPE)
         merged["position"] = part["position"]
         merged["part"] = which
         merged["offset"] = part["offset"]
         merged["length"] = part["length"]
-        merged["dump"] = remap[part["dump"]]
+        merged["dump"] = part["dump"]
         indices.append(merged)
         tokens_path = parts / f"{which:04d}.tokens.bin"
         maps.append(
@@ -511,19 +551,22 @@ def _write(
     positions, parts_col = index["position"], index["part"]
     offsets, lengths, dumps = index["offset"], index["length"], index["dump"]
 
-    writers = {
-        "val": _ShardWriter(out, "val", None),
-        "train": _ShardWriter(out, "train", SHARD_TOKENS),
-    }
+    if extend:
+        writers = {"train": _ShardWriter.continuing(out, "train", SHARD_TOKENS)}
+        split, val_docs = "train", 0
+    else:
+        writers = {
+            "val": _ShardWriter(out, "val", None),
+            "train": _ShardWriter(out, "train", SHARD_TOKENS),
+        }
+        split, val_docs = "val", None
+    train_target = target_tokens - val_tokens
     doc_start = np.empty(index.size, dtype=np.int64)
     doc_position = np.empty(index.size, dtype=np.int64)
     doc_dump = np.empty(index.size, dtype=np.int16)
     count = 0
-    val_docs: int | None = None
-    split = "val"
     buffer: list[np.ndarray] = []
     buffered = 0
-    written = 0
 
     def flush() -> None:
         nonlocal buffer, buffered
@@ -532,14 +575,14 @@ def _write(
         buffer, buffered = [], 0
 
     for i in range(index.size):
-        if split == "val" and writers["val"].written + buffered >= val_tokens:
+        length = int(lengths[i])
+        if split == "val" and writers["val"].written + buffered + length > val_tokens:
             flush()
             writers["val"].close()
             split = "train"
             val_docs = count
-        if written >= target_tokens:
+        if split == "train" and writers["train"].written + buffered >= train_target:
             break
-        length = int(lengths[i])
         doc_start[count] = writers[split].written + buffered
         doc_position[count] = positions[i]
         doc_dump[count] = dumps[i]
@@ -547,30 +590,44 @@ def _write(
         offset = int(offsets[i])
         buffer.append(maps[int(parts_col[i])][offset : offset + length])
         buffered += length
-        written += length
         if buffered >= (1 << 24):
             flush()
     flush()
     for writer in writers.values():
         writer.close()
-    if written < target_tokens:
+    if split == "val":
         raise RuntimeError(
-            f"selection exhausted at {written:,} of {target_tokens:,} tokens; "
-            "rebuild with a smaller --tokens-per-doc"
+            f"selection exhausted inside the held-out slice at "
+            f"{writers['val'].written:,} of {val_tokens:,} tokens; rebuild with "
+            "a smaller --tokens-per-doc"
         )
-    if val_docs is None or writers["train"].written == 0:
-        raise RuntimeError("the target leaves no training tokens after the slice")
+    if not extend and not val_docs:
+        raise RuntimeError("no document fits the held-out slice")
+    if writers["train"].written < train_target:
+        raise RuntimeError(
+            f"selection exhausted at {writers['train'].written:,} of "
+            f"{train_target:,} training tokens; rebuild with a smaller "
+            "--tokens-per-doc"
+        )
+
+    def sidecar(first: int, last: int) -> np.ndarray:
+        records = np.empty(last - first, dtype=DOC_DTYPE)
+        records["start"] = doc_start[first:last]
+        records["source"] = shuffle.inverse(doc_position[first:last])
+        records["dump"] = doc_dump[first:last]
+        return records
 
     counts = {}
-    for name, first, last in (("val", 0, val_docs), ("train", val_docs, count)):
-        sidecar = np.empty(last - first, dtype=DOC_DTYPE)
-        sidecar["start"] = doc_start[first:last]
-        sidecar["source"] = shuffle.inverse(doc_position[first:last])
-        sidecar["dump"] = doc_dump[first:last]
-        np.save(out / f"{name}.docs.npy", sidecar)
-        counts[f"{name}_docs"] = last - first
-        counts[f"{name}_tokens"] = writers[name].written
-    counts["dumps"] = dump_names
+    if not extend:
+        np.save(out / "val.docs.npy", sidecar(0, val_docs))
+        counts["val_docs"] = val_docs
+        counts["val_tokens"] = writers["val"].written
+    train_docs = sidecar(val_docs, count)
+    if extend:
+        train_docs = np.concatenate([np.load(out / "train.docs.npy"), train_docs])
+    np.save(out / "train.docs.npy", train_docs)
+    counts["train_docs"] = int(train_docs.size)
+    counts["train_tokens"] = writers["train"].written
     counts["unused_selected"] = int(index.size - count)
     return counts
 
@@ -606,6 +663,7 @@ def tokenize(
     revision: str = CANONICAL_DATASET_REVISION,
     scratch: str | Path | None = None,
     check_packages: bool = True,
+    extend: bool = False,
 ) -> dict:
     """Build the shuffled stream's first ``target_tokens`` stored tokens.
 
@@ -615,13 +673,49 @@ def tokenize(
     then write the parts in stream order, the held-out slice first. The
     stream is a pure function of the source revision, the tokenizer revision,
     and the seed: any two builds agree on their common prefix. Refuses to run
-    if ``meta.json`` already exists; a partial build resumes.
+    if ``meta.json`` already exists unless ``extend`` continues that store to
+    a larger target under the same settings, selecting from the position
+    after its last document and appending; a partial build resumes.
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    previous = None
     if (out / META).exists():
-        raise FileExistsError(f"{out / META} exists; delete the directory to redo")
+        if not extend:
+            raise FileExistsError(f"{out / META} exists; delete the directory to redo")
+        previous = read_meta(out)
+        settings = {
+            "dataset": dataset,
+            "config": config,
+            "revision": revision,
+            "tokenizer": tokenizer_name,
+            "tokenizer_revision": tokenizer_revision,
+            "shuffle_seed": seed,
+            "val_target": val_tokens,
+        }
+        for key, value in settings.items():
+            if previous.get(key) != value:
+                raise ValueError(
+                    f"--continue: {key} is {previous.get(key)!r} in the store, "
+                    f"{value!r} requested"
+                )
+        if previous["train_tokens"] >= target_tokens - val_tokens:
+            telemetry.log(
+                "tokenized",
+                train=previous["train_tokens"],
+                val=previous["val_tokens"],
+                docs=previous["train_docs"] + previous["val_docs"],
+                unchanged=True,
+            )
+            return previous
+    elif extend:
+        raise FileNotFoundError(f"--continue: no store at {out}")
     packages = data_package_versions() if check_packages else {}
+    if previous is not None and check_packages and packages != previous["packages"]:
+        raise ValueError(
+            f"--continue: the store was built with {previous['packages']}, "
+            f"this environment has {packages}"
+        )
     if source is None:
         scratch = Path(scratch) if scratch is not None else out / "scratch"
         scratch.mkdir(parents=True, exist_ok=True)
@@ -647,11 +741,30 @@ def tokenize(
     else:
         index = index_source(source)
         source_path.write_text(json.dumps(index))
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    if previous is not None and previous["source_sha256"] != source_sha256:
+        raise ValueError("--continue: source.json differs from the store's")
     universe = universe_size(index)
     if universe == 0:
         raise RuntimeError("the source holds no documents")
+    shuffle = Shuffle(universe, seed)
     selected = min(universe, math.ceil(target_tokens / tokens_per_doc))
-    telemetry.log("universe", docs=universe, selected=selected, files=len(index["files"]))
+    first = 0
+    if previous is not None:
+        last = int(np.load(out / "train.docs.npy")["source"][-1])
+        first = int(shuffle([last])[0]) + 1
+        if selected <= first:
+            raise ValueError(
+                "--continue: the selection ends inside the store; lower "
+                "--tokens-per-doc"
+            )
+    telemetry.log(
+        "universe",
+        docs=universe,
+        first=first,
+        selected=selected,
+        files=len(index["files"]),
+    )
 
     parts = out / "parts"
     parts.mkdir(exist_ok=True)
@@ -661,10 +774,12 @@ def tokenize(
         parts=parts,
         seed=seed,
         universe=universe,
+        first=first,
         selected=selected,
         bases=tuple(file_bases(index)),
         row_groups=tuple(tuple(f["row_groups"]) for f in index["files"]),
         paths=tuple(f["path"] for f in index["files"]),
+        dumps=tuple(index["dumps"]),
     )
     _select(build, workers)
 
@@ -674,29 +789,37 @@ def tokenize(
         len(index["files"]),
         target_tokens=target_tokens,
         val_tokens=val_tokens,
-        shuffle=Shuffle(universe, seed),
+        shuffle=shuffle,
+        extend=previous is not None,
     )
-    meta = {
-        "tokenizer": tokenizer_name,
-        "tokenizer_revision": tokenizer_revision,
-        "eos_id": eos,
-        "dataset": dataset,
-        "config": config,
-        "revision": revision,
-        "packages": packages,
-        "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
-        "shuffle_seed": seed,
-        "universe_docs": universe,
-        "selected_docs": selected,
-        "tokens_per_doc": tokens_per_doc,
-        "unused_selected": counts["unused_selected"],
-        "val_tokens": counts["val_tokens"],
-        "train_tokens": counts["train_tokens"],
-        "val_docs": counts["val_docs"],
-        "train_docs": counts["train_docs"],
-        "dumps": counts["dumps"],
-        "vocab_size": VOCAB_SIZE,
-    }
+    if previous is None:
+        meta = {
+            "tokenizer": tokenizer_name,
+            "tokenizer_revision": tokenizer_revision,
+            "eos_id": eos,
+            "dataset": dataset,
+            "config": config,
+            "revision": revision,
+            "packages": packages,
+            "source_sha256": source_sha256,
+            "shuffle_seed": seed,
+            "universe_docs": universe,
+            "dumps": index["dumps"],
+            "vocab_size": VOCAB_SIZE,
+            "val_target": val_tokens,
+            "val_tokens": counts["val_tokens"],
+            "val_docs": counts["val_docs"],
+        }
+    else:
+        meta = dict(previous)
+    meta.update(
+        target_tokens=target_tokens,
+        tokens_per_doc=tokens_per_doc,
+        selected_docs=selected,
+        unused_selected=counts["unused_selected"],
+        train_tokens=counts["train_tokens"],
+        train_docs=counts["train_docs"],
+    )
     (out / META).write_text(json.dumps(meta, indent=2))
     shutil.rmtree(parts)
     if isinstance(source, HubSource):

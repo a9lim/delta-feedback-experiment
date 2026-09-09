@@ -49,8 +49,12 @@ one stream; `delta tokenize` indexes the source's row groups, selects and
 tokenizes the documents whose position falls below `target / tokens-per-doc`
 one file at a time, and writes them in stream order with a per-split sidecar
 of document starts, universe addresses, and crawls; `delta verify` checks a
-store; `datasets` left the `data-build` extra for `pyarrow` and the pins
-moved to what Jobe runs; `--eval-rows` defaults to 512; and
+store; `delta tokenize --scale S --tokens-per-param R` sizes a store for a
+planned run, rounded up to the next billion, and `--continue` extends a
+finished store in place onto the bytes a fresh build would write (the
+held-out slice is the first documents *up to* its cap so both rules agree);
+`datasets` left the `data-build` extra for `pyarrow` and the pins moved to
+what Jobe runs; `--eval-rows` defaults to 512; and
 `scripts/store_cutover.py` retires a store once the spool stops reading it.
 The Jobe rebuild to `/data/delta/tokens-350B` runs beside
 `screen-delta-arl-s1`, which stays on the old store until it lands; the

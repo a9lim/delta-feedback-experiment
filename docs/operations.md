@@ -54,11 +54,16 @@ Foreground training and queueing are alternative ways to run a condition.
 # Portable invariant suite; includes the full CUDA gate on a CUDA host.
 delta probe
 
-# Build the screen's 57B-token prefix of the shuffled stream from the pinned
-# dataset and tokenizer commits; the bridge ladder's store is --target 167e9
-# of the same stream. Resumable; reads all of sample-350BT once (hours).
-delta tokenize --out /data/delta/tokens-350B --scratch /data/delta/scratch --workers 3
+# Build a prefix of the shuffled stream from the pinned dataset and tokenizer
+# commits, sized for a planned run (rounded up to the next billion; the default
+# is the screen at 400x, 57B). Resumable; reads all of sample-350BT once (hours).
+delta tokenize --out /data/delta/tokens-350B --scale screen --tokens-per-param 400 \
+  --scratch /data/delta/scratch --workers 3
 delta verify /data/delta/tokens-350B
+# Extend a finished store in place to a larger target; same bytes as a fresh
+# build at that target, so it reads the whole source again.
+delta tokenize --out /data/delta/tokens-350B --continue --scale bridge --tokens-per-param 100 \
+  --scratch /data/delta/scratch --workers 3
 # Retire a superseded store once the spool no longer reads it (--wait polls;
 # without --delete it only reports). Runs trained on it cannot resume after.
 python scripts/store_cutover.py --new /data/delta/tokens-350B \

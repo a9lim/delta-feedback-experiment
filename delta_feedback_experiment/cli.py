@@ -10,6 +10,7 @@ pipeline: an offline probe, then the training run.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -108,9 +109,24 @@ def tokenize_command(argv: list[str]) -> None:
     parser.add_argument(
         "--target",
         type=float,
-        default=CANONICAL_TARGET_TOKENS,
-        help="stored tokens to write, held-out slice included (57e9 covers the "
-        "screen's 400x schedule; the bridge's needs 167e9)",
+        default=None,
+        help="stored tokens to write, held-out slice included (default 57e9, "
+        "the screen's 400x schedule; the bridge's needs 167e9)",
+    )
+    parser.add_argument(
+        "--scale",
+        choices=("screen", "bridge", "flagship"),
+        help="derive --target from this scale's schedule at --tokens-per-param: "
+        "its rows of seq_len + 1 tokens plus the held-out slice, rounded up to "
+        "the next billion",
+    )
+    parser.add_argument("--tokens-per-param", type=float)
+    parser.add_argument(
+        "--continue",
+        dest="extend",
+        action="store_true",
+        help="extend the store at --out to the target in place, appending the "
+        "stream's next documents; every other setting must match its meta",
     )
     parser.add_argument(
         "--val",
@@ -147,11 +163,19 @@ def tokenize_command(argv: list[str]) -> None:
     parser.add_argument("--revision", default=CANONICAL_DATASET_REVISION)
     parser.add_argument("--tokenizer-revision", default=CANONICAL_TOKENIZER_REVISION)
     args = parser.parse_args(argv)
+    if (args.scale is None) != (args.tokens_per_param is None):
+        parser.error("--scale and --tokens-per-param go together")
+    if args.scale is not None:
+        if args.target is not None:
+            parser.error("--target and --scale name the target two ways")
+        target = stream_target(args.scale, args.tokens_per_param, int(args.val))
+    else:
+        target = int(CANONICAL_TARGET_TOKENS if args.target is None else args.target)
     from .data import tokenize
 
     tokenize(
         args.out,
-        target_tokens=int(args.target),
+        target_tokens=target,
         val_tokens=int(args.val),
         seed=args.seed,
         tokens_per_doc=args.tokens_per_doc,
@@ -160,7 +184,24 @@ def tokenize_command(argv: list[str]) -> None:
         config=args.config,
         revision=args.revision,
         tokenizer_revision=args.tokenizer_revision,
+        extend=args.extend,
     )
+
+
+BILLION = 1_000_000_000
+
+
+def stream_target(scale: str, tokens_per_param: float, val_tokens: int) -> int:
+    """Stored tokens for a scale's schedule at a ratio: its rows of
+    ``seq_len + 1`` tokens plus the held-out slice, rounded up to the next
+    billion so the store reads as a round figure and leaves headroom."""
+    from .train import parse_run_args
+
+    run = parse_run_args(
+        ["stream", "--scale", scale, "--tokens-per-param", f"{tokens_per_param:g}"]
+    )
+    needed = run.steps * run.batch_rows * (run.seq_len + 1) + val_tokens
+    return math.ceil(needed / BILLION) * BILLION
 
 
 def verify_command(argv: list[str]) -> None:

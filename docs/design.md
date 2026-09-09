@@ -83,8 +83,11 @@ source's row groups; select the documents whose position falls below
 per-file parts; write the parts in stream order into a local contiguous
 uint32 store, so that step-addressed rows, validation, and resume never
 depend on network or iterator state. The held-out slice is the stream's first
-documents, 30M tokens of whole documents; training follows in contiguous
-shards. A sidecar per split (`val.docs.npy`, `train.docs.npy`; `DOC_DTYPE`)
+documents up to 30M tokens; training follows in contiguous shards until it
+holds the target less the slice's cap, ending on a document boundary.
+`delta tokenize --continue` extends a finished store to a larger target in
+place, selecting from the position after its last document and appending,
+and lands on the bytes a fresh build at that target writes. A sidecar per split (`val.docs.npy`, `train.docs.npy`; `DOC_DTYPE`)
 records every document's start offset, universe address, which names the
 parquet row holding its text, URL, and score, and its crawl as an index into
 `meta["dumps"]`. `delta verify DIR` checks a store against its meta and
@@ -106,10 +109,11 @@ jitter are additionally keyed by the microbatch's first global row. None of
 them depend on ambient RNG state, so a resume returns to the same row and the
 same draws.
 
-The default build target is 57B stored tokens including the held-out slice,
-enough for the screen's 400x schedule in [scaling.md](scaling.md) with about
-584M tokens of headroom; the bridge's 400x rung needs `--target 167e9` from
-the same stream.
+`delta tokenize --scale S --tokens-per-param R` sizes a store for a planned
+run: that schedule's rows of `seq_len + 1` tokens plus the slice's cap,
+rounded up to the next billion. The default target is the screen at 400x,
+57B stored tokens with about 584M of headroom; the bridge's 400x rung is
+167B from the same stream.
 
 ## Training
 
