@@ -476,15 +476,16 @@ def micro_draws(
 def automatic_checkpoint(
     model: DeltaModel, n_passes: int, iterations: int, args, device
 ) -> bool:
-    """Use selective storage above the screen's measured raw-activation budget."""
+    """Keep cell-final activations above the screen's raw-activation budget."""
     if device.type != "cuda":
         return False
     cfg = model.cfg
     # Ten cell-passes of the screen geometry fit the 24 GiB card raw, including
-    # the one-pass loop family through r = 8. Deeper modes retain bounded
-    # projection and dense-attention outputs and reconstruct expanded MLP
-    # values and PKDA auxiliaries. Count actual executed layers and tokens,
-    # including repeated core iterations.
+    # the one-pass loop family through r = 8. Deeper modes retain the final
+    # block of each cell and checkpoint every other whole compiled block.
+    # This retains one quarter at the screen in every condition; under `a`
+    # those are the global-attention blocks. Count actual executed layers
+    # and tokens, including repeated core iterations.
     raw_work = 4096 * 768 * 40
     work = (
         args.micro_rows

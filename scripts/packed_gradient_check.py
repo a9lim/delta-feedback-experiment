@@ -1,10 +1,10 @@
 """Compare split and packed projection gradients on the screen CUDA geometry.
 
-    python scripts/packed_gradient_check.py --compile --selective --output /tmp/packed.json
+    python scripts/packed_gradient_check.py --compile --checkpoint --output /tmp/packed.json
 
 Synthetic operands; includes 128-call accumulation, no training-quality claim.
-``--selective`` adds pointwise work and a compiled checkpoint path to detect
-omitted or repeated gradient-sink writes during activation recomputation.
+``--checkpoint`` adds pointwise work and whole-function checkpointing around
+the compiled projection to detect omitted or repeated gradient-sink writes.
 """
 
 from __future__ import annotations
@@ -17,8 +17,8 @@ import statistics
 from pathlib import Path
 
 import torch
+import torch.utils.checkpoint
 
-from delta_feedback_experiment.activation import checkpoint_context
 from delta_feedback_experiment.cuda_kernels import sink_linear
 
 
@@ -73,8 +73,8 @@ def benchmark_case(name, splits, args):
     ) / math.sqrt(total_rows)
     paths = {}
     modes = (
-        ("split", "packed", "packed_selective")
-        if args.selective
+        ("split", "packed", "packed_checkpoint")
+        if args.checkpoint
         else ("split", "packed")
     )
     for mode in modes:
@@ -94,29 +94,31 @@ def benchmark_case(name, splits, args):
 
         def projection(value, sinks=sinks, slab=slab):
             output = sink_linear(value, weights, sinks, shadow, packed_sink=slab)
-            # All comparison arms do identical work. The nonlinear composition
-            # supplies genuine recomputation beyond the MUST_SAVE matrix op.
-            return output.sin() * torch.sigmoid(output) if args.selective else output
+            # All comparison arms do identical work; the checkpoint wraps the
+            # compiled projection exactly as it wraps production blocks.
+            return output.sin() * torch.sigmoid(output) if args.checkpoint else output
 
-        if mode == "packed_selective":
-
-            def forward(value, projection=projection):
-                return torch.utils.checkpoint.checkpoint(
-                    projection,
-                    value,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                    context_fn=checkpoint_context,
-                )
-        else:
-            forward = projection
-        if args.compile:
-            forward = torch.compile(
-                forward,
+        compiled_projection = (
+            torch.compile(
+                projection,
                 fullgraph=True,
                 dynamic=False,
                 mode="max-autotune-no-cudagraphs",
             )
+            if args.compile
+            else projection
+        )
+        if mode == "packed_checkpoint":
+
+            def forward(value, compiled_projection=compiled_projection):
+                return torch.utils.checkpoint.checkpoint(
+                    compiled_projection,
+                    value,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+        else:
+            forward = compiled_projection
 
         def step(forward=forward, activations=activations):
             activations.grad.zero_()
@@ -138,8 +140,8 @@ def benchmark_case(name, splits, args):
         "dim": d,
         "splits": list(splits),
         "compiled": args.compile,
-        "selective_check": args.selective,
-        "note": "Captured projection forward+dX+dW; selective checks add identical nonlinear work to every arm.",
+        "checkpoint_check": args.checkpoint,
+        "note": "Captured projection forward+dX+dW; checkpoint checks add identical nonlinear work to every arm.",
     }
     for calls in (1, 128):
         for path in paths.values():
@@ -160,8 +162,8 @@ def benchmark_case(name, splits, args):
                 )
             ],
         }
-        if args.selective:
-            checkpointed, raw = paths["packed_selective"], paths["packed"]
+        if args.checkpoint:
+            checkpointed, raw = paths["packed_checkpoint"], paths["packed"]
             check = {
                 "output": discrepancy(checkpointed["output"], raw["output"]),
                 "input_gradient": discrepancy(checkpointed["x"].grad, raw["x"].grad),
@@ -181,7 +183,7 @@ def benchmark_case(name, splits, args):
                 row["finite"] and row["relative_l2"] <= args.max_relative_error
                 for row in values
             )
-            result[f"selective_parity_{calls}_calls"] = check
+            result[f"checkpoint_parity_{calls}_calls"] = check
     timings = {mode: [] for mode in paths}
     for round_index in range(args.rounds):
         # Alternate order to reduce clock/thermal attribution bias.
@@ -224,18 +226,18 @@ def main():
     parser.add_argument("--replays", type=int, default=30)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
-        "--selective",
+        "--checkpoint",
         action="store_true",
-        help="also check selective checkpointing; implies --compile",
+        help="also check whole-function checkpointing of compiled projections; implies --compile",
     )
     parser.add_argument(
         "--max-relative-error",
         type=float,
         default=0.01,
-        help="selective versus raw numerical failure threshold",
+        help="checkpoint versus raw numerical failure threshold",
     )
     args = parser.parse_args()
-    args.compile = args.compile or args.selective
+    args.compile = args.compile or args.checkpoint
     torch.set_float32_matmul_precision("high")
     report = {
         "torch": torch.__version__,
@@ -251,12 +253,14 @@ def main():
         print(json.dumps(row), flush=True)
         Path(args.output).write_text(json.dumps(report, indent=2) + "\n")
         torch.cuda.empty_cache()
-    if args.selective and any(
-        not row[f"selective_parity_{calls}_calls"]["passed"]
+    if args.checkpoint and any(
+        not row[f"checkpoint_parity_{calls}_calls"]["passed"]
         for row in report["cases"]
         for calls in (1, 128)
     ):
-        raise SystemExit("Selective checkpoint gradient parity failed; see saved JSON.")
+        raise SystemExit(
+            "Whole-block checkpoint gradient parity failed; see saved JSON."
+        )
 
 
 if __name__ == "__main__":

@@ -45,20 +45,20 @@ from delta_feedback_experiment.optim import (
     split_parameters,
 )
 from delta_feedback_experiment.train import (
+    BATCH_TOKENS,
     CONTRACT,
     GRAD_CLIP_NORM,
     CudaGraphTrainer,
     automatic_checkpoint,
-    BATCH_TOKENS,
     build_parser,
     build_schedule,
-    parse_run_args,
-    resolve_run_args,
     clip_gradients,
     draw_iterations,
     draw_passes,
     feedback_boundary,
     mix,
+    parse_run_args,
+    resolve_run_args,
     route_summary,
     train,
 )
@@ -201,16 +201,16 @@ def parquet_source(root: Path, files: int = 3, rows: int = 40) -> LocalSource:
 
 
 def build(out: Path, source: LocalSource, **overrides) -> dict:
-    settings = dict(
-        target_tokens=600,
-        val_tokens=200,
-        seed=3,
-        tokens_per_doc=10,
-        source=source,
-        tokenizer=char_tokenizer,
-        check_packages=False,
-        config="sample-tiny",
-    )
+    settings = {
+        "target_tokens": 600,
+        "val_tokens": 200,
+        "seed": 3,
+        "tokens_per_doc": 10,
+        "source": source,
+        "tokenizer": char_tokenizer,
+        "check_packages": False,
+        "config": "sample-tiny",
+    }
     settings.update(overrides)
     return tokenize(out, **settings)
 
@@ -1055,7 +1055,7 @@ def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
 
 
 def test_multipass_checkpoint_parity():
-    """The guarded larger modes preserve plain-path loss and gradients."""
+    """Cell-final storage preserves plain-path gradients in both trunk families."""
     from delta_feedback_experiment.model import (
         DeltaModel,
         condition_config,
@@ -1063,17 +1063,17 @@ def test_multipass_checkpoint_parity():
         multipass_loss,
     )
 
-    geometry = dict(
-        vocab_size=97,
-        dim=32,
-        heads=2,
-        kv_heads=2,
-        head_dim=16,
-        intermediate=64,
-        pkda_heads=2,
-        pkda_head_dim=16,
-        max_seq_len=17,
-    )
+    geometry = {
+        "vocab_size": 97,
+        "dim": 32,
+        "heads": 2,
+        "kv_heads": 2,
+        "head_dim": 16,
+        "intermediate": 64,
+        "pkda_heads": 2,
+        "pkda_head_dim": 16,
+        "max_seq_len": 17,
+    }
     torch.manual_seed(0)
     tokens = torch.randint(0, 97, (2, 17))
     prefix = torch.ones((1, 2), dtype=torch.long)
@@ -1090,12 +1090,58 @@ def test_multipass_checkpoint_parity():
         )
         return loss.item(), grads
 
-    for condition, layers, iterations in (("arf", 2, None), ("arfl", 12, 3)):
+    for condition, layers, iterations in (
+        ("arf", 2, None),
+        ("arf", 4, None),
+        ("rf", 4, None),
+        ("arfl", 12, 3),
+        ("rfl", 12, 3),
+    ):
         cfg = condition_config(condition, layers=layers, **geometry)
         plain_loss, plain_grads = run(cfg, False, iterations)
         checked_loss, checked_grads = run(cfg, True, iterations)
         assert checked_loss == pytest.approx(plain_loss, rel=1e-6), condition
         assert torch.allclose(plain_grads, checked_grads, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize("condition,cell_size", [("", 3), ("", 4), ("a", 4)])
+def test_checkpoint_retains_only_cell_final_blocks(monkeypatch, condition, cell_size):
+    from delta_feedback_experiment.model import DeltaModel, condition_config
+
+    model = DeltaModel(
+        condition_config(
+            condition,
+            vocab_size=97,
+            dim=32,
+            layers=2 * cell_size,
+            heads=2,
+            kv_heads=2,
+            head_dim=16,
+            intermediate=64,
+            pkda_heads=2,
+            pkda_head_dim=16,
+            max_seq_len=8,
+            routing_block_size=cell_size,
+        )
+    )
+    model.grad_checkpoint = True
+    checkpointed = []
+    original = torch.utils.checkpoint.checkpoint
+
+    def record_checkpoint(function, block, *args, **kwargs):
+        checkpointed.append(block.layer)
+        return original(function, block, *args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", record_checkpoint)
+    output = model.forward_column(
+        model.embed_tokens(torch.zeros(1, 8, dtype=torch.long))
+    )
+    output.h_top.sum().backward()
+    assert checkpointed == [
+        layer
+        for layer in range(2 * cell_size)
+        if layer not in (cell_size - 1, 2 * cell_size - 1)
+    ]
 
 
 def test_checkpoint_policy_is_internal_and_screen_measured():
@@ -1114,7 +1160,7 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     args.micro_rows = 1
     # The loop counts executed layers, 8 + 4r per pass at the screen, against
     # the measured raw budget of forty layer-passes (ten cells) at one
-    # 4,096-token row, the same tokens as the four 1,024-token rows measured.
+    # 4,096-token row. Over-budget modes retain only each cell's final block.
     assert not automatic_checkpoint(looped, 3, 1, args, cuda)
     assert not automatic_checkpoint(looped, 1, 8, args, cuda)
     assert not automatic_checkpoint(looped, 2, 3, args, cuda)

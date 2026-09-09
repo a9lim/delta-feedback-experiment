@@ -5,8 +5,8 @@ from itertools import pairwise
 import pytest
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
-from delta_feedback_experiment.activation import checkpoint_context
 from delta_feedback_experiment.cuda_kernels import sink_linear
 from delta_feedback_experiment.model import DeltaModel, condition_config
 
@@ -120,22 +120,22 @@ def test_packed_linear_repeated_backward_preserves_segment_gradients(
         output = sink_linear(x, weights, sinks, shadow, packed_sink=packed)
         return output.sin() * torch.sigmoid(output) if checkpointed else output
 
-    def forward(x):
+    compiled_projection = (
+        torch.compile(projection, backend="aot_eager", fullgraph=True)
+        if compiled
+        else projection
+    )
+
+    def run(x):
         if checkpointed:
             return torch.utils.checkpoint.checkpoint(
-                projection,
+                compiled_projection,
                 x,
                 use_reentrant=False,
                 preserve_rng_state=False,
-                context_fn=checkpoint_context,
             )
-        return projection(x)
+        return compiled_projection(x)
 
-    run = (
-        torch.compile(forward, backend="aot_eager", fullgraph=True)
-        if compiled
-        else forward
-    )
     for _ in range(3):
         x = torch.randn(2, 5, 8, requires_grad=True)
         reference_x = x.detach().clone().requires_grad_()

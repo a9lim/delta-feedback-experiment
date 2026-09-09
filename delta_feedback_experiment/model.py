@@ -40,10 +40,10 @@ from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
-from .activation import checkpoint_context
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, sink_linear
 from .parameter_groups import is_normuonh_parameter
@@ -887,36 +887,13 @@ def _pkda_block(block, h, block_start, gate_weight, banked, *tensors):
     return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
 
 
-def _selective_block(block, h, block_start, gate_weight, banked, *tensors):
-    """Trace checkpointing inside compilation so AOT sees the storage policy."""
-    return torch.utils.checkpoint.checkpoint(
-        _block_for_checkpoint,
-        block,
-        h,
-        block_start,
-        gate_weight,
-        banked,
-        *tensors,
-        use_reentrant=False,
-        preserve_rng_state=False,
-        context_fn=checkpoint_context,
-    )
+def _retain_block_activations(layer: int, cell_size: int) -> bool:
+    """Retain the final block of each cell when the full column exceeds memory.
 
-
-def _selective_attention_block(block, h, block_start, gate_weight, banked, *tensors):
-    return _selective_block(block, h, block_start, gate_weight, banked, *tensors)
-
-
-def _selective_pkda_block(block, h, block_start, gate_weight, banked, *tensors):
-    return _selective_block(block, h, block_start, gate_weight, banked, *tensors)
-
-
-_compiled_selective_block = torch.compile(
-    _selective_attention_block, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
-)
-_compiled_selective_pkda_block = torch.compile(
-    _selective_pkda_block, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
-)
+    Selecting by position bounds storage for both hybrid and all-dense trunks;
+    in a hybrid cell the retained block is its global-attention block.
+    """
+    return layer % cell_size == cell_size - 1
 
 
 _compiled_block = torch.compile(
@@ -1026,7 +1003,7 @@ class DeltaModel(nn.Module):
             if cfg.routing_active:
                 self.payload_router = Router(cfg)
         self.grad_checkpoint = False
-        """Runtime switch: selectively store activations in training blocks."""
+        """Runtime switch: retain cell-final activations, checkpoint other blocks."""
         self.bank_sources = True
         """Runtime switch: give each routed source one gradient accumulator.
 
@@ -1416,13 +1393,13 @@ class DeltaModel(nn.Module):
             else None
         )
         block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
-        if checkpointing:
-            selective = (
-                _compiled_selective_pkda_block
-                if block.is_pkda
-                else _compiled_selective_block
-            )
-            h, delta = (selective if h.is_cuda else _selective_block)(
+        if checkpointing and not _retain_block_activations(
+            block.layer, self.cfg.routing_block_size
+        ):
+            # Keep checkpointing outside compilation: both stored and
+            # recomputed blocks use the same compiled numerical boundaries.
+            h, delta = torch.utils.checkpoint.checkpoint(
+                block_fn if h.is_cuda else _block_for_checkpoint,
                 block,
                 h,
                 entry,
@@ -1430,6 +1407,8 @@ class DeltaModel(nn.Module):
                 len(banked),
                 *passed,
                 *banked,
+                use_reentrant=False,
+                preserve_rng_state=False,
             )
             return h, delta, None, None
         if h.is_cuda and cache is None and not want_weights:
