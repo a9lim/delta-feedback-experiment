@@ -3,8 +3,8 @@
     python scripts/store_cutover.py --new /data/delta/tokens-350B \\
         --old /data/delta/tokens --old /data/delta/tokens-smoke [--wait] [--delete]
 
-Verifies the new store, then refuses while a job is active or a pending job's
-arguments name an old path. ``--wait`` polls until the spool is clear;
+Verifies the new store, then refuses while an active or pending job's
+arguments name an old path. ``--wait`` polls until none does;
 ``--delete`` removes the old paths, otherwise the script only reports. A run
 trained on a deleted store cannot be resumed or ``--continue``d afterwards.
 """
@@ -24,17 +24,17 @@ from delta_feedback_experiment.data import verify
 
 
 def busy(old: list[Path]) -> list[str]:
-    """Spool jobs that stand in the way: the active one, or a pending reader."""
+    """Spool jobs, active or pending, whose arguments name an old store."""
+    names = {str(path) for path in old}
     reasons = []
     active = SPOOL.layout.active
-    if active.exists():
-        reasons.append(f"active: {json.loads(active.read_text())['tag']}")
-    names = {str(path) for path in old}
-    for pending in SPOOL.pending_paths():
-        job = json.loads(pending.read_text())
+    candidates = [("active", active)] if active.exists() else []
+    candidates += [("pending", path) for path in SPOOL.pending_paths()]
+    for state, path in candidates:
+        job = json.loads(path.read_text())
         words = [word for vector in job.get("argv", []) for word in vector]
         if any(word in names for word in words):
-            reasons.append(f"pending reader: {job['tag']}")
+            reasons.append(f"{state} reader: {job['tag']}")
     return reasons
 
 
