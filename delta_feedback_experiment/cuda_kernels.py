@@ -823,7 +823,9 @@ class ShadowOperand(torch.autograd.Function):
         return gradient.float(), None, None
 
 
-def shadowed_weight(master: Tensor, shadow: Tensor | None, dtype: torch.dtype) -> Tensor:
+def shadowed_weight(
+    master: Tensor, shadow: Tensor | None, dtype: torch.dtype
+) -> Tensor:
     """The GEMM operand for ``master``: its bound shadow when one matches
     ``dtype`` and autograd is live, otherwise the master itself (autocast or the
     caller then casts as before)."""
@@ -851,13 +853,19 @@ class _SinkLinear(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x: Tensor, splits: tuple[int, ...], operand: Tensor, *tensors: Tensor
+        ctx,
+        x: Tensor,
+        splits: tuple[int, ...],
+        operand: Tensor,
+        packed_sink: Tensor | None,
+        *tensors: Tensor,
     ) -> Tensor:
         count = len(splits)
         ctx.save_for_backward(x, operand)
         # Sinks are mutated by every backward that reaches them, so they are
         # held as plain attributes rather than version-checked saved tensors.
         ctx.sinks = tensors[count:]
+        ctx.packed_sink = packed_sink
         ctx.splits = splits
         return F.linear(x, operand)
 
@@ -868,15 +876,20 @@ class _SinkLinear(torch.autograd.Function):
         grad_x = gradient @ weight
         flat_gradient = gradient.reshape(-1, gradient.shape[-1])
         flat_x = x.reshape(-1, x.shape[-1])
-        start = 0
-        fence = None
-        for size, sink in zip(ctx.splits, sinks, strict=True):
-            token = dw_accum(flat_gradient[:, start : start + size], flat_x, sink)
-            fence = token if fence is None else fence + token
-            start += size
+        if ctx.packed_sink is not None:
+            # The optimizer still sees disjoint per-parameter views, while one
+            # GEMM accumulates all row segments into their shared backing.
+            fence = dw_accum(flat_gradient, flat_x, ctx.packed_sink)
+        else:
+            start = 0
+            fence = None
+            for size, sink in zip(ctx.splits, sinks, strict=True):
+                token = dw_accum(flat_gradient[:, start : start + size], flat_x, sink)
+                fence = token if fence is None else fence + token
+                start += size
         # The fence is zero; the dependency keeps every accumulation alive.
         grad_x = grad_x + fence.to(grad_x.dtype)
-        return (grad_x, None, None) + (None,) * (2 * len(ctx.splits))
+        return (grad_x, None, None, None) + (None,) * (2 * len(ctx.splits))
 
 
 def sink_linear(
@@ -884,6 +897,8 @@ def sink_linear(
     weights: tuple[Tensor, ...],
     sinks: tuple[Tensor | None, ...],
     shadow: Tensor | None = None,
+    *,
+    packed_sink: Tensor | None = None,
 ) -> Tensor:
     """Linear over concatenated weights; bound sinks accumulate dW in place.
 
@@ -891,6 +906,10 @@ def sink_linear(
     weights, refreshed once per optimizer step, so no replay re-casts or
     re-concatenates FP32 parameters.  Without one (portable paths, analysis,
     cached decoding) the operand is cast per call.
+
+    A bound ``packed_sink`` spans the disjoint row views in ``sinks`` and lets
+    their weight gradients accumulate with one GEMM. The model validates the
+    storage relationship at binding time, outside compiled execution.
     """
     if shadow is not None and shadow.dtype == x.dtype:
         operand = shadow
@@ -901,7 +920,7 @@ def sink_linear(
     if not torch.is_grad_enabled() or any(sink is None for sink in sinks):
         return F.linear(x, operand)
     return _SinkLinear.apply(
-        x, tuple(w.shape[0] for w in weights), operand, *weights, *sinks
+        x, tuple(w.shape[0] for w in weights), operand, packed_sink, *weights, *sinks
     )
 
 

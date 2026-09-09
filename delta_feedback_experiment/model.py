@@ -43,7 +43,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
-from .attention import causal_attention, causal_block_mask, prefix_attention
+from .activation import checkpoint_context
+from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, sink_linear
 from .parameter_groups import is_normuonh_parameter
 from .pkda import PreconditionedKDA
@@ -452,6 +453,7 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(cfg.head_dim, cfg.norm_eps)
         self.qkv_sink: Tensor | None = None
         self.gate_sink: Tensor | None = None
+        self.packed_qkv_sink: Tensor | None = None
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
@@ -462,7 +464,6 @@ class Attention(nn.Module):
         gate_weight: Tensor,
         cache: KVCache | None,
         layer: int,
-        attention_mask=None,
     ) -> Tensor:
         batch, length, _ = x.shape
         cfg = self.cfg
@@ -473,6 +474,7 @@ class Attention(nn.Module):
             (self.qkv_proj.weight, gate_weight),
             (self.qkv_sink, self.gate_sink),
             self.qkv_shadow,
+            packed_sink=self.packed_qkv_sink,
         ).split((self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1)
         q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
         k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
@@ -489,7 +491,7 @@ class Attention(nn.Module):
             k, v = k_prefix.transpose(1, 2), v_prefix.transpose(1, 2)
         if q.is_cuda:
             if causal:
-                out = causal_attention(q, k, v, attention_mask).transpose(1, 2)
+                out = causal_attention(q, k, v).transpose(1, 2)
             else:
                 out = prefix_attention(q, k, v).transpose(1, 2)
         else:
@@ -805,7 +807,6 @@ class Block(nn.Module):
         want_weights: bool,
         *sources: Tensor,
         accumulators: tuple[Tensor, ...] = (),
-        attention_mask=None,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         """Returns (h, cell delta, attn weights, mlp weights). The branch
         outputs stay inside: nothing reads them, and a compiled block that
@@ -839,9 +840,7 @@ class Block(nn.Module):
             if cache is not None:
                 cache.update_pkda(self.layer, state, a_state, conv_state)
         else:
-            mixed = self.attn(
-                normalized, gate_weight, cache, self.layer, attention_mask
-            )
+            mixed = self.attn(normalized, gate_weight, cache, self.layer)
         a = self.branch_scale * mixed
         h = h + a
         if self.mlp_router is not None and block_start is not None:
@@ -856,8 +855,8 @@ class Block(nn.Module):
         return h, h - start, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, block_start, gate_weight, mask, banked, *tensors):
-    """Pure checkpoint wrapper; immutable mask geometry is a per-call input.
+def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
+    """Pure checkpoint wrapper with a positional source-bank interface.
 
     ``banked`` counts the accumulators that follow the sources in ``tensors``:
     the flat signature keeps activation checkpointing and Dynamo's specialized
@@ -872,7 +871,6 @@ def _block_for_checkpoint(block, h, block_start, gate_weight, mask, banked, *ten
         False,
         *sources,
         accumulators=tensors[len(sources) :],
-        attention_mask=mask,
     )
     return h, delta
 
@@ -881,16 +879,44 @@ def _block_for_checkpoint(block, h, block_start, gate_weight, mask, banked, *ten
 # cache on the code object and, when it recompiles, evaluates every earlier
 # entry's guards against the current call to log the reason; one family's
 # guards name attributes the other family's mixer does not have.
-def _attention_block(block, h, block_start, gate_weight, mask, banked, *tensors):
-    return _block_for_checkpoint(
-        block, h, block_start, gate_weight, mask, banked, *tensors
+def _attention_block(block, h, block_start, gate_weight, banked, *tensors):
+    return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
+
+
+def _pkda_block(block, h, block_start, gate_weight, banked, *tensors):
+    return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
+
+
+def _selective_block(block, h, block_start, gate_weight, banked, *tensors):
+    """Trace checkpointing inside compilation so AOT sees the storage policy."""
+    return torch.utils.checkpoint.checkpoint(
+        _block_for_checkpoint,
+        block,
+        h,
+        block_start,
+        gate_weight,
+        banked,
+        *tensors,
+        use_reentrant=False,
+        preserve_rng_state=False,
+        context_fn=checkpoint_context,
     )
 
 
-def _pkda_block(block, h, block_start, gate_weight, mask, banked, *tensors):
-    return _block_for_checkpoint(
-        block, h, block_start, gate_weight, mask, banked, *tensors
-    )
+def _selective_attention_block(block, h, block_start, gate_weight, banked, *tensors):
+    return _selective_block(block, h, block_start, gate_weight, banked, *tensors)
+
+
+def _selective_pkda_block(block, h, block_start, gate_weight, banked, *tensors):
+    return _selective_block(block, h, block_start, gate_weight, banked, *tensors)
+
+
+_compiled_selective_block = torch.compile(
+    _selective_attention_block, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+_compiled_selective_pkda_block = torch.compile(
+    _selective_pkda_block, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
 
 
 _compiled_block = torch.compile(
@@ -1000,7 +1026,7 @@ class DeltaModel(nn.Module):
             if cfg.routing_active:
                 self.payload_router = Router(cfg)
         self.grad_checkpoint = False
-        """Runtime switch: checkpoint each block during training forwards."""
+        """Runtime switch: selectively store activations in training blocks."""
         self.bank_sources = True
         """Runtime switch: give each routed source one gradient accumulator.
 
@@ -1081,6 +1107,48 @@ class DeltaModel(nn.Module):
 
     # -- persistent gradient sinks -------------------------------------------
 
+    def allocate_gradient_buffers(self) -> dict[nn.Parameter, Tensor]:
+        """Allocate FP32 gradients, packing projections that share a GEMM.
+
+        Q/K/V and dense QKV/gate retain separate parameters and optimizer
+        state. Their gradients are disjoint contiguous row views of one
+        backing allocation, so the backward can accumulate the whole GEMM
+        without materializing or combining per-parameter gradients.
+        """
+        buffers: dict[nn.Parameter, Tensor] = {}
+        for block in self.blocks:
+            attn = block.attn
+            if block.is_pkda:
+                parameters = (
+                    attn.q_proj.weight,
+                    attn.k_proj.weight,
+                    attn.v_proj.weight,
+                )
+            else:
+                parameters = (
+                    attn.qkv_proj.weight,
+                    self.attention_gates[block.global_gate_index].weight,
+                )
+            if not all(parameter.requires_grad for parameter in parameters):
+                continue
+            slab = torch.zeros(
+                (
+                    sum(parameter.shape[0] for parameter in parameters),
+                    parameters[0].shape[1],
+                ),
+                device=parameters[0].device,
+                dtype=torch.float32,
+            )
+            start = 0
+            for parameter in parameters:
+                rows = parameter.shape[0]
+                buffers[parameter] = slab[start : start + rows]
+                start += rows
+        for parameter in self.parameters():
+            if parameter.requires_grad and parameter not in buffers:
+                buffers[parameter] = torch.zeros_like(parameter, dtype=torch.float32)
+        return buffers
+
     def bind_gradient_sinks(
         self, sinks: dict[nn.Parameter, Tensor] | None
     ) -> set[nn.Parameter]:
@@ -1097,6 +1165,10 @@ class DeltaModel(nn.Module):
         from the FP32 masters once per optimizer update, so no replay casts or
         concatenates parameters; the shadows are neither parameters nor
         checkpoint state.
+
+        Buffers from ``allocate_gradient_buffers`` also expose a packed sink
+        for each concatenated projection. Ordinary independently allocated
+        buffers remain valid; their backward accumulates each segment alone.
         """
         lookup = sinks or {}
         bound: set[nn.Parameter] = set()
@@ -1107,6 +1179,39 @@ class DeltaModel(nn.Module):
             if buffer is not None:
                 bound.add(parameter)
             return buffer
+
+        def packed_sink(
+            current: Tensor | None, *parameters: nn.Parameter
+        ) -> Tensor | None:
+            parts = [lookup.get(parameter) for parameter in parameters]
+            if any(part is None for part in parts):
+                return None
+            first = parts[0]
+            columns = parameters[0].shape[1]
+            offset = first.storage_offset()
+            base_address = first.untyped_storage().data_ptr()
+            for parameter, part in zip(parameters, parts, strict=True):
+                if (
+                    part.shape != parameter.shape
+                    or part.dtype != torch.float32
+                    or part.device != first.device
+                    or not part.is_contiguous()
+                    or part.untyped_storage().data_ptr() != base_address
+                    or part.storage_offset() != offset
+                ):
+                    return None
+                offset += part.numel()
+            shape = (sum(parameter.shape[0] for parameter in parameters), columns)
+            if (
+                current is not None
+                and current.shape == shape
+                and current.dtype == first.dtype
+                and current.device == first.device
+                and current.untyped_storage().data_ptr() == base_address
+                and current.storage_offset() == first.storage_offset()
+            ):
+                return current
+            return first.as_strided(shape, (columns, 1))
 
         def shadow(current: Tensor | None, *weights: Tensor) -> Tensor | None:
             # Rebinding keeps an existing shadow: the compiled blocks were
@@ -1158,6 +1263,12 @@ class DeltaModel(nn.Module):
                 attn.q_sink = sink(attn.q_proj.weight)
                 attn.k_sink = sink(attn.k_proj.weight)
                 attn.v_sink = sink(attn.v_proj.weight)
+                attn.packed_qkv_sink = packed_sink(
+                    attn.packed_qkv_sink,
+                    attn.q_proj.weight,
+                    attn.k_proj.weight,
+                    attn.v_proj.weight,
+                )
                 attn.o_sink = sink(attn.o_proj.weight)
                 attn.qkv_shadow = shadow(
                     attn.qkv_shadow,
@@ -1181,6 +1292,9 @@ class DeltaModel(nn.Module):
                 gate = self.attention_gates[block.global_gate_index].weight
                 attn.qkv_sink = sink(attn.qkv_proj.weight)
                 attn.gate_sink = sink(gate)
+                attn.packed_qkv_sink = packed_sink(
+                    attn.packed_qkv_sink, attn.qkv_proj.weight, gate
+                )
                 attn.o_sink = sink(attn.o_proj.weight)
                 attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight, gate)
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
@@ -1292,7 +1406,6 @@ class DeltaModel(nn.Module):
         cache: KVCache | None,
         want_weights: bool,
         checkpointing: bool,
-        attention_mask,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         """One block on the residual ``h``: returns (h, cell delta, attention
         weights, MLP weights); the weights are None unless requested.
@@ -1303,25 +1416,25 @@ class DeltaModel(nn.Module):
             else None
         )
         block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
-        mask = None if block.is_pkda else attention_mask
         if checkpointing:
-            h, delta = torch.utils.checkpoint.checkpoint(
-                block_fn if h.is_cuda else _block_for_checkpoint,
+            selective = (
+                _compiled_selective_pkda_block
+                if block.is_pkda
+                else _compiled_selective_block
+            )
+            h, delta = (selective if h.is_cuda else _selective_block)(
                 block,
                 h,
                 entry,
                 gate_weight,
-                mask,
                 len(banked),
                 *passed,
                 *banked,
-                use_reentrant=False,
-                preserve_rng_state=False,
             )
             return h, delta, None, None
         if h.is_cuda and cache is None and not want_weights:
             h, delta = block_fn(
-                block, h, entry, gate_weight, mask, len(banked), *passed, *banked
+                block, h, entry, gate_weight, len(banked), *passed, *banked
             )
             return h, delta, None, None
         h, delta, w_attn, w_mlp = block(
@@ -1332,7 +1445,6 @@ class DeltaModel(nn.Module):
             want_weights,
             *passed,
             accumulators=banked,
-            attention_mask=mask,
         )
         return h, delta, w_attn, w_mlp
 
@@ -1379,9 +1491,7 @@ class DeltaModel(nn.Module):
             if w_mlp is not None:
                 site = f"L{block.layer}{label}.mlp"
                 weights_out[site] = w_mlp
-                mlp_names = (
-                    [*passed_names, f"partial{cell}"] if opens else passed_names
-                )
+                mlp_names = [*passed_names, f"partial{cell}"] if opens else passed_names
                 route_source_names[site] = ("null", *mlp_names)
         return h, partial
 
@@ -1412,13 +1522,6 @@ class DeltaModel(nn.Module):
                 )
             iterations = cache.iterations
         iterations = cfg.resolve_iterations(iterations)
-        # Mask construction belongs outside fullgraph block compilation. The
-        # same immutable geometry is reused by all global layers and passes.
-        attention_mask = (
-            causal_block_mask(x.shape[1], x.device)
-            if x.is_cuda and cache is None
-            else None
-        )
 
         # Banking needs the Triton router's in-place accumulation and a live
         # backward; without either the sources stay raw and every reader
@@ -1455,14 +1558,13 @@ class DeltaModel(nn.Module):
             and cache is None
             and not want_weights
         )
-        runtime = dict(
-            cache=cache,
-            want_weights=want_weights,
-            checkpointing=checkpointing,
-            attention_mask=attention_mask,
-            weights_out=weights_out,
-            route_source_names=route_source_names,
-        )
+        runtime = {
+            "cache": cache,
+            "want_weights": want_weights,
+            "checkpointing": checkpointing,
+            "weights_out": weights_out,
+            "route_source_names": route_source_names,
+        }
 
         def complete(carrier: Tensor, delta: Tensor, cell: int) -> Tensor:
             """Store a completed block delta as a source; return the carrier.

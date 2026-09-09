@@ -1,4 +1,4 @@
-"""FlexAttention qualification against independent dense math and cache semantics.
+"""Native Flash attention qualification against dense math and cache semantics.
 
 CUDA tests use the screen's non-power-of-two head dimension and real GQA.
 They belong to the serial Jobe gate; CPU checks retain cache-policy coverage.
@@ -9,11 +9,15 @@ import torch
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from delta_feedback_experiment.attention import causal_attention, prefix_attention
+from delta_feedback_experiment.attention import (
+    _causal_attention,
+    causal_attention,
+    prefix_attention,
+)
 from delta_feedback_experiment.model import KVCache, condition_config
 
 CUDA_ONLY = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlexAttention requires CUDA qualification"
+    not torch.cuda.is_available(), reason="attention requires CUDA qualification"
 )
 
 
@@ -28,6 +32,51 @@ def _math_attention(query, key, value, *, causal):
             value.float().repeat_interleave(groups, dim=1),
             is_causal=causal,
         )
+
+
+def test_flash_backend_scope_compiles_fullgraph_and_restores_caller_preferences():
+    # The CPU Flash implementation lets the portable gate check Dynamo's
+    # context handling without claiming CUDA kernel qualification. Production
+    # compiles this same helper inside the larger fullgraph transformer block.
+    inputs = tuple(
+        torch.randn(1, 2, 17, 96, dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(3)
+    )
+    compiled = torch.compile(_causal_attention, fullgraph=True, backend="eager")
+    with sdpa_kernel(SDPBackend.MATH):
+        actual = compiled(*inputs)
+        assert torch.backends.cuda.math_sdp_enabled()
+        assert not torch.backends.cuda.flash_sdp_enabled()
+        expected = F.scaled_dot_product_attention(*inputs, is_causal=True)
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=8e-3)
+        gradients = torch.autograd.grad(actual.sum(), inputs)
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert torch.backends.cuda.math_sdp_enabled()
+        assert not torch.backends.cuda.flash_sdp_enabled()
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA_ONLY)])
+def test_fp32_causal_diagnostic_matches_independent_gqa_math(device):
+    inputs = tuple(
+        torch.randn(1, heads, 17, 96, device=device, requires_grad=True)
+        for heads in (4, 2, 2)
+    )
+    references = tuple(value.detach().clone().requires_grad_() for value in inputs)
+    # CPU checks the dtype branch under Dynamo; CUDA checks the authoritative
+    # compiled path used by the loop's full-forward diagnostic.
+    attention = (
+        causal_attention
+        if device == "cuda"
+        else torch.compile(_causal_attention, fullgraph=True, backend="eager")
+    )
+    actual = attention(*inputs)
+    expected = _math_attention(*references, causal=True)
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    upstream = torch.randn_like(actual)
+    gradients = torch.autograd.grad(actual, inputs, upstream)
+    reference_gradients = torch.autograd.grad(expected, references, upstream)
+    for gradient, reference in zip(gradients, reference_gradients, strict=True):
+        torch.testing.assert_close(gradient, reference, rtol=2e-5, atol=2e-6)
 
 
 def _inputs(length, heads=8, kv_heads=4):

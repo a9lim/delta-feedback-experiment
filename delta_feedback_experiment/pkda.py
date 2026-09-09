@@ -161,6 +161,7 @@ class PreconditionedKDA(nn.Module):
         self.q_sink: Tensor | None = None
         self.k_sink: Tensor | None = None
         self.v_sink: Tensor | None = None
+        self.packed_qkv_sink: Tensor | None = None
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
@@ -229,6 +230,7 @@ class PreconditionedKDA(nn.Module):
                 (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
                 (self.q_sink, self.k_sink, self.v_sink),
                 self.qkv_shadow,
+                packed_sink=self.packed_qkv_sink,
             )
             weight = torch.cat(
                 (

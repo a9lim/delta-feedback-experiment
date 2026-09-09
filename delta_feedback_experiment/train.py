@@ -19,13 +19,13 @@ import argparse
 import contextlib
 import gc
 import math
-from types import SimpleNamespace
-from fractions import Fraction
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from transformer_experiments import checkpoints, runs, telemetry
@@ -61,18 +61,39 @@ BATCH_TOKENS = 524_288
 """Predicted tokens per optimizer step at every scale: 2^19, 128 rows of 4,096."""
 
 SCALES: dict[str, dict[str, int]] = {
-    "screen": dict(
-        dim=768, layers=12, heads=8, kv_heads=4, intermediate=3328, pkda_heads=10,
-        seq_len=4096, batch_rows=128, micro_rows=1,
-    ),
-    "bridge": dict(
-        dim=1152, layers=16, heads=12, kv_heads=6, intermediate=4992, pkda_heads=15,
-        seq_len=4096, batch_rows=128, micro_rows=1,
-    ),
-    "flagship": dict(
-        dim=1536, layers=24, heads=16, kv_heads=8, intermediate=6656, pkda_heads=20,
-        seq_len=4096, batch_rows=128, micro_rows=1,
-    ),
+    "screen": {
+        "dim": 768,
+        "layers": 12,
+        "heads": 8,
+        "kv_heads": 4,
+        "intermediate": 3328,
+        "pkda_heads": 10,
+        "seq_len": 4096,
+        "batch_rows": 128,
+        "micro_rows": 1,
+    },
+    "bridge": {
+        "dim": 1152,
+        "layers": 16,
+        "heads": 12,
+        "kv_heads": 6,
+        "intermediate": 4992,
+        "pkda_heads": 15,
+        "seq_len": 4096,
+        "batch_rows": 128,
+        "micro_rows": 1,
+    },
+    "flagship": {
+        "dim": 1536,
+        "layers": 24,
+        "heads": 16,
+        "kv_heads": 8,
+        "intermediate": 6656,
+        "pkda_heads": 20,
+        "seq_len": 4096,
+        "batch_rows": 128,
+        "micro_rows": 1,
+    },
 }
 """The geometries of ``docs/scaling.md``: the column, and the row length,
 rows per step, and single-process microbatch every scale shares, 4,096-token
@@ -350,7 +371,9 @@ def feedback_boundary(args, total: int) -> int:
     return round(args.feedback_start * total)
 
 
-def continuation_step(source, source_schedule: Schedule, args, schedule: Schedule) -> int:
+def continuation_step(
+    source, source_schedule: Schedule, args, schedule: Schedule
+) -> int:
     """The last step of a finished run that a longer schedule reproduces.
 
     Up to it every step was warmup or heat under both schedules and on the
@@ -453,17 +476,16 @@ def micro_draws(
 def automatic_checkpoint(
     model: DeltaModel, n_passes: int, iterations: int, args, device
 ) -> bool:
-    """Measured internal activation policy for the screen."""
+    """Use selective storage above the screen's measured raw-activation budget."""
     if device.type != "cuda":
         return False
     cfg = model.cfg
     # Ten cell-passes of the screen geometry fit the 24 GiB card raw: the whole
     # one-pass loop family through r = 8 captured at 14.6 GiB allocated, and
     # its r = 8 replay is 154 ms raw against 199 ms recomputing every block.
-    # Every deeper mode (two passes above r = 3, three passes above r = 1)
-    # still checkpoints; the three-pass family raw ran out of memory. Measured
-    # at four 1,024-token rows per microbatch, the same 4,096 tokens as the
-    # one-row microbatch that replaced them.
+    # Deeper modes retain projection and dense-attention outputs and recompute
+    # other activations inside each compiled block. The budget counts the
+    # actual executed layers and tokens, including repeated core iterations.
     raw_work = 4096 * 768 * 40
     work = (
         args.micro_rows
@@ -574,7 +596,7 @@ class CudaGraphTrainer:
         specs = self._reachable_specs(schedule)
         for spec in specs:
             self.states[spec] = self._allocate(spec)
-        self._buffers = {p: torch.zeros_like(p) for p in self.parameters}
+        self._buffers = model.allocate_gradient_buffers()
         self.sink_fed = model.bind_gradient_sinks(self._buffers)
 
         # The head's classifier gradient lands in one persistent BF16 buffer
@@ -1117,21 +1139,21 @@ class AsyncSnapshotWriter:
 
 def model_fields(args) -> dict:
     """The ``ModelConfig`` fields one run's arguments name."""
-    return dict(
-        vocab_size=args.vocab_size,
-        dim=args.dim,
-        layers=args.layers,
-        heads=args.heads,
-        kv_heads=args.kv_heads,
-        head_dim=args.head_dim,
-        intermediate=args.intermediate,
-        pkda_heads=args.pkda_heads,
-        pkda_head_dim=args.pkda_head_dim,
-        pkda_conv_size=args.pkda_conv_size,
-        max_seq_len=args.seq_len + 1,
-        loop_iterations=args.loop_iterations,
-        loop_max_iterations=args.loop_max_iterations,
-    )
+    return {
+        "vocab_size": args.vocab_size,
+        "dim": args.dim,
+        "layers": args.layers,
+        "heads": args.heads,
+        "kv_heads": args.kv_heads,
+        "head_dim": args.head_dim,
+        "intermediate": args.intermediate,
+        "pkda_heads": args.pkda_heads,
+        "pkda_head_dim": args.pkda_head_dim,
+        "pkda_conv_size": args.pkda_conv_size,
+        "max_seq_len": args.seq_len + 1,
+        "loop_iterations": args.loop_iterations,
+        "loop_max_iterations": args.loop_max_iterations,
+    }
 
 
 def reference_active(args) -> int:
@@ -1217,7 +1239,9 @@ def build_schedule(args) -> Schedule:
     # run's warmup and is that run's continuation exactly, while a shorter
     # one keeps the fraction. Cooldown and the feedback boundary stay
     # fractions of the run.
-    warmup = round(args.warmup_frac * min(total, schedule_steps(args, DEFAULT_TOKENS_PER_PARAM)))
+    warmup = round(
+        args.warmup_frac * min(total, schedule_steps(args, DEFAULT_TOKENS_PER_PARAM))
+    )
     cooldown = round(args.cooldown_frac * total)
     heat = total - warmup - cooldown
     if heat < 1:
@@ -1351,9 +1375,9 @@ def train(argv: list[str] | None = None) -> dict:
         raise ValueError(f"schedule needs {needed} rows, stream has {data_train.rows}")
 
     torch.manual_seed(args.seed)
-    model = DeltaModel(
-        condition_config(args.condition, **model_fields(args))
-    ).to(device)
+    model = DeltaModel(condition_config(args.condition, **model_fields(args))).to(
+        device
+    )
     optimizers = build_optimizers(
         model,
         lr_normuonh=args.lr_normuonh,
