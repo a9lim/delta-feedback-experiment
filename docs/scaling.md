@@ -124,8 +124,9 @@ Under the cap the draw gives `E[r] = 15.56`, median 14, `P(r = 1) = 0.1%`,
 The larger geometry spends about 3.39T cell-tokens, so this run uses about
 1.5x as many cell-tokens with half the active parameters; that is accounting,
 not measured device time. Per sequence at 8,192 context one cell's mixer
-cache is 27.9 MiB: Standard decoding at `r_max` holds 34 cells, 949 MiB, and
-Soft or Fused decoding holds 3 cells, 83.7 MiB.
+cache is 27.9 MiB; every decode mode holds `2 + r` cells at the request's
+`r`, 502 MiB at `r = 16` and 949 MiB at the cap. The three-cell fused decode
+cache belongs to `L`.
 
 ## When one of these would be worth it
 

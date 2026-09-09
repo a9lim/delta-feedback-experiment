@@ -4,6 +4,56 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-08 — The `l` letter is built
+
+The tied-depth loop of [depth-architecture.md](depth-architecture.md) exists:
+`arfl` builds, trains, evaluates, and decodes on the portable path, and every
+subset of `arfl` builds and pairs with its unlooped condition. What was built
+and the decisions behind it:
+
+- The loop holds the first and last cells and runs the cell between them as
+  one tied core `r` times per column. `r` is drawn once per step from the
+  recurrent-depth log-normal Poisson draw with mean 4 and cap 8 on its own
+  keyed sub-stream (`--loop-iterations` and `--loop-max-iterations`, both
+  state-defining; snapshots move to v25). The core's partial is measured from
+  the prelude output across iterations, so the core routers see an `arf`
+  second-cell bank at every iteration and answer one stationary question.
+- Mixing is same-depth: iteration `i` reads earlier positions' iteration-`i`
+  writes, which is the recurrent-depth paper's training regime. The FBT
+  payload is the only channel between columns. This needed no new kernel;
+  each iteration is one more full-sequence pass through the same four blocks.
+  The shared core cache of the earlier spec is deferred to an `L` letter, `l`
+  plus the cache, specified on the same page and not built: it is the
+  project's own departure from the paper, it needs a fused-position PKDA
+  operator and a two-piece attention merge, and it would add a second, wide
+  cross-column channel before we know what the first one carries under a
+  loop.
+- The presence mask at the core's iteration-1 attention entry is gone from
+  the spec. A router scores whatever sources it is handed, so that site reads
+  a three-source bank exactly as a cell entry does today. The one code
+  consequence is that a block's "has a prior partial" is now whether it was
+  handed a cell entry rather than a static per-layer flag, which leaves the
+  flat column byte-identical.
+- a9 declined a trained warm start, the previous column's core delta landed
+  at the current core entry: it does not line up with existing work and would
+  make the model less legible on purpose, which is not the goal. The
+  zero-shot warm-start sweep went with it.
+- At `r = 1` a looped condition coincides with its unlooped one in values,
+  routes, losses, and gradients. The suite checks this on CPU for `al`,
+  `afl`, `arl`, and `arfl`; the CUDA gate checks loss and gradient at the
+  screen geometry. Decode parity through per-iteration core cache tracks
+  holds to FP32 accumulation noise, relative error under `1e-4` at twenty
+  executed layers. The draw's statistics match the spec (`E[r]` 3.88, median
+  4, 10.3% at 1, 8.0% at 8), and resume is exact for `arfl`.
+- New diagnostics: `depth_trace`, the fixed-`r` sweep, which on plain
+  positions is one trajectory read out after every iteration, as a `depth`
+  telemetry record and as `scripts/depth_trace.py`; and
+  `scripts/loop_memory_stage.py` for the staged memory and time measurement
+  on Jobe. The trainer reports cell-tokens per second beside pass-tokens and
+  logs the realized `r`.
+
+Nothing was trained.
+
 ## 2026-09-08 — The plain trunk is gated NoPE GQA
 
 Every dense attention layer is now the same layer: bias-free causal GQA with

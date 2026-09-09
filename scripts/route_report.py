@@ -37,8 +37,18 @@ from delta_feedback_experiment.data import TokenData
 from delta_feedback_experiment.model import multipass
 
 
-def site_names(layers: int) -> list[str]:
-    return [f"L{i}.{kind}" for i in range(layers) for kind in ("attn", "mlp")]
+def site_names(cfg) -> list[str]:
+    """Every routing site in execution order; a core site under ``l`` is
+    tagged by iteration (``L4i2.attn``) at the evaluation count."""
+    names = []
+    for layer in range(cfg.layers):
+        labels = (
+            [f"i{i}" for i in range(cfg.loop_iterations)]
+            if cfg.is_core_layer(layer)
+            else [""]
+        )
+        names += [f"L{layer}{label}.{kind}" for label in labels for kind in ("attn", "mlp")]
+    return names
 
 
 @torch.no_grad()
@@ -126,7 +136,7 @@ def site_matrix(means, route_names, cfg, passes=(0, 1)):
     labels.  Each row is placed by label rather than source position because
     the bank changes at block boundaries.
     """
-    sites = site_names(cfg.layers)
+    sites = site_names(cfg)
     columns = ["null", "seed"]
     columns += [f"block{i}" for i in range(cfg.routing_blocks)]
     columns += [f"partial{i}" for i in range(cfg.routing_blocks)]

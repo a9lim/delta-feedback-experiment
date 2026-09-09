@@ -158,12 +158,12 @@ references:
       Defines the prelude/recurrent-core/coda decoder, the log-normal Poisson
       draw of the iteration count, truncated backpropagation through the last
       iterations, a KV cache budget shared across iterations, and the zero-shot
-      warm start of the next token's state. The unimplemented depth-recurrent
-      specification takes the tied core, the iteration draw, and the
-      shared-cache idea; it replaces the adapter with MHDB reads, the random
-      initial state with the prelude output, the sandwich norm with the
-      unchanged pre-norm shell, and the untrained warm start with the trained
-      FBT payload.
+      warm start of the next token's state. The `l` letter takes the tied core
+      and the iteration draw and keeps same-depth mixing; it replaces the
+      adapter with MHDB reads, the random initial state with the prelude
+      output, the sandwich norm with the unchanged pre-norm shell, and the
+      zero-shot warm start with the trained FBT payload. The zero-shot cache
+      sharing is the unbuilt `L` letter.
 
   - arxiv: "2609.03807"
     slug: langford2026-free-pause-tokens

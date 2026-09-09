@@ -35,6 +35,8 @@ GEOMETRY = (
     "pkda_heads",
     "pkda_head_dim",
     "pkda_conv_size",
+    "loop_iterations",
+    "loop_max_iterations",
 )
 """State-defining geometry fields a snapshot carries in its ``args``."""
 

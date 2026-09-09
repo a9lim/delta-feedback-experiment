@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from delta_feedback_experiment.model import (
+    depth_trace,
     BASE_NORMAL_INIT_STD,
     CONDITION_LETTERS,
     DeltaModel,
@@ -42,13 +43,23 @@ TINY = {
 }
 
 
+TINY_LOOP = TINY | {"layers": 12, "loop_iterations": 2, "loop_max_iterations": 3}
+"""The loop needs three whole cells: prelude, core, coda."""
+
 BUILDABLE = ("", "a", "r", "f", "ar", "af", "rf", "arf")
-"""Every buildable condition: the subsets of ``arf`` in canonical order."""
+"""The subsets of ``arf`` in canonical order; every one builds at ``TINY``."""
+
+LOOPED = ("l", "al", "rl", "fl", "arl", "afl", "rfl", "arfl")
+"""The same subsets with ``l``; every one builds at ``TINY_LOOP``."""
 
 
-def tiny(condition: str, seed: int = 0) -> DeltaModel:
+def geometry(condition: str) -> dict:
+    return TINY_LOOP if "l" in condition else TINY
+
+
+def tiny(condition: str, seed: int = 0, **overrides) -> DeltaModel:
     torch.manual_seed(seed)
-    return DeltaModel(condition_config(condition, **TINY)).eval()
+    return DeltaModel(condition_config(condition, **(geometry(condition) | overrides))).eval()
 
 
 def tokens(batch=2, length=16, seed=1, vocab=97):
@@ -76,12 +87,41 @@ def test_condition_grammar():
     for count in range(5):
         for letters in itertools.combinations("lfra", count):
             text = "".join(letters)
-            assert condition_config(text, **TINY).condition == parse_condition(text)
-    looped = condition_config("arfl", **TINY)
+            config = condition_config(text, **geometry(text))
+            assert config.condition == parse_condition(text)
+    looped = condition_config("arfl", **TINY_LOOP)
     assert looped.loop and looped.hybrid
     assert looped.routing_active and looped.feedback_active
-    with pytest.raises(NotImplementedError, match="not built"):
-        DeltaModel(looped)
+    assert looped.core_layers == range(4, 8)
+    assert looped.routing_blocks == 3
+    assert looped.executed_layers(1) == 12 and looped.executed_layers(3) == 20
+    assert not condition_config("arf", **TINY).is_core_layer(1)
+
+
+def test_loop_geometry_and_iteration_bounds():
+    """The loop needs whole cells and at least three of them; iteration counts
+    live in 1..max, and a condition without l runs the core exactly once."""
+    with pytest.raises(ValueError, match="three"):
+        condition_config("arfl", **TINY)
+    with pytest.raises(ValueError, match="three"):
+        condition_config("l", **(TINY | {"layers": 9}))
+    with pytest.raises(ValueError, match="iterations"):
+        condition_config("l", **(TINY_LOOP | {"loop_max_iterations": 1}))
+    with pytest.raises(ValueError, match="iterations"):
+        condition_config("l", **(TINY_LOOP | {"loop_iterations": 0}))
+    looped = condition_config("arfl", **TINY_LOOP)
+    assert looped.resolve_iterations(None) == 2
+    assert looped.resolve_iterations(3) == 3
+    for bad in (0, 4):
+        with pytest.raises(ValueError, match="outside"):
+            looped.resolve_iterations(bad)
+    plain = condition_config("arf", **TINY)
+    assert plain.resolve_iterations(None) == 1 and plain.resolve_iterations(1) == 1
+    with pytest.raises(ValueError, match="without l"):
+        plain.resolve_iterations(2)
+    model = tiny("arf")
+    with pytest.raises(ValueError, match="without l"):
+        forward(model, tokens(), iterations=2)
 
 
 def test_condition_flags():
@@ -142,6 +182,12 @@ def test_letters_only_add_parameters():
         }
     for condition in ("r", "ar", "rf", "arf"):
         assert any("null" in name for name in names[condition])
+    # l adds no parameter: the core is the same cell, tied across iterations.
+    for condition in BUILDABLE:
+        assert {name for name, _ in tiny(condition + "l").named_parameters()} == {
+            name
+            for name, _ in tiny(condition, **{"layers": 12}).named_parameters()
+        }, condition
     assert not any("blocks.0.attn.q_proj" in name for name in names[""])
     # Every dense attention layer owns a gate: all four on the plain trunk,
     # the cell's fourth layer under a.
@@ -159,6 +205,7 @@ def test_screen_param_count():
         "ar": (256_330_536, 139_643_688),
         "af": (257_457_192, 140_770_344),
         "arf": (257_514_792, 140_827_944),
+        "arfl": (257_514_792, 140_827_944),
     }
     with torch.device("meta"):
         for condition, (total, active_non_embedding) in expected.items():
@@ -233,6 +280,23 @@ def test_initialization_pairs_across_conditions_by_letter():
     states = {
         condition: tiny(condition, seed=17).state_dict() for condition in BUILDABLE
     }
+    for left in BUILDABLE:
+        for right in BUILDABLE:
+            if ("a" in left) != ("a" in right):
+                continue
+            for name in states[left].keys() & states[right].keys():
+                assert torch.equal(states[left][name], states[right][name]), (
+                    left,
+                    right,
+                    name,
+                )
+    # The loop pairs with its own unlooped condition at the loop geometry.
+    for condition in ("al", "arl", "arfl", "rfl"):
+        looped = tiny(condition, seed=17).state_dict()
+        flat = tiny(condition.replace("l", ""), seed=17, layers=12).state_dict()
+        assert looped.keys() == flat.keys()
+        for name in looped:
+            assert torch.equal(looped[name], flat[name]), (condition, name)
     for left in BUILDABLE:
         for right in BUILDABLE:
             if ("a" in left) != ("a" in right):
@@ -768,11 +832,188 @@ def test_hybrid_cache_owns_only_global_kv_and_fixed_pkda_states():
     cache = KVCache(model.cfg, batch=2, device=toks.device, dtype=torch.float32)
     model.forward_column(model.embed_tokens(toks), cache=cache)
     assert cache.k.shape[:2] == (1, 2)
-    assert set(cache.pkda_states) == {0, 1, 2}
+    assert set(cache.pkda_states) == {(0, 0), (1, 0), (2, 0)}
     for state, a_state, conv_state in cache.pkda_states.values():
         assert state.shape == (2, 2, 16, 16) and state.dtype == torch.float32
         assert a_state.shape == (2, 2, 16) and a_state.dtype == torch.float32
         assert all(part.shape == (2, 32, 3) for part in conv_state)
+
+
+# -- the loop ------------------------------------------------------------------
+
+
+def test_loop_at_one_iteration_is_the_unlooped_condition():
+    """At r = 1 the column executes the same twelve layers with the same
+    parameters and the same banks: values, routes, losses, and gradients
+    coincide with the condition without l."""
+    for condition in ("al", "afl", "arl", "arfl"):
+        looped = tiny(condition).train()
+        flat = tiny(condition.replace("l", ""), layers=12).train()
+        toks = tokens()
+        n_passes = 2 if looped.cfg.feedback_active else 1
+        prefix = torch.ones((1, toks.shape[0]), dtype=torch.long) * 3
+        kwargs = dict(prefix_lens=prefix) if n_passes > 1 else {}
+        outs_l = multipass(
+            looped, toks, n_passes, iterations=1, want_weights=True, **kwargs
+        )
+        outs_f = multipass(flat, toks, n_passes, want_weights=True, **kwargs)
+        for out_l, out_f in zip(outs_l, outs_f, strict=True):
+            assert torch.equal(out_l.h_top, out_f.h_top), condition
+            assert out_l.source_names == out_f.source_names
+            if out_l.payload is not None:
+                assert torch.equal(out_l.payload, out_f.payload)
+            # The core's sites carry an iteration tag; everything else matches.
+            translated = {
+                site.replace("i0.", "."): weights
+                for site, weights in out_l.route_weights.items()
+            }
+            assert translated.keys() == out_f.route_weights.keys(), condition
+            for site, weights in translated.items():
+                assert torch.equal(weights, out_f.route_weights[site]), (condition, site)
+            translated_names = {
+                site.replace("i0.", "."): names
+                for site, names in out_l.route_source_names.items()
+            }
+            assert translated_names == out_f.route_source_names, condition
+        total_l, _ = multipass_loss(looped, toks, outs_l)
+        total_f, _ = multipass_loss(flat, toks, outs_f)
+        assert torch.equal(total_l, total_f), condition
+        total_l.backward()
+        total_f.backward()
+        for (name, p_l), (_, p_f) in zip(
+            looped.named_parameters(), flat.named_parameters(), strict=True
+        ):
+            assert (p_l.grad is None) == (p_f.grad is None), (condition, name)
+            if p_l.grad is not None:
+                assert torch.equal(p_l.grad, p_f.grad), (condition, name)
+
+
+def test_loop_banks_sites_and_telescoping():
+    """The core is one cell: its partial is measured from the prelude output
+    across iterations, absent only at the attention entry of iteration 1, and
+    the residual still telescopes over seed and the three cell deltas."""
+    model = tiny("arfl")
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "query" in name:
+                parameter.normal_(std=1.0)
+    out = forward(model, tokens(), want_weights=True, iterations=3)
+    assert out.iterations == 3
+    assert out.source_names == ("seed", "block0", "block1", "block2")
+    names = out.route_source_names
+    assert names["L3.mlp"] == ("null", "seed", "partial0")
+    assert names["L4i0.attn"] == ("null", "seed", "block0")
+    assert names["L4i0.mlp"] == ("null", "seed", "block0", "partial1")
+    assert names["L4i1.attn"] == ("null", "seed", "block0", "partial1")
+    assert names["L4i2.attn"] == ("null", "seed", "block0", "partial1")
+    assert names["L7i2.mlp"] == ("null", "seed", "block0", "partial1")
+    assert names["L8.attn"] == ("null", "seed", "block0", "block1")
+    assert names["L11.mlp"] == ("null", "seed", "block0", "block1", "partial2")
+    assert names["payload"] == ("null", "seed", "block0", "block1", "block2")
+    assert not any("L4.attn" == site or "L8i" in site for site in names)
+    rebuilt = out.sources[0] + torch.stack(out.sources[1:]).sum(0)
+    assert torch.allclose(out.h_top, rebuilt, atol=1e-5)
+    assert torch.allclose(out.core_state - out.core_entry, out.sources[2], atol=1e-5)
+    assert torch.allclose(out.core_entry, out.sources[0] + out.sources[1], atol=1e-5)
+
+
+def test_loop_same_depth_iterations_are_a_prefix():
+    """Iteration i of a column reads earlier positions' iteration-i writes, so
+    the state after i iterations does not depend on how many follow: a deeper
+    run repeats the shallower run's iterations exactly."""
+    model = tiny("arfl")
+    toks = tokens()
+    two = forward(model, toks, want_weights=True, iterations=2)
+    three = forward(model, toks, want_weights=True, iterations=3)
+    assert torch.equal(two.core_entry, three.core_entry)
+    for site, weights in two.route_weights.items():
+        if "i0." in site or "i1." in site:
+            assert torch.equal(weights, three.route_weights[site]), site
+    assert not torch.allclose(two.core_state, three.core_state)
+    assert not torch.allclose(two.h_top, three.h_top)
+
+
+def test_loop_gradients_sum_across_iterations():
+    model = tiny("arfl").train()
+    toks = tokens()
+    prefix = torch.ones((1, toks.shape[0]), dtype=torch.long)
+    core_name = "blocks.5.mlp.down_proj.weight"
+
+    def gradient(iterations):
+        model.zero_grad(set_to_none=True)
+        outs = multipass(model, toks, 2, prefix_lens=prefix, iterations=iterations)
+        total, _ = multipass_loss(model, toks, outs)
+        total.backward()
+        return dict(model.named_parameters())[core_name].grad.clone()
+
+    one, three = gradient(1), gradient(3)
+    assert one.abs().sum() > 0 and three.abs().sum() > 0
+    assert not torch.allclose(one, three)
+
+
+def test_loop_cached_decode_matches_full_forward():
+    """Standard decoding through per-iteration core tracks equals one full
+    parallel forward at the same iteration count."""
+    for condition in LOOPED:
+        for iterations in (1, 3):
+            model = tiny(condition)
+            toks = tokens(batch=2, length=10)
+            full = forward(model, toks, iterations=iterations)
+            cache = KVCache(
+                model.cfg, batch=2, device=toks.device, dtype=torch.float32,
+                iterations=iterations,
+            )
+            prefill = model.forward_column(model.embed_tokens(toks[:, :4]), cache=cache)
+            pieces = [prefill.h_top]
+            for t in range(4, toks.shape[1]):
+                pieces.append(model.step(toks[:, t : t + 1], None, cache).h_top)
+            stepped = torch.cat(pieces, dim=1)
+            # Parallel and single-column mixers accumulate FP32 products in
+            # different orders, and the loop executes up to twenty layers, so
+            # the bound is relative rather than the four-layer absolute one.
+            relative = (stepped - full.h_top).norm() / full.h_top.norm()
+            assert relative < 1e-4, (condition, iterations, relative)
+            assert cache.iteration == 0
+    model = tiny("arfl")
+    cache = KVCache(model.cfg, batch=2, device="cpu", dtype=torch.float32, iterations=3)
+    assert len(cache.global_slots) == 1 + 3 + 1
+    with pytest.raises(ValueError, match="tracks"):
+        model.forward_column(model.embed_tokens(tokens()), cache=cache, iterations=2)
+
+
+def test_loop_cached_feedback_decode_matches_exact_recurrence():
+    model = tiny("arfl")
+    toks = tokens(batch=2, length=12)
+    prompt_len = 5
+    cache = KVCache(model.cfg, batch=2, device=toks.device, dtype=torch.float32)
+    assert cache.iterations == 2
+    prefill = model.forward_column(model.embed_tokens(toks[:, :prompt_len]), cache=cache)
+    stepped = []
+    payload = prefill.payload[:, -1:]
+    for t in range(prompt_len, toks.shape[1]):
+        out = model.step(toks[:, t : t + 1], payload, cache)
+        stepped.append(out.h_top)
+        payload = out.payload
+    stepped = torch.cat(stepped, dim=1)
+    reference = reference_decode(model, toks, prompt_len)
+    assert (stepped - reference).norm() / reference.norm() < 1e-4
+
+
+def test_depth_trace_runs_and_is_one_trajectory():
+    model = tiny("arfl")
+    toks = tokens(batch=2, length=12)
+    records = depth_trace(model, toks)
+    assert [record["iterations"] for record in records] == [1, 2, 3]
+    assert all(
+        math.isfinite(record["loss"]) and math.isfinite(record["update_norm"])
+        for record in records
+    )
+    fused = depth_trace(model, toks, 2, fused=True)
+    assert len(fused) == 2 and all(math.isfinite(r["loss"]) for r in fused)
+    with pytest.raises(ValueError, match="needs a condition with l"):
+        depth_trace(tiny("arf"), toks)
+    with pytest.raises(ValueError, match="with f"):
+        depth_trace(tiny("arl"), toks, fused=True)
 
 
 def test_contraction_diagnostic_runs():

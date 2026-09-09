@@ -4,9 +4,11 @@ This document defines the exact computation, state, initialization, and
 optimizer of the small model organism. The implemented family is one `DeltaModel`
 addressed by the condition letters in [design.md](design.md): `a` for
 Preconditioned Kimi Delta Attention (PKDA) in three of every four layers, `r`
-for Multi-Head Delta Block routing (MHDB), and `f` for Full-Bandwidth
-Transformer (FBT) feedback. Hard Delta Feedback, `arf`, has all three;
-dropping a letter removes that package from the computation.
+for Multi-Head Delta Block routing (MHDB), `f` for Full-Bandwidth
+Transformer (FBT) feedback, and `l` for the tied-depth loop of
+[depth-architecture.md](depth-architecture.md). `arfl` has all four and
+`arf` is the flat column; dropping a letter removes that package from the
+computation.
 
 The named states and source identities are the handles the analysis scripts
 use; [interpretability](interpretability.md) lists those scripts and
@@ -80,13 +82,15 @@ diagram's explicit payload edge.
 | Completed block deltas and current partial | Contributions within one column; MHDB reads them without replacing the residual identity |
 | `h_top` | Completed column state before final readout normalization |
 | Payload | Normalization of top state plus routed enrichment under `r` with `f`, shifted to the next token column |
+| Core entry and core state | `l`: the prelude output the tied core starts from and the residual after its last iteration; their difference is the core partial |
 | PKDA matrix, preconditioner, convolution history | Token-mixer memory, continued during decode and reset within each current Jacobi prefill pass |
 | GQA K/V | Visible-prefix cache for the global layers |
 
 Distinguish token-mixer recurrence from explicit payload feedback: every `a`
-condition has PKDA recurrence whether or not it has `f`. The current model has
-no tied-depth loop; that different state transition is the `l` letter,
-specified in [depth-architecture.md](depth-architecture.md).
+condition has PKDA recurrence whether or not it has `f`. Under `l` the middle
+cell is a tied core iterated within the column, a third recurrence with
+iteration-indexed mixer states; [depth-architecture.md](depth-architecture.md)
+specifies it, and every contract on this page holds inside it.
 
 ## Residual shell
 
@@ -464,7 +468,8 @@ the run.
 ## Parameter and cache accounting
 
 The small `arf` organism has **257,514,792** parameters, of which
-**140,827,944** are active non-embedding parameters. The other conditions'
+**140,827,944** are active non-embedding parameters; `arfl` has exactly the
+same, since the loop ties a cell rather than adding one. The other conditions'
 counts are in [design.md](design.md#conditions). At 1,024 positions its
 three cells require about 10.37 MiB of token-mixer cache per sequence: about
 5.87 MiB for FP32 PKDA matrix/diagonal states and BF16 convolution histories,

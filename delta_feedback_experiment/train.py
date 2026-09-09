@@ -34,6 +34,7 @@ from .model import (
     CONDITION_LETTERS,
     DeltaModel,
     condition_config,
+    depth_trace,
     iterate_fused,
     multipass,
     multipass_loss,
@@ -48,7 +49,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=24, resumable=frozenset({24}), surface_version=16
+    version=25, resumable=frozenset({25}), surface_version=16
 )
 
 GRAD_CLIP_NORM = 10.0
@@ -66,6 +67,8 @@ EXACT_FIELDS = (
     "cooldown_frac",
     "feedback_start",
     "three_pass",
+    "loop_iterations",
+    "loop_max_iterations",
     "lr_normuonh",
     "lr_nadam",
     "jitter",
@@ -201,6 +204,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
+    recipe.add_argument(
+        "--loop-iterations",
+        type=int,
+        default=4,
+        help=(
+            "l: mean core iterations per column, drawn once per step; also the "
+            "fixed count evaluation and decoding use"
+        ),
+    )
+    recipe.add_argument(
+        "--loop-max-iterations",
+        type=int,
+        default=8,
+        help="l: cap of the per-step iteration draw",
+    )
 
     trunk = parser.add_argument_group("trunk (state-defining)")
     trunk.add_argument("--vocab-size", type=int, default=151936)
@@ -260,6 +278,39 @@ def draw_passes(args, step: int, total: int) -> int:
     return 3 if draw < args.three_pass else 2
 
 
+LOOP_DRAW_SIGMA = 0.5
+"""Log-normal spread of the recurrent-depth iteration draw."""
+
+
+def draw_iterations(args, step: int, loop: bool) -> int:
+    """The step's core iteration count under ``l``, shared by every pass and
+    microbatch of the step.
+
+    The recurrent-depth log-normal Poisson draw with its rate shifted by one::
+
+        tau ~ Normal(log(r_mean - 1) - sigma^2 / 2, sigma)
+        r   = min(1 + Poisson(exp(tau)), r_max)
+
+    so the uncapped mean of ``r`` is ``r_mean``. The draw has its own keyed
+    sub-stream, so the pass, prefix, and jitter draws stay identical to the
+    condition without ``l``.
+    """
+    if not loop:
+        return 1
+    mean, cap = args.loop_iterations, args.loop_max_iterations
+    if mean <= 1:
+        return 1
+    generator = torch.Generator().manual_seed(mix(args.data_seed, 0x6C6F6F70, step))
+    tau = torch.normal(
+        math.log(mean - 1) - LOOP_DRAW_SIGMA**2 / 2,
+        LOOP_DRAW_SIGMA,
+        size=(1,),
+        generator=generator,
+    )
+    count = torch.poisson(tau.exp(), generator=generator)
+    return min(1 + int(count.item()), cap)
+
+
 def micro_draws(
     args,
     step: int,
@@ -294,13 +345,21 @@ def micro_draws(
     return prefix_out, jitter_out
 
 
-def automatic_checkpoint(model: DeltaModel, n_passes: int, args, device) -> bool:
+def automatic_checkpoint(
+    model: DeltaModel, n_passes: int, iterations: int, args, device
+) -> bool:
     """Measured internal activation policy for the screen."""
     if device.type != "cuda":
         return False
     cfg = model.cfg
     screen_work = 4 * 1024 * 768 * 12 * 3
-    work = args.micro_rows * args.seq_len * cfg.dim * cfg.layers * n_passes
+    work = (
+        args.micro_rows
+        * args.seq_len
+        * cfg.dim
+        * cfg.executed_layers(iterations)
+        * n_passes
+    )
     # PKDA's kernel recomputes its chunk intermediates internally. The exact
     # screen k=3 graph is admitted raw; larger geometries remain guarded.
     return work > screen_work
@@ -310,6 +369,7 @@ def automatic_checkpoint(model: DeltaModel, n_passes: int, args, device) -> bool
 class GraphSpec:
     n_passes: int
     checkpoint: bool
+    iterations: int = 1
 
 
 @dataclass
@@ -441,13 +501,17 @@ class CudaGraphTrainer:
                 if self.model.cfg.feedback_active
                 else 1
             )
+            iterations = draw_iterations(self.args, step, self.model.cfg.loop)
             specs.add(
                 GraphSpec(
                     n_passes,
-                    automatic_checkpoint(self.model, n_passes, self.args, self.device),
+                    automatic_checkpoint(
+                        self.model, n_passes, iterations, self.args, self.device
+                    ),
+                    iterations,
                 )
             )
-        return sorted(specs, key=lambda spec: spec.n_passes)
+        return sorted(specs, key=lambda spec: (spec.n_passes, spec.iterations))
 
     def _allocate(self, spec: GraphSpec) -> CapturedMicro:
         rows = torch.zeros(
@@ -491,6 +555,7 @@ class CudaGraphTrainer:
                 state.spec.n_passes,
                 prefix_lens=state.prefix,
                 jitter=state.jitter,
+                iterations=state.spec.iterations,
             )
             loss, losses = multipass_loss(
                 self.model, state.rows, outs, z_coef=state.z_coef
@@ -793,8 +858,9 @@ def route_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[
         if site == "payload":
             router = model.payload_router
         else:
+            # A core site under l is tagged by iteration: ``L4i2.attn``.
             layer_kind, sublayer = site.split(".")
-            block = model.blocks[int(layer_kind[1:])]
+            block = model.blocks[int(layer_kind[1:].partition("i")[0])]
             router = getattr(block, f"{sublayer}_router")
         record["null_rms"] = round(router.null.float().square().mean().sqrt().item(), 4)
         records.append(record)
@@ -978,6 +1044,8 @@ def train(argv: list[str] | None = None) -> dict:
             pkda_head_dim=args.pkda_head_dim,
             pkda_conv_size=args.pkda_conv_size,
             max_seq_len=args.seq_len + 1,
+            loop_iterations=args.loop_iterations,
+            loop_max_iterations=args.loop_max_iterations,
         )
     ).to(device)
     optimizers = build_optimizers(
@@ -1042,6 +1110,7 @@ def train(argv: list[str] | None = None) -> dict:
         )
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0
+    window_cell_tokens = 0.0
     summary: dict = {}
     interrupted = False
     snapshot_writer = AsyncSnapshotWriter(args, model, pair, protected)
@@ -1055,11 +1124,14 @@ def train(argv: list[str] | None = None) -> dict:
             n_passes = 1
             if model.cfg.feedback_active:
                 n_passes = draw_passes(args, step, total)
-            checkpointing = automatic_checkpoint(model, n_passes, args, device)
+            iterations = draw_iterations(args, step, model.cfg.loop)
+            checkpointing = automatic_checkpoint(
+                model, n_passes, iterations, args, device
+            )
 
             micros = args.batch_rows // args.micro_rows
             if graph_runner is not None:
-                spec = GraphSpec(n_passes, checkpointing)
+                spec = GraphSpec(n_passes, checkpointing, iterations)
                 graph_state = graph_runner.begin(spec, z_coef)
                 graph_runner.replay_batch(
                     graph_state, data_train, step, (step - 1) * args.batch_rows
@@ -1092,6 +1164,7 @@ def train(argv: list[str] | None = None) -> dict:
                             n_passes,
                             prefix_lens=prefix,
                             jitter=jitter,
+                            iterations=iterations,
                         )
                         loss, losses = multipass_loss(model, rows, outs, z_coef=z_coef)
                     (loss / micros).backward()
@@ -1106,8 +1179,13 @@ def train(argv: list[str] | None = None) -> dict:
                 graph_runner.zero_grad()
             else:
                 model.zero_grad(set_to_none=True)
+            # A pass executes ``executed_layers / cell`` cell-equivalents, so
+            # cell-tokens beside pass-tokens keep matched data apart from
+            # matched compute when the loop makes the column deeper.
+            cells = model.cfg.executed_layers(iterations) / model.cfg.routing_block_size
             window_tokens += args.batch_rows * args.seq_len
             window_pass_tokens += n_passes * args.batch_rows * args.seq_len
+            window_cell_tokens += cells * n_passes * args.batch_rows * args.seq_len
 
             elapsed = time.monotonic() - window_start
             fields = {
@@ -1116,11 +1194,16 @@ def train(argv: list[str] | None = None) -> dict:
                 "loss": telemetry.format_metric(step_loss),
                 "pass1": telemetry.format_metric(pass1_loss),
                 "k": n_passes,
+            }
+            if model.cfg.loop:
+                fields["r"] = iterations
+            fields |= {
                 "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
                 "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
                 "gnorm": telemetry.format_metric(grad_norm),
                 "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
                 "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),
+                "cell_tok_s": (f"{window_cell_tokens / max(elapsed, 1e-9):.0f}"),
                 "elapsed": f"{time.monotonic() - process_start:.1f}",
             }
             if device.type == "cuda":
@@ -1131,6 +1214,7 @@ def train(argv: list[str] | None = None) -> dict:
                 0,
                 0,
             )
+            window_cell_tokens = 0.0
 
             if step % args.eval_every == 0 or step == total:
                 address = telemetry.step_address(step, total)
@@ -1159,6 +1243,22 @@ def train(argv: list[str] | None = None) -> dict:
                         loss0=telemetry.format_metric(trace[0]["loss"]),
                         loss8=telemetry.format_metric(trace[-1]["loss"]),
                         upd8=telemetry.format_metric(trace[-1]["update_norm"]),
+                    )
+                if model.cfg.loop:
+                    sweep = depth_trace(model, data_val.batch(0, 2, device))
+                    model.train()
+                    by_depth = {record["iterations"]: record for record in sweep}
+                    telemetry.log(
+                        "depth",
+                        step=address,
+                        r_mean=model.cfg.loop_iterations,
+                        r_max=model.cfg.loop_max_iterations,
+                        loss_one=telemetry.format_metric(by_depth[1]["loss"]),
+                        loss_mean=telemetry.format_metric(
+                            by_depth[model.cfg.loop_iterations]["loss"]
+                        ),
+                        loss_max=telemetry.format_metric(sweep[-1]["loss"]),
+                        upd_max=telemetry.format_metric(sweep[-1]["update_norm"]),
                     )
 
             if step % args.snapshot_every == 0 or step in protected:

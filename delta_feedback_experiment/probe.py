@@ -32,6 +32,8 @@ def cuda_gate() -> None:
         condition_config,
         iterate_fused,
         linear_cross_entropy,
+        multipass,
+        multipass_loss,
     )
     from .optim import OptimizerPair, build_optimizers
     from .pkda import (
@@ -47,6 +49,7 @@ def cuda_gate() -> None:
         CudaGraphTrainer,
         build_parser,
         build_schedule,
+        automatic_checkpoint,
         clip_gradients,
         evaluate,
         execution_fields,
@@ -433,7 +436,7 @@ def cuda_gate() -> None:
     # Exercise causal FlexAttention and explicit GQA prefix-cache decoding.
     # BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
-    def decode_parity(condition: str, layers: int) -> float:
+    def decode_parity(condition: str, layers: int, **extra) -> float:
         decode_cfg = condition_config(
             condition,
             vocab_size=1000,
@@ -446,6 +449,7 @@ def cuda_gate() -> None:
             pkda_heads=2,
             pkda_head_dim=128,
             max_seq_len=16,
+            **extra,
         )
         torch.manual_seed(0)
         decode_model = DeltaModel(decode_cfg).cuda().eval()
@@ -484,6 +488,10 @@ def cuda_gate() -> None:
 
     plain_decode_rel = decode_parity("", 3)
     hybrid_decode_rel = decode_parity("a", 4)
+    # The loop decodes through one core cache track per iteration.
+    loop_decode_rel = decode_parity(
+        "arfl", 12, loop_iterations=2, loop_max_iterations=2
+    )
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -491,6 +499,109 @@ def cuda_gate() -> None:
     args = build_parser().parse_args(["cuda-probe", "--condition", "arf"])
     schedule = build_schedule(args)
     torch.set_float32_matmul_precision("high")
+
+    def screen_model(condition: str) -> DeltaModel:
+        torch.manual_seed(args.seed)
+        return (
+            DeltaModel(
+                condition_config(
+                    condition,
+                    vocab_size=args.vocab_size,
+                    dim=args.dim,
+                    layers=args.layers,
+                    heads=args.heads,
+                    kv_heads=args.kv_heads,
+                    head_dim=args.head_dim,
+                    intermediate=args.intermediate,
+                    max_seq_len=args.seq_len + 1,
+                    loop_iterations=args.loop_iterations,
+                    loop_max_iterations=args.loop_max_iterations,
+                )
+            )
+            .cuda()
+            .train()
+        )
+
+    # At one iteration the loop is its unlooped condition: the same
+    # parameters, banks, and compiled blocks. One eager two-pass microbatch at
+    # the screen geometry must give the same loss and gradients up to the
+    # head's nondeterministic BF16 accumulation order.
+    parity_rows = torch.randint(
+        0,
+        args.vocab_size,
+        (2, args.seq_len + 1),
+        generator=torch.Generator().manual_seed(23),
+    ).cuda()
+    parity_prefix = torch.full((1, 2), 7, dtype=torch.long, device="cuda")
+    parity: dict[str, tuple[float, torch.Tensor]] = {}
+    for condition, iterations in (("arf", None), ("arfl", 1)):
+        parity_model = screen_model(condition)
+        parity_model.refresh_shadows()
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            parity_outs = multipass(
+                parity_model,
+                parity_rows,
+                2,
+                prefix_lens=parity_prefix,
+                iterations=iterations,
+            )
+            parity_loss, _ = multipass_loss(parity_model, parity_rows, parity_outs)
+        parity_loss.backward()
+        parity[condition] = (
+            parity_loss.item(),
+            torch.cat(
+                [
+                    parameter.grad.detach().flatten().float()
+                    for _, parameter in sorted(parity_model.named_parameters())
+                    if parameter.grad is not None
+                ]
+            ),
+        )
+        del parity_model, parity_outs, parity_loss
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    (flat_loss, flat_grad), (loop_loss, loop_grad) = parity["arf"], parity["arfl"]
+    if not math.isclose(flat_loss, loop_loss, rel_tol=1e-3, abs_tol=1e-3):
+        raise AssertionError(
+            f"arfl at r = 1 drifts from arf: loss {loop_loss} versus {flat_loss}"
+        )
+    if flat_grad.shape != loop_grad.shape:
+        raise AssertionError("arfl at r = 1 has a different gradient surface than arf")
+    loop_grad_rel = relative_error(loop_grad, flat_grad)
+    if loop_grad_rel >= 0.01:
+        raise AssertionError(
+            f"arfl at r = 1 drifts from arf: gradient rel {loop_grad_rel:.4f}"
+        )
+    del parity, flat_grad, loop_grad, parity_rows, parity_prefix
+
+    # The first stage of the loop's memory measurement: one eager one-pass
+    # microbatch at the iteration cap, forward and backward, under the
+    # trainer's own activation policy.
+    torch.cuda.reset_peak_memory_stats()
+    loop_model = screen_model("arfl")
+    loop_model.refresh_shadows()
+    loop_model.grad_checkpoint = automatic_checkpoint(
+        loop_model, 1, args.loop_max_iterations, args, torch.device("cuda")
+    )
+    loop_rows = torch.randint(
+        0,
+        args.vocab_size,
+        (args.micro_rows, args.seq_len + 1),
+        generator=torch.Generator().manual_seed(29),
+    ).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        loop_outs = multipass(
+            loop_model, loop_rows, 1, iterations=args.loop_max_iterations
+        )
+        loop_loss, _ = multipass_loss(loop_model, loop_rows, loop_outs)
+    loop_loss.backward()
+    torch.cuda.synchronize()
+    if not math.isfinite(loop_loss.item()):
+        raise AssertionError("nonfinite arfl loss at the iteration cap")
+    loop_cap_peak = torch.cuda.max_memory_allocated() / 2**30
+    del loop_model, loop_rows, loop_outs, loop_loss
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
 
     class _ProbeValidation:
         def __init__(self):
@@ -688,7 +799,10 @@ def cuda_gate() -> None:
         f"pkda_rel={pkda_value_rel:.4f} | "
         f"conv_rel={conv_rel:.4f} | "
         f"norm_gate_rel={norm_gate_rel:.4f} | "
-        f"decode_rel={plain_decode_rel:.4f}/{hybrid_decode_rel:.4f} | "
+        f"decode_rel={plain_decode_rel:.4f}/{hybrid_decode_rel:.4f}"
+        f"/{loop_decode_rel:.4f} | "
+        f"loop_grad_rel={loop_grad_rel:.4f} | "
+        f"loop_cap_peak={loop_cap_peak:.2f}GiB | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)
     )

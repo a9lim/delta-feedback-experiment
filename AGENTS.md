@@ -9,9 +9,10 @@ clear a gate before it can be used to decide what to try next.
 
 One `DeltaModel` family, addressed by condition letters: `a` makes three of
 every four attention layers PKDA, `r` adds MHDB block-delta reads, `f` adds
-FBT feedback between token columns, and `l` names the tied-depth loop that is
-specified and not built. `--condition arf` is the full built stack;
-the empty condition is the plain decoder. Three full-schedule specimens exist
+FBT feedback between token columns, and `l` makes the middle cell a tied core
+iterated a drawn number of times per column. `--condition arfl` is the full
+built stack and `arf` the flat column; the empty condition is the plain
+decoder. Three full-schedule specimens exist
 on Jobe (`screen-delta-ar-s1`, an `ar` run; `screen-delta-arf-s1-highLR` and
 `screen-delta-arf-s1`, `arf` runs); the current read of what they show is
 in `docs/findings.md`.
@@ -25,7 +26,8 @@ in `docs/findings.md`.
 - [docs/architecture.md](docs/architecture.md): the exact model, state,
   initialization, and optimizer, with the small and the larger geometry.
 - [docs/depth-architecture.md](docs/depth-architecture.md): the `l` letter,
-  the tied-depth loop, specified and unbuilt.
+  the tied-depth loop, and `L`, its shared-cache extension, specified and
+  unbuilt.
 - [docs/interpretability.md](docs/interpretability.md): the analysis scripts,
   what each shows, and the shape of the future study.
 - [docs/findings.md](docs/findings.md): the distilled current picture of the
@@ -51,8 +53,7 @@ change it everywhere at once.
 
 - One `DeltaModel` and `CONDITION_LETTERS` define the family. A condition is the
   canonical string `parse_condition` returns (letters in `arfl` order) and
-  `ModelConfig.condition` renders it back; every subset of `arf` builds and
-  `l` raises until the loop exists. Every dense attention layer is gated NoPE
+  `ModelConfig.condition` renders it back; every subset of `arfl` builds. Every dense attention layer is gated NoPE
   GQA. Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x 3`;
   without `a` it is twelve such layers. The larger geometry in
   `architecture.md` is the same architecture at six cells and width 1,536.
@@ -72,6 +73,13 @@ change it everywhere at once.
   `payload_norm(h_top + route(null, seed, block deltas))`.
 - Feedback passes are causal and differentiable across passes; the payload is
   never detached.
+- Under `l` the first cell is the prelude, the last the coda, and the cell
+  between them one tied core run `r` times per column, `r` drawn once per
+  step from a log-normal Poisson with mean 4 and cap 8. The core's partial is
+  measured from the prelude output across iterations, mixing is same-depth
+  (iteration `i` reads iteration-`i` writes, one decode cache track per
+  iteration), and the payload is the only channel between columns. At `r = 1`
+  a looped condition is its unlooped condition exactly.
 - NorMuonH owns ordinary hidden matrices, initialized `Normal(0, 1/sqrt(d_in))`
   with fixed realized Frobenius radii; NAdam owns gates, embeddings, norms,
   routing parameters, PKDA controls, convolutions, and vectors in one group.
@@ -85,8 +93,9 @@ change it everywhere at once.
   randomness; conditions on the same trunk letter pair every parameter they
   share byte-identically, each letter's private weights from that letter's own
   stream. Two such runs can be compared token by token.
-- A `k`-pass batch costs `k` transformer evaluations. Report pass-tokens
-  beside predicted tokens; equal steps are matched data, not matched compute.
+- A `k`-pass batch costs `k` transformer evaluations, and under `l` a pass
+  executes `2 + r` cells. Report pass-tokens and cell-tokens beside predicted
+  tokens; equal steps are matched data, not matched compute.
 - Pass-1 validation is the common number. Conditions with `f` also report the fused
   number and the self-composition trace.
 - Independently trained runs differ like two seeds even when paired, so a
@@ -101,7 +110,7 @@ change it everywhere at once.
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
   collection outside train/eval graph capture.
-- Snapshots are v24. Only v24 resumes; v16 through v23 stay readable for
+- Snapshots are v25. Only v25 resumes; v16 through v24 stay readable for
   evaluation and forks, and every specimen records its condition as letters.
 - Before touching Jobe, look at `delta status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker

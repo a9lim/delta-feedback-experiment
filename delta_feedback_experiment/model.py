@@ -5,8 +5,8 @@ condition-agnostic model semantics: a condition is a string of letters from
 :data:`CONDITION_LETTERS`, each switching on one :class:`ModelConfig` flag
 over the plain twelve-layer gated NoPE GQA decoder (the empty condition).
 ``a`` replaces three of every four attention layers with PKDA, ``r`` adds MHDB
-reads, ``f`` adds FBT feedback, and ``l`` names the tied-depth loop that is
-specified and not built.
+reads, ``f`` adds FBT feedback, and ``l`` turns the cells between the first
+and last into one tied core that runs a drawn number of times per column.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired conditions
 architecturally identical in everything but the flags.
@@ -79,7 +79,10 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
         "feedback",
         "full-bandwidth feedback: the FBT entry and a payload for the next column",
     ),
-    "l": ("loop", "Huginn loop: the tied-depth core, specified and not built"),
+    "l": (
+        "loop",
+        "Huginn loop: the middle cells become one tied core iterated per column",
+    ),
 }
 """Letter -> (``ModelConfig`` flag, one-line change), in canonical order."""
 
@@ -141,11 +144,29 @@ class ModelConfig:
     """``f``: FBT gated entry plus a payload for the next column."""
 
     loop: bool = False
-    """``l``: the tied-depth core of ``docs/depth-architecture.md``; not built."""
+    """``l``: the cells between the first and last become one tied core that
+    runs ``iterations`` times per column (``docs/depth-architecture.md``)."""
+
+    loop_iterations: int = 4
+    """``l``: mean of the per-step iteration draw, and the fixed count that
+    evaluation and decoding use."""
+
+    loop_max_iterations: int = 8
+    """``l``: cap of the per-step iteration draw."""
 
     def __post_init__(self) -> None:
         if self.routing_block_size < 1:
             raise ValueError("routing block size must be positive")
+        if self.loop_iterations < 1 or self.loop_max_iterations < self.loop_iterations:
+            raise ValueError("loop iterations must satisfy 1 <= mean <= max")
+        if self.loop and (
+            self.layers % self.routing_block_size
+            or self.layers < 3 * self.routing_block_size
+        ):
+            raise ValueError(
+                "l needs whole cells and at least three of them: "
+                "a prelude, a core, and a coda"
+            )
         if self.pkda_heads < 1 or self.pkda_head_dim < 1:
             raise ValueError("PKDA head count and dimension must be positive")
         if self.pkda_conv_size < 1:
@@ -172,7 +193,37 @@ class ModelConfig:
     @property
     def routing_blocks(self) -> int:
         """Number of completed block deltas emitted by a full column."""
+        if self.loop:
+            return 3
         return (self.layers + self.routing_block_size - 1) // self.routing_block_size
+
+    @property
+    def core_layers(self) -> range:
+        """``l``: the tied core, every layer between the first and last cells."""
+        return range(self.routing_block_size, self.layers - self.routing_block_size)
+
+    def is_core_layer(self, layer: int) -> bool:
+        return self.loop and layer in self.core_layers
+
+    def executed_layers(self, iterations: int) -> int:
+        """Layers one column pass evaluates at ``iterations`` core iterations."""
+        if not self.loop:
+            return self.layers
+        return 2 * self.routing_block_size + iterations * len(self.core_layers)
+
+    def resolve_iterations(self, iterations: int | None) -> int:
+        """The core iteration count a column runs; ``None`` is the default."""
+        if not self.loop:
+            if iterations not in (None, 1):
+                raise ValueError("a condition without l runs the core once")
+            return 1
+        if iterations is None:
+            return self.loop_iterations
+        if not 1 <= iterations <= self.loop_max_iterations:
+            raise ValueError(
+                f"iterations {iterations} outside 1..{self.loop_max_iterations}"
+            )
+        return iterations
 
     @property
     def feedback_active(self) -> bool:
@@ -279,14 +330,29 @@ class KVCache:
 
     Only global-attention layers receive KV slots. PKDA layers retain their
     FP32 matrix/preconditioner states and three short-convolution histories.
-    The caller advances the shared position once per column.
+    The caller advances the shared position once per column. Under ``l`` a
+    core layer owns one track per iteration, because iteration ``i`` of a
+    column mixes over the earlier columns' iteration-``i`` writes;
+    ``forward_column`` selects the track through ``iteration`` before each
+    core iteration and every track shares the column position.
     """
 
-    def __init__(self, cfg: ModelConfig, batch: int, device, dtype):
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        batch: int,
+        device,
+        dtype,
+        iterations: int | None = None,
+    ):
         self.cfg = cfg
-        self.global_slots = {
-            layer: slot for slot, layer in enumerate(cfg.global_attention_layers)
-        }
+        self.iterations = cfg.resolve_iterations(iterations)
+        self.iteration = 0
+        self.global_slots: dict[tuple[int, int], int] = {}
+        for layer in cfg.global_attention_layers:
+            tracks = self.iterations if cfg.is_core_layer(layer) else 1
+            for track in range(tracks):
+                self.global_slots[layer, track] = len(self.global_slots)
         # Position-major storage keeps each incoming column's write contiguous.
         shape = (
             len(self.global_slots),
@@ -298,7 +364,7 @@ class KVCache:
         self.k = torch.zeros(shape, device=device, dtype=dtype)
         self.v = torch.zeros(shape, device=device, dtype=dtype)
         self.pkda_states: dict[
-            int,
+            tuple[int, int],
             tuple[
                 Tensor,
                 Tensor,
@@ -307,13 +373,16 @@ class KVCache:
         ] = {}
         self.pos = 0
 
+    def _track(self, layer: int) -> tuple[int, int]:
+        return layer, (self.iteration if self.cfg.is_core_layer(layer) else 0)
+
     def attention_tensors(self, layer: int) -> tuple[Tensor, Tensor]:
-        slot = self.global_slots[layer]
+        slot = self.global_slots[self._track(layer)]
         return self.k[slot], self.v[slot]
 
     def update(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Write k/v [B,T,Hkv,D]; return the full prefix in that layout."""
-        slot = self.global_slots[layer]
+        slot = self.global_slots[self._track(layer)]
         length = k.shape[1]
         self.k[slot, :, self.pos : self.pos + length] = k
         self.v[slot, :, self.pos : self.pos + length] = v
@@ -329,7 +398,7 @@ class KVCache:
         Tensor | None,
         tuple[Tensor, Tensor, Tensor] | None,
     ]:
-        return self.pkda_states.get(layer, (None, None, None))
+        return self.pkda_states.get(self._track(layer), (None, None, None))
 
     def update_pkda(
         self,
@@ -338,13 +407,14 @@ class KVCache:
         a_state: Tensor,
         conv_state: tuple[Tensor, Tensor, Tensor],
     ) -> None:
-        self.pkda_states[layer] = (state, a_state, conv_state)
+        self.pkda_states[self._track(layer)] = (state, a_state, conv_state)
 
     def advance(self, length: int) -> None:
         self.pos += length
 
     def reset(self) -> None:
         self.pos = 0
+        self.iteration = 0
         self.pkda_states.clear()
 
 
@@ -633,7 +703,6 @@ class Block(nn.Module):
         )
         self.mlp = SwiGLU(cfg)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
-        self.has_prior_partial = layer % cfg.routing_block_size != 0
         if cfg.routing_active:
             self.attn_router = Router(cfg)
             self.mlp_router = Router(cfg)
@@ -660,12 +729,13 @@ class Block(nn.Module):
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
         """Returns (h, attn delta, mlp delta, cell delta, attn weights, mlp
         weights). ``block_start`` is the residual at the cell's entry, or None
-        when this block is that entry; the returned cell delta is the next
-        sublayer's partial source or, at the cell boundary, the completed
-        block delta, computed here so it lands inside the compiled block
-        instead of as an eager subtraction. (Passing ``h`` twice would make
-        Dynamo guard the inputs against aliasing, and its recompile-reason
-        logging then evaluates those guards across block instances.)"""
+        when this block opens the cell; with an entry the last source is the
+        cell's partial so far. The returned cell delta is the next sublayer's
+        partial source or, at the cell boundary, the completed block delta,
+        computed here so it lands inside the compiled block instead of as an
+        eager subtraction. (Passing ``h`` twice would make Dynamo guard the
+        inputs against aliasing, and its recompile-reason logging then
+        evaluates those guards across block instances.)"""
         start = h if block_start is None else block_start
         x, w_attn = self._read(h, self.attn_router, sources, want_weights)
         normalized = self.attn_norm(x)
@@ -688,7 +758,7 @@ class Block(nn.Module):
             )
         a = self.branch_scale * mixed
         h = h + a
-        if self.mlp_router is not None and self.has_prior_partial:
+        if self.mlp_router is not None and block_start is not None:
             mlp_sources = (*sources[:-1], sources[-1] + a)
         else:
             mlp_sources = (*sources, a)
@@ -768,6 +838,15 @@ class ColumnOutput:
     n_seeds: int
     """How many leading entries of ``sources`` are seeds, not deltas."""
 
+    iterations: int
+    """Core iterations this column ran; 1 without ``l``."""
+
+    core_entry: Tensor | None
+    """``l``: the residual at core entry, the prelude output [B, T, D]."""
+
+    core_state: Tensor | None
+    """``l``: the residual at core exit after the last iteration [B, T, D]."""
+
 
 _ClassifierShadow = ShadowOperand
 """The tied classifier reads its BF16 shadow through the shared operand.
@@ -783,11 +862,6 @@ class DeltaModel(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        if cfg.loop:
-            raise NotImplementedError(
-                "the l condition (tied-depth loop) is specified in "
-                "docs/depth-architecture.md and not built"
-            )
         self.cfg = cfg
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
@@ -1046,6 +1120,101 @@ class DeltaModel(nn.Module):
 
     # -- one column pass -------------------------------------------------------
 
+    def _run_block(
+        self,
+        block: Block,
+        h: Tensor,
+        entry: Tensor | None,
+        passed: list[Tensor],
+        *,
+        cache: KVCache | None,
+        want_weights: bool,
+        checkpointing: bool,
+        attention_mask,
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+        """One block on the residual ``h``: returns (h, cell delta, attention
+        weights, MLP weights); the weights are None unless requested."""
+        gate_weight = (
+            self.attention_gates[block.global_gate_index].weight
+            if block.global_gate_index is not None
+            else None
+        )
+        block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
+        mask = None if block.is_pkda else attention_mask
+        if checkpointing:
+            h, _a, _m, delta = torch.utils.checkpoint.checkpoint(
+                block_fn if h.is_cuda else _block_for_checkpoint,
+                block,
+                h,
+                entry,
+                gate_weight,
+                mask,
+                *passed,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+            return h, delta, None, None
+        if h.is_cuda and cache is None and not want_weights:
+            h, _a, _m, delta = block_fn(block, h, entry, gate_weight, mask, *passed)
+            return h, delta, None, None
+        h, _a, _m, delta, w_attn, w_mlp = block(
+            h,
+            entry,
+            cache,
+            gate_weight,
+            want_weights,
+            *passed,
+            attention_mask=mask,
+        )
+        return h, delta, w_attn, w_mlp
+
+    def _run_cell(
+        self,
+        blocks: Iterable[Block],
+        h: Tensor,
+        cell: int,
+        sources: list[Tensor] | None,
+        names: list[str],
+        *,
+        entry: Tensor | None = None,
+        partial: Tensor | None = None,
+        label: str = "",
+        weights_out: dict[str, Tensor],
+        route_source_names: dict[str, tuple[str, ...]],
+        **runtime,
+    ) -> tuple[Tensor, Tensor]:
+        """Run ``blocks`` as routing cell ``cell``; return (h, cell delta).
+
+        Without ``entry`` the first block opens the cell and measures from its
+        own input. With it the blocks continue a cell already under way:
+        ``entry`` is that cell's entry residual and ``partial`` the progress
+        made so far, the first block's partial source. ``label`` tags the
+        recorded route sites so a tied core's iterations stay distinct.
+        """
+        cell_start = h if entry is None else entry
+        for index, block in enumerate(blocks):
+            opens = entry is None and index == 0
+            passed = list(sources) if sources is not None else []
+            passed_names = list(names)
+            if sources is not None and not opens:
+                passed.append(partial)
+                passed_names.append(f"partial{cell}")
+            h, partial, w_attn, w_mlp = self._run_block(
+                block, h, None if opens else cell_start, passed, **runtime
+            )
+            if w_attn is not None:
+                site = f"L{block.layer}{label}.attn"
+                weights_out[site] = w_attn
+                route_source_names[site] = ("null", *passed_names)
+            if w_mlp is not None:
+                site = f"L{block.layer}{label}.mlp"
+                weights_out[site] = w_mlp
+                mlp_names = (
+                    [*passed_names, f"partial{cell}"] if opens else passed_names
+                )
+                route_source_names[site] = ("null", *mlp_names)
+        return h, partial
+
     def forward_column(
         self,
         x: Tensor,
@@ -1053,15 +1222,26 @@ class DeltaModel(nn.Module):
         cache: KVCache | None = None,
         want_weights: bool = False,
         need_payload: bool = True,
+        iterations: int | None = None,
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
         ``x`` is the actual column input: plain embeddings on pass 1 and
         Standard decoding, or the fused FBT input on feedback passes. With a
         cache, positions start at ``cache.pos`` and every mixer cache advances
-        by ``T`` exactly once.
+        by ``T`` exactly once. ``iterations`` is the core iteration count
+        under ``l``; the default is the configured mean, or the count the
+        cache was allocated for.
         """
         cfg = self.cfg
+        if cache is not None:
+            if iterations is not None and iterations != cache.iterations:
+                raise ValueError(
+                    f"the cache holds {cache.iterations} iteration tracks, "
+                    f"not {iterations}"
+                )
+            iterations = cache.iterations
+        iterations = cfg.resolve_iterations(iterations)
         # Mask construction belongs outside fullgraph block compilation. The
         # same immutable geometry is reused by all global layers and passes.
         attention_mask = (
@@ -1077,7 +1257,6 @@ class DeltaModel(nn.Module):
             source_names.append("seed")
         seeds = len(sources) if sources is not None else 0
 
-        h = x
         weights_out: dict[str, Tensor] = {}
         route_source_names: dict[str, tuple[str, ...]] = {}
         checkpointing = (
@@ -1087,73 +1266,61 @@ class DeltaModel(nn.Module):
             and cache is None
             and not want_weights
         )
-        block_start = h
-        # The residual's distance from the cell entry, produced by each block
-        # for the next sublayer's partial source and the cell's completed delta.
-        delta: Tensor | None = None
-        for block in self.blocks:
-            block_index = block.layer // cfg.routing_block_size
-            block_offset = block.layer % cfg.routing_block_size
-            if block_offset == 0:
-                block_start = h
-            # A cell-entry block measures its delta from its own input.
-            entry = None if block_offset == 0 else block_start
-            passed_sources = list(sources) if sources is not None else []
-            passed_names = list(source_names)
-            if sources is not None and block_offset:
-                passed_sources.append(delta)
-                passed_names.append(f"partial{block_index}")
-            passed = tuple(passed_sources)
-            gate_weight = (
-                self.attention_gates[block.global_gate_index].weight
-                if block.global_gate_index is not None
-                else None
-            )
-            block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
-            mask = None if block.is_pkda else attention_mask
-            if checkpointing:
-                h, _a, _m, delta = torch.utils.checkpoint.checkpoint(
-                    block_fn if h.is_cuda else _block_for_checkpoint,
-                    block,
-                    h,
-                    entry,
-                    gate_weight,
-                    mask,
-                    *passed,
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            elif h.is_cuda and cache is None and not want_weights:
-                h, _a, _m, delta = block_fn(block, h, entry, gate_weight, mask, *passed)
-            else:
-                h, _a, _m, delta, w_attn, w_mlp = block(
-                    h,
-                    entry,
-                    cache,
-                    gate_weight,
-                    want_weights,
-                    *passed,
-                    attention_mask=mask,
-                )
-                if w_attn is not None:
-                    site = f"L{block.layer}.attn"
-                    weights_out[site] = w_attn
-                    route_source_names[site] = ("null", *passed_names)
-                if w_mlp is not None:
-                    site = f"L{block.layer}.mlp"
-                    weights_out[site] = w_mlp
-                    mlp_names = (
-                        passed_names
-                        if block.has_prior_partial
-                        else [*passed_names, f"partial{block_index}"]
-                    )
-                    route_source_names[site] = ("null", *mlp_names)
-            if sources is not None and (
-                block_offset == cfg.routing_block_size - 1
-                or block.layer == cfg.layers - 1
-            ):
+        runtime = dict(
+            cache=cache,
+            want_weights=want_weights,
+            checkpointing=checkpointing,
+            attention_mask=attention_mask,
+            weights_out=weights_out,
+            route_source_names=route_source_names,
+        )
+
+        def complete(delta: Tensor, cell: int) -> None:
+            if sources is not None:
                 sources.append(delta)
-                source_names.append(f"block{block_index}")
+                source_names.append(f"block{cell}")
+
+        h = x
+        size = cfg.routing_block_size
+        core_entry = core_state = None
+        if cfg.loop:
+            # Prelude, tied core, coda: three cells, the core one cell of
+            # ``iterations x core layers`` whose partial accumulates from the
+            # prelude output across iterations. An iteration boundary is a
+            # boundary in weights, not in state.
+            prelude = self.blocks[:size]
+            core = self.blocks[size : cfg.layers - size]
+            coda = self.blocks[cfg.layers - size :]
+            h, delta = self._run_cell(prelude, h, 0, sources, source_names, **runtime)
+            complete(delta, 0)
+            core_entry = h
+            for iteration in range(iterations):
+                if cache is not None:
+                    cache.iteration = iteration
+                h, delta = self._run_cell(
+                    core,
+                    h,
+                    1,
+                    sources,
+                    source_names,
+                    entry=None if iteration == 0 else core_entry,
+                    partial=None if iteration == 0 else delta,
+                    label=f"i{iteration}",
+                    **runtime,
+                )
+            if cache is not None:
+                cache.iteration = 0
+            core_state = h
+            complete(delta, 1)
+            h, delta = self._run_cell(coda, h, 2, sources, source_names, **runtime)
+            complete(delta, 2)
+        else:
+            for cell in range(cfg.routing_blocks):
+                blocks = self.blocks[cell * size : (cell + 1) * size]
+                h, delta = self._run_cell(
+                    blocks, h, cell, sources, source_names, **runtime
+                )
+                complete(delta, cell)
         if cache is not None:
             cache.advance(x.shape[1])
 
@@ -1184,6 +1351,9 @@ class DeltaModel(nn.Module):
             sources=sources,
             source_names=tuple(source_names),
             n_seeds=seeds,
+            iterations=iterations,
+            core_entry=core_entry,
+            core_state=core_state,
         )
 
     # -- sequential decoding ---------------------------------------------------
@@ -1222,6 +1392,7 @@ def multipass(
     prefix_lens: Tensor | None = None,
     jitter: Tensor | None = None,
     want_weights: bool = False,
+    iterations: int | None = None,
 ) -> list[ColumnOutput]:
     """The condition-agnostic Jacobi multi-pass forward.
 
@@ -1235,14 +1406,18 @@ def multipass(
     payload before shifting, so the keyed draw is independent of how many
     positions execute.  Both are pre-drawn by the caller — the shared
     randomness contract lives in the trainer, not here.  Conditions
-    without ``f`` simply take n_passes=1.
+    without ``f`` simply take n_passes=1.  ``iterations`` is the step's core
+    iteration count under ``l``, shared by every pass.
     """
     cfg = model.cfg
     if n_passes > 1 and not cfg.feedback_active:
         raise ValueError("multi-pass batches require a condition with f")
     e = model.embed_tokens(tokens[:, :-1])
     out = model.forward_column(
-        e, want_weights=want_weights, need_payload=n_passes > 1 or want_weights
+        e,
+        want_weights=want_weights,
+        need_payload=n_passes > 1 or want_weights,
+        iterations=iterations,
     )
     outs = [out]
     if n_passes == 1:
@@ -1261,6 +1436,7 @@ def multipass(
             torch.where(plain[..., None], e, fused),
             want_weights=want_weights,
             need_payload=i < n_passes - 2 or want_weights,
+            iterations=iterations,
         )
         outs.append(out)
     return outs
@@ -1476,9 +1652,22 @@ def multipass_loss(
     return total, losses
 
 
+def _monitor_autocast(tokens: Tensor):
+    # The monitors are part of the standing training loop, so CUDA follows
+    # the same BF16 activation path as captured training and evaluation, which
+    # preserves the numerical contract and reuses the captured block
+    # specializations instead of compiling a second set.
+    if tokens.is_cuda:
+        return torch.autocast("cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
 @torch.no_grad()
 def iterate_fused(
-    model: DeltaModel, tokens: Tensor, n_iters: int
+    model: DeltaModel,
+    tokens: Tensor,
+    n_iters: int,
+    iterations: int | None = None,
 ) -> list[dict[str, float]]:
     """The contraction diagnostic: iterated fully-fused prefill passes.
 
@@ -1486,34 +1675,85 @@ def iterate_fused(
     fused) and reports per-iteration validation loss and the update size
     ||h(k) − h(k−1)|| (FBT Fig. 3).  Decaying update norms and flat loss
     are the contraction signature; oscillation or rising loss means the
-    map diverges under self-composition.
+    map diverges under self-composition.  Every pass runs ``iterations``
+    core iterations under ``l`` (default: the configured mean).
     """
     cfg = model.cfg
     if not cfg.feedback_active:
         raise ValueError("the contraction diagnostic needs a condition with f")
-    # This is part of the standing training monitor, so CUDA must follow the
-    # same BF16 activation path as captured training and evaluation, which
-    # preserves the numerical contract and reuses the captured block
-    # specializations instead of compiling a second set.
-    autocast = (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if tokens.is_cuda
-        else contextlib.nullcontext()
-    )
-    with autocast:
+    with _monitor_autocast(tokens):
         e = model.embed_tokens(tokens[:, :-1])
         batch, length = e.shape[:2]
         positions = torch.arange(length, device=tokens.device)
         plain = (positions[None, :] < 1).expand(batch, -1)
 
-        out = model.forward_column(e)
+        out = model.forward_column(e, iterations=iterations)
         records = []
         for _ in range(n_iters):
             previous = out.h_top
             p_shifted = shift_right(out.payload)
             fused = model.fuse(p_shifted, e)
-            out = model.forward_column(torch.where(plain[..., None], e, fused))
+            out = model.forward_column(
+                torch.where(plain[..., None], e, fused), iterations=iterations
+            )
             loss, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
             delta = (out.h_top - previous).float().norm(dim=-1).mean()
             records.append({"loss": loss.item(), "update_norm": delta.item()})
+    return records
+
+
+@torch.no_grad()
+def depth_trace(
+    model: DeltaModel,
+    tokens: Tensor,
+    iterations: int | None = None,
+    *,
+    fused: bool = False,
+) -> list[dict[str, float]]:
+    """The loop's fixed-``r`` sweep: loss and core update size per iteration.
+
+    Runs the column at every iteration count from 1 to ``iterations``
+    (default: the configured cap) and reports the held-out loss with the coda
+    applied after that many iterations, plus ``mean_token ||core_state(r) -
+    core_state(r-1)||_2``, the size of iteration ``r``'s update; at ``r = 1``
+    the update is measured from the core entry.  Under same-depth mixing the
+    state after iteration ``i`` does not depend on how many iterations follow,
+    so on plain positions the sweep is one trajectory read out after every
+    iteration.  With ``fused`` the column is a second pass with plain-prefix
+    length 1 whose payload comes from a first pass at the same count.
+    """
+    cfg = model.cfg
+    if not cfg.loop:
+        raise ValueError("the depth trace needs a condition with l")
+    if fused and not cfg.feedback_active:
+        raise ValueError("a fused depth trace needs a condition with f")
+    if iterations is None:
+        iterations = cfg.loop_max_iterations
+    with _monitor_autocast(tokens):
+        e = model.embed_tokens(tokens[:, :-1])
+        targets = tokens[:, 1:]
+        batch, length = e.shape[:2]
+        positions = torch.arange(length, device=tokens.device)
+        plain = (positions[None, :] < 1).expand(batch, -1)
+        records = []
+        previous = None
+        for depth in range(1, iterations + 1):
+            x = e
+            if fused:
+                first = model.forward_column(e, iterations=depth)
+                x = torch.where(
+                    plain[..., None], e, model.fuse(shift_right(first.payload), e)
+                )
+            out = model.forward_column(x, need_payload=False, iterations=depth)
+            loss, _ = sequence_ce(model, out.h_top, targets)
+            reference = out.core_entry if previous is None else previous
+            update = (out.core_state - reference).float().norm(dim=-1).mean()
+            previous = out.core_state
+            records.append(
+                {
+                    "iterations": depth,
+                    "loss": loss.item(),
+                    "update_norm": update.item(),
+                }
+            )
     return records

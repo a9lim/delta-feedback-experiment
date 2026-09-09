@@ -16,7 +16,7 @@ which one it is indexed by.
 |---|---|---|
 | Token-mixer memory | PKDA matrix, diagonal preconditioner, and convolution history advance along tokens; GQA retains prefix K/V | Every condition with `a`, whether or not it has `f` |
 | Latent feedback | FBT transfers the previous column's payload through the current token's gate | Every condition with `f`; Jacobi passes train it in parallel |
-| Tied depth | A shared core repeatedly updates one column's residual state | The `l` letter, specified and not built |
+| Tied depth | A shared core repeatedly updates one column's residual state; iteration `i` mixes over earlier columns' iteration-`i` writes | Every condition with `l` |
 
 In repeated-prefill diagnostics each pass recomputes its mixer states from
 zero and consumes the preceding pass's shifted payload. In sequential feedback
@@ -39,6 +39,7 @@ across generated tokens. The two execution modes can behave differently.
 | `scripts/downstream_eval.py` | The workspace zero-shot suite in Standard, Soft, or Fused mode, with per-document records for paired comparison | Soft feeds back only along the scored continuation |
 | `scripts/training_curves.py`, `scripts/analysis_figures.py` | Figures from run logs and from the JSON records above | Rendering only |
 | `iterate_fused` | Per-iteration held-out loss and mean top-state update norm on fixed tokens | Payload-only repeated prefill |
+| `depth_trace`, `scripts/depth_trace.py` | Loss after each core iteration count, the size of each iteration's update, and the core routers' source mass by iteration | Fixed-`r` sweep; on plain positions one trajectory read out after every iteration |
 | Trainer telemetry / `delta watch` | Training health, validation, routing summaries, recurrent dynamics | Operational |
 | `delta probe` and portable semantics | Numerical, causal, gradient, cache, and execution invariants | Engineering |
 
@@ -101,9 +102,10 @@ and task behavior separate some of these; interventions separate the rest.
 The fixed-token self-composition trace is the first diagnostic; perturbation
 propagation, recovery, and dependence on history are natural follow-ons.
 
-The `l` letter adds iteration-indexed states and a shared core cache. Its
-two-channel sequence trace advances both the payload and the write bank, so
-the current payload-only trace does not test its dynamics. See
+The `l` letter adds iteration-indexed states; the depth trace is its
+within-column diagnostic, and the payload trace still tests its horizontal
+channel at fixed `r`. The `L` letter would add a shared core cache whose
+two-channel sequence trace advances both the payload and the write bank; see
 [depth-architecture.md](depth-architecture.md).
 
 ## The study the organism is for

@@ -58,8 +58,9 @@ analysis. CUDA training uses the same equations through the following path:
 - Workspace cut-cross-entropy with BF16 operands, capture-safe preprocessing,
   differentiable log-partition for z-loss, ascending mean-logit vocabulary
   tiling, and backward filtering equivalent to its late-filter decision.
-- Fixed-shape Inductor tuning; one train graph per reachable pass count and
-  shared-pool no-grad validation graphs. Cyclic Python garbage is collected
+- Fixed-shape Inductor tuning; one train graph per reachable (pass count,
+  core iteration count) pair and shared-pool no-grad validation graphs at the
+  evaluation count. Cyclic Python garbage is collected
   before capture and automatic collection is suspended through capture entry,
   body, and exit, restoring the caller's setting even on exceptions.
 - One pinned host batch and one device batch per update. An event fences host

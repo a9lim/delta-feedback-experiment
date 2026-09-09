@@ -65,6 +65,8 @@ delta queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
   --data-dir /data/delta/tokens
 delta queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
   --data-dir /data/delta/tokens
+delta queue example-arfl-s1 --condition arfl --seed 1 --data-seed 0 \
+  --data-dir /data/delta/tokens
 
 # Inspect and control the detached queue.
 delta status
@@ -88,15 +90,17 @@ The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024
 predictions per row: 3,520,921,600 predicted tokens. Linear warmup occupies the
 first 2% of updates and the `1 - sqrt(u)` cooldown occupies the final 20%.
 Feedback starts independently at three quarters of the schedule; conditions
-with `f` draw two or three passes on every later step. Every condition sees the
-same addressed token rows; conditions with `f` also share deterministic pass,
-prefix, and jitter streams. The global FP32 gradient is clipped to norm 10.0 before the shared
+with `f` draw two or three passes on every later step. Conditions with `l`
+draw the core iteration count once per step, mean 4 and cap 8, and log it as
+`r`. Every condition sees the same addressed token rows; conditions with `f`
+also share deterministic pass, prefix, and jitter streams, and the iteration
+draw is its own stream. The global FP32 gradient is clipped to norm 10.0 before the shared
 NorMuonH/NAdam update. NorMuonH uses a `6e-3` stable rate; every NAdam-owned
 parameter, including the tied embedding/readout, uses `3e-4`. Both sides apply
 their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v24, and only v24 is resumable. V16–v23
+Snapshots use checkpoint contract v25, and only v25 is resumable. V16–v24
 remain readable for evaluation and forks. Protected snapshots persist at the
 cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
 limits the current invocation without changing the schedule.
@@ -120,6 +124,10 @@ python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens --
 # Fused pass against pass 1 on one feedback snapshot: position, surprise, and
 # frequency structure, gate and seed statistics, self-composition.
 python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+
+# Loop depth trace (l): loss after each iteration count, core update sizes,
+# and core router mass by iteration, plain and fused.
+python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
 
 # Entry interventions: gate temperature, seed scale, embedding bypass,
 # zero or foreign payload.

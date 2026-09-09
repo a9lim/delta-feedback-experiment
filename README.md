@@ -15,7 +15,7 @@ rest of the docs describe what the code does today.
 
 ## What we are growing
 
-The model is a decoder with three kinds of recurrence available to it:
+The model is a decoder with four kinds of recurrence available to it:
 
 - **Token-mixer memory.** Preconditioned Kimi Delta Attention (PKDA) layers
   carry a recurrent matrix state along the token axis; every fourth layer is a
@@ -27,6 +27,9 @@ The model is a decoder with three kinds of recurrence available to it:
 - **Depth routing.** Multi-Head Delta Block routing (MHDB) lets every sublayer
   read the column seed and the completed four-layer block deltas, and lets the
   outgoing payload be a routed mixture of them instead of just the top state.
+- **Tied depth.** Under `l` the middle cell is one weight-tied core that runs
+  a drawn number of times per column, so a column can refine its state before
+  it emits a payload.
 
 ```text
 previous token's latent payload + current token embedding
@@ -51,11 +54,11 @@ initializations and compared:
 | `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA]` cells |
 | `r` | MHDB residual reads of the seed and block deltas before every sublayer; with `f`, a routed payload |
 | `f` | Full-bandwidth feedback: the FBT entry and a payload for the next column |
-| `l` | Huginn loop: a tied-depth core, [specified](docs/depth-architecture.md) and not built |
+| `l` | Huginn loop: the middle cell becomes a tied core iterated a drawn number of times per column ([depth-architecture.md](docs/depth-architecture.md)) |
 
-`--condition arf` is the full built stack; `ar` and `af` each drop one
-package; `a` is the bare hybrid trunk; the empty condition is the plain
-decoder. The [architecture page](docs/architecture.md) has the exact
+`--condition arfl` is the full built stack and `arf` the flat column; `ar`
+and `af` each drop one package; `a` is the bare hybrid trunk; the empty
+condition is the plain decoder. The [architecture page](docs/architecture.md) has the exact
 equations, geometry, and optimizer.
 
 ## What "ready" looks like
@@ -94,10 +97,9 @@ Directions on the bench, none decided:
 - Redesign the entry so the previous column's state lands somewhere the
   current column cannot simply cancel, for example at a core entry rather than
   the seed.
-- Build the `l` letter, the tied core in
-  [depth-architecture.md](docs/depth-architecture.md), so computation can
-  refine within a column and persist across columns through two trained
-  channels.
+- Train the first `arfl` specimen, now that the tied core of
+  [depth-architecture.md](docs/depth-architecture.md) is built, and see
+  whether within-column refinement changes what the payload carries.
 - Separate a persistent state stream from a read-only prediction stream, the
   Free Pause Tokens idea assessed in [literature](docs/literature.md).
 - Give the model a task that needs the channel, rather than hoping FineWeb

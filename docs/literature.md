@@ -17,7 +17,7 @@ those roles to the organism.
 | Multi-head and Delta Attention Residuals | Grouped source selection and additive delta-source semantics | Addressable seed and block contributions, with a residual reconstruction identity |
 | Attention Residuals | Cumulative-state routing comparison | Clarifies how additive delta routing differs from replacing the residual read |
 | NorMuon / Hyperball / NAdam implementation | Matrix update direction, fixed realized radii, and semantic-scale optimization | A fixed training recipe across controls, with explicit parameter ownership |
-| Recurrent-depth language models | Prelude/tied-core/coda, iteration draw, and shared-cache ideas for the `l` letter | An iteration axis, `l`, specified and not built |
+| Recurrent-depth language models | Prelude/tied-core/coda and the iteration draw for the `l` letter; zero-shot cache sharing as the trained `L` channel | An iteration axis, `l`, built; `L` specified |
 | Free Pause Tokens | Design comparison: separate persistent state from a read-only prediction stream | A candidate way to separate memory from prediction; assessed below |
 
 The local synthesis choices include the PKDA/GQA composition, four-layer MHDB
@@ -68,8 +68,8 @@ Huginn supplies repeated application of a tied core before readout. Free Pause
 Tokens supplies a second stream alongside a fixed-depth backbone. Weight
 sharing between streams does not itself introduce depth recurrence. Our loop
 already replaces much of Huginn: MHDB input injection, deterministic prelude
-initialization, full backpropagation, PKDA/GQA, and trained FBT/cache channels
-are local choices. This is a decision about computational structure, not a
+initialization, full backpropagation, PKDA/GQA, and the trained FBT payload
+are local choices; the shared cache is the unbuilt `L`. This is a decision about computational structure, not a
 choice between loading two pretrained models.
 
 For the specified question of how iterated computation persists across tokens,
@@ -124,7 +124,7 @@ would combine the paper's separation with Huginn-style iteration and simplify
 which stream can write memory, but it changes the loop's scientific object:
 refinement would not reach later tokens through a latent payload. Conversely,
 letting the state core iterate and adding a prediction reader preserves carried
-refinement but retains the current loop's cache complexity and adds compute.
+refinement but adds compute and, under `L`, the cache complexity.
 Neither alternative inherits the paper's loss or latency results. For Jobe,
 measure prefill, decode across batch sizes, full backward memory, and captured
 execution before calling either cheaper.

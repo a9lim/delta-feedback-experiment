@@ -13,6 +13,7 @@ from the snapshots and logs; the commands are in
 | `weights-<A>-vs-<B>/` | `scripts/weight_divergence.py` | Angular movement of shared parameters |
 | `curves-<A>-vs-<B>/` | `scripts/training_curves.py` | Paired validation and training curves, matched compute, routing and contraction monitors |
 | `downstream-<tag>/` | `scripts/downstream_eval.py` | Zero-shot task records per mode, with paired comparisons beside them |
+| `depth-<tag>/` | `scripts/depth_trace.py` | Loss and core update size by iteration count, plain and fused, and core router mass by iteration |
 
 Anything meant to survive a regeneration, such as an architecture diagram,
 goes under `figures/architectures/`, which is tracked.

@@ -20,9 +20,9 @@ back.
 | `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA] x 3` | `hybrid` |
 | `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
 | `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
-| `l` | Huginn loop: the tied-depth core of [depth-architecture.md](depth-architecture.md); specified, not built | `loop` |
+| `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([depth-architecture.md](depth-architecture.md)) | `loop` |
 
-Every subset of `arf` builds. At the screen geometry:
+Every subset of `arfl` builds. At the screen geometry:
 
 | Condition | Parameters | Active non-embedding |
 |---|---:|---:|
@@ -34,12 +34,15 @@ Every subset of `arf` builds. At the screen geometry:
 | `ar` | 256,330,536 | 139,643,688 |
 | `af` | 257,457,192 | 140,770,344 |
 | `arf` | 257,514,792 | 140,827,944 |
+| `arfl` | 257,514,792 | 140,827,944 |
 
-`arf` is the full built stack. `a` alone already has recurrent mixer memory.
-`r` without `f` seeds from the plain embedding and emits no payload; `f`
-without `r` emits `payload_norm(h_top)`; `r` with `f` uses the fused seed as a
-routing source and enriches the payload with routed sources. The specimens so
-far are `ar` and `arf` runs.
+`arfl` is the full built stack and `arf` the flat column. `a` alone already
+has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
+emits no payload; `f` without `r` emits `payload_norm(h_top)`; `r` with `f`
+uses the fused seed as a routing source and enriches the payload with routed
+sources. `l` adds no parameters: it holds the first and last cells and runs
+the cell between them as one tied core, so every looped condition has its
+unlooped condition's counts. The specimens so far are `ar` and `arf` runs.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every
 parameter they share byte-identically for a given seed: the trunk from the
@@ -49,11 +52,13 @@ one; routers initialize to zero. The plain trunk and the
 `a` trunk consume the common stream differently, so parameters do not pair
 across `a`. Two conditions trained with the same seed and data seed therefore
 see the same rows in the same order with the same keyed feedback draws, and
-can be compared token by token.
+can be compared token by token. A looped condition pairs with its unlooped
+one the same way: the iteration draw is its own keyed sub-stream, so `arfl`
+and `arf` share every pass, prefix, and jitter draw.
 
-`l` is reserved: it parses, `ModelConfig.loop` records it, and `DeltaModel`
-refuses to build it until the loop exists. At one core iteration `arfl` is
-exactly `arf`.
+`l` needs whole cells and at least three of them. At one core iteration
+`arfl` is exactly `arf`: the same layers, parameters, banks, routes, losses,
+and gradients.
 
 ## Geometry
 
@@ -77,6 +82,9 @@ The trunk is twelve gated NoPE GQA layers; under `a` it is:
 | PKDA convolution width | 4 |
 | Routing groups | 4, the KV-head count |
 | RMSNorm epsilon | `1e-6` everywhere, including PKDA output |
+
+Under `l` the first of those cells is the prelude, the last the coda, and the
+one between them the tied core, run `r` times per column.
 
 Relative to the larger geometry in `architecture.md`, the screen halves the
 residual, SwiGLU, and PKDA projection widths (`768 / 3,328 / 1,280` against
@@ -157,6 +165,16 @@ K > 1:  loss = ell_1 + mean(ell_2, ..., ell_K)
 During cooldown the same combination applies to the squared log-partition
 penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 
+### Core iterations
+
+Conditions with `l` draw the core iteration count `r` once per step from the
+recurrent-depth log-normal Poisson draw with mean `r_mean = 4` and cap
+`r_max = 8`, `E[r] = 3.88` under the cap, shared by every pass and microbatch
+of the step; the draw is its own keyed sub-stream. A pass at `r` iterations
+executes `2 + r` cells, so a `k`-pass batch costs `k (2 + r)` cell evaluations
+per predicted token. The trainer logs the realized `r` and reports
+cell-tokens beside pass-tokens.
+
 ### Schedule
 
 Both parameter groups share one warmup-stable-cooldown multiplier. Warmup
@@ -191,17 +209,18 @@ parameter with `a`, 30.7–31.1 without.
 | `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the two group learning rates |
 | `--feedback-start` | 0.75 | fraction of the schedule before the feedback boundary; 0 trains fused from step 0 |
 | `--three-pass` | 0.12 | probability of three passes after the boundary; 1 makes every feedback step three-pass |
+| `--loop-iterations`, `--loop-max-iterations` | 4, 8 | `l`: mean and cap of the per-step core iteration draw; the mean is also the fixed evaluation and decode count |
 | `--jitter` | 0.02 | payload jitter half-width |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v23 snapshot |
+| `--resume` | | continues a tag from its latest v25 snapshot |
 
 The specimens so far used the default recipe (`ar`) and
 `--feedback-start 0 --three-pass 1` (`arf`); see [findings.md](findings.md).
 
 ### Checkpoints and queue
 
-Snapshots use checkpoint contract v24, and only v24 resumes; v16 through v23
+Snapshots use checkpoint contract v25, and only v25 resumes; v16 through v24
 stay readable for evaluation and forks. Every snapshot records its condition
 as letters. A snapshot holds the model, both
 optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
@@ -221,7 +240,8 @@ an active child, and the worker refreshes before the next job.
 
 Every evaluation point reports pass-1 held-out cross-entropy as `val`.
 Conditions with `f` also report `val_fused`, a second pass with plain-prefix
-length 1. Decoding has three modes:
+length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
+Decoding has three modes, each at one fixed `r` under `l`:
 
 - **Standard:** one plain prompt prefill, no feedback during decode.
 - **Soft:** one plain prefill, then one feedback transition per generated
@@ -240,9 +260,10 @@ I = G_arf - G_ar - G_af = L_ar + L_af - L_arf - L_a
 
 Positive `I` is superadditive loss reduction. Computed on paired checkpoints
 by mode; writing `plain` for the empty condition, `L_plain - L_a` is the
-whole-trunk contrast. Report parameters, predicted tokens, and pass-tokens
-with every number; a matched-compute view compares at equal cumulative
-pass-tokens. The full two-seed screen over the `a` conditions and the plain
+whole-trunk contrast. Report parameters, predicted tokens, pass-tokens, and
+cell-tokens with every number; a matched-compute view compares at equal
+cumulative cell-tokens, since a loop pass is deeper than a flat one.
+`L_arf - L_arfl` at equal steps is the loop's matched-data contrast. The full two-seed screen over the `a` conditions and the plain
 decoder is the natural complete comparison and has not been run; it is one
 option among several for what to train next, not a prerequisite.
 
@@ -264,6 +285,12 @@ tokens with plain-prefix length 1 and records loss and
 `mean_token ||h_top^(k) - h_top^(k-1)||_2` per iteration. Mixer caches reset
 within each prefill; only the shifted payload passes between iterations. The
 training monitor runs eight iterations; the analysis scripts run thirty.
+Under `l` the trace runs at `r = r_mean`.
+
+For conditions with `l`, `depth_trace` sweeps the fixed iteration count from
+1 to `r_max` and records the held-out loss after each count and the size of
+each iteration's core update; the trainer logs it as the `depth` record and
+`scripts/depth_trace.py` runs it on a snapshot.
 
 ### Routing and interventions
 

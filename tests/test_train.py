@@ -47,6 +47,7 @@ from delta_feedback_experiment.train import (
     build_parser,
     build_schedule,
     clip_gradients,
+    draw_iterations,
     draw_passes,
     feedback_boundary,
     mix,
@@ -301,8 +302,8 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 24
-    assert CONTRACT.resumable == frozenset({24})
+    assert CONTRACT.version == 25
+    assert CONTRACT.resumable == frozenset({25})
     assert CONTRACT.surface_version == 16
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
@@ -419,13 +420,15 @@ def test_route_summary_reports_universal_nulls_and_payload_seed():
             return rows.to(device) if device is not None else rows
 
     args = SimpleNamespace(eval_rows=2)
-    for condition in ("ar", "arf"):
+    for condition in ("ar", "arf", "arfl"):
         model = DeltaModel(
             condition_config(
                 condition,
                 vocab_size=97,
                 dim=32,
-                layers=2,
+                layers=12 if "l" in condition else 2,
+                loop_iterations=2,
+                loop_max_iterations=2,
                 heads=2,
                 kv_heads=2,
                 head_dim=16,
@@ -615,6 +618,26 @@ def test_pass_mixture_fractions():
     assert mean_passes == pytest.approx(1.28, abs=0.03)
 
 
+def test_iteration_draw_statistics():
+    """The recurrent-depth log-normal Poisson draw, rate shifted by one and
+    capped: at the screen defaults E[r] = 3.88, median 4, P(r = 1) = 10.3%,
+    P(r = 8) = 8.0%. Its sub-stream leaves the pass draw untouched."""
+    args = build_parser().parse_args(["x"])
+    assert (args.loop_iterations, args.loop_max_iterations) == (4, 8)
+    draws = [draw_iterations(args, step, True) for step in range(1, 20001)]
+    assert min(draws) == 1 and max(draws) == 8
+    assert sum(draws) / len(draws) == pytest.approx(3.88, abs=0.05)
+    assert sorted(draws)[len(draws) // 2] == 4
+    assert draws.count(1) / len(draws) == pytest.approx(0.103, abs=0.01)
+    assert draws.count(8) / len(draws) == pytest.approx(0.080, abs=0.01)
+    assert draws[:8] == [draw_iterations(args, step, True) for step in range(1, 9)]
+    assert all(draw_iterations(args, step, False) == 1 for step in range(1, 50))
+    args.loop_iterations = 1
+    assert all(draw_iterations(args, step, True) == 1 for step in range(1, 50))
+    args.loop_iterations, args.loop_max_iterations = 4, 3
+    assert max(draw_iterations(args, step, True) for step in range(1, 500)) == 3
+
+
 # -- end-to-end ----------------------------------------------------------------
 
 
@@ -635,14 +658,22 @@ def run(tmp_path, tag, extra):
     )
 
 
+LOOP_ARGS = ["--layers", "12", "--loop-iterations", "2", "--loop-max-iterations", "3"]
+"""The tiny loop geometry: three whole cells and a small draw."""
+
+
+def condition_args(condition: str) -> list[str]:
+    return ["--condition", condition, *(LOOP_ARGS if "l" in condition else [])]
+
+
 @pytest.mark.parametrize(
     "condition",
-    ["", "a", "r", "f", "ar", "af", "rf", "arf"],
+    ["", "a", "r", "f", "ar", "af", "rf", "arf", "l", "arl", "afl", "arfl"],
     ids=lambda condition: condition or "plain",
 )
 def test_tiny_run_completes(tmp_path, capsys, condition):
     tag = f"t-{condition or 'plain'}"
-    summary = run(tmp_path, tag, ["--condition", condition])
+    summary = run(tmp_path, tag, condition_args(condition))
     assert summary["step"] == 8
     assert np.isfinite(summary["loss"])
     assert np.isfinite(summary["val"])
@@ -661,13 +692,17 @@ def test_tiny_run_completes(tmp_path, capsys, condition):
     assert all("lr_nadam=" in line for line in step_records)
     assert all("lr_embedding=" not in line for line in step_records)
     assert all("lr_h=" not in line for line in step_records)
+    assert all("cell_tok_s=" in line for line in step_records)
+    assert all(("| r=" in line) == ("l" in condition) for line in step_records)
 
 
-def test_resume_is_exact(tmp_path, capsys):
-    full = run(tmp_path, "full", ["--condition", "arf"])
-    half = run(tmp_path, "half", ["--condition", "fra", "--max-steps", "5"])
+@pytest.mark.parametrize("condition", ["arf", "arfl"])
+def test_resume_is_exact(tmp_path, capsys, condition):
+    full = run(tmp_path, "full", condition_args(condition))
+    scrambled = condition_args(condition[::-1])
+    half = run(tmp_path, "half", [*scrambled, "--max-steps", "5"])
     assert half["step"] == 5
-    resumed = run(tmp_path, "half", ["--condition", "arf", "--resume"])
+    resumed = run(tmp_path, "half", [*condition_args(condition), "--resume"])
     assert resumed["step"] == 8
     assert resumed["loss"] == full["loss"]
     assert resumed["val"] == full["val"]
@@ -694,12 +729,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", range(9, 24))
+@pytest.mark.parametrize("version", range(9, 25))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--condition", "", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[24\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[25\\]"):
         run(tmp_path, tag, ["--condition", "", "--resume"])
 
 
@@ -712,11 +747,9 @@ def test_multipass_checkpoint_parity():
         multipass_loss,
     )
 
-    cfg = condition_config(
-        "arf",
+    geometry = dict(
         vocab_size=97,
         dim=32,
-        layers=2,
         heads=2,
         kv_heads=2,
         head_dim=16,
@@ -729,11 +762,11 @@ def test_multipass_checkpoint_parity():
     tokens = torch.randint(0, 97, (2, 17))
     prefix = torch.ones((1, 2), dtype=torch.long)
 
-    def run(flag):
+    def run(cfg, flag, iterations):
         torch.manual_seed(1)
         model = DeltaModel(cfg)
         model.grad_checkpoint = flag
-        outs = multipass(model, tokens, 2, prefix_lens=prefix)
+        outs = multipass(model, tokens, 2, prefix_lens=prefix, iterations=iterations)
         loss, _ = multipass_loss(model, tokens, outs)
         loss.backward()
         grads = torch.cat(
@@ -741,22 +774,33 @@ def test_multipass_checkpoint_parity():
         )
         return loss.item(), grads
 
-    plain_loss, plain_grads = run(False)
-    checked_loss, checked_grads = run(True)
-    assert checked_loss == pytest.approx(plain_loss, rel=1e-6)
-    assert torch.allclose(plain_grads, checked_grads, rtol=1e-5, atol=1e-7)
+    for condition, layers, iterations in (("arf", 2, None), ("arfl", 12, 3)):
+        cfg = condition_config(condition, layers=layers, **geometry)
+        plain_loss, plain_grads = run(cfg, False, iterations)
+        checked_loss, checked_grads = run(cfg, True, iterations)
+        assert checked_loss == pytest.approx(plain_loss, rel=1e-6), condition
+        assert torch.allclose(plain_grads, checked_grads, rtol=1e-5, atol=1e-7)
 
 
 def test_checkpoint_policy_is_internal_and_screen_measured():
     from delta_feedback_experiment.model import DeltaModel, condition_config
 
     args = build_parser().parse_args(["x"])
+    cuda = torch.device("cuda")
     with torch.device("meta"):
         model = DeltaModel(condition_config("arf"))
-    assert not automatic_checkpoint(model, 2, args, torch.device("cuda"))
-    assert not automatic_checkpoint(model, 3, args, torch.device("cuda"))
+        looped = DeltaModel(condition_config("arfl"))
+    assert not automatic_checkpoint(model, 2, 1, args, cuda)
+    assert not automatic_checkpoint(model, 3, 1, args, cuda)
     args.micro_rows = 8
-    assert automatic_checkpoint(model, 3, args, torch.device("cuda"))
+    assert automatic_checkpoint(model, 3, 1, args, cuda)
+    args.micro_rows = 4
+    # The loop counts executed layers: 8 + 4r per pass at the screen.
+    assert not automatic_checkpoint(looped, 3, 1, args, cuda)
+    assert not automatic_checkpoint(looped, 1, 7, args, cuda)
+    assert automatic_checkpoint(looped, 1, 8, args, cuda)
+    assert automatic_checkpoint(looped, 2, 3, args, cuda)
+    assert not automatic_checkpoint(looped, 2, 8, args, torch.device("cpu"))
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--grad-checkpoint"])
 
