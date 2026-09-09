@@ -578,7 +578,9 @@ def cuda_gate() -> None:
                 prefix_lens=parity_prefix,
                 iterations=iterations,
             )
-            parity_loss, _ = multipass_loss(parity_model, parity_rows, parity_outs)
+            # Index rather than unpack: a lingering per-pass losses list would
+            # keep the whole eager graph, parameters, and gradients alive.
+            parity_loss = multipass_loss(parity_model, parity_rows, parity_outs)[0]
         parity_loss.backward()
         parity[label] = (
             parity_loss.item(),
@@ -632,7 +634,7 @@ def cuda_gate() -> None:
         loop_outs = multipass(
             loop_model, loop_rows, 1, iterations=args.loop_max_iterations
         )
-        loop_loss, _ = multipass_loss(loop_model, loop_rows, loop_outs)
+        loop_loss = multipass_loss(loop_model, loop_rows, loop_outs)[0]
     loop_loss.backward()
     torch.cuda.synchronize()
     if not math.isfinite(loop_loss.item()):

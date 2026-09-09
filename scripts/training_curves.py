@@ -32,7 +32,7 @@ STEP_RE = re.compile(r"^(\w+)\s*\|")
 
 def parse_log(path: Path) -> dict:
     """Return {'run': {...}, 'schedule': {...}, 'steps': {step: {...}}, 'evals': [...], 'routes': [...], 'contracts': [...]}."""
-    out = {"run": {}, "schedule": {}, "steps": {}, "evals": {}, "routes": [], "contracts": {}}
+    out = {"run": {}, "schedule": {}, "steps": {}, "evals": {}, "routes": [], "contracts": {}, "depths": {}}
     for line in path.read_text().splitlines():
         m = STEP_RE.match(line)
         if not m:
@@ -65,9 +65,24 @@ def parse_log(path: Path) -> dict:
             out["routes"].append(fields)
         elif kind == "contract":
             out["contracts"][int(fields["step"])] = fields
+        elif kind == "depth":
+            out["depths"][int(fields["step"])] = fields
     out["evals"] = [out["evals"][s] for s in sorted(out["evals"])]
     out["contracts"] = [out["contracts"][s] for s in sorted(out["contracts"])]
+    out["depths"] = [out["depths"][s] for s in sorted(out["depths"])]
     return out
+
+
+def cells_per_pass(run: dict, r: np.ndarray) -> np.ndarray:
+    """Cell-equivalents one pass executes at each step: ``layers / cell`` for a
+    flat column, ``2 + r * core / cell`` under ``l`` (the two held cells plus
+    the core ``r`` times), from the run record's geometry."""
+    layers = int(run["run"].get("layers", 12))
+    cell = int(run["run"].get("routing_block_size", 4))
+    if "l" not in str(run["run"].get("condition", "")):
+        return np.full_like(r, layers / cell)
+    core = layers - 2 * cell
+    return 2 + np.nan_to_num(r, nan=1.0) * core / cell
 
 
 def ema(x: np.ndarray, span: int) -> np.ndarray:
@@ -83,7 +98,7 @@ def ema(x: np.ndarray, span: int) -> np.ndarray:
 def step_arrays(steps: dict) -> dict[str, np.ndarray]:
     keys = sorted(steps)
     cols = {"step": np.array(keys, dtype=float)}
-    for name in ("loss", "pass1", "k", "gnorm", "pass_tok_s", "tok_s"):
+    for name in ("loss", "pass1", "k", "r", "gnorm", "pass_tok_s", "cell_tok_s", "tok_s"):
         cols[name] = np.array([steps[s].get(name, np.nan) for s in keys], dtype=float)
     return cols
 
@@ -117,7 +132,9 @@ def main() -> None:
     arrays = []
     for run in runs:
         a = step_arrays(run["steps"])
-        a["cum_pass_tokens"] = np.cumsum(np.nan_to_num(a["k"], nan=1.0)) * tokens_per_step
+        passes = np.nan_to_num(a["k"], nan=1.0)
+        a["cum_pass_tokens"] = np.cumsum(passes) * tokens_per_step
+        a["cum_cell_tokens"] = np.cumsum(passes * cells_per_pass(run, a["r"])) * tokens_per_step
         a["cum_tokens"] = a["step"] * tokens_per_step
         a["fused_train"] = np.where(a["k"] > 1, a["loss"] - a["pass1"], np.nan)
         arrays.append(a)
@@ -179,11 +196,11 @@ def main() -> None:
     for e, a, lab, col, fb in zip(evals, arrays, labels, colors, feedback):
         idx = np.searchsorted(a["step"], e["step"]).clip(0, len(a["step"]) - 1)
         axes[0].plot(a["cum_tokens"][idx], e["val"], color=col, label=f"{lab}: pass 1")
-        axes[1].plot(a["cum_pass_tokens"][idx], e["val"], color=col, label=f"{lab}: pass 1")
+        axes[1].plot(a["cum_cell_tokens"][idx], e["val"], color=col, label=f"{lab}: pass 1")
         if fb:
-            axes[1].plot(a["cum_pass_tokens"][idx], e["val_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
+            axes[1].plot(a["cum_cell_tokens"][idx], e["val_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
     axes[0].set(xlabel="predicted tokens (matched data)", ylabel="held-out CE", title="Against predicted tokens", xscale="log")
-    axes[1].set(xlabel="pass-tokens (matched compute)", ylabel="held-out CE", title="Against pass-tokens", xscale="log")
+    axes[1].set(xlabel="cell-tokens (matched compute)", ylabel="held-out CE", title="Against cell-tokens", xscale="log")
     for ax in axes:
         ax.set_ylim(min(np.nanmin(e["val"]) for e in evals) - 0.05, 4.2)
         ax.legend()
@@ -299,6 +316,30 @@ def main() -> None:
         for ax in axes:
             ax.legend()
         fs.save(fig, out_dir / "contraction.png")
+
+    # -- depth monitor (l) ------------------------------------------------------
+    depth_runs = [(r, l, c) for r, l, c in zip(runs, labels, colors) if r["depths"]]
+    if depth_runs:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
+        for run, lab, col in depth_runs:
+            s = np.array([r["step"] for r in run["depths"]], dtype=float)
+            one = np.array([r["loss_one"] for r in run["depths"]])
+            mean = np.array([r["loss_mean"] for r in run["depths"]])
+            mx = np.array([r["loss_max"] for r in run["depths"]])
+            upd = np.array([r["upd_max"] for r in run["depths"]])
+            r_mean, r_max = int(run["depths"][-1]["r_mean"]), int(run["depths"][-1]["r_max"])
+            axes[0].plot(s, mean - one, "o-", color=col, ms=3, label=f"{lab}: r = {r_mean}")
+            axes[0].plot(s, mx - one, "o--", color=col, ms=3, lw=1.2, label=f"{lab}: r = {r_max}")
+            axes[1].plot(s, upd, "o-", color=col, ms=3, label=lab)
+            summary["runs"].setdefault(lab, {})["depth_final"] = {
+                "loss_one": float(one[-1]), "loss_mean": float(mean[-1]), "loss_max": float(mx[-1]), "upd_max": float(upd[-1]),
+            }
+        fs.zero_line(axes[0])
+        axes[0].set(xlabel="optimizer step", ylabel="CE(r) − CE(r = 1)", title="Fixed-r sweep: gain from iterating (2 rows)")
+        axes[1].set(xlabel="optimizer step", ylabel="mean ‖core(r_max) − core(r_max − 1)‖₂", title="Core update at the cap", yscale="log")
+        for ax in axes:
+            ax.legend()
+        fs.save(fig, out_dir / "depth-monitor.png")
 
     # -- summary ---------------------------------------------------------------
     for run, a, e, lab in zip(runs, arrays, evals, labels):
