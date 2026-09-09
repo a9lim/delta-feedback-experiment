@@ -348,23 +348,34 @@ request's `r`:
 | 4 | 6 | 20.7 MiB |
 | 8 | 10 | 34.6 MiB |
 
-Training memory is not established by this arithmetic; the probe records the
-eager one-pass peak at `r_max`, and `scripts/loop_memory_stage.py` records
-each eager mode and the captured family. Jobe step times below are estimates,
-not measurements. The anchor is the measured 14.21 s three-pass `arf` step in
-the short [runtime qualification](runtime-qualification.md), approximated
-conservatively as `k x (1.3 s + 0.30 s per layer evaluation)` per step, with
-block checkpointing adding one third to the layer term. At the expected `E[r]
-= 3.88`:
+Training memory and step time are measured, not derived
+([runtime qualification](runtime-qualification.md#the-loop), record
+`data/summary/loop-stage-2026-09-08.json`). Capturing the twenty-four train
+graphs and the evaluation graph took 68 s and peaked at 14.34 GiB allocated
+and 23.02 GiB reserved, against 13.85 and 23.01 GiB for the flat column's four
+graphs. Eager three-pass microbatches peak at 12.74 GiB raw at `r = 1` and
+4.02 GiB checkpointed at `r = 8`. Replay per four-row microbatch, in
+milliseconds, with the trainer's activation policy checkpointing every mode
+deeper than the flat three-pass step:
 
-| Condition | One pass | Two passes | Three passes | Mean step, default mixture | Full schedule |
-|---|---:|---:|---:|---:|---:|
-| `arf` | 5.0 s | 9.9 s | 14.9 s | 6.3 s | ~19 h |
-| `arfl` | 10.8 s | 21.7 s | 32.5 s | 13.9 s | ~41 h |
+| Passes \ `r` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 53.5 | 67.9 | 82.3 | 96.8 | 111.3 | 125.9 | 140.2 | 199.6 |
+| 2 | 107.8 | 136.7 | 210.5 | 248.4 | 286.4 | 324.3 | 362.3 | 400.4 |
+| 3 | 162.1 | 259.6 | 316.5 | 373.5 | 430.9 | 487.8 | 544.8 | 601.8 |
 
-The dense recipe of the existing `arf` specimens, three passes on every step,
-puts `arfl` at about 97 hours on this model, and two passes on every step at
-about 65. The captured replay times replace these once measured.
+The jumps at `r = 8` for one pass, `r = 3` for two, and `r = 2` for three are
+where checkpointing switches on and recomputes each block once. At the
+schedule's realized draws a step's replay averages 7.9, 18.8, and 29.1 s at
+one, two, and three passes. With one second of optimizer, clipping, shadow,
+and staging overhead per step, which projects the flat three-pass step to
+41.7 h against the 42.3 h measured, the schedule projects to:
+
+| Recipe | `arfl` | `arf` |
+|---|---:|---:|
+| default mixture | 35.8 h | ~19 h |
+| two passes on every step | 59.1 h | ~28 h |
+| three passes on every step | 89.8 h | 42.3 h |
 
 ## Larger geometry
 

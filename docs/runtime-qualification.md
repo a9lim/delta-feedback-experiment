@@ -17,6 +17,7 @@ through the same checks.
 | [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Exact environment selection, dependency checks, portable/CUDA gates, and capture memory |
 | [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Paired six-update diagnostic from a trained checkpoint, with runtime versions, revisions, loss/gradient differences, and limitations |
 | [Execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces, component measurements, profiler counts, backend decisions, and reproduction commands |
+| [Loop staging](../data/summary/loop-stage-2026-09-08.json) | Eager and captured memory of every `arfl` mode, replay time per (pass count, `r`), and the projected schedule |
 
 Jobe passed 114 experiment tests and the full `delta probe` CUDA gate. The Mac
 passed 106 tests with eight CUDA cases skipped. The workspace's 122 tests
@@ -112,6 +113,19 @@ runtime above:
 
 The captured `(pass count, r)` family is not part of the probe; it is
 measured by `scripts/loop_memory_stage.py` and captured again by each run.
+The 2026-09-08 staging record for `arfl` at the default recipe: eager
+one-, two-, and three-pass microbatches peak at 5.27, 9.20, and 12.74 GiB
+allocated raw at `r = 1` and at 2.79, 3.39, and 4.02 GiB checkpointed at
+`r = 8`; the twenty-four train graphs and the evaluation graph capture in
+67.9 s at 14.34 GiB allocated and 23.02 GiB reserved; replay runs from
+53.5 ms (one pass, `r = 1`, the flat column's own time) to 601.8 ms (three
+passes, `r = 8`) per four-row microbatch, the full table in
+[depth-architecture.md](depth-architecture.md#parameter-cache-and-cost-accounting).
+Reproduce with:
+
+```bash
+python scripts/loop_memory_stage.py --out data/summary/loop-stage-DATE.json --condition arfl
+```
 
 ## Short-update evidence and its limits
 

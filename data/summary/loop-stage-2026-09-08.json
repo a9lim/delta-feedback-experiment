@@ -1,0 +1,275 @@
+{
+  "args": {
+    "condition": "arfl",
+    "seed": 1,
+    "data_seed": 0,
+    "seq_len": 1024,
+    "batch_rows": 320,
+    "micro_rows": 4,
+    "steps": 10745,
+    "warmup_frac": 0.02,
+    "cooldown_frac": 0.2,
+    "feedback_start": 0.75,
+    "three_pass": 0.12,
+    "loop_iterations": 4,
+    "loop_max_iterations": 8,
+    "lr_normuonh": 0.006,
+    "lr_nadam": 0.0003,
+    "jitter": 0.02,
+    "zloss": 1e-05,
+    "vocab_size": 151936,
+    "dim": 768,
+    "layers": 12,
+    "heads": 8,
+    "kv_heads": 4,
+    "head_dim": 96,
+    "intermediate": 3328,
+    "pkda_heads": 10,
+    "pkda_head_dim": 128,
+    "pkda_conv_size": 4
+  },
+  "torch": "2.14.0+cu132",
+  "device": "NVIDIA GeForce RTX 4090",
+  "stages": [
+    {
+      "stage": "eager",
+      "k": 1,
+      "r": 1,
+      "checkpoint": false,
+      "loss": 12.076496124267578,
+      "seconds": 32.853,
+      "allocated_gib": 5.265,
+      "reserved_gib": 5.863
+    },
+    {
+      "stage": "eager",
+      "k": 2,
+      "r": 1,
+      "checkpoint": false,
+      "loss": 24.15233612060547,
+      "seconds": 0.15,
+      "allocated_gib": 9.201,
+      "reserved_gib": 9.473
+    },
+    {
+      "stage": "eager",
+      "k": 3,
+      "r": 1,
+      "checkpoint": false,
+      "loss": 24.15426254272461,
+      "seconds": 0.219,
+      "allocated_gib": 12.74,
+      "reserved_gib": 13.092
+    },
+    {
+      "stage": "eager",
+      "k": 1,
+      "r": 8,
+      "checkpoint": true,
+      "loss": 12.060537338256836,
+      "seconds": 0.237,
+      "allocated_gib": 2.791,
+      "reserved_gib": 3.49
+    },
+    {
+      "stage": "eager",
+      "k": 2,
+      "r": 8,
+      "checkpoint": true,
+      "loss": 24.114946365356445,
+      "seconds": 0.474,
+      "allocated_gib": 3.387,
+      "reserved_gib": 4.428
+    },
+    {
+      "stage": "eager",
+      "k": 3,
+      "r": 8,
+      "checkpoint": true,
+      "loss": 24.117652893066406,
+      "seconds": 0.71,
+      "allocated_gib": 4.018,
+      "reserved_gib": 5.225
+    },
+    {
+      "stage": "capture",
+      "seconds": 67.9,
+      "train_graphs": 24,
+      "eval_graphs": 1,
+      "allocated_gib": 14.34,
+      "reserved_gib": 23.02,
+      "replays": [
+        {
+          "k": 1,
+          "r": 1,
+          "checkpoint": false,
+          "ms": 53.5,
+          "loss": 0.1509578675031662
+        },
+        {
+          "k": 1,
+          "r": 2,
+          "checkpoint": false,
+          "ms": 67.9,
+          "loss": 0.1509304642677307
+        },
+        {
+          "k": 1,
+          "r": 3,
+          "checkpoint": false,
+          "ms": 82.3,
+          "loss": 0.15088196098804474
+        },
+        {
+          "k": 1,
+          "r": 4,
+          "checkpoint": false,
+          "ms": 96.8,
+          "loss": 0.150843545794487
+        },
+        {
+          "k": 1,
+          "r": 5,
+          "checkpoint": false,
+          "ms": 111.3,
+          "loss": 0.15081124007701874
+        },
+        {
+          "k": 1,
+          "r": 6,
+          "checkpoint": false,
+          "ms": 125.9,
+          "loss": 0.15078483521938324
+        },
+        {
+          "k": 1,
+          "r": 7,
+          "checkpoint": false,
+          "ms": 140.2,
+          "loss": 0.15076874196529388
+        },
+        {
+          "k": 1,
+          "r": 8,
+          "checkpoint": true,
+          "ms": 199.6,
+          "loss": 0.15076209604740143
+        },
+        {
+          "k": 2,
+          "r": 1,
+          "checkpoint": false,
+          "ms": 107.8,
+          "loss": 0.3018132746219635
+        },
+        {
+          "k": 2,
+          "r": 2,
+          "checkpoint": false,
+          "ms": 136.7,
+          "loss": 0.3019164204597473
+        },
+        {
+          "k": 2,
+          "r": 3,
+          "checkpoint": true,
+          "ms": 210.5,
+          "loss": 0.30172988772392273
+        },
+        {
+          "k": 2,
+          "r": 4,
+          "checkpoint": true,
+          "ms": 248.4,
+          "loss": 0.3017398715019226
+        },
+        {
+          "k": 2,
+          "r": 5,
+          "checkpoint": true,
+          "ms": 286.4,
+          "loss": 0.30171045660972595
+        },
+        {
+          "k": 2,
+          "r": 6,
+          "checkpoint": true,
+          "ms": 324.3,
+          "loss": 0.30153700709342957
+        },
+        {
+          "k": 2,
+          "r": 7,
+          "checkpoint": true,
+          "ms": 362.3,
+          "loss": 0.30156004428863525
+        },
+        {
+          "k": 2,
+          "r": 8,
+          "checkpoint": true,
+          "ms": 400.4,
+          "loss": 0.3014553189277649
+        },
+        {
+          "k": 3,
+          "r": 1,
+          "checkpoint": false,
+          "ms": 162.1,
+          "loss": 0.30188360810279846
+        },
+        {
+          "k": 3,
+          "r": 2,
+          "checkpoint": true,
+          "ms": 259.6,
+          "loss": 0.3018389344215393
+        },
+        {
+          "k": 3,
+          "r": 3,
+          "checkpoint": true,
+          "ms": 316.5,
+          "loss": 0.3018614947795868
+        },
+        {
+          "k": 3,
+          "r": 4,
+          "checkpoint": true,
+          "ms": 373.5,
+          "loss": 0.30172786116600037
+        },
+        {
+          "k": 3,
+          "r": 5,
+          "checkpoint": true,
+          "ms": 430.9,
+          "loss": 0.30159711837768555
+        },
+        {
+          "k": 3,
+          "r": 6,
+          "checkpoint": true,
+          "ms": 487.8,
+          "loss": 0.3016113340854645
+        },
+        {
+          "k": 3,
+          "r": 7,
+          "checkpoint": true,
+          "ms": 544.8,
+          "loss": 0.30159124732017517
+        },
+        {
+          "k": 3,
+          "r": 8,
+          "checkpoint": true,
+          "ms": 601.8,
+          "loss": 0.3015258312225342
+        }
+      ],
+      "projected_replay_hours": 32.81,
+      "note": "replay only: the optimizer, clipping, shadow refresh, evaluation, and snapshots add to every step"
+    }
+  ]
+}

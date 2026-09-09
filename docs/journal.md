@@ -64,6 +64,17 @@ BF16 accumulation reaches every parameter through the backward; the loop at
 measures the floor and holds the loop to it. Numbers in
 [runtime-qualification.md](runtime-qualification.md#the-loop).
 
+The staged measurement (`scripts/loop_memory_stage.py`, record
+`data/summary/loop-stage-2026-09-08.json`) says the whole family fits: the
+twenty-four train graphs capture at 14.34 GiB allocated against the flat
+column's 13.85, and the deepest eager mode, three passes at `r = 8`, peaks
+at 4.02 GiB under block checkpointing. Replay runs from 53.5 ms per
+microbatch at one pass and `r = 1`, the flat column's own number, to
+601.8 ms at three passes and `r = 8`. Projected with the measured overhead,
+the full schedule is 35.8 h on the default mixture, 59.1 h at two passes on
+every step, and 89.8 h at three, against 42.3 h for the dense `arf`
+specimens. The recipe for the first `arfl` specimen is a9's call.
+
 Nothing was trained.
 
 ## 2026-09-08 — The plain trunk is gated NoPE GQA
