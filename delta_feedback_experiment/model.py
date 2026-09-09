@@ -956,6 +956,7 @@ class DeltaModel(nn.Module):
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.register_buffer("_classifier_shadow", None, persistent=False)
+        self.register_buffer("_classifier_accum", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         # Capture the exact common-trunk initialization boundary before
@@ -1122,6 +1123,10 @@ class DeltaModel(nn.Module):
         self.embed_tokens.grad_sink = (
             sink(self.embed_tokens.weight) if self.embed_tokens.weight.is_cuda else None
         )
+        if self.embed_tokens.grad_sink is None:
+            # The classifier accumulator drains into that sink; without one it
+            # would strand the head's gradient.
+            self._classifier_accum = None
         for block in self.blocks:
             block.mlp.gate_up_sink = sink(block.mlp.gate_up_proj.weight)
             block.mlp.down_sink = sink(block.mlp.down_proj.weight)
@@ -1203,15 +1208,47 @@ class DeltaModel(nn.Module):
                 [weight for _, weight in self._shadow_refresh],
             )
 
-    def classifier_for_loss(self) -> Tensor:
-        """Return the graph-stable BF16 CCE operand linked to the FP32 master."""
+    def bind_classifier_accum(self, buffer: Tensor | None) -> None:
+        """Bind the trainer's persistent BF16 classifier-gradient accumulator.
+
+        With one bound the head's backward adds its dC straight into this
+        buffer over several microbatches, and the trainer flushes it into the
+        FP32 embedding sink and clears it on its own cadence; without one every
+        head call widens its own dC into the sink. The buffer is neither a
+        parameter nor checkpoint state, and it is only meaningful alongside a
+        bound embedding sink, which is where its contents eventually land.
+        """
+        if buffer is not None:
+            master = self.embed_tokens.weight
+            if self.embed_tokens.grad_sink is None:
+                raise RuntimeError("the classifier accumulator needs a bound sink")
+            if buffer.shape != master.shape or buffer.dtype != torch.bfloat16:
+                raise ValueError("the classifier accumulator must be the BF16 operand")
+        self._classifier_accum = buffer
+
+    def classifier_for_loss(self) -> tuple[Tensor, Tensor | None]:
+        """The head's classifier operand and the buffer its gradient lands in.
+
+        One decision, so the operand and the destination cannot disagree. On
+        CUDA the operand is always the graph-stable BF16 shadow: with an
+        accumulator bound and gradients live the head hands it over plainly and
+        names the buffer, because CCE's backward writes the classifier gradient
+        there itself; otherwise the shadow is read through the shared operand,
+        whose backward widens that gradient into the FP32 sink. The portable
+        path reads the FP32 master through ordinary autograd.
+        """
         master = self.embed_tokens.weight
         if not master.is_cuda:
-            return master
+            return master, None
         if self._classifier_shadow is None:
             raise RuntimeError("CUDA classifier shadow was not prepared")
-        return _ClassifierShadow.apply(
-            master, self._classifier_shadow, self.embed_tokens.grad_sink
+        if self._classifier_accum is not None and torch.is_grad_enabled():
+            return self._classifier_shadow, self._classifier_accum
+        return (
+            _ClassifierShadow.apply(
+                master, self._classifier_shadow, self.embed_tokens.grad_sink
+            ),
+            None,
         )
 
     # -- one column pass -------------------------------------------------------
@@ -1653,6 +1690,7 @@ def _fixed_cce_z(
     *,
     skip_early: bool = True,
     tile_flags: Tensor | None = None,
+    c_grad_accum: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Current CCE with capture-safe preprocessing and differentiable LSE.
 
@@ -1667,6 +1705,12 @@ def _fixed_cce_z(
     drop before recomputing its logits. ``skip_early`` and ``tile_flags`` are
     the fork's diagnostics: the probe forces the late filter alone and checks
     that both paths compute the identical tile set.
+
+    ``c_grad_accum`` is a caller-owned persistent BF16 ``[V, D]`` buffer. With
+    one the backward lock-adds this call's classifier gradient straight into it
+    instead of zero-filling a fresh 233 MB tensor and returning it, and the
+    classifier receives no autograd gradient at all; the caller flushes the
+    buffer into its FP32 sink and clears it on its own cadence.
     """
     if (
         CCEParams is None
@@ -1696,6 +1740,7 @@ def _fixed_cce_z(
         vocab_ordering=vocab_ordering,
         skip_early=skip_early,
         tile_flags=tile_flags,
+        c_grad_accum=c_grad_accum,
     )
     ce, lse = linear_cross_entropy_apply(
         embeddings,
@@ -1734,7 +1779,13 @@ def sequence_ce(
             if torch.is_grad_enabled()
             else None
         )
-        return _fixed_cce_z(normalized, model.classifier_for_loss(), targets, ordering)
+        # Every gradient-bearing head call of a microbatch -- one per feedback
+        # pass -- accumulates into the one bound buffer; evaluation has no
+        # backward to accumulate and reads the classifier as before.
+        classifier, accum = model.classifier_for_loss()
+        return _fixed_cce_z(
+            normalized, classifier, targets, ordering, c_grad_accum=accum
+        )
 
     ce_sum = h_top.new_zeros((), dtype=torch.float32)
     z_sum = h_top.new_zeros((), dtype=torch.float32)

@@ -444,6 +444,106 @@ def cuda_gate() -> None:
     del flag_e, flag_c, flag_shadow, flag_t, flag_order, tile_sets, tile_flags
     del flag_ce, flag_z
 
+    # The head's classifier gradient reaches the FP32 sink either once per
+    # microbatch or once per flush window, with the window's contributions
+    # accumulated in the BF16 buffer the kernel already lock-adds into. Both
+    # paths are measured against the exact FP32 gradient of the same operands:
+    # a window may not move the step's gradient off the per-microbatch path by
+    # more than the BF16 rounding it replaces, and above all may not change its
+    # magnitude, which is what a coherent accumulation bias would do.
+    torch.manual_seed(19)
+    accum_vocab, accum_dim, accum_rows, accum_micros = 4096, 64, 256, 8
+    accum_c = (torch.randn(accum_vocab, accum_dim, device="cuda") * 0.5).to(
+        torch.bfloat16
+    )
+    accum_batches = [
+        (
+            (torch.randn(accum_rows, accum_dim, device="cuda") * 2.0).to(
+                torch.bfloat16
+            ),
+            torch.randint(0, accum_vocab, (accum_rows,), device="cuda"),
+        )
+        for _ in range(accum_micros)
+    ]
+    accum_reference = torch.zeros(accum_vocab, accum_dim, device="cuda")
+    with torch.no_grad():
+        for accum_e, accum_t in accum_batches:
+            probabilities = torch.softmax(accum_e.float() @ accum_c.float().mT, dim=-1)
+            probabilities[torch.arange(accum_rows, device="cuda"), accum_t] -= 1.0
+            accum_reference += probabilities.mT @ accum_e.float() / accum_rows
+    del probabilities
+
+    def head_gradient(window: int | None) -> torch.Tensor:
+        """The classifier gradient of every microbatch, summed in the sink."""
+        sink = torch.zeros(accum_vocab, accum_dim, device="cuda")
+        buffer = None if window is None else torch.zeros_like(accum_c)
+        # A fresh master per call: its accumulator node would otherwise outlive
+        # the call and be reused by the next one's backward.
+        master = accum_c.float().requires_grad_()
+        for index, (accum_e, accum_t) in enumerate(accum_batches, start=1):
+            embeddings = accum_e.clone().requires_grad_()
+            if buffer is None:
+                classifier = _ClassifierShadow.apply(master, accum_c, sink)
+            else:
+                classifier = accum_c
+            loss, _ = _fixed_cce_z(
+                embeddings,
+                classifier,
+                accum_t,
+                batch_vocab_order(embeddings, accum_c),
+                c_grad_accum=buffer,
+            )
+            loss.backward()
+            if buffer is not None and index % window == 0:
+                sink.add_(buffer)
+                buffer.zero_()
+        if buffer is not None:
+            sink.add_(buffer)
+        if master.grad is not None:
+            raise AssertionError("the sunk classifier gradient reached autograd")
+        return sink
+
+    def head_error(gradient: torch.Tensor) -> tuple[float, float]:
+        difference = (gradient - accum_reference).norm() / accum_reference.norm()
+        return difference.item(), (gradient.norm() / accum_reference.norm()).item()
+
+    per_micro_rel, per_micro_ratio = head_error(head_gradient(None))
+    repeat_rel, repeat_ratio = head_error(head_gradient(None))
+    # The head's own run-to-run floor: the forward's LSE lock combines its
+    # vocabulary tiles in whatever order they arrive.
+    accum_floor = max(
+        abs(repeat_rel - per_micro_rel), abs(repeat_ratio - per_micro_ratio), 1e-5
+    )
+    once_rel, once_ratio = head_error(head_gradient(1))
+    if (
+        abs(once_rel - per_micro_rel) > 8 * accum_floor
+        or abs(once_ratio - per_micro_ratio) > 8 * accum_floor
+    ):
+        raise AssertionError(
+            "flushing the head buffer every microbatch is not the per-microbatch "
+            f"path: rel {once_rel:.4e} versus {per_micro_rel:.4e}, norm ratio "
+            f"{once_ratio:.6f} versus {per_micro_ratio:.6f}, floor {accum_floor:.1e}"
+        )
+    flush_rel, flush_ratio = head_error(head_gradient(4))
+    # A four-microbatch window rounds its sum in BF16, which on these operands
+    # costs 2.4e-4 of relative error and 9.4e-5 of norm; the bands below are
+    # four times that, against a run-to-run floor of 1e-7. (On the trained
+    # screen head, whose rows accumulate far more mass, the same window costs
+    # 1.9e-2 against 7.9e-3 per microbatch and 0.21% of norm against 0.08%.)
+    # A window that stopped accumulating, or accumulated the wrong rows, misses
+    # or misplaces whole microbatches and fails here by orders of magnitude.
+    if abs(flush_ratio - per_micro_ratio) > 5e-4:
+        raise AssertionError(
+            "the head's flush window moved the classifier gradient norm: "
+            f"{flush_ratio:.6f} versus {per_micro_ratio:.6f}"
+        )
+    if flush_rel > per_micro_rel + 1e-3:
+        raise AssertionError(
+            f"the head's flush window drifted: {flush_rel:.4e} versus "
+            f"{per_micro_rel:.4e}"
+        )
+    del accum_c, accum_batches, accum_reference
+
     # The packed control projection exposes five semantic slices, but its
     # backward writes their gradients directly into one GEMM-ready buffer.
     control_splits = (128, 8, 8, 8, 128)
@@ -843,7 +943,29 @@ def cuda_gate() -> None:
             torch.cuda.synchronize()
             samples.append(time.monotonic() - started)
         elapsed = statistics.median(samples[2:])
+        # The captured body must reach the head accumulator and the eager
+        # flush must carry it into the FP32 sink: every other quantity in the
+        # step would still look finite if the classifier's contribution
+        # quietly stopped arriving.
+        head_sink = model.embed_tokens.grad_sink
+        if runner.head_accum is None or head_sink is None:
+            raise AssertionError("the CUDA head has no classifier accumulator")
         runner.prepare_optimizer(state)
+        if runner.head_accum.any() or runner._head_pending:
+            raise AssertionError("the head accumulator survived its flush")
+        # The last replay is the only one this sink holds, and the token
+        # lookup can reach at most its own micro_rows x seq_len ids; the
+        # head's gradient reaches most of the vocabulary, so the width of the
+        # sink is the head's contribution arriving.
+        # Reductions straight to [V]; a bool copy of the sink would be 116 MB.
+        touched = int(
+            ((head_sink.amax(dim=1) > 0) | (head_sink.amin(dim=1) < 0)).sum()
+        )
+        if touched <= 2 * args.micro_rows * args.seq_len:
+            raise AssertionError(
+                f"the head's classifier gradient did not reach the sink: "
+                f"{touched} of {args.vocab_size} rows"
+            )
         grad_norm = clip_gradients(model.parameters())
         if not math.isfinite(grad_norm) or not math.isfinite(state.loss_sum.item()):
             active_names = {
@@ -904,6 +1026,7 @@ def cuda_gate() -> None:
         f"decode_rel={plain_decode_rel:.4f}/{hybrid_decode_rel:.4f}"
         f"/{loop_decode_rel:.4f} | "
         f"loop_grad_rel={loop_grad_rel:.4f}/floor={grad_floor:.4f} | "
+        f"head_flush_rel={flush_rel:.2e}/micro={per_micro_rel:.2e} | "
         f"loop_cap_peak={loop_cap_peak:.2f}GiB | "
         f"stage_residual={stage_residual:.2f}GiB | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "

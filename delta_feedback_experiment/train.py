@@ -93,6 +93,7 @@ RUNTIME_FIELDS = (
     "eval_every",
     "snapshot_every",
     "eval_rows",
+    "head_flush_every",
 )
 """Per-invocation settings: inherited unless retyped."""
 
@@ -243,6 +244,15 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--eval-every", type=int, default=250)
     runtime.add_argument("--snapshot-every", type=int, default=500)
     runtime.add_argument("--eval-rows", type=int, default=32)
+    runtime.add_argument(
+        "--head-flush-every",
+        type=int,
+        default=4,
+        help="head calls -- one per feedback pass per microbatch -- whose "
+        "classifier gradient accumulates in BF16 before it is flushed into "
+        "the FP32 embedding sink; 1 is the per-call path exactly, and wider "
+        "windows trade the head's gradient precision for the flush's bandwidth",
+    )
     return parser
 
 
@@ -442,6 +452,12 @@ class CudaGraphTrainer:
     place from inside backward and hand autograd no gradient, so a buffer that
     warm-up touched marks its parameter active for that mode exactly as an
     autograd gradient marks the remaining vectors and small matrices.
+
+    The head is the one site whose gradient does not reach its FP32 sink on
+    every microbatch: every head call lock-adds into one persistent BF16
+    classifier buffer, and the buffer is added into the sink and cleared
+    whenever another replay would take it past ``head_flush_every`` head calls,
+    plus once more before the optimizer reads the step's gradient.
     """
 
     def __init__(self, model: DeltaModel, optimizers, args, schedule: Schedule):
@@ -464,6 +480,18 @@ class CudaGraphTrainer:
         self._buffers = {p: torch.zeros_like(p) for p in self.parameters}
         self.sink_fed = model.bind_gradient_sinks(self._buffers)
 
+        # The head's classifier gradient lands in one persistent BF16 buffer
+        # instead of a fresh 233 MB zero tensor per call, and reaches the FP32
+        # sink once every ``head_flush_every`` head calls.  It exists and is
+        # zeroed before warm-up traces the head, carries no autograd history,
+        # and keeps its address through capture.
+        self.head_flush_every = args.head_flush_every
+        self._head_pending = 0
+        self.head_accum = None
+        if model.embed_tokens.grad_sink is not None:
+            self.head_accum = torch.zeros_like(model._classifier_shadow)
+            model.bind_classifier_accum(self.head_accum)
+
         # The package sets Dynamo's recompile budget once for the process, so
         # every block and router specialization compiles here and in later
         # eager evaluation alike.
@@ -476,6 +504,8 @@ class CudaGraphTrainer:
         del self._buffers
         # Rebinding drops the sinks of parameters no reachable mode ever touches.
         self.sink_fed = model.bind_gradient_sinks(self.grad_buffers)
+        # A dropped embedding sink takes the head's accumulator with it.
+        self.head_accum = model._classifier_accum
         for parameter, gradient in self.grad_buffers.items():
             parameter.grad = gradient
 
@@ -567,15 +597,39 @@ class CudaGraphTrainer:
         state.loss_sum.add_(loss.detach() / self.micros)
         state.pass1_sum.add_(losses[0].detach() / self.micros)
 
+    def _drain_head_accum(self) -> None:
+        """Add the head's accumulated BF16 gradient into its FP32 sink.
+
+        Eager work between replays, never inside a captured body: the buffer's
+        contents are the only thing that crosses, its address does not move,
+        and the sink is the same one every other bound site accumulates into.
+        """
+        self.model.embed_tokens.grad_sink.add_(self.head_accum)
+        self.head_accum.zero_()
+        self._head_pending = 0
+
+    def flush_head_accum(self) -> None:
+        """Drain the head accumulator when a replay has written into it."""
+        if self.head_accum is not None and self._head_pending:
+            self._drain_head_accum()
+
     def _warm(self, state: CapturedMicro) -> set[torch.nn.Parameter]:
         for parameter in self.sink_fed:
             self._buffers[parameter].zero_()
+        if self.head_accum is not None:
+            self.head_accum.zero_()
+            self._head_pending = 0
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(2):
                 self.model.zero_grad(set_to_none=True)
                 self._body(state)
+                # Warm-up decides which parameters a mode touches from its
+                # buffers, so the head's gradient has to reach the sink here
+                # exactly as a replayed step's does.
+                if self.head_accum is not None:
+                    self._drain_head_accum()
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
         active = {p for p in self.parameters if p.grad is not None}
@@ -585,6 +639,11 @@ class CudaGraphTrainer:
     def _capture(self, state: CapturedMicro, pool) -> None:
         for gradient in self.grad_buffers.values():
             gradient.zero_()
+        if self.head_accum is not None:
+            # Capture records the head's accumulation into this buffer; the
+            # zeroing stays outside the body, where every replay leaves it.
+            self.head_accum.zero_()
+            self._head_pending = 0
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
         # Capturing on a blocking stream cannot inherit unfinished
@@ -651,6 +710,16 @@ class CudaGraphTrainer:
                 generator=self.generator,
             )
         state.graph.replay()
+        if self.head_accum is not None:
+            # The window counts head calls, not replays: a k-pass microbatch
+            # calls the head k times and every call rounds the running BF16
+            # sum, so the cadence has to hold the number of contributions
+            # between flushes fixed across conditions. Draining before the
+            # next replay would overrun keeps that number at or under the
+            # window even when it is not a multiple of the pass count.
+            self._head_pending += state.spec.n_passes
+            if self._head_pending + state.spec.n_passes > self.head_flush_every:
+                self._drain_head_accum()
 
     def replay_batch(
         self, state: CapturedMicro, data: TokenData, step: int, first_row: int
@@ -663,14 +732,21 @@ class CudaGraphTrainer:
                 step,
                 first_row + offset,
             )
+        # A microbatch count that is not a multiple of the flush cadence leaves
+        # a remainder; the step's gradient is complete only once it is drained.
+        self.flush_head_accum()
 
     def prepare_optimizer(self, state: CapturedMicro) -> None:
+        self.flush_head_accum()
         for parameter in self.parameters:
             parameter.grad = (
                 self.grad_buffers.get(parameter) if parameter in state.active else None
             )
 
     def zero_grad(self) -> None:
+        if self.head_accum is not None:
+            self.head_accum.zero_()
+            self._head_pending = 0
         for parameter in self.parameters:
             gradient = self.grad_buffers.get(parameter)
             parameter.grad = gradient
@@ -787,6 +863,7 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
         "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
         "eval_graphs": len(eval_graph_runner.states),
         "checkpoint_modes": sum(spec.checkpoint for spec in graph_runner.states),
+        "head_flush_every": graph_runner.head_flush_every,
     }
 
 
@@ -1018,6 +1095,8 @@ def train(argv: list[str] | None = None) -> dict:
 
     if args.batch_rows % args.micro_rows:
         raise ValueError("batch-rows must be a multiple of micro-rows")
+    if args.head_flush_every < 1:
+        raise ValueError("head-flush-every must be at least one head call")
     schedule = build_schedule(args)
     total = schedule.total
 

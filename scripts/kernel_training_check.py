@@ -215,6 +215,7 @@ def run(options) -> None:
                     "batch_rows": args.batch_rows,
                     "micro_rows": args.micro_rows,
                     "seq_len": args.seq_len,
+                    "head_flush_every": args.head_flush_every,
                 },
                 "updates": options.updates,
                 "optimizer_state": "fresh, identical in baseline and candidate",

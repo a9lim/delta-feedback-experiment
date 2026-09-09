@@ -376,6 +376,13 @@ for the PKDA matrix and diagonal boundary states. Cut cross-entropy reads an
 address-stable BF16 classifier shadow that is refreshed from the tied embedding
 once after every optimizer update and is neither a parameter nor checkpoint
 state. Its authoritative tied parameter and accumulated gradient remain FP32.
+The head's own classifier gradient reaches that FP32 gradient through a second
+address-stable BF16 buffer: every head call lock-adds into it, and the captured
+trainer adds it into the FP32 sink and clears it whenever another microbatch
+would take the buffer past `--head-flush-every` head calls, and once more before
+the optimizer reads the step. A feedback pass is a head call, so the number of
+BF16 additions between two FP32 flushes is the same under every pass count. The
+buffer is a runtime operand like the shadow, not state.
 
 ## NorMuonH and NAdam
 

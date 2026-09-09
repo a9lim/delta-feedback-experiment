@@ -118,6 +118,7 @@ def main() -> None:
         "batch_rows": args.batch_rows,
         "seq_len": args.seq_len,
         "zloss": args.zloss,
+        "head_flush_every": args.head_flush_every,
         "torch": torch.__version__,
         "gpu": torch.cuda.get_device_name(),
     }
@@ -134,6 +135,7 @@ def main() -> None:
             "batch_rows",
             "seq_len",
             "zloss",
+            "head_flush_every",
         ):
             if prior[field] != identity[field]:
                 raise ValueError(f"baseline mismatch: {field}")
