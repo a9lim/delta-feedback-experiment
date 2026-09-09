@@ -4,6 +4,8 @@ Run this same file from each checkout with PYTHONPATH pointing at that checkout.
 The full-family option also captures evaluation in the shared graph pool.
 ``--checkpoint-policy blanket`` isolates selective storage from other changes
 by using the former whole-block checkpoint arrangement in this process only.
+``cell-final`` retains each cell's final compiled block and checkpoints the
+others, preserving the same compiled block boundaries in every condition.
 """
 
 import argparse
@@ -60,36 +62,15 @@ def main():
     parser.add_argument("--full-family", action="store_true")
     parser.add_argument(
         "--checkpoint-policy",
-        choices=("current", "blanket"),
+        choices=("current", "blanket", "cell-final"),
         default="current",
-        help="diagnostic storage control; blanket checkpoints each compiled block",
+        help="diagnostic storage control; blanket checkpoints each compiled block, cell-final retains the last block of each routing cell",
     )
     parser.add_argument("--updates", type=int, default=0)
     parser.add_argument("--batches", type=int, default=1)
     parser.add_argument("--gradients", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
-    if options.checkpoint_policy == "blanket":
-        from delta_feedback_experiment import model as model_module
-
-        def blanket_attention(*args):
-            return torch.utils.checkpoint.checkpoint(
-                model_module._compiled_block,
-                *args,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
-
-        def blanket_pkda(*args):
-            return torch.utils.checkpoint.checkpoint(
-                model_module._compiled_pkda_block,
-                *args,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
-
-        model_module._compiled_selective_block = blanket_attention
-        model_module._compiled_selective_pkda_block = blanket_pkda
     torch.manual_seed(1)
     torch.set_float32_matmul_precision("high")
     args = parse_run_args(["round8-qualification", "--condition", "arfl"])
@@ -98,6 +79,36 @@ def main():
         .cuda()
         .train()
     )
+    if options.checkpoint_policy != "current":
+        from delta_feedback_experiment import model as model_module
+
+        def run_with_storage_policy(compiled, *block_args):
+            block = block_args[0]
+            # Block owns its layer index, while the model owns cell geometry.
+            # Selecting by position also bounds retained blocks without PKDA.
+            cell_size = model.cfg.routing_block_size
+            if (
+                options.checkpoint_policy == "cell-final"
+                and block.layer % cell_size == cell_size - 1
+            ):
+                return compiled(*block_args)
+            return torch.utils.checkpoint.checkpoint(
+                compiled,
+                *block_args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+
+        def attention_with_storage(*block_args):
+            return run_with_storage_policy(model_module._compiled_block, *block_args)
+
+        def pkda_with_storage(*block_args):
+            return run_with_storage_policy(
+                model_module._compiled_pkda_block, *block_args
+            )
+
+        model_module._compiled_selective_block = attention_with_storage
+        model_module._compiled_selective_pkda_block = pkda_with_storage
     modes = [tuple(map(int, mode.split(":"))) for mode in options.modes.split(",")]
     batch_modes = (
         {tuple(map(int, mode.split(":"))) for mode in options.batch_modes.split(",")}
