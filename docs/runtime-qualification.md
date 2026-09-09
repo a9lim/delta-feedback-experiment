@@ -46,6 +46,12 @@ analysis. CUDA training uses the same equations through the following path:
   for cached decode. Q/K/V projection and convolution work is packed; output
   norm/gate and control-gradient packing are fused. CUDA training never falls
   back silently to a sequential implementation.
+- The dense convolution, recurrence, and norm/gate reach FLA through custom
+  operators with exact fake implementations and their own backward operators,
+  so Dynamo keeps them in the graph and a PKDA block compiles as one graph
+  instead of fifteen joined by breaks at FLA's disabled entry points. Each
+  forward asserts the metadata its fake promises. Cached decode calls FLA
+  directly.
 - Compiled native FlexAttention with causal masks shared across layers and
   passes. Cached decode writes BF16 K/V and exposes only the valid prefix.
   Global Q/K/V and gate projections share a GEMM. No external `flash-attn`
@@ -53,6 +59,16 @@ analysis. CUDA training uses the same equations through the following path:
 - Triton MHDB routing with site-local nulls, raw values, a source softmax per
   group, and full-width RMS coupling in backward. Each compiled block emits
   its distance from the cell entry for the current/completed delta bank.
+- Each within-column source is banked at its birth: readers receive an alias
+  and the routing backward adds their contribution into the source's own BF16
+  accumulator, one program per token so no atomics, and returns no gradient
+  for it. The bank rides the residual stream, so its backward runs once every
+  reader has, and it hands the finished accumulator on as the source's
+  gradient. The accumulator is allocated where the source is born, which under
+  capture is one address in the graph's pool and one memset per replay. A
+  reader that does not bank (the portable and non-Triton routers) still
+  returns an ordinary gradient and the bank adds it; the gate compares the two
+  accumulations on the same model.
 - Persistent FP32 projection/embedding gradient sinks and address-stable BF16
   weight shadows refreshed once per optimizer update. Shadows are runtime
   operands, not additional learned or checkpointed state.

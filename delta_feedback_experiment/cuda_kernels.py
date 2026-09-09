@@ -317,6 +317,7 @@ if triton is not None:
         num_heads: tl.constexpr,
         head_dim: tl.constexpr,
         n_sources: tl.constexpr,
+        n_banked: tl.constexpr,
         tokens_per_program: tl.constexpr,
         block_h: tl.constexpr,
         block_k: tl.constexpr,
@@ -326,6 +327,12 @@ if triton is not None:
         Per-token source gradients are stored directly; the query and null
         gradients, which are sums over every token, stay in FP32 registers and
         leave as one ``[dim]`` partial per program.
+
+        The first ``n_banked`` sources are banked: their destination is the
+        source's own accumulator, which this program reads and rewrites for the
+        tokens it owns.  No two programs share a token, so the read-modify-write
+        needs no atomics, and the caller then has one gradient per banked source
+        instead of one per reader for autograd to sum.
         """
         pid = tl.program_id(0)
         h_offsets = tl.arange(0, block_h)
@@ -471,6 +478,12 @@ if triton is not None:
                         g25,
                         g26,
                     )
+                    if index <= n_banked:
+                        source_grad += tl.load(
+                            grad_source + token * dim + offsets,
+                            mask=token_mask,
+                            other=0.0,
+                        ).to(tl.float32)
                     tl.store(
                         grad_source + token * dim + offsets,
                         source_grad.to(grad_source.dtype.element_ty),
@@ -483,8 +496,13 @@ if triton is not None:
         )
 
 
-ROUTE_TOKENS_PER_PROGRAM = 4
-"""Tokens folded into one backward program; sets the query/null partial count."""
+ROUTE_TOKENS_PER_PROGRAM = 8
+"""Tokens folded into one backward program; sets the query/null partial count.
+
+Eight is where the screen geometry's widest banks are fastest and the partial
+buffer its reduction reads is half of what four leaves; below eight the
+reduction grows without making the kernel quicker, above it the per-program
+serial work starts to cost more than the reduction saves."""
 
 
 def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
@@ -579,23 +597,28 @@ def _route_backward_impl(
     inv_rms: Tensor,
     null: Tensor,
     sources: list[Tensor],
+    accumulators: list[Tensor],
     num_heads: int,
 ) -> tuple[Tensor, Tensor, list[Tensor]]:
     grad_routed = grad_routed.contiguous()
     bank = (null, *sources)
     n_sources = len(bank)
+    n_banked = len(accumulators)
     batch, length, dim = sources[0].shape
     bt = batch * length
     head_dim = _check_route_dims(dim, num_heads)
     block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
     flat_weights = weights.view(n_sources, bt, num_heads)
     padded = _padded_sources(bank)
+    # A banked source's destination is its own accumulator, which the kernel
+    # adds into; only the rest need a gradient tensor of their own.
     source_grads = [
         torch.empty(source.shape, device=source.device, dtype=source.dtype)
-        for source in sources
+        for source in sources[n_banked:]
     ]
-    padded_grads = tuple(source_grads) + (source_grads[-1],) * (
-        MAX_ROUTE_SOURCES - len(source_grads)
+    destinations = [*accumulators, *source_grads]
+    padded_grads = tuple(destinations) + (destinations[-1],) * (
+        MAX_ROUTE_SOURCES - len(destinations)
     )
     programs = triton.cdiv(bt, ROUTE_TOKENS_PER_PROGRAM)
     partials = torch.empty(
@@ -614,6 +637,7 @@ def _route_backward_impl(
         num_heads=num_heads,
         head_dim=head_dim,
         n_sources=n_sources,
+        n_banked=n_banked,
         tokens_per_program=ROUTE_TOKENS_PER_PROGRAM,
         block_h=block_h,
         block_k=block_k,
@@ -934,9 +958,14 @@ if triton is not None:
         present: Tensor,
         null: Tensor,
         sources: list[Tensor],
+        accumulators: list[Tensor],
         eps: float,
         num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        # ``accumulators`` is the banked sources' gradient destination. The
+        # forward never reads it; it is an input so that the site's backward
+        # receives the same buffers the source's bank will hand to autograd.
+        del accumulators
         return _route_forward_impl(projected, present, null, sources, eps, num_heads)
 
     @_route_forward_op.register_fake
@@ -945,10 +974,11 @@ if triton is not None:
         present: Tensor,
         null: Tensor,
         sources: list[Tensor],
+        accumulators: list[Tensor],
         eps: float,
         num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        del present, null, eps
+        del present, null, accumulators, eps
         batch, length, _ = sources[0].shape
         n_sources = len(sources) + 1
         routed = torch.empty_like(sources[0])
@@ -972,10 +1002,32 @@ if triton is not None:
         inv_rms: Tensor,
         null: Tensor,
         sources: list[Tensor],
+        accumulators: list[Tensor],
         num_heads: int,
     ) -> tuple[Tensor, Tensor, list[Tensor]]:
+        """MHDB backward; banked sources are accumulated into in place.
+
+        Like ``dw_accum`` this declares no mutation while writing the
+        accumulators, and for the same reason: each site's forward saves them,
+        and a declared mutation would bump the version counter that every other
+        site's saved copy is checked against.  The two differ in what keeps the
+        call alive.  ``dw_accum`` returns a zero token its caller folds into a
+        live gradient; here the query and null gradients are live outputs of
+        every site, because a router's query and null are always trained.
+        ``Router.forward`` asserts that, so freezing them fails there rather
+        than silently dropping banked gradients.  ``torch.library.opcheck``'s
+        schema test rejects both; the accumulators are external graph inputs
+        held by the source's bank, so no buffer reuse can reach them.
+        """
         return _route_backward_impl(
-            projected, grad_routed, weights, inv_rms, null, sources, num_heads
+            projected,
+            grad_routed,
+            weights,
+            inv_rms,
+            null,
+            sources,
+            accumulators,
+            num_heads,
         )
 
     @_route_backward_op.register_fake
@@ -986,34 +1038,55 @@ if triton is not None:
         inv_rms: Tensor,
         null: Tensor,
         sources: list[Tensor],
+        accumulators: list[Tensor],
         num_heads: int,
     ) -> tuple[Tensor, Tensor, list[Tensor]]:
         del grad_routed, weights, inv_rms, num_heads
         return (
             torch.empty_like(projected),
             torch.empty_like(null),
-            [torch.empty_like(source) for source in sources],
+            [torch.empty_like(source) for source in sources[len(accumulators) :]],
         )
 
     def _route_setup_context(ctx, inputs, output) -> None:
-        projected, _present, null, sources, _eps, num_heads = inputs
+        projected, _present, null, sources, accumulators, _eps, num_heads = inputs
         _routed, weights, inv_rms = output
-        ctx.save_for_backward(projected, null, weights, inv_rms, *sources)
+        # The accumulators are mutated by every reader between this forward and
+        # this backward, through an operator that declares no mutation for the
+        # reason ``dw_accum`` documents, so their saved versions stay valid.
+        ctx.save_for_backward(
+            projected, null, weights, inv_rms, *sources, *accumulators
+        )
         ctx.num_heads = num_heads
+        ctx.n_sources = len(sources)
         ctx.mark_non_differentiable(weights, inv_rms)
 
     def _route_autograd_backward(ctx, grad_routed, _grad_weights, _grad_inv_rms):
-        projected, null, weights, inv_rms, *sources = ctx.saved_tensors
+        projected, null, weights, inv_rms, *rest = ctx.saved_tensors
+        sources = list(rest[: ctx.n_sources])
+        accumulators = list(rest[ctx.n_sources :])
         grad_projected, grad_null, source_grads = _route_backward_op(
             projected,
             grad_routed,
             weights,
             inv_rms,
             null,
-            list(sources),
+            sources,
+            accumulators,
             ctx.num_heads,
         )
-        return grad_projected, None, grad_null, source_grads, None, None
+        # A banked source took its gradient in place; autograd gets none for
+        # it. The list inputs take a list of gradients of their own length.
+        gradients = [None] * len(accumulators) + list(source_grads)
+        return (
+            grad_projected,
+            None,
+            grad_null,
+            gradients,
+            [None] * len(accumulators),
+            None,
+            None,
+        )
 
     _route_forward_op.register_autograd(
         _route_autograd_backward, setup_context=_route_setup_context
@@ -1029,21 +1102,33 @@ def bespoke_route(
     eps: float,
     num_heads: int,
     sources: tuple[Tensor, ...],
+    accumulators: tuple[Tensor, ...] = (),
 ) -> tuple[Tensor, Tensor]:
     """Full-width RMS keys plus per-head depth softmaxes in fused Triton.
 
     ``null`` is the site's width-``dim`` null value; it is source 0 of the
-    returned weights and never materialized per token.
+    returned weights and never materialized per token.  ``accumulators`` are the
+    banked destinations of the leading sources: the backward adds each of their
+    gradients into its accumulator and returns none for it, so a source read by
+    many sites costs one gradient tensor rather than one per site.
     """
     if triton is None or not projected.is_cuda:
         raise RuntimeError("bespoke_route requires Triton CUDA")
+    if len(accumulators) > len(sources):
+        raise ValueError("banked accumulators must be a prefix of the sources")
     present_arg = (
         present
         if present is not None
         else torch.empty(0, device=projected.device, dtype=torch.bool)
     )
     routed, weights, _inv_rms = _route_forward_op(
-        projected, present_arg, null.contiguous(), list(sources), eps, num_heads
+        projected,
+        present_arg,
+        null.contiguous(),
+        list(sources),
+        list(accumulators),
+        eps,
+        num_heads,
     )
     return routed, weights
 

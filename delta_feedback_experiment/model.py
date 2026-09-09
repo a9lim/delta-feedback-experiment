@@ -597,6 +597,52 @@ _compiled_route_sources = torch.compile(
 )
 
 
+class _BankedSource(torch.autograd.Function):
+    """Give a routing source one gradient accumulator for all of its readers.
+
+    A source of the within-column bank — the column seed, a completed block
+    delta — is read by every later site, so autograd would hold one gradient
+    contribution per reader and sum them in place afterwards: at ``r = 4`` the
+    seed alone reached twenty-four block backwards.  Here the source is handed
+    out through an alias whose readers add their contribution straight into
+    ``accumulator`` and return no gradient, and this backward passes the
+    finished accumulator on as the source's gradient.
+
+    The residual stream rides through as ``carrier`` so the node is on the
+    stream's own path: its backward therefore runs, and it runs only once every
+    reader of the alias has, which is exactly when the accumulator is complete.
+    A reader that is not banked (the portable and non-Triton routers) still
+    returns an ordinary gradient, which arrives here as ``grad_alias`` and is
+    added; correctness never depends on who banks.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, carrier: Tensor, source: Tensor, accumulator: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        ctx.set_materialize_grads(False)
+        ctx.accumulator = accumulator
+        return carrier.view_as(carrier), source.view_as(source)
+
+    @staticmethod
+    def backward(ctx, grad_carrier, grad_alias):
+        gathered = ctx.accumulator
+        if grad_alias is not None:
+            gathered = gathered + grad_alias
+        return grad_carrier, gathered, None
+
+
+def bank_source(carrier: Tensor, source: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """(carrier, the alias later sites read, the alias's gradient accumulator).
+
+    The accumulator is allocated where the source is born, so under capture it
+    is one address in the graph's own pool and one memset per replay.
+    """
+    accumulator = torch.zeros_like(source)
+    carrier, alias = _BankedSource.apply(carrier, source, accumulator)
+    return carrier, alias, accumulator
+
+
 class Router(nn.Module):
     """One MHDB site: per-group softmaxes, RMS-normed keys, raw values.
 
@@ -619,8 +665,15 @@ class Router(nn.Module):
         sources: list[Tensor],
         masks: list[Tensor | None],
         want_weights: bool,
+        accumulators: tuple[Tensor, ...] = (),
     ) -> tuple[Tensor | None, Tensor | None]:
-        """Return a routed addition and weights shaped ``[N,B,T,H]``."""
+        """Return a routed addition and weights shaped ``[N,B,T,H]``.
+
+        ``accumulators`` are the gradient accumulators of the leading, banked
+        sources; the Triton backward adds into them instead of returning a
+        gradient per site.  Every other path ignores them and returns ordinary
+        gradients, which the bank then adds.
+        """
         if not sources:
             return None, None
         null = self.null.to(sources[0].dtype)
@@ -636,6 +689,14 @@ class Router(nn.Module):
                 ]
             )
         if sources[0].is_cuda and route_triton is not None:
+            if accumulators and not (
+                self.query.requires_grad and self.null.requires_grad
+            ):
+                # The banked accumulation rides on this site's query and null
+                # gradients being live outputs; see the routing backward.
+                raise RuntimeError(
+                    "a banked routing site needs a trainable query and null"
+                )
             projected = (self.query.float() * self.key_norm.weight.float()).to(
                 sources[0].dtype
             )
@@ -646,6 +707,7 @@ class Router(nn.Module):
                 self.key_norm.eps,
                 self.num_heads,
                 tuple(sources),
+                tuple(accumulators),
             )
         elif sources[0].is_cuda:
             routed, weights = _compiled_route_sources(
@@ -710,11 +772,11 @@ class Block(nn.Module):
             self.attn_router = None
             self.mlp_router = None
 
-    def _read(self, h, router, sources, want_weights):
+    def _read(self, h, router, sources, accumulators, want_weights):
         if router is None or not sources:
             return h, None
         masks: list[Tensor | None] = [None] * len(sources)
-        routed, weights = router(list(sources), masks, want_weights)
+        routed, weights = router(list(sources), masks, want_weights, accumulators)
         return (h if routed is None else h + routed), weights
 
     def forward(
@@ -725,19 +787,26 @@ class Block(nn.Module):
         gate_weight: Tensor | None,
         want_weights: bool,
         *sources: Tensor,
+        accumulators: tuple[Tensor, ...] = (),
         attention_mask=None,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
-        """Returns (h, attn delta, mlp delta, cell delta, attn weights, mlp
-        weights). ``block_start`` is the residual at the cell's entry, or None
-        when this block opens the cell; with an entry the last source is the
-        cell's partial so far. The returned cell delta is the next sublayer's
-        partial source or, at the cell boundary, the completed block delta,
-        computed here so it lands inside the compiled block instead of as an
-        eager subtraction. (Passing ``h`` twice would make Dynamo guard the
-        inputs against aliasing, and its recompile-reason logging then
-        evaluates those guards across block instances.)"""
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+        """Returns (h, cell delta, attn weights, mlp weights). The branch
+        outputs stay inside: nothing reads them, and a compiled block that
+        returned them would both write them and take autograd's materialized
+        zero gradient back. ``block_start`` is the residual at the cell's
+        entry, or None when this block opens the cell; with an entry the last
+        source is the cell's partial so far. ``accumulators`` belong to the
+        leading banked sources, which are the same at both of this block's read
+        sites: the partial the MLP read replaces, and the attention delta the
+        opening block appends, are always last and never banked. The returned cell
+        delta is the next sublayer's partial source or, at the cell boundary,
+        the completed block delta, computed here so it lands inside the
+        compiled block instead of as an eager subtraction. (Passing ``h`` twice
+        would make Dynamo guard the inputs against aliasing, and its
+        recompile-reason logging then evaluates those guards across block
+        instances.)"""
         start = h if block_start is None else block_start
-        x, w_attn = self._read(h, self.attn_router, sources, want_weights)
+        x, w_attn = self._read(h, self.attn_router, sources, accumulators, want_weights)
         normalized = self.attn_norm(x)
         if self.is_pkda:
             state = a_state = conv_state = None
@@ -762,30 +831,49 @@ class Block(nn.Module):
             mlp_sources = (*sources[:-1], sources[-1] + a)
         else:
             mlp_sources = (*sources, a)
-        x, w_mlp = self._read(h, self.mlp_router, mlp_sources, want_weights)
+        x, w_mlp = self._read(
+            h, self.mlp_router, mlp_sources, accumulators, want_weights
+        )
         m = self.branch_scale * self.mlp(self.mlp_norm(x))
         h = h + m
-        return h, a, m, h - start, w_attn, w_mlp
+        return h, h - start, w_attn, w_mlp
 
 
-def _block_for_checkpoint(block, h, block_start, gate_weight, mask, *sources):
-    """Pure checkpoint wrapper; immutable mask geometry is a per-call input."""
-    h, a, m, delta, _, _ = block(
-        h, block_start, None, gate_weight, False, *sources, attention_mask=mask
+def _block_for_checkpoint(block, h, block_start, gate_weight, mask, banked, *tensors):
+    """Pure checkpoint wrapper; immutable mask geometry is a per-call input.
+
+    ``banked`` counts the accumulators that follow the sources in ``tensors``:
+    the flat signature keeps activation checkpointing and Dynamo's specialized
+    call convention positional.
+    """
+    sources = tensors[: len(tensors) - banked]
+    h, delta, _, _ = block(
+        h,
+        block_start,
+        None,
+        gate_weight,
+        False,
+        *sources,
+        accumulators=tensors[len(sources) :],
+        attention_mask=mask,
     )
-    return h, a, m, delta
+    return h, delta
 
 
 # Each block family compiles through its own code object. Dynamo keys its
 # cache on the code object and, when it recompiles, evaluates every earlier
 # entry's guards against the current call to log the reason; one family's
 # guards name attributes the other family's mixer does not have.
-def _attention_block(block, h, block_start, gate_weight, mask, *sources):
-    return _block_for_checkpoint(block, h, block_start, gate_weight, mask, *sources)
+def _attention_block(block, h, block_start, gate_weight, mask, banked, *tensors):
+    return _block_for_checkpoint(
+        block, h, block_start, gate_weight, mask, banked, *tensors
+    )
 
 
-def _pkda_block(block, h, block_start, gate_weight, mask, *sources):
-    return _block_for_checkpoint(block, h, block_start, gate_weight, mask, *sources)
+def _pkda_block(block, h, block_start, gate_weight, mask, banked, *tensors):
+    return _block_for_checkpoint(
+        block, h, block_start, gate_weight, mask, banked, *tensors
+    )
 
 
 _compiled_block = torch.compile(
@@ -800,10 +888,12 @@ _compiled_block = torch.compile(
 
 _compiled_pkda_block = torch.compile(
     _pkda_block,
-    # FLA's opaque recurrence remains its own kernel boundary. Inductor graph
-    # breaks around it and fuses the projections, controls, norm/gate, MLP,
-    # residual updates, and routing on either side.
-    fullgraph=False,
+    # FLA's kernels are wrapped as custom operators in ``fla_ops``, so the
+    # recurrence stays its own kernel boundary without breaking the graph:
+    # the projections, controls, norm/gate, MLP, residual updates, and both
+    # routed reads compile and fuse as one graph, and every input reaches
+    # autograd through exactly one backward.
+    fullgraph=True,
     dynamic=False,
     mode=INDUCTOR_MODE,
 )
@@ -893,6 +983,12 @@ class DeltaModel(nn.Module):
                 self.payload_router = Router(cfg)
         self.grad_checkpoint = False
         """Runtime switch: checkpoint each block during training forwards."""
+        self.bank_sources = True
+        """Runtime switch: give each routed source one gradient accumulator.
+
+        Off, every site returns its own gradient for every source and autograd
+        sums them, which is what the portable and no-grad paths do anyway and
+        what the gate compares the banked accumulation against."""
         torch.random.set_rng_state(common_init_state)
         self.embed_tokens.apply(self._init_weights)
         self.blocks.apply(self._init_weights)
@@ -1126,6 +1222,7 @@ class DeltaModel(nn.Module):
         h: Tensor,
         entry: Tensor | None,
         passed: list[Tensor],
+        banked: tuple[Tensor, ...],
         *,
         cache: KVCache | None,
         want_weights: bool,
@@ -1133,7 +1230,8 @@ class DeltaModel(nn.Module):
         attention_mask,
     ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
         """One block on the residual ``h``: returns (h, cell delta, attention
-        weights, MLP weights); the weights are None unless requested."""
+        weights, MLP weights); the weights are None unless requested.
+        ``banked`` are the accumulators of the leading sources in ``passed``."""
         gate_weight = (
             self.attention_gates[block.global_gate_index].weight
             if block.global_gate_index is not None
@@ -1142,28 +1240,33 @@ class DeltaModel(nn.Module):
         block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
         mask = None if block.is_pkda else attention_mask
         if checkpointing:
-            h, _a, _m, delta = torch.utils.checkpoint.checkpoint(
+            h, delta = torch.utils.checkpoint.checkpoint(
                 block_fn if h.is_cuda else _block_for_checkpoint,
                 block,
                 h,
                 entry,
                 gate_weight,
                 mask,
+                len(banked),
                 *passed,
+                *banked,
                 use_reentrant=False,
                 preserve_rng_state=False,
             )
             return h, delta, None, None
         if h.is_cuda and cache is None and not want_weights:
-            h, _a, _m, delta = block_fn(block, h, entry, gate_weight, mask, *passed)
+            h, delta = block_fn(
+                block, h, entry, gate_weight, mask, len(banked), *passed, *banked
+            )
             return h, delta, None, None
-        h, _a, _m, delta, w_attn, w_mlp = block(
+        h, delta, w_attn, w_mlp = block(
             h,
             entry,
             cache,
             gate_weight,
             want_weights,
             *passed,
+            accumulators=banked,
             attention_mask=mask,
         )
         return h, delta, w_attn, w_mlp
@@ -1175,6 +1278,7 @@ class DeltaModel(nn.Module):
         cell: int,
         sources: list[Tensor] | None,
         names: list[str],
+        accumulators: list[Tensor],
         *,
         entry: Tensor | None = None,
         partial: Tensor | None = None,
@@ -1192,6 +1296,7 @@ class DeltaModel(nn.Module):
         recorded route sites so a tied core's iterations stay distinct.
         """
         cell_start = h if entry is None else entry
+        banked = tuple(accumulators)
         for index, block in enumerate(blocks):
             opens = entry is None and index == 0
             passed = list(sources) if sources is not None else []
@@ -1200,7 +1305,7 @@ class DeltaModel(nn.Module):
                 passed.append(partial)
                 passed_names.append(f"partial{cell}")
             h, partial, w_attn, w_mlp = self._run_block(
-                block, h, None if opens else cell_start, passed, **runtime
+                block, h, None if opens else cell_start, passed, banked, **runtime
             )
             if w_attn is not None:
                 site = f"L{block.layer}{label}.attn"
@@ -1250,10 +1355,29 @@ class DeltaModel(nn.Module):
             else None
         )
 
+        # Banking needs the Triton router's in-place accumulation and a live
+        # backward; without either the sources stay raw and every reader
+        # returns its own gradient, as before.
+        banking = (
+            self.bank_sources
+            and cfg.routing_active
+            and x.is_cuda
+            and route_triton is not None
+            and torch.is_grad_enabled()
+        )
+        payload_reads = cfg.feedback_active and cfg.routing_active and need_payload
+
+        h = x
         sources: list[Tensor] | None = None
         source_names: list[str] = []
+        accumulators: list[Tensor] = []
         if cfg.routing_active:
-            sources = [x]
+            if banking:
+                h, seed, accumulator = bank_source(h, x)
+                sources = [seed]
+                accumulators.append(accumulator)
+            else:
+                sources = [x]
             source_names.append("seed")
         seeds = len(sources) if sources is not None else 0
 
@@ -1275,12 +1399,25 @@ class DeltaModel(nn.Module):
             route_source_names=route_source_names,
         )
 
-        def complete(delta: Tensor, cell: int) -> None:
-            if sources is not None:
-                sources.append(delta)
-                source_names.append(f"block{cell}")
+        def complete(carrier: Tensor, delta: Tensor, cell: int) -> Tensor:
+            """Store a completed block delta as a source; return the carrier.
 
-        h = x
+            A delta the rest of this column never reads — the last cell's,
+            without a payload to write — is stored raw: banking it would give
+            the block an all-zero gradient contribution to accumulate.
+            """
+            if sources is None:
+                return carrier
+            readers = cell < cfg.routing_blocks - 1 or payload_reads
+            if banking and readers:
+                carrier, alias, accumulator = bank_source(carrier, delta)
+                sources.append(alias)
+                accumulators.append(accumulator)
+            else:
+                sources.append(delta)
+            source_names.append(f"block{cell}")
+            return carrier
+
         size = cfg.routing_block_size
         core_entry = core_state = None
         if cfg.loop:
@@ -1291,8 +1428,10 @@ class DeltaModel(nn.Module):
             prelude = self.blocks[:size]
             core = self.blocks[size : cfg.layers - size]
             coda = self.blocks[cfg.layers - size :]
-            h, delta = self._run_cell(prelude, h, 0, sources, source_names, **runtime)
-            complete(delta, 0)
+            h, delta = self._run_cell(
+                prelude, h, 0, sources, source_names, accumulators, **runtime
+            )
+            h = complete(h, delta, 0)
             core_entry = h
             for iteration in range(iterations):
                 if cache is not None:
@@ -1303,6 +1442,7 @@ class DeltaModel(nn.Module):
                     1,
                     sources,
                     source_names,
+                    accumulators,
                     entry=None if iteration == 0 else core_entry,
                     partial=None if iteration == 0 else delta,
                     label=f"i{iteration}",
@@ -1311,16 +1451,18 @@ class DeltaModel(nn.Module):
             if cache is not None:
                 cache.iteration = 0
             core_state = h
-            complete(delta, 1)
-            h, delta = self._run_cell(coda, h, 2, sources, source_names, **runtime)
-            complete(delta, 2)
+            h = complete(h, delta, 1)
+            h, delta = self._run_cell(
+                coda, h, 2, sources, source_names, accumulators, **runtime
+            )
+            h = complete(h, delta, 2)
         else:
             for cell in range(cfg.routing_blocks):
                 blocks = self.blocks[cell * size : (cell + 1) * size]
                 h, delta = self._run_cell(
-                    blocks, h, cell, sources, source_names, **runtime
+                    blocks, h, cell, sources, source_names, accumulators, **runtime
                 )
-                complete(delta, cell)
+                h = complete(h, delta, cell)
         if cache is not None:
             cache.advance(x.shape[1])
 
@@ -1330,7 +1472,10 @@ class DeltaModel(nn.Module):
             if cfg.routing_active:
                 payload_sources = [sources[seeds - 1], *sources[seeds:]]
                 routed, weights = self.payload_router(
-                    payload_sources, [None] * len(payload_sources), want_weights
+                    payload_sources,
+                    [None] * len(payload_sources),
+                    want_weights,
+                    tuple(accumulators),
                 )
                 if weights is not None:
                     weights_out["payload"] = weights

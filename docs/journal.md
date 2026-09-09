@@ -34,15 +34,31 @@ What moves it, in the order it is being taken:
   passes through `r = 3` keep their activations; the three-pass family raw
   runs out of memory at 22.4 GiB, so deeper modes still checkpoint. Exact,
   and 3.5% of an `arl` run.
-- **Eager gradient sums between compiled graphs.** Autograd adds 150
+- **Eager gradient sums between compiled graphs.** Autograd added 150
   residual-shaped BF16 tensors per `r = 4` microbatch (2.2 ms), summing the
   gradient contributions that reach one tensor from several compiled
-  graphs: the seed and completed block deltas fan out to every later block,
-  and the PKDA blocks compile as several graphs around FLA's kernels, so
-  the same source enters more than one graph per block. The fix in progress
-  wraps FLA's operators as custom ops so PKDA blocks compile whole, and
-  routes the cross-block sources through a bank whose backward hands back
-  an in-place accumulated buffer.
+  graphs. `torch._dynamo.explain` named the second cause exactly: a PKDA
+  block compiled into **fifteen** graphs joined by fourteen breaks, every one
+  of them at a `torch.compiler.disable`d FLA entry point (four at the fused
+  convolution, one at the recurrence, three at the norm/gate), so each of the
+  block's two routed reads sat in a different graph and every source entered
+  twice per block. Wrapping those three kernels as custom operators with
+  exact fake implementations makes a PKDA block one graph (0 breaks, 57 ops)
+  and took the count to 63; it is bit-identical to calling FLA directly
+  except for `d log_atk_scale`, whose atomic FP32 reduction differs by
+  4.5e-8 against a run-to-run spread of 7.6e-6. It bought no time on its own
+  (+0.3 ms at `r = 4`): the sums it removed came back as in-graph adds. What
+  bought time was the bank underneath it — each within-column source now
+  hands its readers an alias plus one BF16 accumulator that the routing
+  backward adds into in place, one program per token, and returns no
+  gradient for. That took 63 adds to 22 (2.18 ms to 0.42) for 0.78 ms of
+  read-modify-write in the router kernel, and the whole round runs `r = 1/4/8`
+  at 58.4/101.6/159.4 ms against 58.8/102.7/161.1, with 3,215 kernels
+  against 3,504. The 22 that remain are all cell-entry fan-out: the tied
+  core's entry residual is `block_start` in sixteen block calls because the
+  cell delta is `h - start`. Writing it as `partial + a + m` instead would
+  delete the input, but it is a different rounding of the delta and so a
+  different model.
 - **The classifier gradient's round trip.** Each microbatch zero-fills a
   233 MB BF16 classifier gradient and adds it into the FP32 sink (1.17 GB of
   traffic, 1.2 ms). In progress: accumulate across `N` microbatches in one

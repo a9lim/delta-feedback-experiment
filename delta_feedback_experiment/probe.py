@@ -24,6 +24,7 @@ def cuda_gate() -> None:
 
     from .cuda_kernels import bespoke_route
     from .cuda_kernels import triton as route_triton
+    from .fla_ops import pkda_norm_gate
     from .model import (
         DeltaModel,
         KVCache,
@@ -43,7 +44,6 @@ def cuda_gate() -> None:
         _l2norm,
         _PackedControlSplit,
         pkda_cuda_available,
-        rms_norm_gated,
     )
     from .train import (
         CONTRACT,
@@ -147,6 +147,44 @@ def cuda_gate() -> None:
         for actual, expected in zip(grads, ref_grads, strict=True):
             if not torch.allclose(actual, expected, rtol=5e-2, atol=5e-3):
                 raise AssertionError(f"H={heads} bespoke router gradient drift")
+
+        # Banked sources: two sites read the same bank, their gradients go
+        # into the sources' accumulators instead of coming back per site, and
+        # the finished accumulator must equal the sum autograd would have
+        # formed. The comparison is against the unbanked run's own two-site
+        # sum, so only the accumulation order can differ.
+        banked = len(sources) - 1 or 1
+        accumulators = tuple(
+            torch.zeros_like(source) for source in sources[:banked]
+        )
+        for source in sources:
+            source.grad = None
+        query.grad = key.grad = null.grad = None
+        # A fresh projection: the first backward already freed the graph that
+        # built the one above.
+        banked_projected = (query * key).to(sources[0].dtype)
+        first, _ = bespoke_route(
+            banked_projected, present, null, 1e-6, heads, sources, accumulators
+        )
+        second, _ = bespoke_route(
+            banked_projected, present, null, 1e-6, heads, sources, accumulators
+        )
+        (first.float().square().mean() + second.float().square().mean()).backward()
+        for index, source in enumerate(sources):
+            gathered = (
+                accumulators[index] if index < banked else source.grad
+            )
+            expected = 2 * grads[3 + index].float()
+            if index < banked and source.grad is not None:
+                raise AssertionError(
+                    f"H={heads} banked source {index} still returned a gradient"
+                )
+            if not torch.allclose(
+                gathered.float(), expected, rtol=5e-2, atol=5e-3
+            ):
+                raise AssertionError(
+                    f"H={heads} banked router source {index} gradient drift"
+                )
 
     route_parity(48, 4, 3, 11, 5, 7)
     route_parity(
@@ -301,13 +339,8 @@ def cuda_gate() -> None:
     ).requires_grad_()
     norm_gate = torch.randn_like(norm_output).requires_grad_()
     norm_weight = torch.randn(16, device="cuda", dtype=torch.float32).requires_grad_()
-    norm_actual = rms_norm_gated(
-        norm_output,
-        norm_gate,
-        norm_weight,
-        None,
-        "sigmoid",
-        eps=pkda_norm_eps,
+    norm_actual, _ = pkda_norm_gate(
+        norm_output, norm_gate, norm_weight, pkda_norm_eps
     )
     norm_ref_output = norm_output.detach().clone().requires_grad_()
     norm_ref_gate = norm_gate.detach().clone().requires_grad_()
@@ -563,12 +596,14 @@ def cuda_gate() -> None:
     ).cuda()
     parity_prefix = torch.full((1, 2), 7, dtype=torch.long, device="cuda")
     parity: dict[str, tuple[float, torch.Tensor]] = {}
-    for label, condition, iterations in (
-        ("arf", "arf", None),
-        ("arf again", "arf", None),
-        ("arfl", "arfl", 1),
+    for label, condition, iterations, banked in (
+        ("arf", "arf", None, True),
+        ("arf again", "arf", None, True),
+        ("arf unbanked", "arf", None, False),
+        ("arfl", "arfl", 1, True),
     ):
         parity_model = screen_model(condition)
+        parity_model.bank_sources = banked
         parity_model.refresh_shadows()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             parity_outs = multipass(
@@ -603,13 +638,37 @@ def cuda_gate() -> None:
     if flat_grad.shape != loop_grad.shape:
         raise AssertionError("arfl at r = 1 has a different gradient surface than arf")
     grad_floor = relative_error(parity["arf again"][1], flat_grad)
+    # Every routed source hands its readers one accumulator instead of one
+    # gradient each. The sum is over the same terms in the same order, but a
+    # banked term is added to the running sum unrounded while an unbanked one
+    # is rounded to BF16 first, and a BF16 running sum over the seed's
+    # forty-eight readers carries about a percent either way. So the two
+    # accumulations differ by more than the model against itself does; the
+    # bound is wide enough for that and far below anything a misrouted
+    # accumulator would produce.
+    unbanked_loss, unbanked_grad = parity["arf unbanked"]
+    # Banking cannot reach the forward at all, so any difference here is the
+    # head's own tile accumulation, which moves the loss by about 3e-4 between
+    # two runs of the same model. Hold it to that spread with room.
+    loss_floor = abs(parity["arf again"][0] - flat_loss)
+    if abs(unbanked_loss - flat_loss) > 2 * loss_floor + 1e-3:
+        raise AssertionError(
+            f"the source bank moved the loss: {flat_loss} versus {unbanked_loss}, "
+            f"against a same-model floor of {loss_floor}"
+        )
+    unbanked_rel = relative_error(flat_grad, unbanked_grad)
+    if unbanked_rel > 4 * grad_floor:
+        raise AssertionError(
+            f"the source bank drifts from per-reader accumulation: gradient rel "
+            f"{unbanked_rel:.4f} against a same-model floor of {grad_floor:.4f}"
+        )
     loop_grad_rel = relative_error(loop_grad, flat_grad)
     if loop_grad_rel > 1.5 * grad_floor + 1e-3:
         raise AssertionError(
             f"arfl at r = 1 drifts from arf: gradient rel {loop_grad_rel:.4f} "
             f"against a same-model floor of {grad_floor:.4f}"
         )
-    del parity, flat_grad, loop_grad, parity_rows, parity_prefix
+    del parity, flat_grad, loop_grad, unbanked_grad, parity_rows, parity_prefix
     # Collect the stage's cyclic garbage before the next model exists, so the
     # capture peak below measures the trainer and not this stage's remains.
     gc.collect()

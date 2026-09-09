@@ -17,17 +17,14 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .cuda_kernels import pack_control_gradients, shadowed_weight, sink_linear
+from .fla_ops import fla_ops_available, pkda_norm_gate, pkda_qkv_conv, pkda_recurrence
 
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
-    from fla.modules.convolution import causal_conv1d
-    from fla.modules.fused_norm_gate import rms_norm_gated
     from fla.ops.precond_kda import (
         chunk_precond_kda,
         fused_recurrent_precond_kda,
     )
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
-    causal_conv1d = None
-    rms_norm_gated = None
     chunk_precond_kda = None
     fused_recurrent_precond_kda = None
 
@@ -43,11 +40,11 @@ def _l2norm(t: Tensor) -> Tensor:
 
 
 def pkda_cuda_available() -> bool:
+    """Whether the wrapped dense operators and the cached-decode kernels exist."""
     return (
-        chunk_precond_kda is not None
+        fla_ops_available()
+        and chunk_precond_kda is not None
         and fused_recurrent_precond_kda is not None
-        and causal_conv1d is not None
-        and rms_norm_gated is not None
     )
 
 
@@ -220,7 +217,7 @@ class PreconditionedKDA(nn.Module):
             x.is_cuda
             and conv_state is None
             and not output_final_state
-            and causal_conv1d is not None
+            and fla_ops_available()
         ):
             # Dense training/prefill has no per-projection cache state. Collapse
             # the three projections into one GEMM over the concatenated weights
@@ -247,16 +244,12 @@ class PreconditionedKDA(nn.Module):
             # K, and V as three contiguous slabs and takes their three gradients
             # back, so the recurrence reads them without contiguity copies and
             # the backward never concatenates them.
-            (q, k, v), _ = causal_conv1d(
-                x=qkv,
-                weight=weight,
-                bias=None,
-                activation="silu",
-                backend="triton",
-                l2norm_head_dim=self.head_dim,
-                l2norm_channels=2 * self.projection_size,
-                l2norm_eps=QK_NORM_EPS,
-                split_outputs=(self.projection_size,) * 3,
+            q, k, v = pkda_qkv_conv(
+                qkv,
+                weight,
+                self.head_dim,
+                2 * self.projection_size,
+                QK_NORM_EPS,
             )
             shape = (*x.shape[:2], self.num_heads, self.head_dim)
             return q.view(shape), k.view(shape), v.view(shape), None
@@ -393,6 +386,26 @@ class PreconditionedKDA(nn.Module):
             raise RuntimeError(
                 "CUDA PKDA requires the pinned flash-linear-attention build"
             )
+        if state is None and a_state is None and not output_final_state:
+            # Dense training and prefill: the wrapped operator keeps Dynamo in
+            # one graph and hands its backward the same intermediates FLA's
+            # ``disable_recompute`` path keeps.
+            output, _saved = pkda_recurrence(
+                q,
+                k,
+                v,
+                raw_decay,
+                precond_decay,
+                precond_beta,
+                beta,
+                self.A_log,
+                self.dt_bias,
+                self.log_precond_center,
+                self.head_dim**-0.5,
+                self.squash_x,
+                self.squash_eps,
+            )
+            return output, None, None
         kwargs = {
             "q": q,
             "k": k,
@@ -479,17 +492,12 @@ class PreconditionedKDA(nn.Module):
             self.output_gate_up.bias,
         ).reshape(*x.shape[:2], self.num_heads, self.head_dim)
         if output.is_cuda:
-            if rms_norm_gated is None:
+            if not fla_ops_available():
                 raise RuntimeError(
                     "CUDA PKDA output requires FLA's fused RMSNorm-gate operator"
                 )
-            mixed = rms_norm_gated(
-                output,
-                gate_logits,
-                self.output_norm,
-                None,
-                "sigmoid",
-                eps=self.norm_eps,
+            mixed, _rstd = pkda_norm_gate(
+                output, gate_logits, self.output_norm, self.norm_eps
             )
         else:
             normalized = output.float() * torch.rsqrt(
