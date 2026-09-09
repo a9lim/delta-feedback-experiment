@@ -691,7 +691,7 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
     evaluator = SimpleNamespace(states={4: None})
     fields = execution_fields(model, trainer, evaluator)
     assert fields == {
-        "flex": 1,
+        "flash_sdpa": 1,
         "cce": 1,
         "cuda_graphs": 3,
         "eval_graphs": 1,

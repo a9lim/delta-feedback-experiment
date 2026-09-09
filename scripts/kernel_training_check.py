@@ -28,9 +28,9 @@ from delta_feedback_experiment.train import (
     CudaEvalRunner,
     CudaGraphTrainer,
     GraphSpec,
-    parse_run_args,
     build_schedule,
     clip_gradients,
+    parse_run_args,
 )
 
 
@@ -83,9 +83,10 @@ def run(options) -> None:
 
         add_feedback_saver(record_search)
     if options.attention:
-        from torch.nn.attention.flex_attention import flex_attention
+        from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
         from delta_feedback_experiment import attention
+        from delta_feedback_experiment import model as model_module
 
         kernel_options = {"BACKEND": "TRITON"}
         if options.attention != "plain":
@@ -95,7 +96,14 @@ def run(options) -> None:
         if options.attention == "prescale":
             kernel_options["PRESCALE_QK"] = True
 
-        def causal(query, key, value, block_mask):
+        def causal_mask(batch, head, query, key):
+            return query >= key
+
+        def causal(query, key, value):
+            block_mask = create_block_mask(
+                causal_mask, None, None, query.shape[-2], key.shape[-2],
+                device=query.device,
+            )
             return flex_attention(
                 query,
                 key,
@@ -105,12 +113,13 @@ def run(options) -> None:
                 kernel_options=kernel_options,
             )
 
-        attention._compiled_causal_attention = torch.compile(
+        attention.causal_attention = torch.compile(
             causal,
             fullgraph=True,
             dynamic=False,
             mode=delta_feedback_experiment.INDUCTOR_MODE,
         )
+        model_module.causal_attention = attention.causal_attention
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1)
     args = parse_run_args(["kernel-stability", "--condition", "arf"])

@@ -10,18 +10,21 @@ from torch.utils.checkpoint import (
 
 
 def activation_policy(ctx, op, *args, **kwargs):
-    """Keep projections and quadratic attention; reconstruct other activations.
+    """Keep bounded projections and attention; reconstruct expanded MLP values.
 
     PKDA exposes its full auxiliary tensor family as one operator, so saving
     that operation would retain its entire recurrent history. Recomputing it
     and pointwise intermediates bounds memory in the longest loop modes.
     """
-    if op in (
-        torch.ops.aten.mm.default,
-        torch.ops.aten.addmm.default,
-        torch.ops.aten._scaled_dot_product_flash_attention.default,
-    ):
+    if op == torch.ops.aten._scaled_dot_product_flash_attention.default:
         return CheckpointPolicy.MUST_SAVE
+    if op in (torch.ops.aten.mm.default, torch.ops.aten.addmm.default):
+        left, right = args[-2:]
+        # The fused gate/up projection expands D to 2I (>8D here). Keeping
+        # those outputs across 120 executed layers exceeds the graph pool;
+        # the packed PKDA QKV output (5D) still fits this sixfold bound.
+        if right.shape[-1] <= 6 * left.shape[-1]:
+            return CheckpointPolicy.MUST_SAVE
     return CheckpointPolicy.PREFER_RECOMPUTE
 
 

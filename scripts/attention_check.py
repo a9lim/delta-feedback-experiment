@@ -132,7 +132,7 @@ def main():
             )
             # These tensors retain the graph outputs' storage for every replay.
             graphs[mode], outputs[mode], timings[mode] = graph, captured, []
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - report each backend/compiler failure
             failures[mode] = f"{type(exc).__name__}: {exc}"
             print(json.dumps({"mode": mode, "error": failures[mode]}), flush=True)
 

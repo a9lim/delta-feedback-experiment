@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from delta_feedback_experiment.activation import checkpoint_context
 from delta_feedback_experiment.cuda_kernels import sink_linear
 from delta_feedback_experiment.model import DeltaModel, condition_config
 
@@ -99,7 +100,10 @@ def test_independent_or_partial_gradient_buffers_do_not_pack():
 
 
 @pytest.mark.parametrize("compiled", [False, True])
-def test_packed_linear_repeated_backward_preserves_segment_gradients(compiled):
+@pytest.mark.parametrize("checkpointed", [False, True])
+def test_packed_linear_repeated_backward_preserves_segment_gradients(
+    compiled, checkpointed
+):
     torch.manual_seed(89)
     weights = tuple(torch.nn.Parameter(torch.randn(rows, 8)) for rows in (6, 3, 5))
     # Nonzero initial contents and a nonzero storage offset catch overwrite
@@ -112,8 +116,20 @@ def test_packed_linear_repeated_backward_preserves_segment_gradients(compiled):
         weight.detach().clone().requires_grad_() for weight in weights
     )
 
+    def projection(x):
+        output = sink_linear(x, weights, sinks, shadow, packed_sink=packed)
+        return output.sin() * torch.sigmoid(output) if checkpointed else output
+
     def forward(x):
-        return sink_linear(x, weights, sinks, shadow, packed_sink=packed)
+        if checkpointed:
+            return torch.utils.checkpoint.checkpoint(
+                projection,
+                x,
+                use_reentrant=False,
+                preserve_rng_state=False,
+                context_fn=checkpoint_context,
+            )
+        return projection(x)
 
     run = (
         torch.compile(forward, backend="aot_eager", fullgraph=True)
@@ -125,6 +141,8 @@ def test_packed_linear_repeated_backward_preserves_segment_gradients(compiled):
         reference_x = x.detach().clone().requires_grad_()
         output = run(x)
         expected = F.linear(reference_x, torch.cat(reference_weights))
+        if checkpointed:
+            expected = expected.sin() * torch.sigmoid(expected)
         cotangent = torch.randn_like(output)
         output.backward(cotangent)
         expected.backward(cotangent)

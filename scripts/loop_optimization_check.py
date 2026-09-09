@@ -48,10 +48,10 @@ def main():
     started = time.perf_counter()
     runner = CudaGraphTrainer(model, optimizers, args, build_schedule(args))
     evaluation = CudaEvalRunner(model, args, runner.pool) if options.full_family else None
-    result = dict(capture_seconds=time.perf_counter() - started,
-                  graph_count=len(runner.states), evaluation_captured=evaluation is not None,
-                  scope="fresh initialization; fixed synthetic rows; runtime and numerical qualification",
-                  modes=[])
+    result = {"capture_seconds": time.perf_counter() - started,
+                  "graph_count": len(runner.states), "evaluation_captured": evaluation is not None,
+                  "scope": "fresh initialization; fixed synthetic rows; runtime and numerical qualification",
+                  "modes": []}
     print(json.dumps({key: value for key, value in result.items() if key != "modes"}), flush=True)
     rows = torch.randint(args.vocab_size, (args.batch_rows, args.seq_len + 1),
                          generator=torch.Generator().manual_seed(31)).cuda()
@@ -68,8 +68,8 @@ def main():
             end.synchronize()
             if index >= 2:
                 samples.append(start.elapsed_time(end))
-        record = dict(k=spec.n_passes, r=spec.iterations, checkpoint=spec.checkpoint,
-                      raw_median_ms=statistics.median(samples), raw_samples_ms=samples, batches=[])
+        record = {"k": spec.n_passes, "r": spec.iterations, "checkpoint": spec.checkpoint,
+                      "raw_median_ms": statistics.median(samples), "raw_samples_ms": samples, "batches": []}
         for batch in range(options.batches + options.updates):
             runner.zero_grad()
             runner.begin(spec)
@@ -90,9 +90,9 @@ def main():
                     optimizer.step()
                 model.refresh_shadows()
             torch.cuda.synchronize()
-            record["batches"].append(dict(replay_seconds=replay_seconds,
-                                           total_seconds=time.perf_counter() - started,
-                                           loss=state.loss_sum.item(), grad_norm=float(norm)))
+            record["batches"].append({"replay_seconds": replay_seconds,
+                                           "total_seconds": time.perf_counter() - started,
+                                           "loss": state.loss_sum.item(), "grad_norm": float(norm)})
         result["modes"].append(record)
         result.update(peak_allocated_gib=torch.cuda.max_memory_allocated() / 2**30,
                       peak_reserved_gib=torch.cuda.max_memory_reserved() / 2**30)

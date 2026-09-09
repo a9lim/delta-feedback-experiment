@@ -885,7 +885,7 @@ def cuda_gate() -> None:
         raise AssertionError("CUDA NAdam did not materialize fresh optimizer state")
     eval_runner = CudaEvalRunner(model, args, runner.pool)
     backend = execution_fields(model, runner, eval_runner)
-    if backend["flex"] != 1 or backend["cuda_graphs"] != 4:
+    if backend["flash_sdpa"] != 1 or backend["cuda_graphs"] != 4:
         raise AssertionError(f"invalid production execution telemetry: {backend}")
     torch.cuda.synchronize()
     prepared = time.monotonic() - started
