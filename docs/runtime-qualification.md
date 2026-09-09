@@ -45,7 +45,10 @@ analysis. CUDA training uses the same equations through the following path:
 - Workspace FLA PKDA chunk kernels for training/prefill and recurrent kernels
   for cached decode. Q/K/V projection and convolution work is packed; output
   norm/gate and control-gradient packing are fused. CUDA training never falls
-  back silently to a sequential implementation.
+  back silently to a sequential implementation. State-kernel tuning keys
+  include sequence count and length, so one long row has its own choice.
+  Ada additionally searches 16-wide state tiles; the recurrence and FP32 state
+  boundaries are unchanged.
 - The dense convolution, recurrence, and norm/gate reach FLA through custom
   operators with exact fake implementations and their own backward operators,
   so Dynamo keeps them in the graph and a PKDA block compiles as one graph

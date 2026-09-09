@@ -480,12 +480,11 @@ def automatic_checkpoint(
     if device.type != "cuda":
         return False
     cfg = model.cfg
-    # Ten cell-passes of the screen geometry fit the 24 GiB card raw: the whole
-    # one-pass loop family through r = 8 captured at 14.6 GiB allocated, and
-    # its r = 8 replay is 154 ms raw against 199 ms recomputing every block.
-    # Deeper modes retain projection and dense-attention outputs and recompute
-    # other activations inside each compiled block. The budget counts the
-    # actual executed layers and tokens, including repeated core iterations.
+    # Ten cell-passes of the screen geometry fit the 24 GiB card raw, including
+    # the one-pass loop family through r = 8. Deeper modes retain bounded
+    # projection and dense-attention outputs and reconstruct expanded MLP
+    # values and PKDA auxiliaries. Count actual executed layers and tokens,
+    # including repeated core iterations.
     raw_work = 4096 * 768 * 40
     work = (
         args.micro_rows
