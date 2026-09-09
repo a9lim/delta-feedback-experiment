@@ -28,7 +28,7 @@ from delta_feedback_experiment.train import (
     CudaEvalRunner,
     CudaGraphTrainer,
     GraphSpec,
-    build_parser,
+    parse_run_args,
     build_schedule,
     clip_gradients,
 )
@@ -113,7 +113,7 @@ def run(options) -> None:
         )
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1)
-    args = build_parser().parse_args(["kernel-stability", "--condition", "arf"])
+    args = parse_run_args(["kernel-stability", "--condition", "arf"])
     payload = torch.load(options.snapshot, map_location="cpu", weights_only=False)
     saved = analysis.saved_args(payload)
     for field in (*analysis.GEOMETRY, "seq_len", "condition"):

@@ -73,6 +73,18 @@ it until funding. The bridge is registered at context 4,096 rather than the
 screen's 1,024 because a9 wants to publish it as an organism, with a 25x
 recipe for Jobe and a 400x recipe for Prime.
 
+a9 then asked what the commands would be and whether `--scale` and a
+tokens-per-parameter flag should address every planned run. Landed as
+`--scale screen|bridge|flagship` and `--tokens-per-param`, default 25, with
+`--steps` derived from it unless typed. Two design points: the ratio's
+denominator is the flat full stack's active count at the scale, not the
+run's own, so `ar`, `arf`, and `arfl` keep one schedule and stay paired,
+which a per-condition count would have broken; and the unit is tokens per
+parameter rather than a multiple of the Chinchilla twenty, because that is
+the number every table here reports. The count rounds up, which moves the
+screen's 400x pair from 171,909 to 171,910 steps. A resume validates what
+`--scale` or `--tokens-per-param` pinned and inherits the rest.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the

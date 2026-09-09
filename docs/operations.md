@@ -68,6 +68,23 @@ delta queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
 delta queue example-arfl-s1 --condition arfl --seed 1 --data-seed 0 \
   --data-dir /data/delta/tokens
 
+# Every planned run is --condition, --scale, and --tokens-per-param: the
+# preset fills the geometry and batch, the ratio derives the schedule (25 is
+# the screen recipe, 400 the Prime recipes; docs/scaling.md has each budget).
+# The bridge on Jobe, and the memory staging to run before it:
+delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
+  --data-dir /data/delta/tokens
+delta queue bridge-delta-arfl-s1 --condition arfl --scale bridge --seed 1 --data-seed 0 \
+  --data-dir /data/delta/tokens
+python scripts/loop_memory_stage.py --out data/summary/loop-stage-bridge-DATE.json \
+  --condition arfl --scale bridge
+# The 400x recipes, which the single-process trainer expresses and Prime's
+# unbuilt distributed path would run:
+delta train screen-delta-arf-400x-s1 --condition arf --tokens-per-param 400 \
+  --seed 1 --data-seed 0 --data-dir /data/delta/tokens
+delta train flagship-delta-arfl-s1 --condition arfl --scale flagship --tokens-per-param 400 \
+  --seed 1 --data-seed 0 --data-dir /data/delta/tokens
+
 # Inspect and control the detached queue.
 delta status
 delta watch

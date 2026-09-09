@@ -42,9 +42,9 @@ def _resumes(job: spool.Job) -> bool:
 
 
 def _validate_job(job: spool.Job) -> None:
-    from .train import build_parser
+    from .train import parse_run_args
 
-    build_parser().parse_args([job.tag, *_train_args(job)])
+    parse_run_args([job.tag, *_train_args(job)])
 
 
 PIPELINE = spool.Pipeline(

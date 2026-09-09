@@ -49,7 +49,7 @@ def cuda_gate() -> None:
         CONTRACT,
         CudaEvalRunner,
         CudaGraphTrainer,
-        build_parser,
+        parse_run_args,
         build_schedule,
         automatic_checkpoint,
         clip_gradients,
@@ -655,7 +655,7 @@ def cuda_gate() -> None:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
-    args = build_parser().parse_args(["cuda-probe", "--condition", "arf"])
+    args = parse_run_args(["cuda-probe", "--condition", "arf"])
     schedule = build_schedule(args)
     torch.set_float32_matmul_precision("high")
 

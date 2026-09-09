@@ -97,6 +97,10 @@ change it everywhere at once.
 - A `k`-pass batch costs `k` transformer evaluations, and under `l` a pass
   executes `2 + r` cells. Report pass-tokens and cell-tokens beside predicted
   tokens; equal steps are matched data, not matched compute.
+- Every planned run is addressed by `--condition`, `--scale`, and
+  `--tokens-per-param`: the preset fills the geometry and batch, the ratio
+  derives the step count from the flat stack's active parameters at that
+  scale, rounded up, and every condition at a scale shares the schedule.
 - Pass-1 validation is the common number. Conditions with `f` also report the fused
   number and the self-composition trace.
 - Independently trained runs differ like two seeds even when paired, so a

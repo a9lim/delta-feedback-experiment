@@ -19,6 +19,7 @@ import argparse
 import contextlib
 import gc
 import math
+from fractions import Fraction
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -54,6 +55,30 @@ CONTRACT = checkpoints.CheckpointContract(
 
 GRAD_CLIP_NORM = 10.0
 """Global FP32 gradient-norm ceiling shared by every run."""
+
+BATCH_TOKENS = 327_680
+"""Predicted tokens per optimizer step at every scale."""
+
+SCALES: dict[str, dict[str, int]] = {
+    "screen": dict(
+        dim=768, layers=12, heads=8, kv_heads=4, intermediate=3328, pkda_heads=10,
+        seq_len=1024, batch_rows=320, micro_rows=4,
+    ),
+    "bridge": dict(
+        dim=1152, layers=16, heads=12, kv_heads=6, intermediate=4992, pkda_heads=15,
+        seq_len=4096, batch_rows=80, micro_rows=1,
+    ),
+    "flagship": dict(
+        dim=1536, layers=24, heads=16, kv_heads=8, intermediate=6656, pkda_heads=20,
+        seq_len=8192, batch_rows=40, micro_rows=1,
+    ),
+}
+"""The geometries of ``docs/scaling.md``: the column, the row length, the rows
+that keep ``BATCH_TOKENS`` predictions per step, and the single-process
+microbatch."""
+
+DEFAULT_TOKENS_PER_PARAM = 25.0
+"""The screen recipe's predicted tokens per reference active parameter."""
 
 EXACT_FIELDS = (
     "condition",
@@ -152,8 +177,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="continue the tag from its latest snapshot",
     )
 
+    scale = parser.add_argument_group("scale")
+    scale.add_argument(
+        "--scale",
+        choices=tuple(SCALES),
+        default="screen",
+        help=(
+            "geometry and batch preset from docs/scaling.md; a trunk or recipe "
+            "flag typed alongside overrides its field (default: screen)"
+        ),
+    )
+    scale.add_argument(
+        "--tokens-per-param",
+        type=float,
+        default=DEFAULT_TOKENS_PER_PARAM,
+        metavar="RATIO",
+        help=(
+            "predicted tokens per active non-embedding parameter of the flat "
+            "full stack at this scale; derives --steps, rounded up to whole "
+            "steps, unless --steps is given (default: 25; the Prime recipes "
+            "use 400)"
+        ),
+    )
+
     schedule = parser.add_argument_group("schedule (state-defining)")
-    schedule.add_argument("--steps", type=runs.parse_step_count, default=10745)
+    schedule.add_argument(
+        "--steps",
+        type=runs.parse_step_count,
+        default=None,
+        help="schedule length; derived from --tokens-per-param unless given",
+    )
     schedule.add_argument(
         "--warmup-frac",
         type=probability,
@@ -187,7 +240,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-rows",
         type=int,
         default=320,
-        help="global batch in rows (320 x 1024 predictions = 327,680 tokens)",
+        help=(
+            "global batch in rows; the scale keeps 327,680 predictions per "
+            "step, as does a retyped --seq-len without this flag"
+        ),
     )
     recipe.add_argument("--micro-rows", type=int, default=4)
     recipe.add_argument("--seq-len", type=int, default=1024)
@@ -1018,6 +1074,86 @@ class AsyncSnapshotWriter:
 # -- the run -------------------------------------------------------------------
 
 
+def model_fields(args) -> dict:
+    """The ``ModelConfig`` fields one run's arguments name."""
+    return dict(
+        vocab_size=args.vocab_size,
+        dim=args.dim,
+        layers=args.layers,
+        heads=args.heads,
+        kv_heads=args.kv_heads,
+        head_dim=args.head_dim,
+        intermediate=args.intermediate,
+        pkda_heads=args.pkda_heads,
+        pkda_head_dim=args.pkda_head_dim,
+        pkda_conv_size=args.pkda_conv_size,
+        max_seq_len=args.seq_len + 1,
+        loop_iterations=args.loop_iterations,
+        loop_max_iterations=args.loop_max_iterations,
+    )
+
+
+def reference_active(args) -> int:
+    """Active non-embedding parameters of the flat full stack, ``arf``, at this
+    geometry: the denominator of the tokens-per-parameter ratio. Every
+    condition at a scale shares it, so paired runs keep one schedule."""
+    with torch.device("meta"):
+        model = DeltaModel(condition_config("arf", **model_fields(args)))
+    total = sum(parameter.numel() for parameter in model.parameters())
+    return total - model.embed_tokens.weight.numel()
+
+
+def schedule_steps(args) -> int:
+    """Steps that reach ``tokens_per_param`` predicted tokens per reference
+    active parameter, rounded up to whole steps so the target is never
+    undershot."""
+    target = Fraction(str(args.tokens_per_param)) * reference_active(args)
+    return math.ceil(target / (args.batch_rows * args.seq_len))
+
+
+def resolve_run_args(
+    parser: argparse.ArgumentParser, argv: list[str]
+) -> tuple[argparse.Namespace, frozenset[str]]:
+    """Parse one command line and settle the recipe it names.
+
+    ``--scale`` fills every geometry and batch field the operator left unset;
+    a retyped ``--seq-len`` without ``--batch-rows`` keeps ``BATCH_TOKENS``
+    predictions per step; and a fresh run's ``--steps`` is derived from
+    ``--tokens-per-param`` unless typed. Returns the settled arguments and the
+    destinations the operator pinned: what they typed, plus what an explicit
+    ``--scale`` or ``--tokens-per-param`` fixed, which a resume validates
+    against the checkpoint rather than inherits from it.
+    """
+    args = parser.parse_args(argv)
+    explicit = checkpoints.explicit_destinations(parser, argv)
+    pinned = set(explicit)
+    for field, value in SCALES[args.scale].items():
+        if field not in explicit:
+            setattr(args, field, value)
+            if "scale" in explicit:
+                pinned.add(field)
+    if "seq_len" in explicit and "batch_rows" not in explicit:
+        if BATCH_TOKENS % args.seq_len:
+            parser.error(
+                f"--seq-len {args.seq_len} does not divide the {BATCH_TOKENS:,}"
+                "-prediction step; give --batch-rows"
+            )
+        args.batch_rows = BATCH_TOKENS // args.seq_len
+        pinned.add("batch_rows")
+    if "steps" in explicit and "tokens_per_param" in explicit:
+        parser.error("give --steps or --tokens-per-param, not both")
+    if "steps" not in explicit and not args.resume:
+        args.steps = schedule_steps(args)
+        if "tokens_per_param" in explicit:
+            pinned.add("steps")
+    return args, frozenset(pinned)
+
+
+def parse_run_args(argv: list[str]) -> argparse.Namespace:
+    """One run's settled arguments; the entry every parser user goes through."""
+    return resolve_run_args(build_parser(), argv)[0]
+
+
 def pick_device(name: str | None) -> torch.device:
     if name:
         return torch.device(name)
@@ -1062,7 +1198,7 @@ def clip_gradients(parameters) -> float:
 def train(argv: list[str] | None = None) -> dict:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    args = parser.parse_args(argv)
+    args, pinned = resolve_run_args(parser, argv)
     device = pick_device(args.device)
     if device.type == "cuda":
         # Ada's TF32 tensor cores materially accelerate NorMuonH's FP32 batched
@@ -1079,9 +1215,8 @@ def train(argv: list[str] | None = None) -> dict:
         missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
         if missing:
             raise ValueError(f"{path}: checkpoint lacks settings {missing}")
-        explicit = checkpoints.explicit_destinations(parser, argv)
         conflicts = checkpoints.mismatched_fields(
-            saved, args, EXACT_FIELDS, only=explicit
+            saved, args, EXACT_FIELDS, only=pinned
         )
         if conflicts:
             raise ValueError(f"resume conflicts with checkpoint settings: {conflicts}")
@@ -1090,8 +1225,14 @@ def train(argv: list[str] | None = None) -> dict:
             saved,
             exact_fields=EXACT_FIELDS,
             runtime_fields=RUNTIME_FIELDS,
-            explicit=explicit,
+            explicit=pinned,
         )
+        if "tokens_per_param" in pinned and schedule_steps(args) != args.steps:
+            raise ValueError(
+                f"--tokens-per-param {args.tokens_per_param:g} is "
+                f"{schedule_steps(args)} steps at the checkpoint's geometry; "
+                f"its schedule is {args.steps}"
+            )
 
     if args.batch_rows % args.micro_rows:
         raise ValueError("batch-rows must be a multiple of micro-rows")
@@ -1113,22 +1254,7 @@ def train(argv: list[str] | None = None) -> dict:
 
     torch.manual_seed(args.seed)
     model = DeltaModel(
-        condition_config(
-            args.condition,
-            vocab_size=args.vocab_size,
-            dim=args.dim,
-            layers=args.layers,
-            heads=args.heads,
-            kv_heads=args.kv_heads,
-            head_dim=args.head_dim,
-            intermediate=args.intermediate,
-            pkda_heads=args.pkda_heads,
-            pkda_head_dim=args.pkda_head_dim,
-            pkda_conv_size=args.pkda_conv_size,
-            max_seq_len=args.seq_len + 1,
-            loop_iterations=args.loop_iterations,
-            loop_max_iterations=args.loop_max_iterations,
-        )
+        condition_config(args.condition, **model_fields(args))
     ).to(device)
     optimizers = build_optimizers(
         model,

@@ -35,7 +35,9 @@ from delta_feedback_experiment.train import (
     CudaEvalRunner,
     CudaGraphTrainer,
     automatic_checkpoint,
-    build_parser,
+    model_fields,
+
+    parse_run_args,
     build_schedule,
     draw_iterations,
     draw_passes,
@@ -55,7 +57,7 @@ def main() -> None:
     own, rest = parser.parse_known_args()
     if "--condition" not in rest:
         rest = ["--condition", "arfl", *rest]
-    args = build_parser().parse_args(["loop-stage", *rest])
+    args = parse_run_args(["loop-stage", *rest])
     stages = set(own.stages.split(","))
     if not torch.cuda.is_available():
         raise SystemExit("this measurement needs the CUDA surface")
@@ -67,22 +69,7 @@ def main() -> None:
         torch.manual_seed(args.seed)
         model = (
             DeltaModel(
-                condition_config(
-                    args.condition,
-                    vocab_size=args.vocab_size,
-                    dim=args.dim,
-                    layers=args.layers,
-                    heads=args.heads,
-                    kv_heads=args.kv_heads,
-                    head_dim=args.head_dim,
-                    intermediate=args.intermediate,
-                    pkda_heads=args.pkda_heads,
-                    pkda_head_dim=args.pkda_head_dim,
-                    pkda_conv_size=args.pkda_conv_size,
-                    max_seq_len=args.seq_len + 1,
-                    loop_iterations=args.loop_iterations,
-                    loop_max_iterations=args.loop_max_iterations,
-                )
+                condition_config(args.condition, **model_fields(args))
             )
             .cuda()
             .train()

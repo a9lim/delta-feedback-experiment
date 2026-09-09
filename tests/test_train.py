@@ -44,8 +44,11 @@ from delta_feedback_experiment.train import (
     GRAD_CLIP_NORM,
     CudaGraphTrainer,
     automatic_checkpoint,
+    BATCH_TOKENS,
     build_parser,
     build_schedule,
+    parse_run_args,
+    resolve_run_args,
     clip_gradients,
     draw_iterations,
     draw_passes,
@@ -491,7 +494,7 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
 
 
 def test_build_schedule_screen_shape():
-    args = build_parser().parse_args(["x"])  # defaults: 10,745 steps
+    args = parse_run_args(["x"])  # the screen at 25 tokens per parameter: 10,745 steps
     assert args.batch_rows == 320
     assert args.batch_rows // args.micro_rows == 80
     schedule = build_schedule(args)
@@ -509,17 +512,62 @@ def test_build_schedule_screen_shape():
 def test_fresh_screen_budgets_match_active_parameter_ratios():
     tokens_per_step = 320 * 1024
     df_active_non_embedding = 140_827_944
-    trials = {25: 10_745, 400: 171_909}
+    trials = {25: 10_745, 400: 171_910}
 
     for target_ratio, steps in trials.items():
         realized_ratio = steps * tokens_per_step / df_active_non_embedding
-        assert realized_ratio == pytest.approx(target_ratio, abs=0.002)
+        assert target_ratio <= realized_ratio < target_ratio + tokens_per_step / df_active_non_embedding
+        assert parse_run_args(["x", "--tokens-per-param", str(target_ratio)]).steps == steps
 
-    prime = build_parser().parse_args(["x", "--steps", "171909"])
+    prime = parse_run_args(["x", "--tokens-per-param", "400"])
     schedule = build_schedule(prime)
-    assert schedule.spans == (3438, 0, 134_089, 34_382)
+    assert schedule.spans == (3438, 0, 134_090, 34_382)
     assert feedback_boundary(prime, schedule.total) == 128_932
-    assert schedule.heat_end == 137_527
+    assert schedule.heat_end == 137_528
+
+
+def test_scale_presets_and_ratio_derive_the_schedule():
+    """--condition, --scale, and --tokens-per-param address every planned run:
+    the preset fills the geometry and batch, the ratio derives the steps from
+    the flat stack's active count at that scale, and every condition at a
+    scale shares the count so paired runs keep one schedule."""
+    screen = parse_run_args(["x"])
+    assert (screen.dim, screen.layers, screen.seq_len, screen.batch_rows, screen.micro_rows) == (768, 12, 1024, 320, 4)
+    assert screen.steps == 10_745
+    bridge = parse_run_args(["x", "--scale", "bridge"])
+    assert (bridge.dim, bridge.layers, bridge.heads, bridge.kv_heads) == (1152, 16, 12, 6)
+    assert (bridge.intermediate, bridge.pkda_heads) == (4992, 15)
+    assert (bridge.seq_len, bridge.batch_rows, bridge.micro_rows, bridge.steps) == (4096, 80, 1, 31_787)
+    assert bridge.batch_rows * bridge.seq_len == BATCH_TOKENS
+    assert parse_run_args(["x", "--scale", "bridge", "--tokens-per-param", "400"]).steps == 508_587
+    assert parse_run_args(["x", "--scale", "flagship", "--tokens-per-param", "400"]).steps == 1_345_272
+    for letters in ("", "a", "arf", "arfl"):
+        assert parse_run_args(["x", "--condition", letters]).steps == 10_745
+    deeper = parse_run_args(["x", "--scale", "bridge", "--layers", "20"])
+    assert (deeper.layers, deeper.dim) == (20, 1152)
+    shorter = parse_run_args(["x", "--scale", "bridge", "--seq-len", "2048"])
+    assert shorter.batch_rows == 160 and shorter.batch_rows * shorter.seq_len == BATCH_TOKENS
+    assert parse_run_args(["x", "--steps", "100"]).steps == 100
+    with pytest.raises(SystemExit):
+        parse_run_args(["x", "--steps", "100", "--tokens-per-param", "25"])
+    with pytest.raises(SystemExit):
+        parse_run_args(["x", "--seq-len", "1000"])
+
+
+def test_resolved_arguments_pin_what_the_operator_fixed():
+    """A resume validates what the operator pinned and inherits the rest: an
+    explicit --scale pins its fields, an explicit --tokens-per-param pins the
+    derived steps, and an untyped schedule stays open for the checkpoint."""
+    parser = build_parser()
+    args, pinned = resolve_run_args(parser, ["x", "--resume"])
+    assert pinned == frozenset({"resume"}) and args.steps is None
+    _, pinned = resolve_run_args(parser, ["x", "--resume", "--scale", "bridge"])
+    assert {"scale", "dim", "layers", "seq_len", "batch_rows", "micro_rows"} <= pinned
+    assert "steps" not in pinned
+    _, pinned = resolve_run_args(parser, ["x", "--tokens-per-param", "400"])
+    assert {"tokens_per_param", "steps"} <= pinned and "dim" not in pinned
+    _, pinned = resolve_run_args(parser, ["x", "--seq-len", "2048"])
+    assert {"seq_len", "batch_rows"} <= pinned
 
 
 def test_fresh_run_uses_authoritative_optimizer_defaults():

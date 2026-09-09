@@ -36,10 +36,13 @@ The widths step by half the screen's, so every geometry keeps the Kimi `5/3`
 recurrent-projection ratio, the `13/3` SwiGLU ratio, and the head widths, and
 MHDB's groups follow the global KV-head count at each. Convolution width,
 RMSNorm epsilon, and every other constant are the architecture's and do not
-vary. The trainer expresses any of them: `--dim`, `--layers`, `--heads`,
-`--kv-heads`, `--intermediate`, `--pkda-heads`, and `--seq-len` set the
-column, `--batch-rows` and `--micro-rows` the batch geometry, `--steps` the
-schedule.
+vary. Every planned run is addressed by `--condition`, `--scale`, and
+`--tokens-per-param`: `--scale screen|bridge|flagship` fills the column, the
+row length, and the batch rows of a geometry, any trunk or recipe flag typed
+alongside overrides its field, and `--tokens-per-param` derives the schedule
+length from the flat full stack's active count at that scale, rounded up to
+whole steps, so every condition at a scale shares one schedule. 25 is the
+screen recipe and 400 the Prime recipes; `--steps` types a length instead.
 
 Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x C`. Under
 `l` the first cell is the prelude, the last the coda, and the cells between
@@ -180,10 +183,12 @@ predictions where the screen's are 1,024 and the flagship's 8,192, so the
 ladder's rungs differ in context as well as size.
 
 ```bash
-delta queue TAG --condition arf --dim 1152 --layers 16 --heads 12 --kv-heads 6 \
-  --intermediate 4992 --pkda-heads 15 --seq-len 4096 --batch-rows 80 \
-  --micro-rows 1 --steps 31787
+delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
+  --data-dir /data/delta/tokens
 ```
+
+`--scale bridge` is the column, row length, and batch above; the 25x schedule
+is derived, and `--tokens-per-param 400` gives the Prime schedule.
 
 ### Parameters
 
@@ -225,7 +230,8 @@ additional.
 
 Both recipes keep the family's 327,680 predictions per optimizer step, which
 at 4,096 predictions per row is 80 rows: on Jobe 80 one-row microbatches, on
-Prime 8 ranks x microbatch 1 x accumulation 10.
+Prime 8 ranks x microbatch 1 x accumulation 10. `--scale bridge` with
+`--tokens-per-param 25` or `400` names them.
 
 | Quantity | 25x, Jobe | 400x, Prime |
 |---|---:|---:|
@@ -258,19 +264,20 @@ gain can be seen to grow or shrink with scale before the flagship is rented.
 ## Longer training at the same size
 
 A fresh `{a, arf}` pair on one 8xH100-80GB Prime node, both conditions seed 1,
-data seed 0, global row zero, 171,909 steps, 56,331,141,120 predicted tokens
-each, nothing loaded from Jobe.
+data seed 0, global row zero, `--tokens-per-param 400` at the screen, which
+is 171,910 steps and 56,331,468,800 predicted tokens each, nothing loaded
+from Jobe.
 
 | Condition | Predicted tokens | Active-token ratio |
 |---|---:|---:|
-| `a` | 56,331,141,120 | 403.55 |
-| `arf` | 56,331,141,120 | 400.00 |
+| `a` | 56,331,468,800 | 403.55 |
+| `arf` | 56,331,468,800 | 400.00 |
 
 | Phase | Steps | Passes, `arf` |
 |---|---:|---|
 | Warmup | 1–3,438 | one |
-| Stable heat | 3,439–137,527 | one through 128,932, then two or three |
-| Cooldown | 137,528–171,909 | two or three |
+| Stable heat | 3,439–137,528 | one through 128,932, then two or three |
+| Cooldown | 137,529–171,910 | two or three |
 
 The pair is 112.66B predicted tokens and about 128.44B expected pass-tokens.
 It compares the complete `arf` package against its shared hybrid baseline.

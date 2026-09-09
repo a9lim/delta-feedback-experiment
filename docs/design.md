@@ -158,14 +158,19 @@ expected pass-tokens per predicted token. Conditions without `f` use one pass
 throughout.
 
 The run is 3,520,921,600 predicted tokens: 25.0–25.2 per active non-embedding
-parameter with `a`, 30.7–31.1 without.
+parameter with `a`, 30.7–31.1 without. The count is derived: 25 predicted
+tokens per active parameter of the `arf` stack at the screen, 140,827,944,
+rounded up to whole steps, and every condition at a scale shares it.
 
 ### Knobs
 
 | Flag | Default | What it changes |
 |---|---:|---|
 | `--condition` | `""` | letters from `arfl` in any order; empty is the plain decoder |
-| `--steps`, `--batch-rows` | 10,745, 320 | schedule length and optimizer batch; the 25x recipe |
+| `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
+| `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule (25 is the screen recipe, 400 the Prime recipes) |
+| `--steps` | derived | schedule length, typed instead of derived |
+| `--seq-len`, `--batch-rows`, `--micro-rows` | by scale | predictions per row, rows per step, and the microbatch; the scale keeps 327,680 predictions per step, as does a retyped `--seq-len` alone |
 | `--seed`, `--data-seed` | | initialization pairing and the keyed data/feedback streams |
 | `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the two group learning rates |
 | `--feedback-start` | 0.75 | fraction of the schedule before the feedback boundary; 0 trains fused from step 0 |
