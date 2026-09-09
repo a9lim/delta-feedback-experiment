@@ -59,6 +59,18 @@ analysis. CUDA training uses the same equations through the following path:
 - Workspace cut-cross-entropy with BF16 operands, capture-safe preprocessing,
   differentiable log-partition for z-loss, ascending mean-logit vocabulary
   tiling, and backward filtering equivalent to its late-filter decision.
+- One persistent BF16 classifier-gradient buffer for the head. The backward
+  lock-adds every call's `dC` into it rather than zero-filling and returning a
+  233 MB tensor per microbatch, so the classifier receives no autograd
+  gradient; the trainer adds the buffer into the FP32 embedding sink and clears
+  it whenever another microbatch would take it past `--head-flush-every` head
+  calls, and once before the optimizer reads the step. One feedback pass is one
+  head call, so the number of BF16 additions a flush carries does not change
+  with the pass count. Vocabulary rows are addressed by original id, so the
+  per-batch permutation does not move a contribution. The gate measures the
+  window's classifier gradient against the exact FP32 gradient of the same
+  operands and against the per-call path, and checks that the captured body
+  reaches the buffer and the flush reaches the sink.
 - Fixed-shape Inductor tuning; one train graph per reachable (pass count,
   core iteration count) pair and shared-pool no-grad validation graphs at the
   evaluation count. Cyclic Python garbage is collected

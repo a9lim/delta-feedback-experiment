@@ -350,7 +350,8 @@ def test_classifier_shadow_is_derived_and_preserves_master_gradients():
 
     model = tiny("arf")
     assert model._classifier_shadow is None
-    assert model.classifier_for_loss() is model.embed_tokens.weight
+    operand, accumulator = model.classifier_for_loss()
+    assert operand is model.embed_tokens.weight and accumulator is None
     assert not any("classifier_shadow" in name for name in model.state_dict())
 
     master = torch.randn(11, 7, dtype=torch.float32, requires_grad=True)

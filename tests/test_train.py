@@ -472,7 +472,8 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
         states={
             GraphSpec(1, False): None,
             GraphSpec(2, False): None,
-        }
+        },
+        head_flush_every=16,
     )
     evaluator = SimpleNamespace(states={4: None})
     fields = execution_fields(model, trainer, evaluator)
@@ -482,6 +483,7 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
         "cuda_graphs": 3,
         "eval_graphs": 1,
         "checkpoint_modes": 0,
+        "head_flush_every": 16,
     }
 
 
