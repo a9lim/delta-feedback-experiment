@@ -1,48 +1,60 @@
-# Geometries and budgets: the screen and the flagship
+# Geometries and budgets: the screen, the bridge, and the flagship
 
-Two geometries of the same architecture. The **screen** is the small organism
-we grow on Jobe: width 768, three cells, the specimens in
-[findings.md](findings.md). The **flagship** is the 1B column at width 1,536
-and six cells, worked out here and not scheduled: it needs the distributed
-path, which is not implemented, and Prime time is real money, so a9 decides
-when to spend it. Every condition builds at both geometries, and the loop at
-each is the flat column with its middle cells tied.
+Three geometries of the same architecture. The **screen** is the small
+organism we grow on Jobe: width 768, three cells, context 1,024, the
+specimens in [findings.md](findings.md). The **bridge** is the rung between:
+width 1,152, four cells, context 4,096, about three times the screen's
+active parameters and the geometric midpoint of the ladder, the largest
+column the single-process trainer can grow on Jobe today and the one meant
+for publication as an organism. The **flagship** is the 1B column at width
+1,536, six cells, context 8,192, worked out here and not scheduled: it needs
+the distributed path, which is not implemented, and Prime time is real money,
+so a9 decides when to spend it. Every condition builds at every geometry,
+and the loop at each is the flat column with its middle cells tied.
 
 "Screen", "25x", and "400x" name recipes by predicted tokens per active
 non-embedding parameter. Every feedback pass and every core iteration adds
 compute on top of that count, so results carry pass-tokens and cell-tokens
 beside predicted tokens; equal steps are matched data, not matched compute.
 
-## The two geometries
+## The three geometries
 
-| Field | Screen | Flagship |
-|---|---:|---:|
-| Vocabulary, Qwen3 tokenizer | 151,936 | 151,936 |
-| Residual width `D` | 768 | 1,536 |
-| Layers / four-layer cells | 12 / 3 | 24 / 6 |
-| SwiGLU intermediate width | 3,328 | 6,656 |
-| Context, predictions per row | 1,024 | 8,192 |
-| Global query / KV heads, head width 96 | 8 / 4 | 16 / 8 |
-| Routing groups, the KV-head count | 4 | 8 |
-| PKDA heads, head width 128 | 10 | 20 |
-| PKDA Q/K/V projection width | 1,280 | 2,560 |
+| Field | Screen | Bridge | Flagship |
+|---|---:|---:|---:|
+| Vocabulary, Qwen3 tokenizer | 151,936 | 151,936 | 151,936 |
+| Residual width `D` | 768 | 1,152 | 1,536 |
+| Layers / four-layer cells | 12 / 3 | 16 / 4 | 24 / 6 |
+| SwiGLU intermediate width | 3,328 | 4,992 | 6,656 |
+| Context, predictions per row | 1,024 | 4,096 | 8,192 |
+| Global query / KV heads, head width 96 | 8 / 4 | 12 / 6 | 16 / 8 |
+| Routing groups, the KV-head count | 4 | 6 | 8 |
+| PKDA heads, head width 128 | 10 | 15 | 20 |
+| PKDA Q/K/V projection width | 1,280 | 1,920 | 2,560 |
+| Active non-embedding parameters | 140,827,944 | 416,634,192 | 1,102,046,496 |
 
-The flagship doubles the residual, SwiGLU, and PKDA projection widths and
-the head counts, so both keep the Kimi `5/3` recurrent-projection ratio and
-the head widths, and MHDB's groups follow the global KV-head count at both.
-Convolution width, RMSNorm epsilon, and every other constant are the
-architecture's and do not vary.
+The widths step by half the screen's, so every geometry keeps the Kimi `5/3`
+recurrent-projection ratio, the `13/3` SwiGLU ratio, and the head widths, and
+MHDB's groups follow the global KV-head count at each. Convolution width,
+RMSNorm epsilon, and every other constant are the architecture's and do not
+vary. The trainer expresses any of them: `--dim`, `--layers`, `--heads`,
+`--kv-heads`, `--intermediate`, `--pkda-heads`, and `--seq-len` set the
+column, `--batch-rows` and `--micro-rows` the batch geometry, `--steps` the
+schedule.
 
 Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x C`. Under
 `l` the first cell is the prelude, the last the coda, and the cells between
 them the tied core:
 
-| | Screen | Flagship |
-|---|---|---|
-| Prelude | layers 0–3 | layers 0–3 |
-| Core | layers 4–7, one cell | layers 4–19, four cells |
-| Coda | layers 8–11 | layers 20–23 |
-| Compute depth per pass | `4 + 4r + 4` layers, `2 + r` cells | `4 + 16r + 4` layers, `2 + 4r` cells |
+| | Screen | Bridge | Flagship |
+|---|---|---|---|
+| Prelude | layers 0–3 | layers 0–3 | layers 0–3 |
+| Core | layers 4–7, one cell | layers 4–11, two cells | layers 4–19, four cells |
+| Coda | layers 8–11 | layers 12–15 | layers 20–23 |
+| Compute depth per pass | `4 + 4r + 4` layers, `2 + r` cells | `4 + 8r + 4` layers, `2 + 2r` cells | `4 + 16r + 4` layers, `2 + 4r` cells |
+
+The draw is `r_mean = 4`, `r_max = 8` at every geometry, so `E[r] = 3.88`,
+median 4, `P(r = 1) = 10.3%`, and `P(r = 8) = 8.0%` throughout; only the
+cells per iteration change.
 
 ## The screen
 
@@ -154,6 +166,94 @@ per step, which projects the flat three-pass step to 41.7 h against the
 | default mixture | 34.8 h | ~19 h |
 | two passes on every step | 57.0 h | ~28 h |
 | three passes on every step | 89.8 h | 42.3 h |
+
+## The bridge
+
+The bridge is the flat column at width 1,152, four cells, and context 4,096:
+the screen's architecture at one and a half times the width and one more
+cell, on rows four times longer. Under `l` its core is two cells, so a bridge
+`arfl` is the first specimen whose core has more than one cell, and its
+`r = 1` column is the bridge `arf`. It is grown with the single-process
+trainer on Jobe at 25x, and it is the middle rung of the 400x ladder on
+Prime between the screen pair and the flagship. Its rows are 4,096
+predictions where the screen's are 1,024 and the flagship's 8,192, so the
+ladder's rungs differ in context as well as size.
+
+```bash
+delta queue TAG --condition arf --dim 1152 --layers 16 --heads 12 --kv-heads 6 \
+  --intermediate 4992 --pkda-heads 15 --seq-len 4096 --batch-rows 80 \
+  --micro-rows 1 --steps 31787
+```
+
+### Parameters
+
+| Component | Parameters |
+|---|---:|
+| Tied embedding and readout | 175,030,272 |
+| 16 SwiGLU channel mixers | 276,037,632 |
+| 12 PKDA mixers | 116,552,400 |
+| 4 gated global GQA mixers, including Q/K norms and gates | 21,234,432 |
+| FBT fusion, `f` | 2,654,208 |
+| Trunk, entry, and payload norms | 41,472 |
+| 32 within-column routers and one payload router | 114,048 |
+| **Total** | **591,664,464** |
+| **Active non-embedding** | **416,634,192** |
+
+Relative to unpreconditioned KDA, PKDA's two width-to-head projections and
+three learned per-head vectors add 34,605 parameters per PKDA layer, or
+415,260 in all; the four GGQA gates are 5,308,416 of the GGQA count. `l`
+adds nothing, as everywhere.
+
+### Decode cache
+
+At a full 4,096-token prompt, one sequence's token-mixer cache is:
+
+| Cache | Size |
+|---|---:|
+| 12 FP32 PKDA matrix states `[15,128,128]` | 11.250 MiB |
+| 12 FP32 PKDA diagonal states `[15,128]` | 0.088 MiB |
+| 12 BF16 Q/K/V convolution histories `[1920,3]` | 0.396 MiB |
+| 4 BF16 global-GQA KV caches `[4096,6,96]` | 36.000 MiB |
+| **Token-mixer total** | **47.733 MiB** |
+
+One cell is 11.9 MiB. Every decode mode under `l` holds `2 + 2r` cells at
+the request's `r`: 47.7 MiB at `r = 1`, 119.3 MiB at `r = 4`, 214.8 MiB at
+the cap. Payload, logits, allocator overhead, and serving metadata are
+additional.
+
+### Budgets
+
+Both recipes keep the family's 327,680 predictions per optimizer step, which
+at 4,096 predictions per row is 80 rows: on Jobe 80 one-row microbatches, on
+Prime 8 ranks x microbatch 1 x accumulation 10.
+
+| Quantity | 25x, Jobe | 400x, Prime |
+|---|---:|---:|
+| Optimizer steps | 31,787 | 508,587 |
+| Aligned budget | 10,415,964,160 predicted tokens | 166,653,788,160 predicted tokens |
+| Predicted tokens per active parameter | 25.0003 | 400.0003 |
+| Warmup | steps 1–636 | steps 1–10,172 |
+| Stable heat | steps 637–25,430 | steps 10,173–406,870 |
+| Cooldown | steps 25,431–31,787 | steps 406,871–508,587 |
+| Feedback boundary | after step 23,840 | after step 381,440 |
+| Expected pass-tokens | about 13.33B | about 213.3B |
+| Expected cell-tokens, `arf` / `arfl` | about 53.3B / 130.1B | about 853B / 2.08T |
+
+The 25x run is the screen recipe at the bridge's size: the same schedule
+shape, pass mixture, and knobs, 2.96x the screen's tokens on a column that
+costs about 2.3x per token, so about 6.8x the screen's arithmetic for `arf`
+and about 9x for `arfl`. Scaling the screen's measured hours by those ratios
+projects roughly six days for the default-mixture `arf` and two weeks for
+`arfl`, before checkpoint recompute; the memory and step time are not yet
+staged, and `scripts/loop_memory_stage.py` at this geometry is the first
+thing to run. The parameters and optimizer state alone are about 2.3x the
+screen's, so the one-row microbatch is expected to train checkpointed.
+
+The 400x run is the flagship recipe at the bridge's size: about 0.17x the
+flagship's arithmetic flat and 0.34x looped, so the pair is the cheap first
+exercise of the distributed path and the middle rung of the ladder, screen
+pair at 56B tokens, bridge at 167B, flagship at 441B, on which a letter's
+gain can be seen to grow or shrink with scale before the flagship is rented.
 
 ## Longer training at the same size
 

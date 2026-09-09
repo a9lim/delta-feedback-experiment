@@ -119,9 +119,9 @@ Directions on the bench, none decided:
   reserves about 23 GiB, so GPU work stays serial.
 - [runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
-- [scaling.md](docs/scaling.md): the screen and the flagship, their geometry,
-  accounting, and budgets, and the longer and larger recipes, worked out but
-  not scheduled.
+- [scaling.md](docs/scaling.md): the screen, the bridge, and the flagship,
+  their geometry, accounting, and budgets, and the longer and larger recipes,
+  worked out but not scheduled.
 - [literature.md](docs/literature.md) and
   [references/refs.yaml](references/refs.yaml): where each mechanism comes from
   and what we changed.

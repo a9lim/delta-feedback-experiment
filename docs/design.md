@@ -47,8 +47,8 @@ and gradients.
 
 ## Geometry
 
-The screen geometry, the flagship, their parameter and cache accounting, and
-their budgets are in [scaling.md](scaling.md). The screen is width 768,
+The screen, the bridge, and the flagship, with their parameter and cache
+accounting and their budgets, are in [scaling.md](scaling.md). The screen is width 768,
 twelve layers in three cells, and context 1,024; under `a` the trunk is
 `[PKDA, PKDA, PKDA, gated global GQA] x 3`, and under `l` the first cell is
 the prelude, the last the coda, and the one between them the tied core, run
@@ -93,6 +93,7 @@ Every optimizer update sees 327,680 predicted tokens:
 |---|---|
 | Jobe screen | 320 rows x 1,024 predictions; 80 four-row microbatches |
 | Prime screen | 8 ranks x 4 rows x 10 accumulation microsteps |
+| Bridge | 80 rows x 4,096 predictions; 80 one-row microbatches on Jobe, 8 ranks x 1 row x 10 accumulation on Prime |
 | Flagship | 8 ranks x 1 row x 8,192 predictions x 5 accumulation microsteps |
 
 Every condition uses the NorMuonH/NAdam partition in [architecture.md](architecture.md).

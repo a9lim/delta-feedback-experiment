@@ -61,6 +61,18 @@ the flagship, with their accounting, budgets, the loop's measured cost, and
 the longer and larger recipes. `design.md` keeps the recipe and points at
 them for counts; the loop's sources table moved to `literature.md`.
 
+a9 then asked about a bridge geometry between the screen and the flagship
+and a super-flagship stretch goal. The ladder arithmetic: width 1,152 makes
+every ratio exact (12/6 heads, 15 PKDA heads at projection width 1,920,
+SwiGLU 4,992, six routing groups), and sixteen layers put it on the
+geometric midpoint of the ladder at 417M active, three times the screen and
+0.38 of the flagship, with a two-cell core. A super-flagship at twice the
+flagship's parameters, 1920 x 32, would cost four times the flagship's
+arithmetic at 400x, roughly seventy-five node-days on eight H100s; a9 parked
+it until funding. The bridge is registered at context 4,096 rather than the
+screen's 1,024 because a9 wants to publish it as an organism, with a 25x
+recipe for Jobe and a 400x recipe for Prime.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the
