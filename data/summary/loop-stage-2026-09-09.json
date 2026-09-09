@@ -36,8 +36,8 @@
       "k": 1,
       "r": 1,
       "checkpoint": false,
-      "loss": 12.076496124267578,
-      "seconds": 32.853,
+      "loss": 12.076559066772461,
+      "seconds": 31.499,
       "allocated_gib": 5.265,
       "reserved_gib": 5.863
     },
@@ -46,8 +46,8 @@
       "k": 2,
       "r": 1,
       "checkpoint": false,
-      "loss": 24.15233612060547,
-      "seconds": 0.15,
+      "loss": 24.152446746826172,
+      "seconds": 0.147,
       "allocated_gib": 9.201,
       "reserved_gib": 9.473
     },
@@ -56,8 +56,8 @@
       "k": 3,
       "r": 1,
       "checkpoint": false,
-      "loss": 24.15426254272461,
-      "seconds": 0.219,
+      "loss": 24.154376983642578,
+      "seconds": 0.212,
       "allocated_gib": 12.74,
       "reserved_gib": 13.092
     },
@@ -65,19 +65,19 @@
       "stage": "eager",
       "k": 1,
       "r": 8,
-      "checkpoint": true,
-      "loss": 12.060537338256836,
-      "seconds": 0.237,
-      "allocated_gib": 2.791,
-      "reserved_gib": 3.49
+      "checkpoint": false,
+      "loss": 12.060417175292969,
+      "seconds": 0.2,
+      "allocated_gib": 13.106,
+      "reserved_gib": 13.836
     },
     {
       "stage": "eager",
       "k": 2,
       "r": 8,
       "checkpoint": true,
-      "loss": 24.114946365356445,
-      "seconds": 0.474,
+      "loss": 24.114852905273438,
+      "seconds": 0.472,
       "allocated_gib": 3.387,
       "reserved_gib": 4.428
     },
@@ -86,17 +86,17 @@
       "k": 3,
       "r": 8,
       "checkpoint": true,
-      "loss": 24.117652893066406,
-      "seconds": 0.71,
+      "loss": 24.117631912231445,
+      "seconds": 0.704,
       "allocated_gib": 4.018,
       "reserved_gib": 5.225
     },
     {
       "stage": "capture",
-      "seconds": 67.9,
+      "seconds": 66.6,
       "train_graphs": 24,
       "eval_graphs": 1,
-      "allocated_gib": 14.34,
+      "allocated_gib": 15.205,
       "reserved_gib": 23.02,
       "replays": [
         {
@@ -104,171 +104,171 @@
           "r": 1,
           "checkpoint": false,
           "ms": 53.5,
-          "loss": 0.1509578675031662
+          "loss": 0.15095758438110352
         },
         {
           "k": 1,
           "r": 2,
           "checkpoint": false,
           "ms": 67.9,
-          "loss": 0.1509304642677307
+          "loss": 0.15092964470386505
         },
         {
           "k": 1,
           "r": 3,
           "checkpoint": false,
           "ms": 82.3,
-          "loss": 0.15088196098804474
+          "loss": 0.15088029205799103
         },
         {
           "k": 1,
           "r": 4,
           "checkpoint": false,
-          "ms": 96.8,
-          "loss": 0.150843545794487
+          "ms": 96.7,
+          "loss": 0.15084333717823029
         },
         {
           "k": 1,
           "r": 5,
           "checkpoint": false,
-          "ms": 111.3,
-          "loss": 0.15081124007701874
+          "ms": 111.2,
+          "loss": 0.15081001818180084
         },
         {
           "k": 1,
           "r": 6,
           "checkpoint": false,
-          "ms": 125.9,
-          "loss": 0.15078483521938324
+          "ms": 125.8,
+          "loss": 0.1507846713066101
         },
         {
           "k": 1,
           "r": 7,
           "checkpoint": false,
           "ms": 140.2,
-          "loss": 0.15076874196529388
+          "loss": 0.15076851844787598
         },
         {
           "k": 1,
           "r": 8,
-          "checkpoint": true,
-          "ms": 199.6,
-          "loss": 0.15076209604740143
+          "checkpoint": false,
+          "ms": 154.7,
+          "loss": 0.15076084434986115
         },
         {
           "k": 2,
           "r": 1,
           "checkpoint": false,
-          "ms": 107.8,
-          "loss": 0.3018132746219635
+          "ms": 107.9,
+          "loss": 0.30181142687797546
         },
         {
           "k": 2,
           "r": 2,
           "checkpoint": false,
-          "ms": 136.7,
-          "loss": 0.3019164204597473
+          "ms": 136.8,
+          "loss": 0.3019135892391205
         },
         {
           "k": 2,
           "r": 3,
-          "checkpoint": true,
-          "ms": 210.5,
-          "loss": 0.30172988772392273
+          "checkpoint": false,
+          "ms": 165.5,
+          "loss": 0.3017251789569855
         },
         {
           "k": 2,
           "r": 4,
           "checkpoint": true,
           "ms": 248.4,
-          "loss": 0.3017398715019226
+          "loss": 0.30173811316490173
         },
         {
           "k": 2,
           "r": 5,
           "checkpoint": true,
           "ms": 286.4,
-          "loss": 0.30171045660972595
+          "loss": 0.3016998767852783
         },
         {
           "k": 2,
           "r": 6,
           "checkpoint": true,
-          "ms": 324.3,
-          "loss": 0.30153700709342957
+          "ms": 324.4,
+          "loss": 0.30152931809425354
         },
         {
           "k": 2,
           "r": 7,
           "checkpoint": true,
-          "ms": 362.3,
-          "loss": 0.30156004428863525
+          "ms": 362.4,
+          "loss": 0.30155736207962036
         },
         {
           "k": 2,
           "r": 8,
           "checkpoint": true,
-          "ms": 400.4,
-          "loss": 0.3014553189277649
+          "ms": 400.3,
+          "loss": 0.3014496862888336
         },
         {
           "k": 3,
           "r": 1,
           "checkpoint": false,
           "ms": 162.1,
-          "loss": 0.30188360810279846
+          "loss": 0.30188336968421936
         },
         {
           "k": 3,
           "r": 2,
           "checkpoint": true,
-          "ms": 259.6,
-          "loss": 0.3018389344215393
+          "ms": 259.3,
+          "loss": 0.3018372654914856
         },
         {
           "k": 3,
           "r": 3,
           "checkpoint": true,
-          "ms": 316.5,
-          "loss": 0.3018614947795868
+          "ms": 316.3,
+          "loss": 0.3018588125705719
         },
         {
           "k": 3,
           "r": 4,
           "checkpoint": true,
-          "ms": 373.5,
-          "loss": 0.30172786116600037
+          "ms": 373.3,
+          "loss": 0.3017284572124481
         },
         {
           "k": 3,
           "r": 5,
           "checkpoint": true,
-          "ms": 430.9,
-          "loss": 0.30159711837768555
+          "ms": 431.0,
+          "loss": 0.3015967011451721
         },
         {
           "k": 3,
           "r": 6,
           "checkpoint": true,
-          "ms": 487.8,
-          "loss": 0.3016113340854645
+          "ms": 488.2,
+          "loss": 0.3016071915626526
         },
         {
           "k": 3,
           "r": 7,
           "checkpoint": true,
-          "ms": 544.8,
-          "loss": 0.30159124732017517
+          "ms": 545.3,
+          "loss": 0.3015854060649872
         },
         {
           "k": 3,
           "r": 8,
           "checkpoint": true,
-          "ms": 601.8,
-          "loss": 0.3015258312225342
+          "ms": 602.1,
+          "loss": 0.3015230596065521
         }
       ],
-      "projected_replay_hours": 32.81,
+      "projected_replay_hours": 31.78,
       "note": "replay only: the optimizer, clipping, shadow refresh, evaluation, and snapshots add to every step"
     }
   ]

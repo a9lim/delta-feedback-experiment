@@ -284,7 +284,8 @@ log-partition penalty applies unchanged.
 
 Backpropagation is complete: every iteration of every pass is in the graph.
 The trainer's activation policy counts executed layers, `8 + 4r` per pass at
-the screen, against the measured three-pass `arf` threshold, so block-level
+the screen, against a measured raw budget of forty layer-passes (ten cells:
+one pass through `r = 8`, two passes through `r = 3`), so block-level
 checkpointing switches on for every mode deeper than that. Truncated
 backpropagation through the last iterations is excluded.
 
@@ -350,31 +351,33 @@ request's `r`:
 
 Training memory and step time are measured, not derived
 ([runtime qualification](runtime-qualification.md#the-loop), record
-`data/summary/loop-stage-2026-09-08.json`). Capturing the twenty-four train
-graphs and the evaluation graph took 68 s and peaked at 14.34 GiB allocated
-and 23.02 GiB reserved, against 13.85 and 23.01 GiB for the flat column's four
+`data/summary/loop-stage-2026-09-09.json`). Capturing the twenty-four train
+graphs and the evaluation graph took 67 s and peaked at 15.21 GiB allocated
+and 23.02 GiB reserved, against 13.85 and 22.99 GiB for the flat column's four
 graphs. Eager three-pass microbatches peak at 12.74 GiB raw at `r = 1` and
-4.02 GiB checkpointed at `r = 8`. Replay per four-row microbatch, in
-milliseconds, with the trainer's activation policy checkpointing every mode
-deeper than the flat three-pass step:
+4.02 GiB checkpointed at `r = 8`; the one-pass microbatch at `r = 8` peaks
+at 13.11 GiB raw. Replay per four-row microbatch, in milliseconds, with the
+trainer's activation policy checkpointing every mode deeper than ten
+cell-passes:
 
 | Passes \ `r` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 53.5 | 67.9 | 82.3 | 96.8 | 111.3 | 125.9 | 140.2 | 199.6 |
-| 2 | 107.8 | 136.7 | 210.5 | 248.4 | 286.4 | 324.3 | 362.3 | 400.4 |
-| 3 | 162.1 | 259.6 | 316.5 | 373.5 | 430.9 | 487.8 | 544.8 | 601.8 |
+| 1 | 53.5 | 67.9 | 82.4 | 96.9 | 111.3 | 125.8 | 140.1 | 154.6 |
+| 2 | 107.8 | 136.7 | 165.4 | 248.4 | 286.3 | 324.3 | 362.2 | 400.2 |
+| 3 | 162.2 | 259.3 | 316.5 | 373.5 | 430.6 | 487.6 | 544.8 | 601.6 |
 
-The jumps at `r = 8` for one pass, `r = 3` for two, and `r = 2` for three are
-where checkpointing switches on and recomputes each block once. At the
-schedule's realized draws a step's replay averages 7.9, 18.8, and 29.1 s at
-one, two, and three passes. With one second of optimizer, clipping, shadow,
-and staging overhead per step, which projects the flat three-pass step to
-41.7 h against the 42.3 h measured, the schedule projects to:
+One pass costs one cell, 14.4 ms, per iteration all the way to the cap. The
+jumps at `r = 4` for two passes and `r = 2` for three are where checkpointing
+switches on and recomputes each block once. At the schedule's realized draws
+a step's replay averages 7.6, 18.1, and 29.1 s at one, two, and three
+passes. With one second of optimizer, clipping, shadow, and staging overhead
+per step, which projects the flat three-pass step to 41.7 h against the
+42.3 h measured, the schedule projects to:
 
 | Recipe | `arfl` | `arf` |
 |---|---:|---:|
-| default mixture | 35.8 h | ~19 h |
-| two passes on every step | 59.1 h | ~28 h |
+| default mixture | 34.8 h | ~19 h |
+| two passes on every step | 57.0 h | ~28 h |
 | three passes on every step | 89.8 h | 42.3 h |
 
 ## Larger geometry

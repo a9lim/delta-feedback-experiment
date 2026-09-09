@@ -4,6 +4,80 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
+
+a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the
+first since the `l` letter made the middle cell run `r` times per column.
+Everything was measured on that snapshot with real rows, restored optimizer
+state, and the production CUDA graphs (scripts under `jobe:~/tmp/r7/`, the
+report "The Loop Ledger"). Two independent Codex reads and two kernel-fork
+reads with file:line citations fed the ranking.
+
+The step is what the cost model says it is. A one-pass microbatch replays in
+`58.7 + 14.6 (r - 1)` ms through `r = 7` and 205.8 ms at `r = 8`, where the
+activation policy recomputed every block; the head is the one part that does
+not scale with `r` (12.6 ms at `r = 1`, 13.5 at `r = 8`). Over the schedule's
+realized draws (`r = 8` on 8.0% of steps, mean 3.90), eighty replays plus
+about 0.14 s of clipping, optimizer, and shadow refresh reproduce the logged
+8.3 s per step. At `r = 4` a microbatch is 42% GEMMs (all at BF16 peak), 25%
+PKDA, 14% pointwise and eager elementwise, 13% head, 6% routers and
+attention, across 3,504 kernels; the checkpoint at `r = 8` adds a full
+forward, 45 ms.
+
+What moves it, in the order it is being taken:
+
+- **Ten cell-passes fit raw.** The whole one-pass loop family captured
+  without checkpointing at 14.6 GiB allocated (the pool reserves the card
+  either way, with the same allocator retry warnings every configuration
+  logs), and the `r = 8` replay is 154 ms raw against 199 recomputing. The
+  policy now admits forty layer-passes, so one pass through `r = 8` and two
+  passes through `r = 3` keep their activations; the three-pass family raw
+  runs out of memory at 22.4 GiB, so deeper modes still checkpoint. Exact,
+  and 3.5% of an `arl` run.
+- **Eager gradient sums between compiled graphs.** Autograd adds 150
+  residual-shaped BF16 tensors per `r = 4` microbatch (2.2 ms), summing the
+  gradient contributions that reach one tensor from several compiled
+  graphs: the seed and completed block deltas fan out to every later block,
+  and the PKDA blocks compile as several graphs around FLA's kernels, so
+  the same source enters more than one graph per block. The fix in progress
+  wraps FLA's operators as custom ops so PKDA blocks compile whole, and
+  routes the cross-block sources through a bank whose backward hands back
+  an in-place accumulated buffer.
+- **The classifier gradient's round trip.** Each microbatch zero-fills a
+  233 MB BF16 classifier gradient and adds it into the FP32 sink (1.17 GB of
+  traffic, 1.2 ms). In progress: accumulate across `N` microbatches in one
+  persistent BF16 buffer and flush every `N`, with `N` chosen by a step-level
+  comparison against the exact FP32 head gradient.
+- **The FLA tail.** The fork read found `bwd_dhu` compiling with a single
+  pipeline stage on Ada (an A100 shared-memory gate), FP32 intermediates the
+  intra backward re-reads with amplification, a gate cumsum computed twice,
+  and a `qg` that the forward o-kernel already holds; then two structural
+  candidates, un-fusing the warp-starved `inter_solve_fused` and a
+  tensor-core forward diagonal whose safety needs the within-sub-chunk gate
+  span measured on real checkpoints first. In progress on the fork.
+
+What was measured and parked for the Hopper run: FP8. At the trunk's exact
+shapes the 4090's tensor cores run 250 to 334 TFLOPS through
+`torch._scaled_mm` against 140 to 172 in BF16, halving a cell's GEMM time in
+isolation (6.92 to 3.78 ms) while naive per-call quantization makes it slower
+than BF16 (7.20 ms); the design that survives review freezes every
+activation and gradient scale for a whole optimizer step (the tied core runs
+up to eight forwards before any backward), calibrates on real rows (warm-up
+runs zero token rows), and pilots the two MLP projections first. The head's
+two large dots are already in the layout FP8 needs on this card, and an
+LSE-shaped proxy ran 1.63x BF16 at 64x128x64 tiles, so the head's FP8 pass
+belongs to the same program.
+
+Also measured and not taken now: the head's filter at 2^-10 costs 12% less
+than at 2^-12 with a per-microbatch gradient error still inside the BF16
+lock-accumulation floor (the unfiltered head is the least accurate on `dE`),
+but the step-level check that caught round four's coherent bias has not been
+run for it; the chunk size of the PKDA kernels is a hard-wired local optimum
+(`inter_solve_fused` fixes four diagonal and six off-diagonal sub-blocks, the
+ATK kernels hold a `BT x BT` decay tile in registers, and the state traffic
+grows as `1/BT`); Triton FP8 with a transposed operand load runs at a third
+of the K-contiguous rate on Ada.
+
 ## 2026-09-08 — The `l` letter is built
 
 The tied-depth loop of [depth-architecture.md](depth-architecture.md) exists:
