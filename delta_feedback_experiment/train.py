@@ -352,7 +352,12 @@ def automatic_checkpoint(
     if device.type != "cuda":
         return False
     cfg = model.cfg
-    screen_work = 4 * 1024 * 768 * 12 * 3
+    # Ten cell-passes of the screen geometry fit the 24 GiB card raw: the whole
+    # one-pass loop family through r = 8 captured at 14.6 GiB allocated, and
+    # its r = 8 replay is 154 ms raw against 199 ms recomputing every block.
+    # Every deeper mode (two passes above r = 3, three passes above r = 1)
+    # still checkpoints; the three-pass family raw ran out of memory.
+    raw_work = 4 * 1024 * 768 * 40
     work = (
         args.micro_rows
         * args.seq_len
@@ -360,9 +365,7 @@ def automatic_checkpoint(
         * cfg.executed_layers(iterations)
         * n_passes
     )
-    # PKDA's kernel recomputes its chunk intermediates internally. The exact
-    # screen k=3 graph is admitted raw; larger geometries remain guarded.
-    return work > screen_work
+    return work > raw_work
 
 
 @dataclass(frozen=True)

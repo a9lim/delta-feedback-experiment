@@ -795,11 +795,13 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     args.micro_rows = 8
     assert automatic_checkpoint(model, 3, 1, args, cuda)
     args.micro_rows = 4
-    # The loop counts executed layers: 8 + 4r per pass at the screen.
+    # The loop counts executed layers, 8 + 4r per pass at the screen, against
+    # the measured raw budget of forty layer-passes (ten cells).
     assert not automatic_checkpoint(looped, 3, 1, args, cuda)
-    assert not automatic_checkpoint(looped, 1, 7, args, cuda)
-    assert automatic_checkpoint(looped, 1, 8, args, cuda)
-    assert automatic_checkpoint(looped, 2, 3, args, cuda)
+    assert not automatic_checkpoint(looped, 1, 8, args, cuda)
+    assert not automatic_checkpoint(looped, 2, 3, args, cuda)
+    assert automatic_checkpoint(looped, 2, 4, args, cuda)
+    assert automatic_checkpoint(looped, 3, 2, args, cuda)
     assert not automatic_checkpoint(looped, 2, 8, args, torch.device("cpu"))
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", "--grad-checkpoint"])
