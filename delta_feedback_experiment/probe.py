@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import gc
 import math
 import statistics
 import subprocess
@@ -607,6 +608,10 @@ def cuda_gate() -> None:
             f"against a same-model floor of {grad_floor:.4f}"
         )
     del parity, flat_grad, loop_grad, parity_rows, parity_prefix
+    # Collect the stage's cyclic garbage before the next model exists, so the
+    # capture peak below measures the trainer and not this stage's remains.
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # The first stage of the loop's memory measurement: one eager one-pass
     # microbatch at the iteration cap, forward and backward, under the
@@ -634,7 +639,9 @@ def cuda_gate() -> None:
         raise AssertionError("nonfinite arfl loss at the iteration cap")
     loop_cap_peak = torch.cuda.max_memory_allocated() / 2**30
     del loop_model, loop_rows, loop_outs, loop_loss
+    gc.collect()
     torch.cuda.empty_cache()
+    stage_residual = torch.cuda.memory_allocated() / 2**30
     torch.cuda.reset_peak_memory_stats()
 
     class _ProbeValidation:
@@ -837,6 +844,7 @@ def cuda_gate() -> None:
         f"/{loop_decode_rel:.4f} | "
         f"loop_grad_rel={loop_grad_rel:.4f}/floor={grad_floor:.4f} | "
         f"loop_cap_peak={loop_cap_peak:.2f}GiB | "
+        f"stage_residual={stage_residual:.2f}GiB | "
         f"graphs={len(runner.states) + len(eval_runner.states)} | "
         + " | ".join(records)
     )
