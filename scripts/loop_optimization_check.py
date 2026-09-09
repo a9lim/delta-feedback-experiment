@@ -2,6 +2,8 @@
 
 Run this same file from each checkout with PYTHONPATH pointing at that checkout.
 The full-family option also captures evaluation in the shared graph pool.
+``--checkpoint-policy blanket`` isolates selective storage from other changes
+by using the former whole-block checkpoint arrangement in this process only.
 """
 
 import argparse
@@ -56,11 +58,38 @@ def main():
         help="optional comma-separated k:r subset for full batches and gradient saves; other selected modes receive raw replay timing only",
     )
     parser.add_argument("--full-family", action="store_true")
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=("current", "blanket"),
+        default="current",
+        help="diagnostic storage control; blanket checkpoints each compiled block",
+    )
     parser.add_argument("--updates", type=int, default=0)
     parser.add_argument("--batches", type=int, default=1)
     parser.add_argument("--gradients", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     options = parser.parse_args()
+    if options.checkpoint_policy == "blanket":
+        from delta_feedback_experiment import model as model_module
+
+        def blanket_attention(*args):
+            return torch.utils.checkpoint.checkpoint(
+                model_module._compiled_block,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+
+        def blanket_pkda(*args):
+            return torch.utils.checkpoint.checkpoint(
+                model_module._compiled_pkda_block,
+                *args,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+
+        model_module._compiled_selective_block = blanket_attention
+        model_module._compiled_selective_pkda_block = blanket_pkda
     torch.manual_seed(1)
     torch.set_float32_matmul_precision("high")
     args = parse_run_args(["round8-qualification", "--condition", "arfl"])
@@ -154,6 +183,7 @@ def main():
         "head_flush_every": args.head_flush_every,
         "jitter": args.jitter,
         "z_coef": 0.0,
+        "checkpoint_policy": options.checkpoint_policy,
         "batches_per_mode": options.batches,
         "updates_per_mode": options.updates,
         "batch_modes": sorted(batch_modes),

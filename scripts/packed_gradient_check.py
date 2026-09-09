@@ -65,9 +65,11 @@ def benchmark_case(name, splits, args):
         for rows in splits
     )
     shadow = torch.cat([weight.detach() for weight in weights]).to(torch.bfloat16)
-    x = torch.randn(m, d, device="cuda", dtype=torch.bfloat16)
+    # Preserve the production [micro_rows, tokens, features] layout through
+    # compilation; a flattened input can select a different fusion path.
+    x = torch.randn(1, m, d, device="cuda", dtype=torch.bfloat16)
     upstream = torch.randn(
-        m, total_rows, device="cuda", dtype=torch.bfloat16
+        1, m, total_rows, device="cuda", dtype=torch.bfloat16
     ) / math.sqrt(total_rows)
     paths = {}
     modes = (
