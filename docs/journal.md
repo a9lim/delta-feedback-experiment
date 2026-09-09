@@ -93,6 +93,18 @@ What moves it, in the order it is being taken:
   overflows while its partner underflows. And `dg2` in BF16 breaks
   `dt_bias`'s gradient nineteen-fold, a 4,096-term cancelling sum.
 
+Merged and qualified in one piece: the probe passes on the combined state
+(145 tests; loop gradient parity 0.0163 against a 0.0164 floor; the flush
+window's own check 9.18e-3 against 8.94e-3 per call; replays 50.8, 102.3,
+and 155.3 ms for one, two, and three passes against 53.5, 107.7, and 161.9
+at the start of the round), and a paired 24-step continuation from the
+step-1846 snapshot tracks the pre-round kernels to 3.2e-5 relative in loss
+with matching gradient norms, 3.6% faster on that stretch of draws on top of
+the raw budget's 3.5%. `screen-delta-arl-s1` resumed from step 1846 on the
+merged state with the default flush window: 47.8k tokens per second at
+`r = 3` against 46.5k before the pause, 36.2k against 34.9k at `r = 5`, and
+the same losses as the continuation check to three decimals.
+
 What was measured and parked for the Hopper run: FP8. At the trunk's exact
 shapes the 4090's tensor cores run 250 to 334 TFLOPS through
 `torch._scaled_mm` against 140 to 172 in BF16, halving a cell's GEMM time in
