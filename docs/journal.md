@@ -61,16 +61,37 @@ What moves it, in the order it is being taken:
   different model.
 - **The classifier gradient's round trip.** Each microbatch zero-fills a
   233 MB BF16 classifier gradient and adds it into the FP32 sink (1.17 GB of
-  traffic, 1.2 ms). In progress: accumulate across `N` microbatches in one
-  persistent BF16 buffer and flush every `N`, with `N` chosen by a step-level
-  comparison against the exact FP32 head gradient.
+  traffic, 1.2 ms). Landed: the fork's backward accumulates into a
+  caller-owned persistent BF16 buffer (`CCEParams.c_grad_accum`) and the
+  trainer flushes it into the FP32 sink every four head calls
+  (`--head-flush-every`, a runtime setting; 1 is the old path exactly, and a
+  resumed snapshot without the field takes the default). Against a dense
+  FP32 classifier gradient over the 80 real microbatches of step 1847 the
+  per-call path sits at 7.9e-3 relative, cosine 0.999969, norm ratio
+  1.00084; window 4 at 1.9e-2, 0.99982, 1.0021; the excess is a coherent
+  norm bias, round four's signature at a thirtieth of its size, so the
+  window is a judgement: three quarters of the saving for a 0.2% bias. Head
+  call 15.16 to 13.68 ms, replay 102.6 to 101.5 ms at `r = 4`.
 - **The FLA tail.** The fork read found `bwd_dhu` compiling with a single
   pipeline stage on Ada (an A100 shared-memory gate), FP32 intermediates the
   intra backward re-reads with amplification, a gate cumsum computed twice,
   and a `qg` that the forward o-kernel already holds; then two structural
   candidates, un-fusing the warp-starved `inter_solve_fused` and a
   tensor-core forward diagonal whose safety needs the within-sub-chunk gate
-  span measured on real checkpoints first. In progress on the fork.
+  span measured on real checkpoints first. Landed on the fork's `patches`:
+  pipeline stages for the Ada scans, `dAqk`/`dAkk` and the ATK `gk`
+  hand-off in the activation dtype, `g` kept, `qg` from the o-kernel, dead
+  arguments and a memset gone: the PKDA layer's in-kernel time 2.348 to
+  2.226 ms (5.2%), drift 7.44e-3 to 7.52e-3, whole-model replay 1.4%. Both
+  structural candidates died on measurement. The un-fused
+  `inter_solve_fused` split is bitwise identical and its own kernels are
+  9 us slower; its apparent win was an allocation-address effect on a
+  neighbouring kernel that a control with only the allocation reproduced.
+  The tensor-core diagonal is unsafe here by an order of magnitude: the
+  within-16-token gate span reaches 701 log2 on `arl` and 908 on `arf`
+  against a ceiling near 85, with single-step decays of 159, so one factor
+  overflows while its partner underflows. And `dg2` in BF16 breaks
+  `dt_bias`'s gradient nineteen-fold, a 4,096-term cancelling sum.
 
 What was measured and parked for the Hopper run: FP8. At the trunk's exact
 shapes the 4090's tensor cores run 250 to 334 TFLOPS through
