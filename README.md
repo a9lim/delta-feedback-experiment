@@ -54,7 +54,7 @@ initializations and compared:
 | `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA]` cells |
 | `r` | MHDB residual reads of the seed and block deltas before every sublayer; with `f`, a routed payload |
 | `f` | Full-bandwidth feedback: the FBT entry and a payload for the next column |
-| `l` | Huginn loop: the cells between the first and last become one tied core iterated a drawn number of times per column ([depth-architecture.md](docs/depth-architecture.md)) |
+| `l` | Huginn loop: the cells between the first and last become one tied core iterated a drawn number of times per column ([architecture.md](docs/architecture.md#letter-l-the-tied-depth-loop)) |
 
 `--condition arfl` is the full built stack and `arf` the flat column; `ar`
 and `af` each drop one package; `a` is the bare hybrid trunk; the empty
@@ -98,7 +98,7 @@ Directions on the bench, none decided:
   current column cannot simply cancel, for example at a core entry rather than
   the seed.
 - Train the first `arfl` specimen, now that the tied core of
-  [depth-architecture.md](docs/depth-architecture.md) is built, and see
+  [architecture.md](docs/architecture.md#letter-l-the-tied-depth-loop) is built, and see
   whether within-column refinement changes what the payload carries.
 - Separate a persistent state stream from a read-only prediction stream, the
   Free Pause Tokens idea assessed in [literature](docs/literature.md).
@@ -109,8 +109,9 @@ Directions on the bench, none decided:
 
 - [design.md](docs/design.md): the conditions, geometry, data, schedule, feedback
   passes, evaluation modes, and the knobs on the recipe.
-- [architecture.md](docs/architecture.md): the exact model, state, and
-  optimizer.
+- [architecture.md](docs/architecture.md): the four letters and the column,
+  their equations and state contracts, initialization, and the optimizer;
+  `L` specified and unbuilt.
 - [interpretability.md](docs/interpretability.md): the analysis scripts,
   what each one shows, and the shape of the future study.
 - [operations.md](docs/operations.md): install, tokenize, train, queue,
@@ -118,7 +119,8 @@ Directions on the bench, none decided:
   reserves about 23 GiB, so GPU work stays serial.
 - [runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
-- [scaling.md](docs/scaling.md): longer and larger recipes, worked out but
+- [scaling.md](docs/scaling.md): the screen and the flagship, their geometry,
+  accounting, and budgets, and the longer and larger recipes, worked out but
   not scheduled.
 - [literature.md](docs/literature.md) and
   [references/refs.yaml](references/refs.yaml): where each mechanism comes from

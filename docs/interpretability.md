@@ -106,7 +106,7 @@ The `l` letter adds iteration-indexed states; the depth trace is its
 within-column diagnostic, and the payload trace still tests its horizontal
 channel at fixed `r`. The `L` letter would add a shared core cache whose
 two-channel sequence trace advances both the payload and the write bank; see
-[depth-architecture.md](depth-architecture.md).
+[architecture.md](architecture.md#letter-l-a-shared-core-cache-specified-and-unbuilt).
 
 ## The study the organism is for
 

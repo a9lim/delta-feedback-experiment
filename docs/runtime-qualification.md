@@ -149,7 +149,7 @@ checkpointed; the twenty-four train graphs and the evaluation graph capture
 in 67 s at 15.21 GiB allocated and 23.02 GiB reserved; replay runs from
 53.5 ms (one pass, `r = 1`, the flat column's own time) to 601.6 ms (three
 passes, `r = 8`) per four-row microbatch, the full table in
-[depth-architecture.md](depth-architecture.md#parameter-cache-and-cost-accounting).
+[scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
 Reproduce with:
 
 ```bash

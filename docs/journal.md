@@ -52,6 +52,15 @@ previous commit, the `r = 1` coincidence is tested at four and five cells,
 and a two-core-cell test pins the banks by name. `scaling.md`'s larger loop is
 now the tied larger geometry, and the loop pages describe the general rule.
 
+Later the same day the three architecture pages became two, at a9's
+suggestion: `architecture.md` holds the four letters and the column, the
+equations and state contracts that do not vary with geometry, with the former
+depth page folded into its `l` section and `L` kept there as the unbuilt
+extension; `scaling.md` holds the two geometries, now called the screen and
+the flagship, with their accounting, budgets, the loop's measured cost, and
+the longer and larger recipes. `design.md` keeps the recipe and points at
+them for counts; the loop's sources table moved to `literature.md`.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the
@@ -177,7 +186,7 @@ of the K-contiguous rate on Ada.
 
 ## 2026-09-08 — The `l` letter is built
 
-The tied-depth loop of [depth-architecture.md](depth-architecture.md) exists:
+The tied-depth loop of [architecture.md](architecture.md#letter-l-the-tied-depth-loop) exists:
 `arfl` builds, trains, evaluates, and decodes on the portable path, and every
 subset of `arfl` builds and pairs with its unlooped condition. What was built
 and the decisions behind it:

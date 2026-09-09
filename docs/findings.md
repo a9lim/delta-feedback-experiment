@@ -96,7 +96,7 @@ through the payload and cancel the rest. Candidate moves, none chosen:
 - Land the previous column's state somewhere the current column cannot cancel
   in one cell, for example at a core entry with the FBT gate kept at the pass
   entry.
-- Build the `l` letter ([depth-architecture.md](depth-architecture.md)) so
+- Build the `l` letter ([architecture.md](architecture.md#letter-l-the-tied-depth-loop)) so
   within-column refinement exists and persists across columns through the
   payload and a shared core cache.
 - Split a persistent state stream from a read-only prediction stream

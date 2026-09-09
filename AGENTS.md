@@ -23,11 +23,9 @@ in `docs/findings.md`.
   things stand, and the doc map.
 - [docs/design.md](docs/design.md): conditions, geometry, data, schedule, feedback
   passes, evaluation modes, and the recipe knobs.
-- [docs/architecture.md](docs/architecture.md): the exact model, state,
-  initialization, and optimizer, with the small and the larger geometry.
-- [docs/depth-architecture.md](docs/depth-architecture.md): the `l` letter,
-  the tied-depth loop, and `L`, its shared-cache extension, specified and
-  unbuilt.
+- [docs/architecture.md](docs/architecture.md): the four letters and the
+  column: equations, state, initialization, precision, and optimizer
+  ownership; `L` specified and unbuilt.
 - [docs/interpretability.md](docs/interpretability.md): the analysis scripts,
   what each shows, and the shape of the future study.
 - [docs/findings.md](docs/findings.md): the distilled current picture of the
@@ -35,8 +33,9 @@ in `docs/findings.md`.
 - [docs/operations.md](docs/operations.md): operator commands.
   [docs/runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
-- [docs/scaling.md](docs/scaling.md): longer and larger recipes, worked out
-  but not scheduled.
+- [docs/scaling.md](docs/scaling.md): the screen and the flagship: geometry,
+  accounting, budgets, the loop's measured cost, and the longer and larger
+  recipes, worked out but not scheduled.
 - [docs/literature.md](docs/literature.md) and
   [references/refs.yaml](references/refs.yaml): sources and departures.
 - [figures/README.md](figures/README.md): the figure directories.
@@ -55,8 +54,8 @@ change it everywhere at once.
   canonical string `parse_condition` returns (letters in `arfl` order) and
   `ModelConfig.condition` renders it back; every subset of `arfl` builds. Every dense attention layer is gated NoPE
   GQA. Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x 3`;
-  without `a` it is twelve such layers. The larger geometry in
-  `architecture.md` is the same architecture at six cells and width 1,536.
+  without `a` it is twelve such layers. The flagship in
+  `scaling.md` is the same architecture at six cells and width 1,536.
 - PKDA runs the literal recurrence on CPU/MPS and the workspace FLA fork's
   chunk and recurrent kernels on CUDA, with FP32 recurrent-matrix and
   preconditioner boundaries. CUDA training does not fall back to the

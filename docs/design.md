@@ -1,11 +1,10 @@
 # Growing recipe: conditions, data, schedule, evaluation
 
 This page describes how a specimen is grown: the condition letters and how
-conditions pair, the small geometry, the token stream, the optimizer batch, the feedback
-passes, the learning-rate schedule, and the numbers we look at afterwards.
+conditions pair, the token stream, the optimizer batch, the feedback passes, the learning-rate schedule, and the numbers we look at afterwards.
 [Architecture](architecture.md) owns the equations;
-[interpretability](interpretability.md) owns the analysis scripts;
-[scaling](scaling.md) keeps the longer and larger recipes.
+[scaling](scaling.md) owns the two geometries, their accounting, and their
+budgets; [interpretability](interpretability.md) owns the analysis scripts.
 
 ## Conditions
 
@@ -20,21 +19,10 @@ back.
 | `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA] x 3` | `hybrid` |
 | `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
 | `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
-| `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([depth-architecture.md](depth-architecture.md)) | `loop` |
+| `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([architecture.md](architecture.md#letter-l-the-tied-depth-loop)) | `loop` |
 
-Every subset of `arfl` builds. At the screen geometry:
-
-| Condition | Parameters | Active non-embedding |
-|---|---:|---:|
-| `""` (plain) | 237,032,448 | 120,345,600 |
-| `r` | 237,087,744 | 120,400,896 |
-| `f` | 238,214,400 | 121,527,552 |
-| `rf` | 238,272,000 | 121,585,152 |
-| `a` | 256,275,240 | 139,588,392 |
-| `ar` | 256,330,536 | 139,643,688 |
-| `af` | 257,457,192 | 140,770,344 |
-| `arf` | 257,514,792 | 140,827,944 |
-| `arfl` | 257,514,792 | 140,827,944 |
+Every subset of `arfl` builds; their parameter counts at the screen are in
+[scaling.md](scaling.md#the-screen).
 
 `arfl` is the full built stack and `arf` the flat column. `a` alone already
 has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
@@ -45,12 +33,9 @@ the cells between them as one tied core, so every looped condition has its
 unlooped condition's counts. The specimens so far are `ar` and `arf` runs.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every
-parameter they share byte-identically for a given seed: the trunk from the
-common stream, the attention gates from their own deterministic stream, and
-`f`'s fusion matrices from `f`'s own, neither of which advances the common
-one; routers initialize to zero. The plain trunk and the
-`a` trunk consume the common stream differently, so parameters do not pair
-across `a`. Two conditions trained with the same seed and data seed therefore
+parameter they share byte-identically for a given seed
+([architecture.md](architecture.md#precision-and-initialization)); parameters
+do not pair across `a`. Two conditions trained with the same seed and data seed therefore
 see the same rows in the same order with the same keyed feedback draws, and
 can be compared token by token. A looped condition pairs with its unlooped
 one the same way: the iteration draw is its own keyed sub-stream, so `arfl`
@@ -62,37 +47,12 @@ and gradients.
 
 ## Geometry
 
-The trunk is twelve gated NoPE GQA layers; under `a` it is:
-
-```text
-[PKDA, PKDA, PKDA, gated global GQA] x 3
-```
-
-| Field | Screen value |
-|---|---:|
-| Vocabulary | 151,936, Qwen3 tokenizer |
-| Width | 768 |
-| Layers / four-layer cells | 12 / 3 |
-| SwiGLU intermediate width | 3,328 |
-| Context / predictions per row | 1,024 |
-| Explicit position encoding | none |
-| GQA query / KV heads / head width | 8 / 4 / 96 |
-| PKDA Q/K/V heads / head width | 10 / 128 |
-| PKDA Q/K/V projection width | 1,280 |
-| PKDA convolution width | 4 |
-| Routing groups | 4, the KV-head count |
-| RMSNorm epsilon | `1e-6` everywhere, including PKDA output |
-
-Under `l` the first of those cells is the prelude, the last the coda, and the
-one between them the tied core, run `r` times per column.
-
-Relative to the larger geometry in `architecture.md`, the screen halves the
-residual, SwiGLU, and PKDA projection widths (`768 / 3,328 / 1,280` against
-`1,536 / 6,656 / 2,560`), so the 10-by-128 PKDA geometry keeps the Kimi `5/3`
-recurrent-projection ratio. Every dense attention layer, the fourth of each
-cell under `a` and all twelve without it, is bias-free causal NoPE GQA with
-packed QKV, per-head Q/K RMSNorm, and a sigmoid output gate. MHDB has four
-groups because its groups follow the global KV-head count.
+The screen geometry, the flagship, their parameter and cache accounting, and
+their budgets are in [scaling.md](scaling.md). The screen is width 768,
+twelve layers in three cells, and context 1,024; under `a` the trunk is
+`[PKDA, PKDA, PKDA, gated global GQA] x 3`, and under `l` the first cell is
+the prelude, the last the coda, and the one between them the tied core, run
+`r` times per column.
 
 ## Data
 
@@ -133,7 +93,7 @@ Every optimizer update sees 327,680 predicted tokens:
 |---|---|
 | Jobe screen | 320 rows x 1,024 predictions; 80 four-row microbatches |
 | Prime screen | 8 ranks x 4 rows x 10 accumulation microsteps |
-| Larger geometry | 8 ranks x 1 row x 8,192 predictions x 5 accumulation microsteps |
+| Flagship | 8 ranks x 1 row x 8,192 predictions x 5 accumulation microsteps |
 
 Every condition uses the NorMuonH/NAdam partition in [architecture.md](architecture.md).
 After all microbatches have accumulated, the single global FP32 gradient

@@ -146,7 +146,7 @@ class ModelConfig:
     loop: bool = False
     """``l``: the cells between the first and last become one tied core that
     runs ``iterations`` times per column, each core cell keeping its own block
-    delta across iterations (``docs/depth-architecture.md``)."""
+    delta across iterations (``docs/architecture.md``)."""
 
     loop_iterations: int = 4
     """``l``: mean of the per-step iteration draw, and the fixed count that

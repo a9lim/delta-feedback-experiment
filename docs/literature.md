@@ -23,9 +23,9 @@ those roles to the organism.
 The local synthesis choices include the PKDA/GQA composition, four-layer MHDB
 source banks, routed enrichment of the payload under `r` with `f`, exact optimizer partition,
 geometry, and paired training schedules. They are specified in
-[architecture.md](architecture.md) and [design.md](design.md). The loop's
-adoptions and replacements are recorded separately in
-[depth-architecture.md](depth-architecture.md#sources).
+[architecture.md](architecture.md) and [design.md](design.md), with the
+geometries in [scaling.md](scaling.md). The loop's adoptions and replacements
+are tabulated [below](#the-loops-adoptions-and-replacements).
 
 Source precedent motivates a component; the probe checks that we implemented
 the chosen equations; what the trained organism does with them is what the
@@ -128,3 +128,11 @@ refinement but adds compute and, under `L`, the cache complexity.
 Neither alternative inherits the paper's loss or latency results. For Jobe,
 measure prefill, decode across batch sizes, full backward memory, and captured
 execution before calling either cheaper.
+
+## The loop's adoptions and replacements
+
+| Source | Adopted | Replaced here |
+|---|---|---|
+| Recurrent-depth language models | tied core between prelude and coda, log-normal Poisson iteration draw, same-depth per-iteration caches, effective-depth accounting | adapter by router reads of the prelude output at every core site; random initial state by the prelude output; sandwich norms by the unchanged pre-norm shell; zero-shot warm start by the trained payload; truncated backpropagation by full backpropagation; zero-shot cache sharing kept for `L` as a trained channel with a budget of one |
+| Full-Bandwidth Transformer | asymmetric fusion, payload, Jacobi passes, prefix mixin, jitter, pass mixture, loss | — |
+| This project | per-cell core deltas accumulated across iterations, iteration-tagged route sites and cache tracks, cell-token accounting, the depth trace; for `L`, plain/fused position labels governing both channels and the fused-position PKDA read with own-term substitution | — |
