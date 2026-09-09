@@ -1,16 +1,17 @@
 # Geometries and budgets: the screen, the bridge, and the flagship
 
-Three geometries of the same architecture. The **screen** is the small
-organism we grow on Jobe: width 768, three cells, context 1,024, the
-specimens in [findings.md](findings.md). The **bridge** is the rung between:
-width 1,152, four cells, context 4,096, about three times the screen's
-active parameters and the geometric midpoint of the ladder, the largest
-column the single-process trainer can grow on Jobe today and the one meant
-for publication as an organism. The **flagship** is the 1B column at width
-1,536, six cells, context 8,192, worked out here and not scheduled: it needs
-the distributed path, which is not implemented, and Prime time is real money,
-so a9 decides when to spend it. Every condition builds at every geometry,
-and the loop at each is the flat column with its middle cells tied.
+Three geometries of the same architecture, every one trained on 4,096-token
+rows in batches of 128 rows, `2^19` predictions per step. The **screen** is
+the small organism we grow on Jobe: width 768, three cells, the specimens in
+[findings.md](findings.md). The **bridge** is the rung between: width 1,152,
+four cells, about three times the screen's active parameters and the
+geometric midpoint of the ladder, the largest column the single-process
+trainer can grow on Jobe today and the one meant for publication as an
+organism. The **flagship** is the 1B column at width 1,536, six cells, worked
+out here and not scheduled: it needs the distributed path, which is not
+implemented, and Prime time is real money, so a9 decides when to spend it.
+Every condition builds at every geometry, and the loop at each is the flat
+column with its middle cells tied.
 
 "Screen", "25x", and "400x" name recipes by predicted tokens per active
 non-embedding parameter. Every feedback pass and every core iteration adds
@@ -25,7 +26,8 @@ beside predicted tokens; equal steps are matched data, not matched compute.
 | Residual width `D` | 768 | 1,152 | 1,536 |
 | Layers / four-layer cells | 12 / 3 | 16 / 4 | 24 / 6 |
 | SwiGLU intermediate width | 3,328 | 4,992 | 6,656 |
-| Context, predictions per row | 1,024 | 4,096 | 8,192 |
+| Context, predictions per row | 4,096 | 4,096 | 4,096 |
+| Rows per step, one-row microbatches | 128 | 128 | 128 |
 | Global query / KV heads, head width 96 | 8 / 4 | 12 / 6 | 16 / 8 |
 | Routing groups, the KV-head count | 4 | 6 | 8 |
 | PKDA heads, head width 128 | 10 | 15 | 20 |
@@ -48,8 +50,22 @@ alongside overrides its field, and `--tokens-per-param` derives the schedule
 length from the flat full stack's active count at that scale, rounded up to
 whole steps, so every condition at a scale shares one schedule. 25 is the
 screen recipe and 400 the Prime recipes; `--steps` types a length instead.
-Warmup is 2% of the 25x length at the scale whatever the ratio, 215, 636,
-and 1,682 steps; cooldown is 20% of the run.
+Warmup is 2% of the 25x length at the scale whatever the ratio, 134, 397,
+and 1,051 steps; cooldown is 20% of the run.
+
+The context and the batch are uniform across the ladder on purpose. Rows of
+4,096 hold about four FineWeb-Edu documents where 1,024 held one, so the
+recurrent state and the dense read see a second document at every scale,
+and the ladder's rungs differ only in size. The batch of `2^19` follows the
+standard result that the efficient batch grows with the token budget rather
+than the model: the DeepSeek fit `B = 0.29 C^0.33` puts the screen's 25x
+optimum near 0.32M tokens, the bridge's near 0.66M, and the flagship's 400x
+near 3M, so `2^19` sits inside the flat basin at the screen and under the
+optimum everywhere larger, where token-efficiency is unharmed and the
+sequential step count stays bounded. FBT trained at 300K and moved to 1.2M
+for its 1T-token baseline. A uniform batch keeps equal steps meaning equal
+tokens at every rung. Batch is the one knob muP does not transfer, so a rate
+sweep belongs at this batch.
 
 Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x C`. Under
 `l` the first cell is the prelude, the last the coda, and the cells between
@@ -104,17 +120,17 @@ three learned per-head vectors add 15,390 parameters per PKDA layer, or
 
 ### Decode cache
 
-At 1,024 positions one cell's token-mixer cache per sequence is 3.456 MiB:
+At 4,096 positions one cell's token-mixer cache per sequence is 7.956 MiB:
 three FP32 PKDA matrix and diagonal states plus BF16 convolution histories,
-1.956 MiB, and one BF16 GQA K/V cache, 1.500 MiB. The flat column's three
-cells hold 10.37 MiB. Every decode mode under `l` holds `2 + r` cells at the
+1.956 MiB, and one BF16 GQA K/V cache, 6.000 MiB. The flat column's three
+cells hold 23.87 MiB. Every decode mode under `l` holds `2 + r` cells at the
 request's `r`:
 
 | Fixed `r` | Cells cached | Cache |
 |---|---:|---:|
-| 1 | 3 | 10.4 MiB |
-| 4 | 6 | 20.7 MiB |
-| 8 | 10 | 34.6 MiB |
+| 1 | 3 | 23.9 MiB |
+| 4 | 6 | 47.7 MiB |
+| 8 | 10 | 79.6 MiB |
 
 Payload, logits, allocator overhead, and serving metadata are additional. This
 is decode-state accounting, not training memory; Jobe's captured training graph
@@ -122,18 +138,18 @@ pool reserves about 23 GiB.
 
 ### Budget
 
-The default recipe is 10,745 steps of 327,680 predicted tokens, or
-3,520,921,600 in all: 25.0–25.2 per active non-embedding parameter with `a`,
-30.7–31.1 without. Its schedule shape, pass mixture, and knobs are in
+The default recipe is 6,716 steps of 524,288 predicted tokens, or
+3,521,118,208 in all: 25.0–25.2 per active non-embedding parameter with `a`,
+29.0–29.3 without. Its schedule shape, pass mixture, and knobs are in
 [design.md](design.md#training); the pass mixture targets 1.28 expected
 pass-tokens per predicted token with `f`.
 
 A finished run extends to a longer ratio with `--continue`, which restores
 the last snapshot the longer schedule reproduces and pays only for the new
 heat and cooldown; warmup is fixed per scale, so the continuation of a run
-at or above 25x is the longer run exactly: at the screen, 25x to 50x restores step 8,059 of
-10,745 and trains 13,430 of the 50x recipe's 21,489 steps, and 50x to
-100x restores step 16,117 and trains 26,861 of 42,978.
+at or above 25x is the longer run exactly: at the screen, 25x to 50x restores step 5,037 of
+6,716 and trains 8,394 of the 50x recipe's 13,431 steps, and 50x to
+100x restores step 10,073 and trains 16,788 of 26,861.
 
 Under `l` at the default draw, `r_mean = 4` and `r_max = 8`:
 
@@ -186,15 +202,13 @@ per step, which projects the flat three-pass step to 41.7 h against the
 
 ## The bridge
 
-The bridge is the flat column at width 1,152, four cells, and context 4,096:
-the screen's architecture at one and a half times the width and one more
-cell, on rows four times longer. Under `l` its core is two cells, so a bridge
-`arfl` is the first specimen whose core has more than one cell, and its
-`r = 1` column is the bridge `arf`. It is grown with the single-process
-trainer on Jobe at 25x, and it is the middle rung of the 400x ladder on
-Prime between the screen pair and the flagship. Its rows are 4,096
-predictions where the screen's are 1,024 and the flagship's 8,192, so the
-ladder's rungs differ in context as well as size.
+The bridge is the flat column at width 1,152 and four cells: the screen's
+architecture at one and a half times the width and one more cell, on the
+same rows and batch. Under `l` its core is two cells, so a bridge `arfl` is
+the first specimen whose core has more than one cell, and its `r = 1` column
+is the bridge `arf`. It is grown with the single-process trainer on Jobe at
+25x, and it is the middle rung of the 400x ladder on Prime between the
+screen pair and the flagship.
 
 ```bash
 delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
@@ -242,20 +256,20 @@ additional.
 
 ### Budgets
 
-Both recipes keep the family's 327,680 predictions per optimizer step, which
-at 4,096 predictions per row is 80 rows: on Jobe 80 one-row microbatches, on
-Prime 8 ranks x microbatch 1 x accumulation 10. `--scale bridge` with
-`--tokens-per-param 25` or `400` names them.
+Both recipes keep the family's 524,288 predictions per optimizer step, 128
+rows of 4,096: on Jobe 128 one-row microbatches, on Prime 8 ranks x
+microbatch 1 x accumulation 16. `--scale bridge` with `--tokens-per-param 25`
+or `400` names them.
 
 | Quantity | 25x, Jobe | 400x, Prime |
 |---|---:|---:|
-| Optimizer steps | 31,787 | 508,587 |
-| Aligned budget | 10,415,964,160 predicted tokens | 166,653,788,160 predicted tokens |
-| Predicted tokens per active parameter | 25.0003 | 400.0003 |
-| Warmup | steps 1–636 | steps 1–636 |
-| Stable heat | steps 637–25,430 | steps 637–406,870 |
-| Cooldown | steps 25,431–31,787 | steps 406,871–508,587 |
-| Feedback boundary | after step 23,840 | after step 381,440 |
+| Optimizer steps | 19,867 | 317,867 |
+| Aligned budget | 10,416,029,696 predicted tokens | 166,653,853,696 predicted tokens |
+| Predicted tokens per active parameter | 25.0004 | 400.0002 |
+| Warmup | steps 1–397 | steps 1–397 |
+| Stable heat | steps 398–15,894 | steps 398–254,294 |
+| Cooldown | steps 15,895–19,867 | steps 254,295–317,867 |
+| Feedback boundary | after step 14,900 | after step 238,400 |
 | Expected pass-tokens | about 13.33B | about 213.3B |
 | Expected cell-tokens, `arf` / `arfl` | about 53.3B / 130.1B | about 853B / 2.08T |
 
@@ -276,9 +290,9 @@ pair at 56B tokens, bridge at 167B, flagship at 441B, on which a letter's
 gain can be seen to grow or shrink with scale before the flagship is rented.
 
 A ladder of ratios at the bridge by `--continue`, 25x to 100x to 200x to
-400x, restores each rung's feedback boundary and trains on: 40,688, 138,908,
-230,137, and 460,272 pass-steps counting the feedback phase at its expected
-2.12 passes, 870,005 in all, or 285B pass-tokens. For `arfl` at 7.5 GFLOPs
+400x, restores each rung's feedback boundary and trains on: 25,430, 86,818,
+143,836, and 287,670 pass-steps counting the feedback phase at its expected
+2.12 passes, 543,754 in all, or 285B pass-tokens. For `arfl` at 7.5 GFLOPs
 per pass-token, the head once and the core cells `E[r]` times, that is about
 2.15e21 FLOPs, 1.34x a single 400x run and 0.74x four independent runs, for
 four finished specimens with cooldowns; the `arf` partner is about half. At
@@ -291,19 +305,19 @@ trainer runs today.
 
 A fresh `{a, arf}` pair on one 8xH100-80GB Prime node, both conditions seed 1,
 data seed 0, global row zero, `--tokens-per-param 400` at the screen, which
-is 171,910 steps and 56,331,468,800 predicted tokens each, nothing loaded
+is 107,444 steps and 56,331,599,872 predicted tokens each, nothing loaded
 from Jobe.
 
 | Condition | Predicted tokens | Active-token ratio |
 |---|---:|---:|
-| `a` | 56,331,468,800 | 403.55 |
-| `arf` | 56,331,468,800 | 400.00 |
+| `a` | 56,331,599,872 | 403.55 |
+| `arf` | 56,331,599,872 | 400.00 |
 
 | Phase | Steps | Passes, `arf` |
 |---|---:|---|
-| Warmup | 1–215 | one |
-| Stable heat | 216–137,528 | one through 128,932, then two or three |
-| Cooldown | 137,529–171,910 | two or three |
+| Warmup | 1–134 | one |
+| Stable heat | 135–85,955 | one through 80,583, then two or three |
+| Cooldown | 85,956–107,444 | two or three |
 
 The pair is 112.66B predicted tokens and about 128.44B expected pass-tokens.
 It compares the complete `arf` package against its shared hybrid baseline.
@@ -365,17 +379,17 @@ three learned per-head vectors add 61,500 parameters per PKDA layer, or
 
 ### Decode cache
 
-At a full 8,192-token prompt, one sequence's token-mixer cache is:
+At a full 4,096-token prompt, one sequence's token-mixer cache is:
 
 | Cache | Size |
 |---|---:|
 | 18 FP32 PKDA matrix states `[20,128,128]` | 22.500 MiB |
 | 18 FP32 PKDA diagonal states `[20,128]` | 0.176 MiB |
 | 18 BF16 Q/K/V convolution histories `[2560,3]` | 0.791 MiB |
-| 6 BF16 global-GQA KV caches `[8192,8,96]` | 144.000 MiB |
-| **Token-mixer total** | **167.467 MiB** |
+| 6 BF16 global-GQA KV caches `[4096,8,96]` | 72.000 MiB |
+| **Token-mixer total** | **95.467 MiB** |
 
-One cell is 27.9 MiB. This excludes allocator overhead, the width-1,536
+One cell is 15.9 MiB. This excludes allocator overhead, the width-1,536
 payload, logits, and serving metadata. An implementation at this geometry
 reproduces these parameter counts, state shapes, and cache continuation
 semantics.
@@ -384,16 +398,16 @@ semantics.
 
 | Quantity | Value |
 |---|---:|
-| Sequence length | 8,192 predictions |
-| Global batch | 40 sequences = 327,680 predictions |
-| Distributed batch | 8 ranks x microbatch 1 x accumulation 5 |
+| Sequence length | 4,096 predictions |
+| Global batch | 128 sequences = 524,288 predictions |
+| Distributed batch | 8 ranks x microbatch 1 x accumulation 16 |
 | Unrounded target | 440,818,598,400 predicted tokens |
-| Optimizer steps | 1,345,272 |
+| Optimizer steps | 840,795 |
 | Aligned budget | 440,818,728,960 predicted tokens |
-| Warmup | steps 1–1,682 |
-| Stable heat | steps 1,683–1,076,218 |
-| Cooldown | steps 1,076,219–1,345,272 |
-| Feedback boundary | after step 1,008,954 |
+| Warmup | steps 1–1,051 |
+| Stable heat | steps 1,052–672,636 |
+| Cooldown | steps 672,637–840,795 |
+| Feedback boundary | after step 630,596 |
 | Whole-run pass mixture | expected 75% / 22% / 3% |
 | Expected compute | about 564.25B pass-tokens, 3.39T cell-tokens |
 
@@ -413,8 +427,8 @@ Compute depth per pass is `4 + 16r + 4` layers, mean 70.1 and cap 136, and
 
 | Quantity | Value |
 |---|---:|
-| Global batch | 327,680 predictions |
-| Optimizer steps | 1,345,272 |
+| Global batch | 524,288 predictions |
+| Optimizer steps | 840,795 |
 | Aligned budget | 440,818,728,960 predicted tokens |
 | Warmup / stable heat / cooldown / feedback boundary | as the flagship |
 | Expected pass-tokens | about 564.25B |
@@ -426,7 +440,7 @@ arithmetic; that is accounting, not measured device time. The two runs pair
 as the screen's do: byte-identical initialization, the same stream, row
 order, schedule, and pass-count, prefix, and jitter draws, with the `r` draw
 the loop's only extra randomness. Every decode mode holds `2 + 4r` cells at
-the request's `r`, 502 MiB at `r = 4` and 949 MiB at the cap. The shared
+the request's `r`, 286 MiB at `r = 4` and 541 MiB at the cap. The shared
 fused decode cache belongs to `L`.
 
 ## When one of these would be worth it

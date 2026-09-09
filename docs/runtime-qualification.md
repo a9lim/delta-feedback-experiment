@@ -94,7 +94,7 @@ analysis. CUDA training uses the same equations through the following path:
   body, and exit, restoring the caller's setting even on exceptions.
 - One pinned host batch and one device batch per update. An event fences host
   reuse during asynchronous transfer; graph-input copies remain stream ordered.
-  The screen uses four 1,024-token rows per microbatch and 80 microbatches per
+  Every scale uses one 4,096-token row per microbatch and 128 microbatches per
   update, with BF16 keyed jitter written directly into graph inputs.
 - NorMuonH shape-bucket compilation including packing, update, and state
   writeback; ordinary per-parameter checkpoint state with no persistent packed

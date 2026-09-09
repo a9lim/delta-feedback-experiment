@@ -57,26 +57,26 @@ CONTRACT = checkpoints.CheckpointContract(
 GRAD_CLIP_NORM = 10.0
 """Global FP32 gradient-norm ceiling shared by every run."""
 
-BATCH_TOKENS = 327_680
-"""Predicted tokens per optimizer step at every scale."""
+BATCH_TOKENS = 524_288
+"""Predicted tokens per optimizer step at every scale: 2^19, 128 rows of 4,096."""
 
 SCALES: dict[str, dict[str, int]] = {
     "screen": dict(
         dim=768, layers=12, heads=8, kv_heads=4, intermediate=3328, pkda_heads=10,
-        seq_len=1024, batch_rows=320, micro_rows=4,
+        seq_len=4096, batch_rows=128, micro_rows=1,
     ),
     "bridge": dict(
         dim=1152, layers=16, heads=12, kv_heads=6, intermediate=4992, pkda_heads=15,
-        seq_len=4096, batch_rows=80, micro_rows=1,
+        seq_len=4096, batch_rows=128, micro_rows=1,
     ),
     "flagship": dict(
         dim=1536, layers=24, heads=16, kv_heads=8, intermediate=6656, pkda_heads=20,
-        seq_len=8192, batch_rows=40, micro_rows=1,
+        seq_len=4096, batch_rows=128, micro_rows=1,
     ),
 }
-"""The geometries of ``docs/scaling.md``: the column, the row length, the rows
-that keep ``BATCH_TOKENS`` predictions per step, and the single-process
-microbatch."""
+"""The geometries of ``docs/scaling.md``: the column, and the row length,
+rows per step, and single-process microbatch every scale shares, 4,096-token
+rows in one-row microbatches with ``BATCH_TOKENS`` predictions per step."""
 
 DEFAULT_TOKENS_PER_PARAM = 25.0
 """The screen recipe's predicted tokens per reference active parameter."""
@@ -251,14 +251,14 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--batch-rows",
         type=int,
-        default=320,
+        default=128,
         help=(
-            "global batch in rows; the scale keeps 327,680 predictions per "
+            "global batch in rows; the scale keeps 524,288 predictions per "
             "step, as does a retyped --seq-len without this flag"
         ),
     )
-    recipe.add_argument("--micro-rows", type=int, default=4)
-    recipe.add_argument("--seq-len", type=int, default=1024)
+    recipe.add_argument("--micro-rows", type=int, default=1)
+    recipe.add_argument("--seq-len", type=int, default=4096)
     recipe.add_argument(
         "--lr-normuonh",
         type=float,
@@ -317,8 +317,9 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument(
         "--eval-rows",
         type=int,
-        default=512,
-        help="held-out rows per evaluation, from the slice's head",
+        default=128,
+        help="held-out rows per evaluation, from the slice's head; 128 rows of "
+        "4,096 is one optimizer batch of predictions",
     )
     runtime.add_argument(
         "--head-flush-every",
@@ -460,8 +461,10 @@ def automatic_checkpoint(
     # one-pass loop family through r = 8 captured at 14.6 GiB allocated, and
     # its r = 8 replay is 154 ms raw against 199 ms recomputing every block.
     # Every deeper mode (two passes above r = 3, three passes above r = 1)
-    # still checkpoints; the three-pass family raw ran out of memory.
-    raw_work = 4 * 1024 * 768 * 40
+    # still checkpoints; the three-pass family raw ran out of memory. Measured
+    # at four 1,024-token rows per microbatch, the same 4,096 tokens as the
+    # one-row microbatch that replaced them.
+    raw_work = 4096 * 768 * 40
     work = (
         args.micro_rows
         * args.seq_len

@@ -49,7 +49,7 @@ and gradients.
 
 The screen, the bridge, and the flagship, with their parameter and cache
 accounting and their budgets, are in [scaling.md](scaling.md). The screen is width 768,
-twelve layers in three cells, and context 1,024; under `a` the trunk is
+twelve layers in three cells, and context 4,096; under `a` the trunk is
 `[PKDA, PKDA, PKDA, gated global GQA] x 3`, and under `l` the first cell is
 the prelude, the last the coda, and the one between them the tied core, run
 `r` times per column.
@@ -93,8 +93,8 @@ parquet row holding its text, URL, and score, and its crawl as an index into
 `meta["dumps"]`. `delta verify DIR` checks a store against its meta and
 sidecars.
 
-One row is a non-overlapping `seq_len + 1` window, so 1,025 stored tokens give
-1,024 predictions. Rows may cross document boundaries, and attention crosses
+One row is a non-overlapping `seq_len + 1` window, so 4,097 stored tokens give
+4,096 predictions. Rows may cross document boundaries, and attention crosses
 them too: with shuffled documents the neighbours are unrelated, which is the
 honest packing regime, and an intra-document mask would be an architecture
 question for PKDA's recurrent state rather than a data one. Step `n`
@@ -119,14 +119,18 @@ rounded up to the next billion. The default target is the screen at 400x,
 
 ### Optimizer batch
 
-Every optimizer update sees 327,680 predicted tokens:
+Every optimizer update at every scale sees 524,288 predicted tokens, `2^19`:
+128 rows of 4,096 predictions. The context is the same at every scale, so the
+rungs of the ladder differ only in size, and the batch is uniform, so equal
+steps are equal tokens at every rung. The efficient batch grows with the
+token budget rather than the model, and `2^19` sits inside the flat basin of
+the published fits at the screen's 25x budget and under it at every larger
+rung ([scaling.md](scaling.md)).
 
 | Surface | Realization |
 |---|---|
-| Jobe screen | 320 rows x 1,024 predictions; 80 four-row microbatches |
-| Prime screen | 8 ranks x 4 rows x 10 accumulation microsteps |
-| Bridge | 80 rows x 4,096 predictions; 80 one-row microbatches on Jobe, 8 ranks x 1 row x 10 accumulation on Prime |
-| Flagship | 8 ranks x 1 row x 8,192 predictions x 5 accumulation microsteps |
+| Jobe, any scale | 128 one-row microbatches |
+| Prime, any scale | 8 ranks x 1 row x 16 accumulation microsteps |
 
 Every condition uses the NorMuonH/NAdam partition in [architecture.md](architecture.md).
 After all microbatches have accumulated, the single global FP32 gradient
@@ -173,19 +177,19 @@ cell-tokens beside pass-tokens.
 All three parameter groups share one warmup-stable-cooldown multiplier. Warmup
 rises linearly over `round(warmup_frac * min(steps, steps at 25x))` updates:
 the fraction applies to the shorter of the run and the 25x recipe at its
-geometry, so warmup is fixed per scale, 215 steps at the screen, 636 at the
-bridge, 1,682 at the flagship, and a longer run does not spend more of it.
+geometry, so warmup is fixed per scale, 134 steps at the screen, 397 at the
+bridge, 1,051 at the flagship, and a longer run does not spend more of it.
 Warmup guards the optimizer's first steps at the batch and learning rate,
 which do not depend on the horizon; cooldown does, and occupies
 `round(cooldown_frac * steps)` updates with multiplier `1 - sqrt(u)` for
 local progress `u`, reaching zero at the last step. Defaults are 0.02 and
-0.20. The default 10,745-step Jobe schedule:
+0.20. The default 6,716-step Jobe schedule:
 
 | Phase | Steps | Passes with `f` |
 |---|---:|---|
-| Warmup | 1–215 | one |
-| Stable heat | 216–8,596 | one through 8,059, then two or three |
-| Cooldown | 8,597–10,745 | two or three |
+| Warmup | 1–134 | one |
+| Stable heat | 135–5,373 | one through 5,037, then two or three |
+| Cooldown | 5,374–6,716 | two or three |
 
 The feedback boundary is `round(feedback_start * steps)`, independent of the
 learning-rate phases, and defaults to three quarters of the schedule. After
@@ -194,8 +198,8 @@ otherwise, which targets a 75% / 22% / 3% pass mixture over the run and 1.28
 expected pass-tokens per predicted token. Conditions without `f` use one pass
 throughout.
 
-The run is 3,520,921,600 predicted tokens: 25.0–25.2 per active non-embedding
-parameter with `a`, 30.7–31.1 without. The count is derived: 25 predicted
+The run is 3,521,118,208 predicted tokens: 25.0–25.2 per active non-embedding
+parameter with `a`, 29.0–29.3 without. The count is derived: 25 predicted
 tokens per active parameter of the `arf` stack at the screen, 140,827,944,
 rounded up to whole steps, and every condition at a scale shares it.
 
@@ -208,7 +212,7 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule (25 is the screen recipe, 400 the Prime recipes) |
 | `--steps` | derived | schedule length, typed instead of derived |
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
-| `--seq-len`, `--batch-rows`, `--micro-rows` | by scale | predictions per row, rows per step, and the microbatch; the scale keeps 327,680 predictions per step, as does a retyped `--seq-len` alone |
+| `--seq-len`, `--batch-rows`, `--micro-rows` | 4,096, 128, 1 at every scale | predictions per row, rows per step, and the microbatch; the scale keeps 524,288 predictions per step, as does a retyped `--seq-len` alone |
 | `--seed`, `--data-seed` | | initialization pairing and the keyed data/feedback streams |
 | `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the NorMuonH relative step, and the base NAdam rate at the muP reference width 1536; the fan-in-`D` NAdam matrices run at `lr_nadam x 1536 / D` and the tied readout carries the same ratio |
 | `--feedback-start` | 0.75 | fraction of the schedule before the feedback boundary; 0 trains fused from step 0 |
@@ -244,8 +248,8 @@ cooldown boundary otherwise. Warmup is fixed per scale, so from that step on
 a continuation of any run at or above 25x is the longer run exactly, and a
 shorter source differs only in the warmup it inherited, which the `continue`
 record reports as `exact`; at the screen a 25x `arf` run
-continued to 50x restores step 8,059 and trains 13,430 new steps
-of a 21,489-step schedule. The queue stores arguments, not Git state; a
+continued to 50x restores step 5,037 and trains 8,394 new steps
+of a 13,431-step schedule. The queue stores arguments, not Git state; a
 source change never stops an active child, and the worker refreshes before
 the next job.
 

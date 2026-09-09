@@ -704,25 +704,26 @@ def test_execution_telemetry_supports_a_pkda_first_layer():
 
 
 def test_build_schedule_screen_shape():
-    args = parse_run_args(["x"])  # the screen at 25 tokens per parameter: 10,745 steps
-    assert args.batch_rows == 320
-    assert args.batch_rows // args.micro_rows == 80
+    args = parse_run_args(["x"])  # the screen at 25 tokens per parameter: 6,716 steps
+    assert args.batch_rows == 128 and args.seq_len == 4096
+    assert args.batch_rows // args.micro_rows == 128
     schedule = build_schedule(args)
-    assert schedule.spans == (215, 0, 8381, 2149)
-    assert schedule.total == 10745
-    assert schedule.phase(215)[0] == "warmup"
-    assert schedule.phase(216)[0] == "heat"
-    assert schedule.phase(8597)[0] == "cooldown"
-    assert schedule.rate_at(8596, 1.0) == 1.0
-    assert schedule.rate_at(10745, 1.0) < 1e-6
-    assert feedback_boundary(args, schedule.total) == 8059
-    assert schedule.heat_end == 8596
+    assert schedule.spans == (134, 0, 5239, 1343)
+    assert schedule.total == 6716
+    assert schedule.phase(134)[0] == "warmup"
+    assert schedule.phase(135)[0] == "heat"
+    assert schedule.phase(5374)[0] == "cooldown"
+    assert schedule.rate_at(5373, 1.0) == 1.0
+    assert schedule.rate_at(6716, 1.0) < 1e-6
+    assert feedback_boundary(args, schedule.total) == 5037
+    assert schedule.heat_end == 5373
 
 
 def test_fresh_screen_budgets_match_active_parameter_ratios():
-    tokens_per_step = 320 * 1024
+    tokens_per_step = 128 * 4096
+    assert tokens_per_step == BATCH_TOKENS == 2**19
     df_active_non_embedding = 140_827_944
-    trials = {25: 10_745, 400: 171_910}
+    trials = {25: 6_716, 400: 107_444}
 
     for target_ratio, steps in trials.items():
         realized_ratio = steps * tokens_per_step / df_active_non_embedding
@@ -731,9 +732,9 @@ def test_fresh_screen_budgets_match_active_parameter_ratios():
 
     prime = parse_run_args(["x", "--tokens-per-param", "400"])
     schedule = build_schedule(prime)
-    assert schedule.spans == (215, 0, 137_313, 34_382)
-    assert feedback_boundary(prime, schedule.total) == 128_932
-    assert schedule.heat_end == 137_528
+    assert schedule.spans == (134, 0, 85_821, 21_489)
+    assert feedback_boundary(prime, schedule.total) == 80_583
+    assert schedule.heat_end == 85_955
 
 
 def test_warmup_is_fixed_per_scale():
@@ -742,13 +743,13 @@ def test_warmup_is_fixed_per_scale():
     keeps the fraction."""
     def warmup(argv):
         return build_schedule(parse_run_args(["x", *argv])).warmup_steps
-    assert warmup([]) == 215
-    assert warmup(["--tokens-per-param", "400"]) == 215
-    assert warmup(["--tokens-per-param", "50", "--condition", "arfl"]) == 215
+    assert warmup([]) == 134
+    assert warmup(["--tokens-per-param", "400"]) == 134
+    assert warmup(["--tokens-per-param", "50", "--condition", "arfl"]) == 134
     assert warmup(["--steps", "100"]) == 2
-    assert warmup(["--scale", "bridge"]) == 636
-    assert warmup(["--scale", "bridge", "--tokens-per-param", "400"]) == 636
-    assert warmup(["--scale", "flagship", "--tokens-per-param", "400"]) == 1_682
+    assert warmup(["--scale", "bridge"]) == 397
+    assert warmup(["--scale", "bridge", "--tokens-per-param", "400"]) == 397
+    assert warmup(["--scale", "flagship", "--tokens-per-param", "400"]) == 1_051
 
 
 def test_scale_presets_and_ratio_derive_the_schedule():
@@ -757,21 +758,24 @@ def test_scale_presets_and_ratio_derive_the_schedule():
     the flat stack's active count at that scale, and every condition at a
     scale shares the count so paired runs keep one schedule."""
     screen = parse_run_args(["x"])
-    assert (screen.dim, screen.layers, screen.seq_len, screen.batch_rows, screen.micro_rows) == (768, 12, 1024, 320, 4)
-    assert screen.steps == 10_745
+    assert (screen.dim, screen.layers, screen.seq_len, screen.batch_rows, screen.micro_rows) == (768, 12, 4096, 128, 1)
+    assert screen.steps == 6_716
     bridge = parse_run_args(["x", "--scale", "bridge"])
     assert (bridge.dim, bridge.layers, bridge.heads, bridge.kv_heads) == (1152, 16, 12, 6)
     assert (bridge.intermediate, bridge.pkda_heads) == (4992, 15)
-    assert (bridge.seq_len, bridge.batch_rows, bridge.micro_rows, bridge.steps) == (4096, 80, 1, 31_787)
+    assert (bridge.seq_len, bridge.batch_rows, bridge.micro_rows, bridge.steps) == (4096, 128, 1, 19_867)
     assert bridge.batch_rows * bridge.seq_len == BATCH_TOKENS
-    assert parse_run_args(["x", "--scale", "bridge", "--tokens-per-param", "400"]).steps == 508_587
-    assert parse_run_args(["x", "--scale", "flagship", "--tokens-per-param", "400"]).steps == 1_345_272
+    assert parse_run_args(["x", "--scale", "bridge", "--tokens-per-param", "400"]).steps == 317_867
+    flagship = parse_run_args(["x", "--scale", "flagship", "--tokens-per-param", "400"])
+    assert (flagship.seq_len, flagship.batch_rows, flagship.micro_rows) == (4096, 128, 1)
+    assert flagship.steps == 840_795
+    assert flagship.steps * BATCH_TOKENS == 440_818_728_960
     for letters in ("", "a", "arf", "arfl"):
-        assert parse_run_args(["x", "--condition", letters]).steps == 10_745
+        assert parse_run_args(["x", "--condition", letters]).steps == 6_716
     deeper = parse_run_args(["x", "--scale", "bridge", "--layers", "20"])
     assert (deeper.layers, deeper.dim) == (20, 1152)
     shorter = parse_run_args(["x", "--scale", "bridge", "--seq-len", "2048"])
-    assert shorter.batch_rows == 160 and shorter.batch_rows * shorter.seq_len == BATCH_TOKENS
+    assert shorter.batch_rows == 256 and shorter.batch_rows * shorter.seq_len == BATCH_TOKENS
     assert parse_run_args(["x", "--steps", "100"]).steps == 100
     with pytest.raises(SystemExit):
         parse_run_args(["x", "--steps", "100", "--tokens-per-param", "25"])
@@ -1102,13 +1106,15 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     with torch.device("meta"):
         model = DeltaModel(condition_config("arf"))
         looped = DeltaModel(condition_config("arfl"))
+    assert (args.micro_rows, args.seq_len) == (1, 4096)
     assert not automatic_checkpoint(model, 2, 1, args, cuda)
     assert not automatic_checkpoint(model, 3, 1, args, cuda)
-    args.micro_rows = 8
+    args.micro_rows = 2
     assert automatic_checkpoint(model, 3, 1, args, cuda)
-    args.micro_rows = 4
+    args.micro_rows = 1
     # The loop counts executed layers, 8 + 4r per pass at the screen, against
-    # the measured raw budget of forty layer-passes (ten cells).
+    # the measured raw budget of forty layer-passes (ten cells) at one
+    # 4,096-token row, the same tokens as the four 1,024-token rows measured.
     assert not automatic_checkpoint(looped, 3, 1, args, cuda)
     assert not automatic_checkpoint(looped, 1, 8, args, cuda)
     assert not automatic_checkpoint(looped, 2, 3, args, cuda)

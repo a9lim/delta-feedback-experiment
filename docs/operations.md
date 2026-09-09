@@ -124,8 +124,8 @@ worker is alive. The worker restores Python's SIGINT handling before its first
 job, so a launcher that ignored the signal (`nohup`, a backgrounded command in
 a non-interactive shell) cannot leave a run that no stop can reach.
 
-The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024
-predictions per row: 3,520,921,600 predicted tokens. Linear warmup occupies the
+The default Jobe run uses 6,716 steps, 128 rows per step, and 4,096
+predictions per row: 3,521,118,208 predicted tokens. Linear warmup occupies the
 first 2% of updates and the `1 - sqrt(u)` cooldown occupies the final 20%.
 Feedback starts independently at three quarters of the schedule; conditions
 with `f` draw two or three passes on every later step. Conditions with `l`

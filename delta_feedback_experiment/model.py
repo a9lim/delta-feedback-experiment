@@ -141,7 +141,7 @@ class ModelConfig:
     pkda_heads: int = 10
     pkda_head_dim: int = 128
     pkda_conv_size: int = 4
-    max_seq_len: int = 1024
+    max_seq_len: int = 4096
     norm_eps: float = 1e-6
     routing_block_size: int = 4
     """Exact MHDB cell width in transformer layers."""

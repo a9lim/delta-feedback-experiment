@@ -13,8 +13,10 @@ analysis of the paired `ar` and `arf` runs unless stated otherwise.
 | `screen-delta-arf-s1` | `arf` | `--feedback-start 0 --three-pass 1` | 6e-3 | 3.076 | 3.077 | Jobe |
 | `screen-delta-arf-s1-highLR` | `arf` | `--feedback-start 0 --three-pass 1` | 2e-2 | 3.113 | 3.113 | Jobe |
 
-All are seed 1, data seed 0, 10,745 steps, 320 rows of 1,024 predictions per
-step, on the same rows. The three-pass-always `arf` runs spend 10.56B
+All were seed 1, data seed 0, 10,745 steps of 320 rows of 1,024 predictions on
+the same rows of the old stream, under the pre-muP screen parametrization;
+they were cleared from Jobe on 2026-09-09, so nothing below can be
+re-evaluated until the reruns exist. The three-pass-always `arf` runs spend 10.56B
 pass-tokens against `ar`'s 3.52B; steps are matched data, not matched
 compute. Only the `ar` run coincides with the current defaults.
 
@@ -75,9 +77,9 @@ That is the opposite of an opaque cross-column channel.
   runs of about 60M tokens read in order, so each stretch of training was one
   CommonCrawl dump, and the held-out slice was the head of one 2013 crawl.
   The stream is now a keyed document shuffle of `sample-350BT` with the base
-  tokenizer's EOS, and the parametrization is muP-pinned to the flagship
-  width; the three specimens above trained on the old order under the plain
-  screen parametrization, and the current code does not load their snapshots.
+  tokenizer's EOS, the parametrization is muP-pinned to the flagship width,
+  and every scale trains 128 rows of 4,096; the three specimens above trained
+  on the old order under the old geometry, and their snapshots are gone.
 
 ## Downstream
 
