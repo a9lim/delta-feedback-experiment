@@ -125,10 +125,10 @@ change it everywhere at once.
 - Projection gradients accumulate into persistent FP32 banks: PKDA Q/K/V and
   dense QKV/gate each share a contiguous allocation with disjoint parameter
   views, so their backward uses one packed GEMM. Optimizer state stays separate.
-- Above the raw activation budget, checkpointing inside each compiled block
-  saves native Flash outputs and projections whose output width is at most
-  six times their input width. Expanded MLP gate/up activations and PKDA
-  forward auxiliaries are reconstructed. Every pass remains differentiable.
+- Above the raw activation budget, each cell retains its final compiled block's
+  activations and checkpoints the preceding blocks. The checkpoint wrapper
+  stays outside block compilation, preserving its numerical boundaries.
+  Every feedback pass and core iteration remains differentiable.
 - Jobe is the single-GPU CUDA surface. Keep GPU jobs serial; the captured
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage

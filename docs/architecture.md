@@ -618,13 +618,11 @@ log-partition penalty applies unchanged.
 
 Backpropagation is complete: every iteration of every pass is in the graph.
 The trainer's activation policy counts executed layers per pass against a
-measured raw budget. Deeper modes use selective checkpointing inside the
-compiled blocks: native Flash-attention outputs and projection GEMM outputs
-whose width is at most six times their input width are saved. This includes
-the screen's packed PKDA Q/K/V projection but excludes its expanded MLP
-gate/up output. Those expanded MLP values, PKDA forward auxiliaries, and other
-reconstructible activations are recomputed for backward. The checkpoint wrapper is compiled together with the
-block so the compiler sees this per-operation storage policy. The budget and
+measured raw budget. Deeper modes retain the final block of each four-layer
+cell and checkpoint its preceding three blocks. With `a`, the retained block
+is dense attention; without `a`, the same quarter of blocks is retained.
+The checkpoint wrapper stays outside each compiled block, so both retained
+and recomputed blocks use the same compilation boundaries. The budget and
 measured costs are in [scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
 Every iteration remains differentiable.
 

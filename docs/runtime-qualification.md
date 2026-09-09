@@ -4,31 +4,28 @@ Analysis depends on the measured computation matching the trained
 computation. This page records the CUDA execution path and its engineering
 evidence.
 
-The committed qualification records dated 2026-09-06 cover Jobe's RTX 4090 with
-PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and standard GIL-enabled CPython
-3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. These records describe
-their exact sources and inputs, not live machine status. Hopper has not been
-through the same checks.
+The current execution measurements are dated 2026-09-09 on Jobe's RTX 4090
+with PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and standard GIL-enabled
+CPython 3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. Records carry
+exact sources and inputs; Hopper has not been through the same checks.
 
 ## Evidence records
 
 | Record | What it establishes |
 |---|---|
-| [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Exact environment selection, dependency checks, portable/CUDA gates, and capture memory |
-| [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Paired six-update diagnostic from a trained checkpoint, with runtime versions, revisions, loss/gradient differences, and limitations |
-| [Execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces, component measurements, profiler counts, backend decisions, and reproduction commands |
-| [Loop staging](../data/summary/loop-stage-2026-09-09.json) | Eager and captured memory of every `arfl` mode, replay time per (pass count, `r`), and the projected schedule |
+| [Current execution optimizations](../data/summary/runtime-optimizations-2026-09-09.json) | Flash SDPA, packed projection gradients, PKDA tiling, selective block retention, full loop timings and accumulated-gradient comparisons |
+| [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Environment migration and its dependency/capture checks |
+| [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Earlier paired six-update diagnostic from a trained checkpoint |
+| [Earlier execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces and component measurements on the earlier stack |
+| [Loop staging baseline](../data/summary/loop-stage-2026-09-09.json) | Pre-optimization memory and timing measurements |
 
-Jobe passed 114 experiment tests and the full `delta probe` CUDA gate. The Mac
-passed 106 tests with eight CUDA cases skipped. The workspace's 122 tests
-passed on each machine, and both environments passed `uv pip check`. Checkpoint
-v23 is unchanged.
-
-The Python 3.13 gate covers PKDA and fused-kernel parity, causal/cached
-attention, all four train/eval graphs, replay, optimizer state and radius
-invariants, post-capture reporting, and checkpoint staging. Capture peaked at
-13.85 GiB allocated and 23.01 GiB reserved. One/two/three-pass microbatch
-replay took 53.4/107.7/161.9 ms. Keep GPU work serial on Jobe's 24 GiB card.
+The current portable suite passes 164 tests with 16 CUDA cases skipped; Jobe
+passes all 180 tests and the integrated `delta probe` CUDA gate. Its four
+train/eval graphs peak at 14.46 GiB allocated and 22.96 GiB reserved, with
+one/two/three-pass replay at 64.6/129.9/195.9 ms. The loop-versus-flat gradient
+error is 1.64%, matching its 1.64% repeat floor; checkpoint staging leaves
+0.02 GiB of residual device allocation. Snapshots remain v26. Keep GPU work
+serial on Jobe's 24 GiB card.
 
 ## Maintained execution contract
 
@@ -108,14 +105,11 @@ analysis. CUDA training uses the same equations through the following path:
   writeback; ordinary per-parameter checkpoint state with no persistent packed
   duplicate. NAdam and global FP32 clipping follow
   [architecture.md](architecture.md).
-- Selective activation checkpointing above the measured work threshold.
-  The checkpoint wrapper is inside full-block compilation so AOTAutograd
-  retains native Flash-attention outputs and `mm`/`addmm` outputs whose width
-  is at most six times their input width. The screen's packed PKDA Q/K/V
-  projection fits that bound; its expanded MLP gate/up projection does not.
-  Expanded MLP values, PKDA forward auxiliaries, and other recomputable
-  activations are reconstructed. The raw-work threshold is unchanged, and
-  all feedback passes and core iterations remain differentiable. Snapshot
+- Selective block activation retention above the measured work threshold.
+  Each four-layer cell retains its final compiled block and checkpoints the
+  preceding three. The checkpoint wrapper stays outside block compilation,
+  preserving its numerical boundaries. The raw-work threshold is unchanged,
+  and all feedback passes and core iterations remain differentiable. Snapshot
   staging is asynchronous to pinned host memory, with atomic background writes.
 
 Inductor artifacts live at `~/.cache/delta-feedback/torchinductor` by default.
@@ -131,80 +125,60 @@ output is attributable to the change.
 
 ## The loop
 
-The CUDA gate checks the `l` letter three ways, all on 2026-09-08 with the
-runtime above:
+The CUDA gate checks the `l` letter three ways:
 
-- **Cached decode through per-iteration core tracks.** On the gate's small
-  geometry (width 128, twelve layers, twelve positions) the full parallel
-  forward and the stepped decode differ, in FP32, by 0.17% relative for
-  `arfl` at two iterations, the same as the flat `a` and `arf` columns at
-  twelve layers. Under BF16 the same comparison drifts with executed depth:
-  3.5% for `a` at four layers, 6.9% for `a` and 7.6% for `arf` at twelve,
-  7.6% for `arfl` at one iteration and 8.7% at two, and 3.2% for the plain
-  GQA loop. The loop check therefore runs in FP32 with a 1% bound; the
-  four-layer BF16 checks keep their 4% bound.
-- **One iteration is the flat column.** At the screen geometry an eager
-  two-pass microbatch gives `arfl` at `r = 1` and `arf` the same loss to a
-  millionth. Their gradients differ by 1.78% relative, and `arf` against
-  itself differs by 1.78%: the head accumulates its BF16 gradient through
-  locks and that order reaches every parameter (embedding 1.84%, trunk
-  1.72%). The gate measures that floor and holds the loop to it.
+- **Cached decode through per-iteration core tracks.** At width 128, twelve
+  layers, and twelve positions, the full parallel forward and stepped
+  `arfl` decode at two iterations must agree within 1% relative error in
+  FP32. Separate four-layer BF16 checks keep their 4% bound.
+- **One iteration is the flat column.** At the screen geometry, eager
+  two-pass `arfl` at `r = 1` and `arf` agree in loss. The gate compares their
+  gradients against a repeated `arf` measurement because the head's BF16
+  accumulation order introduces variation. It also checks banked versus
+  ordinary routed-source gradient accumulation.
 - **The iteration cap runs.** One eager one-pass microbatch at `r = 8`,
   forward and backward under the trainer's activation policy, with its peak
   allocation reported as `loop_cap_peak`.
 
-The captured `(pass count, r)` family is not part of the probe; it is
-measured by `scripts/loop_memory_stage.py` and captured again by each run.
-The 2026-09-09 staging record for `arfl` at the default recipe, one
-4,096-token row per microbatch: eager one-, two-, and three-pass
-microbatches peak at 5.46, 9.59, and 13.33 GiB allocated raw at `r = 1`; at
-`r = 8` the one-pass microbatch peaks at 13.70 GiB raw and the two- and
-three-pass microbatches at 3.43 and 4.08 GiB checkpointed; the twenty-four
-train graphs and the evaluation graph capture in 119 s at 15.85 GiB
-allocated and 22.92 GiB reserved; replay runs from 67.2 ms (one pass,
-`r = 1`, the flat column's own time) to 690.3 ms (three passes, `r = 8`)
-per microbatch, the full table in
-[scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
-Reproduce with:
+The captured `(pass count, r)` family is measured separately from the probe.
+At the screen geometry (`arfl`, one 4,096-token row per microbatch), all 24
+training graphs plus evaluation captured in 92.5 s, peaking at 15.84 GiB
+allocated and 23.02 GiB reserved. Raw replay ranges from 64.6 ms at one pass,
+`r = 1`, to 623.5 ms at three passes, `r = 8`. The full table and schedule
+projection are in [scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
+
+For 128 distinct synthetic rows, the two-pass `r = 4` batch took 34.01 s
+versus 37.42 s on the baseline; three-pass `r = 8` took 80.00 s versus
+88.54 s. These include input replay and head-gradient flushing, excluding
+optimizer, data loading, evaluation, and snapshots. The realized default
+schedule projects to 34.89 replay hours, 6.35% less than the baseline.
+
+The accumulated-gradient relative L2 differences at `(k,r) = (1,1), (1,4),
+(2,4), (3,8)` are 2.83%, 3.63%, 4.67%, and 13.64%; corresponding baseline
+repeats differ by 1.79%, 2.25%, 2.84%, and 8.47%. All values are finite,
+gradient norm ratios remain within 0.032% of one, and the lowest cosine is
+0.9907. This is measurable numerical drift beyond repeat variation,
+particularly at the deepest mode. It is accepted engineering evidence, not
+bitwise equivalence or evidence about training quality. These comparisons
+start from paired fresh weights; no trained specimen was available.
+
+Reproduce the current graph family and gradient dumps with:
 
 ```bash
-python scripts/loop_memory_stage.py --out data/summary/loop-stage-DATE.json --condition arfl
+python scripts/loop_optimization_check.py --full-family --modes 1:1,1:2,1:3,1:4,1:5,1:6,1:7,1:8,2:1,2:2,2:3,2:4,2:5,2:6,2:7,2:8,3:1,3:2,3:3,3:4,3:5,3:6,3:7,3:8 --batch-modes 1:1,1:4,2:4,3:8 --gradients /tmp/current-gradients --output /tmp/current-loop.json
+python scripts/compare_loop_gradients.py /tmp/baseline-gradients /tmp/current-gradients --output /tmp/gradient-comparison.json
 ```
 
 ## Short-update evidence and its limits
 
-The 18-update optimization comparison starts from the same diagnostic
-checkpoint on each side with fresh optimizer state and identical data
-addresses, learning rates, pass schedule, and keyed randomness. Both sides use
-Python 3.13 and the current runtime; the baseline selects plain causal
-attention, per-microbatch uploads, and the baseline optimizer recorded in the
-artifact. Timing excludes the first update.
-
-| Passes | Baseline update | Combined update | Time reduction | Samples per side |
-|---|---:|---:|---:|---:|
-| 1 | 4.749 s | 4.731 s | 0.38% | 8 |
-| 2 | 9.471 s | 9.449 s | 0.24% | 6 |
-| 3 | 14.278 s | 14.252 s | 0.19% | 3 |
-
-The largest update-loss difference was 0.000118, the largest gradient-norm
-relative difference 0.98%, and final pass-one/fused validation differences
-0.000128/0.000160. Both eight-pass traces remained finite. Combined capture
-peaked at 13.83 GiB allocated and 22.91 GiB reserved. These are small
-sequential samples: a modest throughput change, not long-run parity.
-
-The separate optimizer comparison reduced warmed NorMuonH time from 62.15 to
-50.43 ms. In the profiled clipping/optimizer/shadow/zeroing interval, launches
-fell from 629 to 582 and eager `stack`/`cat` calls from 31 each to one each.
-Eager allocation counts did not fall. Staging alone stayed within 0.2% of the
-baseline and adds about 2.5 MiB each of pinned host and device storage.
-
-The six-update whole-runtime migration comparison used Python 3.12.13 on both
-sides, the same checkpoint and rows, and pass counts `1,1,1,2,2,3`. Candidate
-one/two/three-pass update medians were 4.741/9.470/14.209 s. Maximum
-update-loss difference was 0.000277 and gradient-norm relative difference
-0.229%. The record contains the baseline stack and full traces. It does not
-isolate FlexAttention's contribution. The distinct Python 3.13 gate is recorded
-separately.
+The current record compares the baseline and candidate through two optimizer
+updates on the same synthetic 128-row batch at two passes and `r = 4`.
+Both paths keep finite losses and gradients at the recipe's learning rates;
+the maximum loss difference is 0.000452 and gradient-norm relative difference
+0.120%. Fresh weights and repeated synthetic rows cannot establish
+training quality, retained capability, or equivalent learning trajectories.
+The older trained-checkpoint traces are linked as dated evidence for their
+own source revisions; they do not qualify this intervention.
 
 ## Backend constraints
 
