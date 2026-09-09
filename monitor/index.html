@@ -42,7 +42,7 @@
     <div class="chart"><h2>held-out NLL <small>nats at eval cadence · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-val"></div></div>
   </div>
   <div class="grid two">
-    <div class="chart"><h2>learning rates <small>solid NorMuonH · dotted NAdam · one shared multiplier</small></h2><div class="plot" id="p-lr"></div></div>
+    <div class="chart"><h2>learning rates <small>solid NorMuonH · dashed NAdam width group (× 1536/D) · dotted NAdam · one shared multiplier</small></h2><div class="plot" id="p-lr"></div></div>
     <div class="chart"><h2>gradient norm <small>global FP32 L2 before clipping</small></h2><div class="plot" id="p-gnorm"></div></div>
   </div>
   <div class="grid two">
@@ -130,7 +130,7 @@ const EMA_SPAN = 200, ROLL = 200;
 function onStep(run, rec) {
   return {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
-    lr_normuonh: num(rec.lr_normuonh), lr_nadam: num(rec.lr_nadam),
+    lr_normuonh: num(rec.lr_normuonh), lr_nadam: num(rec.lr_nadam), lr_nadam_width: num(rec.lr_nadam_width),
     gnorm: num(rec.gnorm),
     tok_s: num(rec.tok_s), pass_tok_s: num(rec.pass_tok_s), cell_tok_s: num(rec.cell_tok_s),
     mem: num(rec.mem), elapsed: num(rec.elapsed),
@@ -276,7 +276,7 @@ function renderTiles(view) {
     tile('elapsed', fmtDuration(elapsed), began != null ? `began ${fmtWhen(began)}` : ''),
     tile('loss', fmt(last.loss), `pass-1 ${fmt(last.pass1)} · k ${last.k ?? '–'}${last.r != null ? ` · r ${last.r}` : ''}`),
     tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `${feedback && lastVal.val_fused != null ? `fused ${fmt(lastVal.val_fused)} · ` : ''}@ ${lastVal.step.toLocaleString()}` : feedback ? '' : 'no feedback'),
-    tile('lr NorMuonH', fmt(last.lr_normuonh, 3), `NAdam ${fmt(last.lr_nadam, 3)} · gnorm ${fmt(last.gnorm, 3)}`),
+    tile('lr NorMuonH', fmt(last.lr_normuonh, 3), `NAdam ${fmt(last.lr_nadam, 3)} · width ${fmt(last.lr_nadam_width, 3)} · gnorm ${fmt(last.gnorm, 3)}`),
     tile('memory', `${fmt(last.mem, 3)} <small>GiB</small>`, rates.join(' · ')),
     gpuTile(live),
     tile('updated', fmtAge(age), `${esc(status)}${activeHere && state.active.phase ? ' · ' + esc(state.active.phase) : ''}`, live ? 'ok' : (/KILLED|FAILED/.test(status) ? 'bad' : '')),
@@ -293,10 +293,10 @@ const CONFIG_GROUPS = [
   ['a · attention', 'a', ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
   ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
   ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
-  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'grad_clip', 'zloss']],
+  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'grad_clip', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
 ];
-const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap' };
+const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap' };
 function renderConfig(view) {
   const run = view.run, setup = run.meta.run, condition = conditionOf(view);
   const cards = [];
@@ -393,7 +393,7 @@ function rebuild() {
     line(`loss${t}`, alpha(c, 0.3)), line(`loss ema${t}`, c),
     dashed(`pass-1${t}`, alpha(c, 0.3)), dashed(`pass-1 ema${t}`, c)]), { yScale: yLog, marks });
   step('p-val', perRun((c, t) => [line(`val${t}`, c, PTS), dashed(`val fused${t}`, c, PTS)]), { yScale: yLog });
-  step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dotted(`NAdam${t}`, c, v3)]), { yScale: yLog });
+  step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dashed(`NAdam width${t}`, c, v3), dotted(`NAdam${t}`, c, v3)]), { yScale: yLog });
   step('p-gnorm', perRun((c, t) => [line(`gnorm${t}`, c, v3)]), { yScale: yLog });
   step('p-tput', perRun((c, t) => [line(`tok/s${t}`, c, v0), dashed(`pass tok/s${t}`, c, v0), dotted(`cell tok/s${t}`, c, v0)]), { yScale: yLog });
   step('p-cum', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
@@ -458,7 +458,7 @@ function seriesOf(view) {
   return {
     nll: [[xs, loss, ema(loss, EMA_SPAN), pass1, ema(pass1, EMA_SPAN)]],
     val: ev(vals, 'val', 'val_fused'),
-    lr: [[xs, col('lr_normuonh'), col('lr_nadam')]],
+    lr: [[xs, col('lr_normuonh'), col('lr_nadam_width'), col('lr_nadam')]],
     gnorm: [[xs, col('gnorm')]],
     tput: [[xs, col('tok_s'), col('pass_tok_s'), col('cell_tok_s')]],
     cum: [[xs, cum.map((c) => c[0]), cum.map((c) => c[1]), cum.map((c) => c[2])]],

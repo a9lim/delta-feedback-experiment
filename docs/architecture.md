@@ -50,8 +50,8 @@ causal global read. Without `a` every layer is that dense read, and position
 is whatever the causal mask lets the model infer.
 
 On pass 1 and in Standard decoding the seed is the token embedding. The
-readout uses `final_norm(h_top)`; the outgoing payload has its own routing
-and normalization. The mixer caches are additional state paths outside the
+readout uses `final_norm(h_top)` times the muP readout multiplier `1536 / D`;
+the outgoing payload has its own routing and normalization. The mixer caches are additional state paths outside the
 diagram's explicit payload edge.
 
 ### Residual shell
@@ -342,7 +342,7 @@ for cell in four_layer_cells:  # C cells
     completed.append(h - cell_start)
 
 payload = payload_norm(h + mhdb([seed, *completed], site="payload"))
-logits = tied_readout(final_norm(h))
+logits = tied_readout(final_norm(h) * mup_ratio)  # 1536 / D
 ```
 
 Each `mhdb` call above implicitly prepends its own learned null.
@@ -419,7 +419,7 @@ h = coda_cell(h, sources=[seed, Delta_P, Delta_R])
 Delta_C = h - (core_entry + Delta_R)
 
 payload = payload_norm(h + mhdb([seed, Delta_P, Delta_R, Delta_C], site="payload"))
-logits = tied_readout(final_norm(h))
+logits = tied_readout(final_norm(h) * mup_ratio)  # 1536 / D
 ```
 
 Each `mhdb` call prepends its site's learned null. Every cell measures its
@@ -817,7 +817,11 @@ Building `L` touches the following together:
 
 Each NorMuonH-owned matrix `W` with shape `[d_out, d_in]` is initialized from
 `Normal(0, 1 / sqrt(d_in))`, following the Hyperball parameterization. The tied
-embedding/readout and NAdam-owned dense matrices use `Normal(0, 0.02)`.
+embedding/readout and NAdam-owned dense matrices use `Normal(0, 0.02)`. The
+readout multiplies `final_norm(h_top)` by the muP width ratio `1536 / D`
+before the tied classifier product, one at the flagship and two at the
+screen; the multiplier is a fixed part of the parametrization, not a
+parameter, and the CUDA classifier shadow reads the scaled input unchanged.
 Depthwise convolution weights keep PyTorch Conv1d's Kaiming-uniform
 initialization at fan-in 4. RMSNorm scales initialize to one; routing queries
 and nulls initialize to zero. PKDA rates, time constants, centers, and
@@ -846,10 +850,11 @@ buffer is a runtime operand like the shadow, not state.
 
 ## NorMuonH and NAdam
 
-Every condition at every geometry uses one optimizer recipe with two disjoint
-parameter groups: one NorMuonH group and one NAdam group. Their public
-controls are `--lr-normuonh` and `--lr-nadam`, with defaults in
-[design.md](design.md#knobs). No group uses weight decay.
+Every condition at every geometry uses one optimizer recipe with three
+disjoint parameter groups: one NorMuonH group and two NAdam groups, base and
+width-scaled. Their public controls are `--lr-normuonh` and `--lr-nadam`,
+with defaults in [design.md](design.md#knobs); `--lr-nadam` is the base rate
+at the muP reference width. No group uses weight decay.
 
 ### NorMuonH matrices
 
@@ -894,20 +899,43 @@ compiled, captured, staged, and resumed updates.
 ### NAdam parameters
 
 NAdam owns parameters whose norm carries semantic scale and every non-matrix
-parameter:
+parameter, in two groups. The **width-scaled group** holds the NAdam matrices
+whose fan-in is the residual width `D`:
 
-- tied embedding/readout;
 - GGQA gate matrices;
 - the FBT token-gate matrix;
-- PKDA's packed control projection, main-decay expansion, and output-gate
-  expansion;
+- PKDA's packed control projection.
+
+The **base group** holds everything else NAdam owns:
+
+- tied embedding/readout;
+- PKDA's main-decay and output-gate expansions, fan-in 128;
 - RMSNorm weights, router queries and nulls, depthwise convolutions, biases,
   rates, time constants, and preconditioner centers.
 
-Every NAdam-owned parameter, including the tied embedding/readout, belongs to
-one parameter group with learning rate `lr_nadam`. It uses moment betas
-`(0.9, 0.95)`, momentum decay `psi = 0.004`, epsilon `1e-8`, and no weight
-decay. At optimizer step `t`, PyTorch NAdam uses:
+The split is muP for NAdam. NorMuonH's relative step is dimensionless and its
+update's spectral norm is `lr_normuonh * sqrt(d_out / min(d_out, d_in))`, the
+spectral condition up to a constant the aspect ratio fixes, so its rate
+transfers across widths on its own. NAdam moves every coordinate by about its
+rate whatever the gradient, so a matrix with fan-in `D` shifts its output by
+up to `rate * D` per step; the width-scaled group therefore runs at
+`lr_nadam * 1536 / D`, the muP rule for Adam-family hidden weights with the
+flagship as the reference width. Every other NAdam parameter has a fan-in the
+ladder holds fixed: one for the embedding lookup, 192 for a routing group, 128
+for the PKDA expansions, four for a convolution, one for a vector. The tied
+embedding's readout role has fan-in `D` as well and takes the ratio as the
+readout multiplier above rather than a scaled rate, which would also move its
+lookup. At the flagship every ratio is one.
+
+| | Screen | Bridge | Flagship |
+|---|---:|---:|---:|
+| Width ratio `1536 / D` | 2 | 4/3 | 1 |
+| Width-scaled NAdam rate at `lr_nadam = 3e-4` | 6e-4 | 4e-4 | 3e-4 |
+| Readout multiplier | 2 | 4/3 | 1 |
+
+Both groups use moment betas `(0.9, 0.95)`, momentum decay `psi = 0.004`,
+epsilon `1e-8`, and no weight decay. At optimizer step `t`, PyTorch NAdam
+uses:
 
 ```text
 m_t = beta1 m_{t-1} + (1 - beta1) G_t
@@ -919,9 +947,9 @@ U_t = ((1 - mu_t) G_t / (1 - P_t)
       / (sqrt(v_t / (1 - beta2^t)) + eps)
 ```
 
-The update is `theta_t = theta_{t-1} - lr * U_t`. Both parameter groups receive
-the same warmup-stable-cooldown multiplier defined by the current scale's
-schedule. CUDA uses PyTorch's foreach NAdam path outside the captured
+The update is `theta_t = theta_{t-1} - lr * U_t`. All three parameter groups
+receive the same warmup-stable-cooldown multiplier defined by the current
+scale's schedule. CUDA uses PyTorch's foreach NAdam path outside the captured
 forward/backward graphs; its scalar step and momentum-product state stay on
 CPU, while both moment tensors and all parameters remain FP32 on-device.
 NorMuonH compiles each active shape bucket's packing, mathematical update, and

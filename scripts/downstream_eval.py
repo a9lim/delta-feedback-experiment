@@ -69,7 +69,7 @@ class DeltaScorer:
                     analysis.fused_inputs(model, e, out.payload, prefix), need_payload=i < self.passes - 1
                 )
             weight = model.embed_tokens.weight
-            head = lambda h: F.linear(model.final_norm(h), weight.to(h.dtype))
+            head = lambda h: F.linear(model.readout_input(h), weight.to(h.dtype))
             return downstream.span_scores(out.h_top, ids, spans, head)
 
 

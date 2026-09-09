@@ -63,7 +63,7 @@ def main() -> None:
     rows = data.batch(100000, 4, "cuda")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         outputs = model_module.multipass(model, rows, 1)
-        head = model.final_norm(outputs[0].h_top)
+        head = model.readout_input(outputs[0].h_top)
         torch.save(
             {
                 "e": head.detach().cpu(),

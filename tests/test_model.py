@@ -348,6 +348,57 @@ def test_normuonh_matrices_use_inverse_sqrt_fan_in_initialization():
     )
 
 
+def test_readout_and_width_group_carry_the_mup_ratio():
+    """The muP reference width is the flagship, so its ratio is one and the
+    screen's is two; the readout multiplies its logits by the ratio, and the
+    width-scaled NAdam group is exactly the NAdam matrices with fan-in D."""
+    from delta_feedback_experiment.model import MUP_BASE_DIM, ModelConfig
+    from delta_feedback_experiment.optim import DEFAULT_NADAM_LR, build_optimizers
+    from delta_feedback_experiment.parameter_groups import (
+        is_normuonh_parameter,
+        is_width_scaled_parameter,
+    )
+    from delta_feedback_experiment.train import SCALES
+
+    assert MUP_BASE_DIM == SCALES["flagship"]["dim"] == 1536
+    assert ModelConfig(dim=SCALES["flagship"]["dim"]).mup_ratio == 1.0
+    assert ModelConfig(dim=SCALES["bridge"]["dim"]).mup_ratio == pytest.approx(4 / 3)
+    assert ModelConfig(dim=SCALES["screen"]["dim"]).mup_ratio == 2.0
+
+    model = tiny("arf")
+    h = torch.randn(2, 5, TINY["dim"])
+    plain = torch.nn.functional.linear(model.final_norm(h), model.embed_tokens.weight)
+    assert model.cfg.mup_ratio == 48
+    torch.testing.assert_close(model.readout_input(h), model.final_norm(h) * 48)
+    torch.testing.assert_close(model.logits(h), plain * 48)
+
+    # At the reference width the parametrization is the plain one.
+    reference = tiny("arf", dim=1536)
+    h = torch.randn(2, 5, 1536)
+    assert reference.cfg.mup_ratio == 1.0
+    assert reference.readout_input(h) is not None
+    torch.testing.assert_close(reference.readout_input(h), reference.final_norm(h))
+    _, nadam = build_optimizers(reference)
+    assert [group["lr"] for group in nadam.param_groups] == [DEFAULT_NADAM_LR] * 2
+
+    for condition in BUILDABLE + LOOPED:
+        model = tiny(condition)
+        width = [
+            name
+            for name, p in model.named_parameters()
+            if is_width_scaled_parameter(name, p)
+        ]
+        assert width, condition
+        for name, p in model.named_parameters():
+            scaled = is_width_scaled_parameter(name, p)
+            assert not (scaled and is_normuonh_parameter(name, p)), name
+            if scaled:
+                assert p.ndim == 2 and p.shape[1] == TINY["dim"], name
+            elif p.ndim == 2 and not is_normuonh_parameter(name, p):
+                # The other NAdam matrices read one token or one head width.
+                assert name == "embed_tokens.weight" or p.shape[1] == TINY["pkda_head_dim"], name
+
+
 def test_classifier_shadow_is_derived_and_preserves_master_gradients():
     from delta_feedback_experiment.model import _ClassifierShadow
 

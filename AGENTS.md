@@ -83,9 +83,12 @@ change it everywhere at once.
   is its unlooped condition exactly, at any cell count.
 - NorMuonH owns ordinary hidden matrices, initialized `Normal(0, 1/sqrt(d_in))`
   with fixed realized Frobenius radii; NAdam owns gates, embeddings, norms,
-  routing parameters, PKDA controls, convolutions, and vectors in one group.
-  No weight decay. The global FP32 gradient is clipped to norm 10.0 before
-  both steps.
+  routing parameters, PKDA controls, convolutions, and vectors in two groups:
+  the matrices with fan-in `D` (GGQA gates, the FBT token gate, PKDA control
+  projections) at `lr_nadam x 1536 / D`, everything else at `lr_nadam`, and
+  the tied readout multiplies its logits by the same ratio. The flagship is
+  the muP reference width, so its ratio is one. No weight decay. The global
+  FP32 gradient is clipped to norm 10.0 before both steps.
 
 ## Useful bookkeeping
 
@@ -120,8 +123,8 @@ change it everywhere at once.
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
   collection outside train/eval graph capture.
-- Snapshots are v25. Only v25 resumes; v16 through v24 stay readable for
-  evaluation and forks, and every specimen records its condition as letters.
+- Snapshots are v26, and only v26 loads, for resume, evaluation, and forks
+  alike; every specimen records its condition as letters.
 - Before touching Jobe, look at `delta status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker
   refreshes before the next job and runs the current checkout's probe.

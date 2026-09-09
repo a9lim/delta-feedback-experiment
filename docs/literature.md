@@ -17,6 +17,7 @@ those roles to the organism.
 | Multi-head and Delta Attention Residuals | Grouped source selection and additive delta-source semantics | Addressable seed and block contributions, with a residual reconstruction identity |
 | Attention Residuals | Cumulative-state routing comparison | Clarifies how additive delta routing differs from replacing the residual read |
 | NorMuon / Hyperball / NAdam implementation | Matrix update direction, fixed realized radii, and semantic-scale optimization | A fixed training recipe across controls, with explicit parameter ownership |
+| Tensor Programs V, the spectral condition, and the mup shared readout | Width transfer for the NAdam group: the fan-in-`D` matrices and the tied readout carry `1536 / D`; NorMuonH's relative step needs no rule | A rate tuned at the flagship is the rate at every narrower geometry |
 | Recurrent-depth language models | Prelude/tied-core/coda and the iteration draw for the `l` letter; zero-shot cache sharing as the trained `L` channel | An iteration axis, `l`, built; `L` specified |
 | Free Pause Tokens | Design comparison: separate persistent state from a read-only prediction stream | A candidate way to separate memory from prediction; assessed below |
 
@@ -26,6 +27,15 @@ geometry, and paired training schedules. They are specified in
 [architecture.md](architecture.md) and [design.md](design.md), with the
 geometries in [scaling.md](scaling.md). The loop's adoptions and replacements
 are tabulated [below](#the-loops-adoptions-and-replacements).
+
+Width transfer follows muP for the NAdam group only. Tensor Programs V gives
+the Adam rule, hidden and output weights at `1 / fan_in` and inputs and
+vectors width-independent; the spectral condition is why NorMuonH's relative
+step needs no rule; and the mup package's shared readout is the convention
+for a tied embedding, a `1 / width` multiplier on the readout input with the
+embedding's own rate left alone. The departure is the reference width: the
+flagship rather than the smallest geometry, so `--lr-nadam` names the 1B
+rate and the screen is the scaled geometry.
 
 Source precedent motivates a component; the probe checks that we implemented
 the chosen equations; what the trained organism does with them is what the

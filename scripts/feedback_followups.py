@@ -151,8 +151,8 @@ def main() -> None:
             W = model.embed_tokens.weight.to(out1.h_top.dtype)
             for s in range(0, T, 256):
                 t = tgt[:, s : s + 256]
-                z1 = F.linear(model.final_norm(out1.h_top[:, s : s + 256]), W).float()
-                z2 = F.linear(model.final_norm(out2.h_top[:, s : s + 256]), W).float()
+                z1 = F.linear(model.readout_input(out1.h_top[:, s : s + 256]), W).float()
+                z2 = F.linear(model.readout_input(out2.h_top[:, s : s + 256]), W).float()
                 l1 = {T1: (z1 / T1).log_softmax(-1) for T1 in T1s}
                 l2 = {T2: (z2 / T2).log_softmax(-1) for T2 in T2s}
                 for gi, (T1, T2, w) in enumerate(grid):

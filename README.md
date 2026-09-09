@@ -82,6 +82,8 @@ hitting them is the job of the recipe and the architecture.
 Three full-schedule specimens exist on Jobe, all seed 1 on the same rows:
 an `ar` run on the default recipe, and two `arf` runs trained with three
 feedback passes on every step from step 0, at two NorMuonH learning rates.
+All three predate the keyed stream and the muP parametrization; the current
+code does not load their snapshots, and they are due to be rerun.
 
 The current read, from [findings](docs/findings.md): the channel as trained is
 live, stable, and harmless, and it is token-legible. The first cell decodes

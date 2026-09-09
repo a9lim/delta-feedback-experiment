@@ -4,6 +4,45 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-09 — muP for the NAdam group, pinned to the flagship width
+
+a9 asked whether the NAdam parameters should be muP'd, given that NorMuonH is
+width-invariant on its own. Working the NAdam group against the ladder: head
+width and routing-group width are fixed across the three geometries, so only
+four NAdam families have a fan-in that grows with `D`: the tied embedding in
+its readout role, the GGQA gate matrices, the FBT token gate, and PKDA's
+packed control projection. Everything else NAdam owns (the embedding lookup,
+router queries over 192-wide groups, the 128-in PKDA expansions,
+convolutions, norms, vectors) already transfers under a constant rate.
+NorMuonH's step is `lr · R · Normalize_F(U)` with `R = ||W_0||_F`, so its
+update's spectral norm is `lr · sqrt(d_out / min(d_out, d_in))`, the spectral
+condition up to a constant the aspect ratio fixes, and every aspect ratio is
+fixed across the ladder.
+
+The rule landed: a second NAdam group for the three fan-in-`D` matrix
+families at `lr_nadam x 1536 / D`, and a `1536 / D` multiplier on the readout
+input, the mup shared-readout convention, with the flagship as the reference
+width. a9 chose the flagship rather than the screen: the recipe's rates came
+from FBT's 1B fit (1e-2 / 5e-4) and were brought down to 6e-3 / 3e-4 together
+when 1e-2 ran hot, so the NAdam rate was never tuned at the screen and reads
+best as the flagship's. The screen now runs its gates and controls at 6e-4
+under a doubled readout, the bridge at 4e-4 and 4/3.
+
+The readout multiplier changes what a screen snapshot means and the NAdam
+state dict grows a group, so the checkpoint contract is v26 and only v26
+loads. The three specimens (`screen-delta-ar-s1`, `screen-delta-arf-s1`,
+`screen-delta-arf-s1-highLR`) and `screen-delta-arl-s1` are not loadable by
+the current code; they were due for a rerun on the keyed stream anyway.
+
+Not done, and worth doing before the bridge: a coord check at widths 384
+through 1536, some twenty steps at a tiny batch, logging the per-step RMS of
+the gate pre-activations, the PKDA control logits, the routing scores, and
+the logits. Flat across widths confirms the rule and measures the NorMuonH
+invariance instead of assuming it. Depth is the other axis: the
+`1 / sqrt(2L)` branch scale is already the depth-muP residual multiplier,
+and depth-muP for normalized optimizers would also scale both rates by
+`1 / sqrt(L)`, about 0.7 at 24 layers. Neither is scheduled.
+
 ## 2026-09-09 — The loss bumps are the source's crawl order; the stream becomes a keyed document shuffle
 
 a9 noticed that every run's training loss drifts up and down over a few

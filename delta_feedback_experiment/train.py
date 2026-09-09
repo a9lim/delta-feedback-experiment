@@ -51,7 +51,7 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=25, resumable=frozenset({25}), surface_version=16
+    version=26, resumable=frozenset({26}), surface_version=26
 )
 
 GRAD_CLIP_NORM = 10.0
@@ -269,7 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-nadam",
         type=float,
         default=DEFAULT_NADAM_LR,
-        help="NAdam learning rate (default: 0.0003)",
+        help=(
+            "NAdam learning rate at the muP reference width 1536; the fan-in-D "
+            "NAdam matrices run at this times 1536/dim (default: 0.0003)"
+        ),
     )
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -1372,6 +1375,7 @@ def train(argv: list[str] | None = None) -> dict:
             device=str(device),
             grad_clip=GRAD_CLIP_NORM,
             routing_block_size=model.cfg.routing_block_size,
+            mup_ratio=model.cfg.mup_ratio,
             **{name: getattr(args, name) for name in EXACT_FIELDS},
         )
         if args.continue_from:
@@ -1509,6 +1513,9 @@ def train(argv: list[str] | None = None) -> dict:
             fields |= {
                 "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
                 "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
+                "lr_nadam_width": telemetry.format_metric(
+                    learning_rates["nadam_width"]
+                ),
                 "gnorm": telemetry.format_metric(grad_norm),
                 "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
                 "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),

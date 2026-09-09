@@ -96,7 +96,7 @@ def logprob_chunks(
     """
     weight = model.embed_tokens.weight.to(h_top.dtype)
     for start in range(0, h_top.shape[1], chunk):
-        piece = model.final_norm(h_top[:, start : start + chunk])
+        piece = model.readout_input(h_top[:, start : start + chunk])
         yield start, F.linear(piece, weight).float().log_softmax(-1)
 
 

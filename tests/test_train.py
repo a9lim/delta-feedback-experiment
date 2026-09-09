@@ -495,9 +495,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 25
-    assert CONTRACT.resumable == frozenset({25})
-    assert CONTRACT.surface_version == 16
+    assert CONTRACT.version == 26
+    assert CONTRACT.resumable == frozenset({26})
+    assert CONTRACT.surface_version == 26
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(10.0)
@@ -505,7 +505,11 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
 
 
 def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
-    from delta_feedback_experiment.model import DeltaModel, condition_config
+    from delta_feedback_experiment.model import (
+        MUP_BASE_DIM,
+        DeltaModel,
+        condition_config,
+    )
 
     model = DeltaModel(
         condition_config(
@@ -522,26 +526,36 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
             max_seq_len=17,
         )
     )
-    normuonh, nadam = split_parameters(model)
+    normuonh, nadam, width = split_parameters(model)
     names = {id(parameter): name for name, parameter in model.named_parameters()}
     normuonh_names = {names[id(parameter)] for parameter in normuonh}
     nadam_names = {names[id(parameter)] for parameter in nadam}
+    width_names = {names[id(parameter)] for parameter in width}
 
-    assert "attention_gates.0.weight" in nadam_names
+    assert "attention_gates.0.weight" in width_names
     assert "embed_tokens.weight" in nadam_names
     assert "blocks.0.attn_router.query" in nadam_names
     assert "blocks.0.attn_router.key_norm.weight" in nadam_names
     assert "fuse_value.weight" in normuonh_names
-    assert "fuse_gate.weight" in nadam_names
+    assert "fuse_gate.weight" in width_names
     assert "blocks.0.attn.q_proj.weight" in normuonh_names
     assert "blocks.3.attn.qkv_proj.weight" in normuonh_names
-    assert "blocks.0.attn.control_proj.weight" in nadam_names
+    assert "blocks.0.attn.control_proj.weight" in width_names
     assert "blocks.0.attn.decay_up.weight" in nadam_names
     assert "blocks.0.attn.output_gate_up.weight" in nadam_names
     assert "blocks.0.attn.q_conv.weight" in nadam_names
     assert "blocks.0.mlp.gate_up_proj.weight" in normuonh_names
-    assert not (normuonh_names & nadam_names)
-    assert len(normuonh_names) + len(nadam_names) == len(names)
+    # The width-scaled group is exactly the NAdam matrices whose fan-in is D.
+    assert width_names == {
+        "attention_gates.0.weight",
+        "fuse_gate.weight",
+        "blocks.0.attn.control_proj.weight",
+        "blocks.1.attn.control_proj.weight",
+        "blocks.2.attn.control_proj.weight",
+    }
+    assert all(parameter.shape[1] == 32 for parameter in width)
+    assert not (normuonh_names & nadam_names) and not (nadam_names & width_names)
+    assert len(normuonh_names) + len(nadam_names) + len(width_names) == len(names)
 
     normuonh_optimizer, nadam_optimizer = build_optimizers(model)
     assert isinstance(normuonh_optimizer, NorMuonH)
@@ -550,10 +564,14 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     assert normuonh_optimizer.param_groups[0]["lr"] == DEFAULT_NORMUONH_LR
     assert normuonh_optimizer.param_groups[0]["stable_lr"] == DEFAULT_NORMUONH_LR
     assert "weight_decay" not in normuonh_optimizer.param_groups[0]
-    [nadam_group] = nadam_optimizer.param_groups
+    nadam_group, width_group = nadam_optimizer.param_groups
+    assert model.cfg.mup_ratio == MUP_BASE_DIM / 32 == 48
     assert nadam_group["lr"] == DEFAULT_NADAM_LR == 3e-4
     assert nadam_group["stable_lr"] == DEFAULT_NADAM_LR
     assert nadam_group["rate_name"] == "nadam"
+    assert width_group["lr"] == width_group["stable_lr"] == DEFAULT_NADAM_LR * 48
+    assert width_group["rate_name"] == "nadam_width"
+    assert [id(p) for p in width_group["params"]] == [id(p) for p in width]
     for group in nadam_optimizer.param_groups:
         assert group["betas"] == DEFAULT_NADAM_BETAS
         assert group["momentum_decay"] == NADAM_MOMENTUM_DECAY
@@ -570,9 +588,11 @@ def test_semantic_scale_gates_use_nadam_and_value_matrices_use_normuonh():
     assert rates == {
         "normuonh": DEFAULT_NORMUONH_LR / 2,
         "nadam": DEFAULT_NADAM_LR / 2,
+        "nadam_width": DEFAULT_NADAM_LR * 48 / 2,
     }
     assert normuonh_optimizer.param_groups[0]["lr"] == rates["normuonh"]
     assert nadam_group["lr"] == rates["nadam"]
+    assert width_group["lr"] == rates["nadam_width"]
 
 
 def test_optimizer_materialization_restores_fresh_nadam_state():
@@ -945,6 +965,7 @@ def test_tiny_run_completes(tmp_path, capsys, condition):
     assert len(step_records) == 8
     assert all("lr_normuonh=" in line for line in step_records)
     assert all("lr_nadam=" in line for line in step_records)
+    assert all("lr_nadam_width=" in line for line in step_records)
     assert all("lr_embedding=" not in line for line in step_records)
     assert all("lr_h=" not in line for line in step_records)
     assert all("cell_tok_s=" in line for line in step_records)
@@ -1020,12 +1041,12 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", range(9, 25))
+@pytest.mark.parametrize("version", range(9, 26))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--condition", "", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[25\\]"):
+    with pytest.raises(ValueError, match="resumable versions \\[26\\]"):
         run(tmp_path, tag, ["--condition", "", "--resume"])
 
 

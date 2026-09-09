@@ -108,6 +108,18 @@ def parse_condition(text: str) -> str:
 BASE_NORMAL_INIT_STD = 0.02
 """Sampling scale retained for embeddings and NAdam-owned dense matrices."""
 
+MUP_BASE_DIM = 1536
+"""The muP reference width: the flagship column of ``docs/scaling.md``.
+
+NorMuonH's relative step is width-invariant on its own. NAdam's is not: its
+per-coordinate step is the rate whatever the gradient, so a matrix with fan-in
+``D`` moves its output by up to ``rate * D`` per step. The fan-in-``D`` NAdam
+matrices therefore run at ``lr_nadam * MUP_BASE_DIM / dim`` and the tied
+readout multiplies its logits by the same ratio, so the rate tuned at the
+flagship is the rate at every narrower geometry, and the flagship itself is
+the plain parametrization.
+"""
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -181,6 +193,11 @@ class ModelConfig:
             for letter, (flag, _) in CONDITION_LETTERS.items()
             if getattr(self, flag)
         )
+
+    @property
+    def mup_ratio(self) -> float:
+        """The muP width ratio ``MUP_BASE_DIM / dim``; one at the flagship."""
+        return MUP_BASE_DIM / self.dim
 
     @property
     def routing_active(self) -> bool:
@@ -1177,8 +1194,19 @@ class DeltaModel(nn.Module):
         self._shadow_refresh = refresh
         return bound
 
+    def readout_input(self, h_top: Tensor) -> Tensor:
+        """``final_norm(h_top)`` under the muP readout multiplier.
+
+        The tied embedding is an NAdam parameter whose readout role has fan-in
+        ``D``, so its logits carry the width ratio here; a width-scaled rate
+        would also move its lookup role, whose fan-in is one.
+        """
+        normalized = self.final_norm(h_top)
+        ratio = self.cfg.mup_ratio
+        return normalized if ratio == 1.0 else normalized * ratio
+
     def logits(self, h_top: Tensor) -> Tensor:
-        return F.linear(self.final_norm(h_top), self.embed_tokens.weight)
+        return F.linear(self.readout_input(h_top), self.embed_tokens.weight)
 
     @torch.no_grad()
     def refresh_shadows(self) -> None:
@@ -1671,13 +1699,14 @@ def _head_losses(
     norm_weight: Tensor,
     classifier: Tensor,
     norm_eps: float,
+    readout_scale: float,
 ) -> tuple[Tensor, Tensor]:
     dtype = h_chunk.dtype
     normalized = h_chunk.float()
     normalized = normalized * torch.rsqrt(
         normalized.square().mean(dim=-1, keepdim=True) + norm_eps
     )
-    normalized = (normalized * norm_weight.float()).to(dtype)
+    normalized = (normalized * (norm_weight.float() * readout_scale)).to(dtype)
     logits = F.linear(normalized, classifier).float()
     ce = F.cross_entropy(logits.flatten(0, 1), target_chunk.flatten(), reduction="sum")
     return ce, logits.logsumexp(dim=-1).square().sum()
@@ -1812,7 +1841,7 @@ def sequence_ce(
         # CCE fuses tied unembedding and CE, never materializing [B,T,V].
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
-        normalized = model.final_norm(h_top)
+        normalized = model.readout_input(h_top)
         # The ordering is a scheduling hint for the backward, so evaluation
         # (no backward) tiles the classifier in place.
         ordering = (
@@ -1842,6 +1871,7 @@ def sequence_ce(
                 model.final_norm.weight,
                 model.embed_tokens.weight,
                 model.final_norm.eps,
+                model.cfg.mup_ratio,
                 use_reentrant=False,
                 preserve_rng_state=False,
             )
@@ -1853,6 +1883,7 @@ def sequence_ce(
                 model.final_norm.weight,
                 model.embed_tokens.weight,
                 model.final_norm.eps,
+                model.cfg.mup_ratio,
             )
         ce_sum = ce_sum + ce
         z_sum = z_sum + z

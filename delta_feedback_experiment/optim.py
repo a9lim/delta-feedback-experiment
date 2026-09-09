@@ -2,6 +2,13 @@
 NAdam for parameters whose norm carries semantic information, under one WSD
 learning-rate multiplier.
 
+NorMuonH's relative step is width-invariant. NAdam's is not, so its group
+splits in two: the matrices whose fan-in is the residual width run at the
+base rate times the muP width ratio ``MUP_BASE_DIM / dim``, every other NAdam
+parameter at the base rate. ``lr_nadam`` is therefore the rate at the
+flagship width, and the tied readout carries the same ratio as a logit
+multiplier inside the model.
+
 NorMuonH combines NorMuon's Nesterov momentum, Newton-Schulz
 orthogonalization, and neuron-wise second-moment normalization with the
 Hyperball constraint (arXiv:2606.16899). Each constrained matrix keeps its
@@ -18,7 +25,7 @@ from collections import defaultdict
 import torch
 from torch import Tensor
 
-from .parameter_groups import is_normuonh_parameter
+from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
@@ -27,7 +34,7 @@ DEFAULT_NORMUONH_LR = 6e-3
 """Stable dimensionless NorMuonH relative step for fresh runs."""
 
 DEFAULT_NADAM_LR = 3e-4
-"""Stable learning rate for every NAdam-owned parameter."""
+"""Stable NAdam learning rate at the muP reference width."""
 
 DEFAULT_NADAM_BETAS = (0.9, 0.95)
 """First- and second-moment coefficients for NAdam."""
@@ -260,24 +267,29 @@ class NorMuonH(torch.optim.Optimizer):
         return loss
 
 
-def split_parameters(model: torch.nn.Module) -> tuple[list, list]:
-    """Partition trainable parameters into NorMuonH and NAdam groups.
+def split_parameters(model: torch.nn.Module) -> tuple[list, list, list]:
+    """Partition trainable parameters into the NorMuonH group and the two
+    NAdam groups: base and width-scaled.
 
-    Ordinary hidden 2D weights get NorMuonH. The tied embedding/unembedding,
-    global-attention gates, the FBT token gate, and PKDA's packed controls,
-    decay expansion, and output-gate expansion join norms, depthwise
-    convolutions, routing parameters, and vectors in the NAdam group. PKDA
-    Q/K/V/output projections and the FBT value projection use NorMuonH.
+    Ordinary hidden 2D weights get NorMuonH, including PKDA Q/K/V/output
+    projections and the FBT value projection. The NAdam matrices with fan-in
+    ``D``, the global-attention gates, the FBT token gate, and PKDA's packed
+    control projection, form the width-scaled group. The tied
+    embedding/unembedding, PKDA's decay and output-gate expansions, norms,
+    depthwise convolutions, routing parameters, and vectors form the base
+    group.
     """
-    matrices, nadam = [], []
+    matrices, nadam, width = [], [], []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if is_normuonh_parameter(name, parameter):
             matrices.append(parameter)
+        elif is_width_scaled_parameter(name, parameter):
+            width.append(parameter)
         else:
             nadam.append(parameter)
-    return matrices, nadam
+    return matrices, nadam, width
 
 
 def build_optimizers(
@@ -287,12 +299,30 @@ def build_optimizers(
     lr_nadam: float = DEFAULT_NADAM_LR,
     nadam_betas: tuple[float, float] = DEFAULT_NADAM_BETAS,
 ) -> list[torch.optim.Optimizer]:
-    """Build the authoritative NorMuonH/NAdam stack with stable WSD rates."""
-    matrices, nadam_parameters = split_parameters(model)
+    """Build the authoritative NorMuonH/NAdam stack with stable WSD rates.
+
+    ``lr_nadam`` is the base NAdam rate, the rate at the muP reference width;
+    the width-scaled group runs at ``lr_nadam * model.cfg.mup_ratio``.
+    """
+    matrices, nadam_parameters, width_parameters = split_parameters(model)
     normuonh = NorMuonH(matrices, lr=lr_normuonh)
+    lr_width = lr_nadam * model.cfg.mup_ratio
     use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda
     nadam = torch.optim.NAdam(
-        nadam_parameters,
+        [
+            {
+                "params": nadam_parameters,
+                "lr": lr_nadam,
+                "rate_name": "nadam",
+                "stable_lr": lr_nadam,
+            },
+            {
+                "params": width_parameters,
+                "lr": lr_width,
+                "rate_name": "nadam_width",
+                "stable_lr": lr_width,
+            },
+        ],
         lr=lr_nadam,
         betas=nadam_betas,
         eps=1e-8,
@@ -302,8 +332,6 @@ def build_optimizers(
     for group in normuonh.param_groups:
         group["rate_name"] = "normuonh"
         group["stable_lr"] = lr_normuonh
-    nadam.param_groups[0]["rate_name"] = "nadam"
-    nadam.param_groups[0]["stable_lr"] = lr_nadam
     return [normuonh, nadam]
 
 

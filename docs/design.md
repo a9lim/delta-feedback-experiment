@@ -170,7 +170,7 @@ cell-tokens beside pass-tokens.
 
 ### Schedule
 
-Both parameter groups share one warmup-stable-cooldown multiplier. Warmup
+All three parameter groups share one warmup-stable-cooldown multiplier. Warmup
 rises linearly over `round(warmup_frac * min(steps, steps at 25x))` updates:
 the fraction applies to the shorter of the run and the 25x recipe at its
 geometry, so warmup is fixed per scale, 215 steps at the screen, 636 at the
@@ -210,22 +210,22 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | by scale | predictions per row, rows per step, and the microbatch; the scale keeps 327,680 predictions per step, as does a retyped `--seq-len` alone |
 | `--seed`, `--data-seed` | | initialization pairing and the keyed data/feedback streams |
-| `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the two group learning rates |
+| `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the NorMuonH relative step, and the base NAdam rate at the muP reference width 1536; the fan-in-`D` NAdam matrices run at `lr_nadam x 1536 / D` and the tied readout carries the same ratio |
 | `--feedback-start` | 0.75 | fraction of the schedule before the feedback boundary; 0 trains fused from step 0 |
 | `--three-pass` | 0.12 | probability of three passes after the boundary; 1 makes every feedback step three-pass |
 | `--loop-iterations`, `--loop-max-iterations` | 4, 8 | `l`: mean and cap of the per-step core iteration draw; the mean is also the fixed evaluation and decode count |
 | `--jitter` | 0.02 | payload jitter half-width |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v25 snapshot |
+| `--resume` | | continues a tag from its latest v26 snapshot |
 
 The specimens so far used the default recipe (`ar`) and
 `--feedback-start 0 --three-pass 1` (`arf`); see [findings.md](findings.md).
 
 ### Checkpoints and queue
 
-Snapshots use checkpoint contract v25, and only v25 resumes; v16 through v24
-stay readable for evaluation and forks. Every snapshot records its condition
+Snapshots use checkpoint contract v26, and only v26 loads, for resume,
+evaluation, and forks alike. Every snapshot records its condition
 as letters. A snapshot holds the model, both
 optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every

@@ -31,12 +31,17 @@ beside predicted tokens; equal steps are matched data, not matched compute.
 | PKDA heads, head width 128 | 10 | 15 | 20 |
 | PKDA Q/K/V projection width | 1,280 | 1,920 | 2,560 |
 | Active non-embedding parameters | 140,827,944 | 416,634,192 | 1,102,046,496 |
+| muP width ratio `1536 / D`: fan-in-`D` NAdam rate multiplier and readout multiplier | 2 | 4/3 | 1 |
 
 The widths step by half the screen's, so every geometry keeps the Kimi `5/3`
 recurrent-projection ratio, the `13/3` SwiGLU ratio, and the head widths, and
 MHDB's groups follow the global KV-head count at each. Convolution width,
 RMSNorm epsilon, and every other constant are the architecture's and do not
-vary. Every planned run is addressed by `--condition`, `--scale`, and
+vary. The flagship is the muP reference width: the NAdam matrices with fan-in
+`D` and the tied readout carry the ratio `1536 / D`, so `--lr-nadam` names
+the flagship's rate and the screen runs its gates and controls at twice it
+under a doubled readout ([architecture.md](architecture.md#nadam-parameters));
+NorMuonH's relative step needs no rule. Every planned run is addressed by `--condition`, `--scale`, and
 `--tokens-per-param`: `--scale screen|bridge|flagship` fills the column, the
 row length, and the batch rows of a geometry, any trunk or recipe flag typed
 alongside overrides its field, and `--tokens-per-param` derives the schedule

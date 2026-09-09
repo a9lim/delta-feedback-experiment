@@ -75,7 +75,9 @@ That is the opposite of an opaque cross-column channel.
   runs of about 60M tokens read in order, so each stretch of training was one
   CommonCrawl dump, and the held-out slice was the head of one 2013 crawl.
   The stream is now a keyed document shuffle of `sample-350BT` with the base
-  tokenizer's EOS; the three specimens above trained on the old order.
+  tokenizer's EOS, and the parametrization is muP-pinned to the flagship
+  width; the three specimens above trained on the old order under the plain
+  screen parametrization, and the current code does not load their snapshots.
 
 ## Downstream
 

@@ -128,13 +128,15 @@ draw the core iteration count once per step, mean 4 and cap 8, and log it as
 `r`. Every condition sees the same addressed token rows; conditions with `f`
 also share deterministic pass, prefix, and jitter streams, and the iteration
 draw is its own stream. The global FP32 gradient is clipped to norm 10.0 before the shared
-NorMuonH/NAdam update. NorMuonH uses a `6e-3` stable rate; every NAdam-owned
-parameter, including the tied embedding/readout, uses `3e-4`. Both sides apply
+NorMuonH/NAdam update. NorMuonH uses a `6e-3` stable rate; NAdam uses `3e-4`
+at the muP reference width 1536, the fan-in-`D` gate and control matrices
+`3e-4 x 1536 / D`, and the tied readout multiplies its logits by the same
+ratio, so the screen runs those at `6e-4` under a doubled readout. Both sides apply
 their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v25, and only v25 is resumable. V16–v24
-remain readable for evaluation and forks. Protected snapshots persist at the
+Snapshots use checkpoint contract v26, and only v26 loads, for resume,
+evaluation, and forks alike. Protected snapshots persist at the
 cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
 limits the current invocation without changing the schedule.
 

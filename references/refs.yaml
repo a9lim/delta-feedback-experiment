@@ -175,3 +175,30 @@ references:
       A design comparison for delta-loop: it separates persistent memory from
       prediction but does not supply recurrent depth. See docs/literature.md
       for the integration assessment.
+
+  - arxiv: "2203.03466"
+    slug: yang2022-tensor-programs-v
+    note: >
+      Defines maximal update parametrization and zero-shot hyperparameter
+      transfer across width, including the Adam rules used here: hidden and
+      output weights at a rate proportional to 1/fan_in, input weights and
+      vectors width-independent. The experiment applies the rule to the NAdam
+      group only, with the flagship width 1,536 as the reference rather than
+      the smallest geometry, so the screen is the scaled geometry.
+
+  - arxiv: "2310.17813"
+    slug: yang2023-spectral-condition
+    note: >
+      States the spectral condition for feature learning: an update's spectral
+      norm proportional to sqrt(d_out / d_in) at every width. NorMuonH's
+      Hyperball step realizes it up to a constant fixed by the aspect ratio,
+      which is why the NorMuonH rate carries no width rule.
+
+  - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/layer.py#L32-L37
+    slug: microsoft-mup-shared-readout
+    note: >
+      The released muP readout scales its input by output_mult / width_mult
+      before the linear map, and the shared-weight readout inherits that
+      forward, so a tied embedding keeps the input-embedding rate while its
+      readout role carries the width ratio. The experiment's readout
+      multiplies final_norm(h_top) by 1536 / D the same way.
