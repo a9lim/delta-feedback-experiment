@@ -7,13 +7,20 @@
 <title>delta runs</title>
 <link rel="stylesheet" href="/vendor/uPlot.min.css">
 <link rel="stylesheet" href="/monitor.css">
+<style>
+  /* Mechanism sections: one per condition letter, shown when a displayed run has the letter. */
+  section.mech[hidden] { display: none; }
+  section.mech > h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+  section.mech > h3 small { margin-left: 0; }
+  section.mech .note { font-size: 12.5px; color: var(--ink-2); margin: 0 0 8px; max-width: 78ch; }
+</style>
 </head>
 <body>
 <div class="wrap">
 <header>
   <h1><span class="brand">delta</span><select id="run" title="run"></select></h1>
   <div class="controls">
-    <label><input type="checkbox" id="logy" checked> log y</label>
+    <label><input type="checkbox" id="logy" checked> log y <span class="hint">positive quantities</span></label>
     <label>every <output id="every">–</output></label>
     <button id="refresh" title="refresh now">↻</button>
     <span class="hint zoom">drag to zoom · double-click resets</span>
@@ -24,40 +31,75 @@
 <div id="banner">Fetch failed — the Access session may have expired. Tap to reload.</div>
 <div class="tiles" id="tiles"></div>
 <section class="config">
-  <h3>run configuration <small>selected run · exact structured log values</small></h3>
+  <h3>run configuration <small>selected run · exact structured log values · letter groups follow the condition</small></h3>
   <div class="config-grid" id="config"></div>
 </section>
 
-<div class="grid">
-  <div class="chart"><h2>NLL <small>nats · solid train loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
-</div>
-<div class="grid two">
-  <div class="chart"><h2>learning rates <small>NorMuonH · NAdam</small></h2><div class="plot" id="p-lr"></div></div>
-  <div class="chart"><h2>gradient norm <small>global L2 before update</small></h2><div class="plot" id="p-gnorm"></div></div>
-</div>
-<div class="grid two">
-  <div class="chart"><h2>MHDB · max weight <small>averaged over routing heads · uniform is 1/n</small></h2><div class="plot" id="p-route"></div></div>
-  <div class="chart"><h2>MHDB · seed mass <small>head-averaged · payload / deepest attention / deepest MLP</small></h2><div class="plot" id="p-seed"></div></div>
-</div>
-<div class="grid two">
-  <div class="chart"><h2>MHDB · null mass <small>head-averaged · learned opt-out source</small></h2><div class="plot" id="p-null"></div></div>
-  <div class="chart"><h2>MHDB · null RMS <small>source value scale · mass alone is not a no-op once this grows</small></h2><div class="plot" id="p-nullrms"></div></div>
-</div>
-<div class="grid">
-  <div class="chart"><h2>MHDB · head specialization <small>normalized Jensen–Shannon divergence · 0 means identical head routes</small></h2><div class="plot" id="p-headjs"></div></div>
-</div>
-<div class="grid two">
-  <div class="chart"><h2>contraction · fused loss <small>iterated fused prefill · solid iter 0 · dashed iter 8</small></h2><div class="plot" id="p-contract"></div></div>
-  <div class="chart"><h2>contraction · update norm <small>‖h(8) − h(7)‖ · should decay once feedback trains</small></h2><div class="plot" id="p-upd"></div></div>
-</div>
-<div class="grid two">
-  <div class="chart"><h2>depth · loss by iterations <small>l only · fixed-r sweep on 2 rows · solid r = 1 · dashed r_mean · dotted r_max</small></h2><div class="plot" id="p-depth"></div></div>
-  <div class="chart"><h2>depth · core update at r_max <small>mean ‖core(r_max) − core(r_max − 1)‖ · shrinks if the core contracts</small></h2><div class="plot" id="p-depthupd"></div></div>
-</div>
-<h3>eval <small>held-out NLL at eval cadence</small></h3>
-<div class="grid">
-  <div class="chart"><h2>val <small>nats · solid pass-1 (plain LM) · dashed fused pass (feedback in use)</small></h2><div class="plot" id="p-val"></div></div>
-</div>
+<section class="mech" id="sec-train">
+  <h3>training <small id="sum-train"></small></h3>
+  <div class="grid two">
+    <div class="chart"><h2>train NLL <small>nats per step · solid loss · dashed pass-1 · faint raw, full EMA 200 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
+    <div class="chart"><h2>held-out NLL <small>nats at eval cadence · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-val"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>learning rates <small>solid NorMuonH · dotted NAdam · one shared multiplier</small></h2><div class="plot" id="p-lr"></div></div>
+    <div class="chart"><h2>gradient norm <small>global FP32 L2 before clipping</small></h2><div class="plot" id="p-gnorm"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>throughput <small>per second · solid predicted tokens · dashed pass-tokens · dotted cell-tokens</small></h2><div class="plot" id="p-tput"></div></div>
+    <div class="chart"><h2>cumulative tokens <small>solid predicted (matched data) · dashed pass-tokens · dotted cell-tokens (matched compute) · from k, r, and the geometry</small></h2><div class="plot" id="p-cum"></div></div>
+  </div>
+</section>
+
+<section class="mech" data-letter="a" hidden>
+  <h3>a · attention <small id="sum-a"></small></h3>
+  <p class="note">Kimi Delta Attention holds three of every four attention layers; the fourth is gated global GQA. Nothing about the mixers is in the per-step telemetry yet, so this letter has configuration only.</p>
+</section>
+
+<section class="mech" data-letter="r" hidden>
+  <h3>r · residual routing <small id="sum-r"></small></h3>
+  <div class="grid two">
+    <div class="chart"><h2>source mass by site <small>latest eval · head-averaged · solid null · dashed seed · left to right: prelude, core by iteration, coda, payload router</small></h2><div class="plot" id="p-site-mass"></div></div>
+    <div class="chart"><h2>sharpness by site <small>latest eval · solid max weight (uniform is 1/n) · dashed head divergence (normalized Jensen–Shannon, 0 means identical head routes)</small></h2><div class="plot" id="p-site-sharp"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>seed mass <small>head-averaged · solid payload router · dashed deepest attn · dotted deepest MLP</small></h2><div class="plot" id="p-seed"></div></div>
+    <div class="chart"><h2>null mass <small>learned opt-out source · same sites</small></h2><div class="plot" id="p-null"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>max weight <small>uniform is 1/n · same sites</small></h2><div class="plot" id="p-route"></div></div>
+    <div class="chart"><h2>head specialization <small>normalized Jensen–Shannon divergence · same sites</small></h2><div class="plot" id="p-headjs"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>null RMS <small>source value scale · mass alone is not a no-op once this grows · same sites</small></h2><div class="plot" id="p-nullrms"></div></div>
+    <div class="chart"><h2>null RMS by site <small>latest eval</small></h2><div class="plot" id="p-site-nullrms"></div></div>
+  </div>
+</section>
+
+<section class="mech" data-letter="f" hidden>
+  <h3>f · feedback <small id="sum-f"></small></h3>
+  <div class="grid two">
+    <div class="chart"><h2>fused gap <small>fused − pass-1 · ● held-out at eval cadence · dashed train EMA 200 on multi-pass steps · signed, linear</small></h2><div class="plot" id="p-gap"></div></div>
+    <div class="chart"><h2>passes per step <small>k · rolling mean over 200 steps · one before the boundary, two or three after</small></h2><div class="plot" id="p-k"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>self-composition · loss drift <small>iterated fused prefill on 2 rows · loss(8) − loss(0) · signed, linear</small></h2><div class="plot" id="p-drift"></div></div>
+    <div class="chart"><h2>self-composition · update norm <small>‖h(8) − h(7)‖ · shrinks if the payload map contracts</small></h2><div class="plot" id="p-upd"></div></div>
+  </div>
+</section>
+
+<section class="mech" data-letter="l" hidden>
+  <h3>l · loop <small id="sum-l"></small></h3>
+  <div class="grid two">
+    <div class="chart"><h2>loss by iteration count <small>fixed-r sweep on 2 rows · solid r = 1 · dashed r_mean · dotted r_max</small></h2><div class="plot" id="p-depth"></div></div>
+    <div class="chart"><h2>gain from iterating <small>loss(r) − loss(1) · dashed r_mean · dotted r_max · signed, linear</small></h2><div class="plot" id="p-depthgain"></div></div>
+  </div>
+  <div class="grid two">
+    <div class="chart"><h2>core update at r_max <small>mean ‖core(r_max) − core(r_max − 1)‖ · shrinks if the core contracts</small></h2><div class="plot" id="p-depthupd"></div></div>
+    <div class="chart"><h2>iterations per step <small>r drawn once per step · rolling mean over 200 steps · reference r_mean · linear</small></h2><div class="plot" id="p-r"></div></div>
+  </div>
+</section>
+
 <h3>log tail <small>non-step records</small></h3>
 <pre id="tail"></pre>
 </div>
@@ -66,27 +108,31 @@
 <script src="/chassis.js"></script>
 <script>
 'use strict';
-// Delta-feedback view: what this experiment's records mean and which charts
-// they fill. Every generic mechanism — parsing, lineage, polling, uPlot setup —
-// comes from the chassis.
-const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
+// Delta-feedback view: what this experiment's records mean and which panels
+// they fill.  The page is organized by condition letter: a training section
+// every condition shares, then one section per letter (a, r, f, l) shown when
+// a displayed run has it.  Every generic mechanism — parsing, lineage,
+// polling, uPlot setup — comes from the chassis.
+const { P, hue, alpha, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         fmtAge, esc, tile, pace, gpuTile, configGroup, scheduleFields,
-        makeChart, setData, bandsOf, line, dashed, dotted, PTS, join,
+        makeChart, setData, bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs,
         state, runFor } = M;
 
+const LETTERS = ['a', 'r', 'f', 'l'];
+const EMA_SPAN = 200, ROLL = 200;
+
 // ---------------------------------------------------------------- records
-// step: loss/pass1/k (+r under l)/two learning rates/gnorm/tok_s/cell_tok_s/
-// mem/elapsed.  eval: val (+val_fused on feedback conditions).  route: per-site
-// weights at eval cadence.  contract: the standing contraction diagnostic.
-// depth: the loop's fixed-r sweep.  Non-step series live in run.evals so the
+// step: loss/pass1/k (+r under l)/two learning rates/gnorm/throughputs/mem/
+// elapsed.  eval: val (+val_fused with f).  route: per-site weights at eval
+// cadence.  contract: the standing self-composition diagnostic (f).  depth:
+// the loop's fixed-r sweep (l).  Non-step series live in run.evals so the
 // chassis's resume-fold rewinds them with everything else.
 function onStep(run, rec) {
   return {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
-    lr_normuonh: num(rec.lr_normuonh),
-    lr_nadam: num(rec.lr_nadam),
+    lr_normuonh: num(rec.lr_normuonh), lr_nadam: num(rec.lr_nadam),
     gnorm: num(rec.gnorm),
-    tok_s: num(rec.tok_s), cell_tok_s: num(rec.cell_tok_s),
+    tok_s: num(rec.tok_s), pass_tok_s: num(rec.pass_tok_s), cell_tok_s: num(rec.cell_tok_s),
     mem: num(rec.mem), elapsed: num(rec.elapsed),
   };
 }
@@ -103,7 +149,7 @@ function onEval(run, rec, step) {
 function onRecord(run, rec) {
   if (rec.event === 'route') {
     Object.assign(entryAt(run, `route|${rec.site}`, address(rec.step)[0]),
-      { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), nul: num(rec.null), nulrms: num(rec.null_rms), prev: num(rec.prev) });
+      { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), nul: num(rec.null), nulrms: num(rec.null_rms) });
   } else if (rec.event === 'contract') {
     Object.assign(entryAt(run, 'contract', address(rec.step)[0]),
       { loss0: num(rec.loss0), loss8: num(rec.loss8), upd8: num(rec.upd8) });
@@ -113,19 +159,103 @@ function onRecord(run, rec) {
         upd_max: num(rec.upd_max), r_mean: num(rec.r_mean), r_max: num(rec.r_max) });
   }
 }
-// The headline routing sites: the payload router and the deepest attn/mlp
-// sites present in the log (the deepest see every source).
+
+// ---------------------------------------------------------------- conditions
+const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
+const has = (view, letter) => conditionOf(view).includes(letter);
+const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
+// The letters any displayed run has: sections follow them.
+function shownLetters() {
+  const views = shownViews();
+  return new Set(LETTERS.filter((l) => views.some((v) => has(v, l))));
+}
+// The feedback boundary is a schedule event worth a line on every step chart.
+function eventLines(view) {
+  if (!view || !has(view, 'f')) return [];
+  const b = num(view.run.meta.schedule?.feedback_boundary);
+  return b > 0 && b < view.total ? [{ label: 'feedback →', step: b }] : [];
+}
+
+// ---------------------------------------------------------------- sites
+// A routing site is `payload` or `L<layer>[i<iteration>].<attn|mlp>`; the
+// iteration tag marks a core site under l.
+const SITE = /^route\|(payload|L(\d+)(?:i(\d+))?\.(attn|mlp))$/;
+function parseSite(key) {
+  const m = SITE.exec(key);
+  if (!m) return null;
+  return { key, name: m[1], layer: m[2] != null ? +m[2] : null, iter: m[3] != null ? +m[3] : null, kind: m[4] ?? null };
+}
+// Column order over every displayed run: the prelude's sites, the core's by
+// iteration, the coda's, then the payload router.
+function orderedSites(views) {
+  const sites = new Map();
+  for (const v of views) for (const key of v.evals.keys()) { const s = parseSite(key); if (s && !sites.has(s.name)) sites.set(s.name, s); }
+  const core = [...sites.values()].filter((s) => s.iter != null).map((s) => s.layer);
+  const firstCore = core.length ? Math.min(...core) : Infinity;
+  const rank = (s) => (s.name === 'payload' ? [3, 0, 0, 0]
+    : s.iter != null ? [1, s.iter, s.layer, s.kind === 'mlp' ? 1 : 0]
+    : [s.layer < firstCore ? 0 : 2, 0, s.layer, s.kind === 'mlp' ? 1 : 0]);
+  return [...sites.values()].sort((a, b) => { const ra = rank(a), rb = rank(b); for (let i = 0; i < 4; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i]; return 0; });
+}
+const SITES = [];   // the current ordered union; the by-site charts index into it
+// The headline sites for trajectories: the payload router and the deepest
+// column attn/MLP sites in the log (the deepest see every source).
 function routeSites(view) {
   const of = (kind) => {
     let best = null, layer = -1;
     for (const key of view.evals.keys()) {
-      const m = new RegExp(`^route\\|L(\\d+)\\.${kind}$`).exec(key);
-      if (m && +m[1] > layer) { layer = +m[1]; best = key; }
+      const s = parseSite(key);
+      if (s && s.kind === kind && s.iter == null && s.layer > layer) { layer = s.layer; best = key; }
     }
     return best;
   };
   return { payload: view.evals.has('route|payload') ? 'route|payload' : null, attn: of('attn'), mlp: of('mlp') };
 }
+function latestRouteStep(view) {
+  let last = null;
+  for (const [key, list] of view.evals) {
+    if (!parseSite(key) || !list.length) continue;
+    const s = list[list.length - 1].step;
+    if (last == null || s > last) last = s;
+  }
+  return last;
+}
+// Site labels along x, thinned to what fits; the grid follows the labels.
+function siteAxis() {
+  const stride = (u) => Math.max(1, Math.ceil(SITES.length * 46 / Math.max(1, u.bbox.width / (devicePixelRatio || 1))));
+  const thin = (u, splits) => { const k = stride(u); return splits.map((s) => (s % k === 0 ? s : null)); };
+  return {
+    splits: (u, ax, min, max) => { const out = []; for (let i = Math.max(0, Math.ceil(min)); i <= Math.min(SITES.length - 1, Math.floor(max)); i++) out.push(i); return out; },
+    filter: thin,
+    values: (u, splits) => splits.map((s) => (s == null ? null : SITES[s]?.name ?? '')),
+    grid: { stroke: P.grid, width: 1, filter: thin },
+  };
+}
+
+// ---------------------------------------------------------------- smoothing
+// Exponential moving average over the non-null entries; nulls stay null.
+function ema(values, span) {
+  const a = 2 / (span + 1);
+  let acc = null;
+  return values.map((v) => { if (v == null) return null; acc = acc == null ? v : a * v + (1 - a) * acc; return acc; });
+}
+// Trailing mean over the last `window` non-null entries.
+function rolling(values, window) {
+  const out = new Array(values.length).fill(null), buf = [];
+  let sum = 0;
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i];
+    if (v == null) continue;
+    buf.push(v); sum += v;
+    if (buf.length > window) sum -= buf.shift();
+    out[i] = sum / buf.length;
+  }
+  return out;
+}
+const finite = (v) => (Number.isFinite(v) ? v : null);
+// Signed differences are small numbers near zero: fixed decimals, never exponent form.
+const signed = (v, digits = 3) => (v == null || !Number.isFinite(v) ? '–' : (v > 0 ? '+' : '') + v.toFixed(digits));
+const count = (v) => (v == null ? '–' : Math.round(v).toLocaleString());
 
 // ---------------------------------------------------------------- tiles
 function renderTiles(view) {
@@ -136,50 +266,91 @@ function renderTiles(view) {
   const activeHere = state.active && state.active.tag === run.tag;
   const vals = view.evals.get('val') || [];
   const lastVal = vals[vals.length - 1];
-  const condition = run.meta.run?.condition ?? '';
+  const feedback = has(view, 'f');
+  const rates = [`${count(last.tok_s)} tok/s`];
+  if (last.pass_tok_s != null && last.k > 1) rates.push(`${count(last.pass_tok_s)} pass`);
+  if (last.cell_tok_s != null) rates.push(`${count(last.cell_tok_s)} cell`);
   el.innerHTML = [
     tile('step', `${last.step.toLocaleString()} <small>/ ${total.toLocaleString()}</small>`, `${esc(last.phase || '')} · ${(100 * last.step / total).toFixed(1)}% of run`),
     tile('pace', `${fmt(1 / rateRecent, 3)} <small>s/step</small>`, Number.isFinite(etaS) ? `ETA ${fmtDuration(etaS)} · ${fmtWhen(run.serverDate + etaS * 1000)}` : remaining > 0 ? `stopped · ${remaining.toLocaleString()} steps left` : 'complete'),
     tile('elapsed', fmtDuration(elapsed), began != null ? `began ${fmtWhen(began)}` : ''),
-    tile('loss', fmt(last.loss), `pass1 ${fmt(last.pass1)} · k ${last.k ?? '–'}${last.r != null ? ` · r ${last.r}` : ''}`),
-    tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `${condition.includes('f') ? `fused ${fmt(lastVal.val_fused)} · ` : ''}@ ${lastVal.step.toLocaleString()}` : condition.includes('f') ? '' : 'no feedback'),
-    tile('lr NorMuonH', fmt(last.lr_normuonh, 3), `gnorm ${fmt(last.gnorm, 3)}`),
-    tile('memory', `${fmt(last.mem, 3)} <small>GiB</small>`, `${last.tok_s != null ? Math.round(last.tok_s).toLocaleString() : '–'} tok/s${last.cell_tok_s != null ? ` · ${Math.round(last.cell_tok_s).toLocaleString()} cell tok/s` : ''}`),
+    tile('loss', fmt(last.loss), `pass-1 ${fmt(last.pass1)} · k ${last.k ?? '–'}${last.r != null ? ` · r ${last.r}` : ''}`),
+    tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `${feedback && lastVal.val_fused != null ? `fused ${fmt(lastVal.val_fused)} · ` : ''}@ ${lastVal.step.toLocaleString()}` : feedback ? '' : 'no feedback'),
+    tile('lr NorMuonH', fmt(last.lr_normuonh, 3), `NAdam ${fmt(last.lr_nadam, 3)} · gnorm ${fmt(last.gnorm, 3)}`),
+    tile('memory', `${fmt(last.mem, 3)} <small>GiB</small>`, rates.join(' · ')),
     gpuTile(live),
     tile('updated', fmtAge(age), `${esc(status)}${activeHere && state.active.phase ? ' · ' + esc(state.active.phase) : ''}`, live ? 'ok' : (/KILLED|FAILED/.test(status) ? 'bad' : '')),
   ].join('');
 }
 
 // ---------------------------------------------------------------- config
+// Cards follow the sections: the run and its geometry, one card per active
+// letter's knobs, the optimizer, the batch, the runtime path, the schedule.
+// An inactive letter's knobs are logged but idle, so they are not shown.
 const CONFIG_GROUPS = [
-  ['condition & seeds', ['condition', 'seed', 'data_seed']],
-  ['trunk', ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
-  ['optimizer', ['lr_normuonh', 'lr_nadam', 'zloss']],
-  ['feedback', ['feedback_start', 'three_pass', 'jitter']],
-  ['loop', ['loop_iterations', 'loop_max_iterations']],
-  ['batch', ['batch_rows', 'micro_rows']],
+  ['run', null, ['condition', 'seed', 'data_seed', 'params', 'device']],
+  ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
+  ['a · attention', 'a', ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
+  ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
+  ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
+  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'grad_clip', 'zloss']],
+  ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
 ];
-function renderConfig(run) {
-  const setup = run.meta.run;
+const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap' };
+function renderConfig(view) {
+  const run = view.run, setup = run.meta.run, condition = conditionOf(view);
   const cards = [];
   if (setup) {
     const used = new Set(['event', 'tag']);
     // Once the resolved schedule is present, its address and phase lengths
-    // supersede the raw step/warmup/cooldown inputs below.
-    if (run.meta.schedule) {
-      for (const key of ['steps', 'warmup_frac', 'cooldown_frac']) used.add(key);
-    }
-    for (const [title, keys] of CONFIG_GROUPS) {
+    // supersede the raw step/warmup/cooldown inputs.
+    if (run.meta.schedule) for (const key of ['steps', 'warmup_frac', 'cooldown_frac']) used.add(key);
+    for (const [title, letter, keys] of CONFIG_GROUPS) {
       const fields = {};
-      for (const key of keys) if (setup[key] != null) { fields[key] = setup[key]; used.add(key); }
-      cards.push(configGroup(title, fields));
+      for (const key of keys) if (setup[key] != null) { if (!used.has(key)) fields[key] = setup[key]; used.add(key); }
+      if (!letter || condition.includes(letter)) cards.push(configGroup(title, fields, LABELS));
     }
     const other = Object.fromEntries(Object.entries(setup).filter(([key]) => !used.has(key)));
-    cards.push(configGroup('other', other));
+    cards.push(configGroup('other', other, LABELS));
   }
-  cards.push(configGroup('addressed schedule', scheduleFields(run.meta.schedule)));
+  cards.push(configGroup('execution', run.meta.execution, LABELS));
+  cards.push(configGroup('addressed schedule', scheduleFields(run.meta.schedule), LABELS));
   const html = cards.filter(Boolean).join('');
   document.getElementById('config').innerHTML = html || '<div class="config-empty">Structured configuration is unavailable for this log.</div>';
+}
+
+// ---------------------------------------------------------------- summaries
+// Each section header carries the selected run's latest headline numbers for
+// that mechanism, so the state of every letter reads without scrolling.
+function summaries(view) {
+  const setup = view.run.meta.run || {};
+  const out = { train: 'every condition · pass-1 is the common number · loss adds the mean fused pass on multi-pass steps' };
+  if (setup.layers != null) {
+    const layers = +setup.layers, pkda = layers - Math.floor(layers / 4);
+    out.a = `PKDA in ${pkda} of ${layers} attention layers · ${setup.pkda_heads} heads × ${setup.pkda_head_dim} · conv ${setup.pkda_conv_size} · configuration only`;
+  }
+  const step = latestRouteStep(view);
+  if (has(view, 'r') && step != null) {
+    const sites = orderedSites([view]);
+    const pay = (view.evals.get('route|payload') || []).find((e) => e.step === step);
+    out.r = `${sites.length} sites @ ${step.toLocaleString()}`
+      + (pay ? ` · payload router: seed ${fmt(pay.seed, 3)} · null ${fmt(pay.nul, 3)} · head divergence ${fmt(pay.headjs, 3)}` : '')
+      + ' · zero-initialized routers, no knobs';
+  }
+  const vals = view.evals.get('val') || [], lastVal = vals[vals.length - 1];
+  const contract = view.evals.get('contract') || [], lastC = contract[contract.length - 1];
+  const boundary = num(view.run.meta.schedule?.feedback_boundary);
+  const f = [];
+  if (has(view, 'f') && lastVal && lastVal.val_fused != null) f.push(`fused gap ${signed(lastVal.val_fused - lastVal.val, 4)} @ ${lastVal.step.toLocaleString()}`);
+  if (has(view, 'f') && lastC) f.push(`drift ${signed(lastC.loss8 - lastC.loss0, 3)}`, `‖Δh‖ ${fmt(lastC.upd8, 3)}`);
+  if (has(view, 'f') && boundary != null) f.push(`feedback from step ${boundary.toLocaleString()}`);
+  out.f = f.join(' · ');
+  const depth = view.evals.get('depth') || [], lastD = depth[depth.length - 1];
+  const l = [];
+  if (has(view, 'l') && setup.loop_iterations != null) l.push(`r drawn per step · mean ${setup.loop_iterations} · cap ${setup.loop_max_iterations}`);
+  if (has(view, 'l') && lastD) l.push(`gain at r_mean ${signed(lastD.loss_mean - lastD.loss_one, 3)}`, `at r_max ${signed(lastD.loss_max - lastD.loss_one, 3)}`, `‖Δcore‖ ${fmt(lastD.upd_max, 3)} @ ${lastD.step.toLocaleString()}`);
+  out.l = l.join(' · ');
+  return out;
 }
 
 // ---------------------------------------------------------------- charts
@@ -193,143 +364,157 @@ function tightLogRange(u, lo, hi) {
   return [safeLo, paddedHi];
 }
 function rebuild() {
+  // One toggle for every strictly positive quantity.  Masses and normalized
+  // divergences live on [0, 1]; signed differences and counts stay linear.
   const logY = document.getElementById('logy').checked;
-  // Tight log range: NLL sits just above a decade boundary all run, so
-  // decade-snapped ranging would waste half the axis.
   const yLog = logY ? { distr: 3, log: 10, range: tightLogRange } : {};
+  const unit = { range: [0, 1] };
   const ovs = overlayTags();
-  const primary = () => runFor(state.selected);
+  const bands = () => bandsOf(runFor(state.selected));
   const marks = () => viewOf(state.selected)?.snapshots ?? [];
-  const forks = () => viewOf(state.selected)?.forks ?? [];
-  makeChart('p-nll', {
-    series: [
-      line('loss', P.s1), dashed('pass1', P.s1),
-      ...ovs.flatMap((t, i) => [line(`loss · ${t}`, hue(i)), dashed(`pass1 · ${t}`, hue(i))]),
-    ],
-    yScale: yLog, bands: () => bandsOf(primary()), marks, forks,
+  const lines = () => { const v = viewOf(state.selected); return [...(v?.forks ?? []), ...eventLines(v)]; };
+  // Within a run, line style encodes the metric; hue is the run: the selected
+  // run in s1, each overlay in its own slot, its tag suffixed to the label.
+  const perRun = (build) => [...build(P.s1, ''), ...ovs.flatMap((t, i) => build(hue(i), ` · ${t}`))];
+  const v3 = { value: (u, v) => fmt(v, 3) };
+  const v0 = { value: (u, v) => count(v) };
+  const vs = { value: (u, v) => signed(v, 4), ...PTS };   // signed differences, fixed decimals
+  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks: lines, ...extra });
+  const site = (id, series, extra = {}) => makeChart(id, {
+    series, sync: 'site',
+    x: { label: 'site', value: (u, v) => SITES[v]?.name ?? '–' },
+    xScale: { range: (u, min, max) => [min - 0.5, max + 0.5] },
+    xAxis: siteAxis(), ...extra,
   });
-  makeChart('p-val', {
-    series: [
-      line('val', P.s1, PTS), dashed('val fused', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`val · ${t}`, hue(i), PTS), dashed(`val fused · ${t}`, hue(i), PTS)]),
-    ],
-    yScale: yLog, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-lr', {
-    series: [
-      line('NorMuonH', P.s1, { value: (u, v) => fmt(v, 3) }),
-      dotted('NAdam', P.s1),
-      ...ovs.flatMap((t, i) => [
-        line(`NorMuonH · ${t}`, hue(i), { value: (u, v) => fmt(v, 3) }),
-        dotted(`NAdam · ${t}`, hue(i)),
-      ]),
-    ],
-    yScale: { distr: 3, log: 10, range: tightLogRange },
-    bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-gnorm', {
-    series: [line('gnorm', P.s1, { value: (u, v) => fmt(v, 3) }),
-      ...ovs.map((t, i) => line(`gnorm · ${t}`, hue(i), { value: (u, v) => fmt(v, 3) }))],
-    yScale: yLog, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-route', {
-    series: [line('payload', P.s1, PTS), dashed('attn', P.s1, PTS), dotted('mlp', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`payload · ${t}`, hue(i), PTS), dashed(`attn · ${t}`, hue(i), PTS), dotted(`mlp · ${t}`, hue(i), PTS)])],
-    yScale: { range: [0, 1] }, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-seed', {
-    series: [line('payload', P.s1, PTS), dashed('attn', P.s1, PTS), dotted('mlp', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`payload · ${t}`, hue(i), PTS), dashed(`attn · ${t}`, hue(i), PTS), dotted(`mlp · ${t}`, hue(i), PTS)])],
-    yScale: { range: [0, 1] }, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-null', {
-    series: [line('payload', P.s1, PTS), dashed('attn', P.s1, PTS), dotted('mlp', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`payload · ${t}`, hue(i), PTS), dashed(`attn · ${t}`, hue(i), PTS), dotted(`mlp · ${t}`, hue(i), PTS)])],
-    yScale: { range: [0, 1] }, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-nullrms', {
-    series: [line('payload', P.s1, PTS), dashed('attn', P.s1, PTS), dotted('mlp', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`payload · ${t}`, hue(i), PTS), dashed(`attn · ${t}`, hue(i), PTS), dotted(`mlp · ${t}`, hue(i), PTS)])],
-    bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-headjs', {
-    series: [line('payload', P.s1, PTS), dashed('attn', P.s1, PTS), dotted('mlp', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`payload · ${t}`, hue(i), PTS), dashed(`attn · ${t}`, hue(i), PTS), dotted(`mlp · ${t}`, hue(i), PTS)])],
-    yScale: { range: [0, 1] }, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-contract', {
-    series: [line('iter 0', P.s1, PTS), dashed('iter 8', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`iter 0 · ${t}`, hue(i), PTS), dashed(`iter 8 · ${t}`, hue(i), PTS)])],
-    yScale: yLog, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-upd', {
-    series: [line('‖Δh‖', P.s1, PTS), ...ovs.map((t, i) => line(`‖Δh‖ · ${t}`, hue(i), PTS))],
-    yScale: yLog, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-depth', {
-    series: [line('r = 1', P.s1, PTS), dashed('r_mean', P.s1, PTS), dotted('r_max', P.s1, PTS),
-      ...ovs.flatMap((t, i) => [line(`r = 1 · ${t}`, hue(i), PTS), dashed(`r_mean · ${t}`, hue(i), PTS), dotted(`r_max · ${t}`, hue(i), PTS)])],
-    yScale: yLog, bands: () => bandsOf(primary()), forks,
-  });
-  makeChart('p-depthupd', {
-    series: [line('‖Δcore‖', P.s1, PTS), ...ovs.map((t, i) => line(`‖Δcore‖ · ${t}`, hue(i), PTS))],
-    yScale: yLog, bands: () => bandsOf(primary()), forks,
-  });
+  const SPTS = { points: { size: 6 }, spanGaps: false };
+
+  // training
+  step('p-nll', perRun((c, t) => [
+    line(`loss${t}`, alpha(c, 0.3)), line(`loss ema${t}`, c),
+    dashed(`pass-1${t}`, alpha(c, 0.3)), dashed(`pass-1 ema${t}`, c)]), { yScale: yLog, marks });
+  step('p-val', perRun((c, t) => [line(`val${t}`, c, PTS), dashed(`val fused${t}`, c, PTS)]), { yScale: yLog });
+  step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dotted(`NAdam${t}`, c, v3)]), { yScale: yLog });
+  step('p-gnorm', perRun((c, t) => [line(`gnorm${t}`, c, v3)]), { yScale: yLog });
+  step('p-tput', perRun((c, t) => [line(`tok/s${t}`, c, v0), dashed(`pass tok/s${t}`, c, v0), dotted(`cell tok/s${t}`, c, v0)]), { yScale: yLog });
+  step('p-cum', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
+
+  // r · residual routing
+  site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, SPTS), dashed(`seed${t}`, c, SPTS)]), { yScale: unit });
+  site('p-site-sharp', perRun((c, t) => [line(`max${t}`, c, SPTS), dashed(`head JS${t}`, c, SPTS)]), { yScale: unit });
+  site('p-site-nullrms', perRun((c, t) => [line(`null RMS${t}`, c, SPTS)]), { yScale: yLog });
+  const headline = (id, extra) => step(id, perRun((c, t) => [line(`payload${t}`, c, PTS), dashed(`attn${t}`, c, PTS), dotted(`mlp${t}`, c, PTS)]), extra);
+  headline('p-seed', { yScale: unit });
+  headline('p-null', { yScale: unit });
+  headline('p-route', { yScale: unit });
+  headline('p-headjs', { yScale: unit });
+  headline('p-nullrms', { yScale: yLog });
+
+  // f · feedback
+  step('p-gap', [...perRun((c, t) => [line(`val gap${t}`, c, vs), dashed(`train gap ema${t}`, c, { value: vs.value })]), ref('0')]);
+  step('p-k', perRun((c, t) => [line(`k mean${t}`, c, v3)]));
+  step('p-drift', [...perRun((c, t) => [line(`drift${t}`, c, vs)]), ref('0')]);
+  step('p-upd', perRun((c, t) => [line(`‖Δh‖${t}`, c, PTS)]), { yScale: yLog });
+
+  // l · loop
+  step('p-depth', perRun((c, t) => [line(`r = 1${t}`, c, PTS), dashed(`r_mean${t}`, c, PTS), dotted(`r_max${t}`, c, PTS)]), { yScale: yLog });
+  step('p-depthgain', [...perRun((c, t) => [dashed(`r_mean${t}`, c, vs), dotted(`r_max${t}`, c, vs)]), ref('0')]);
+  step('p-depthupd', perRun((c, t) => [line(`‖Δcore‖${t}`, c, PTS)]), { yScale: yLog });
+  step('p-r', [...perRun((c, t) => [line(`r mean${t}`, c, v3)]), ref('r_mean')]);
 }
 
+// One run's tables per chart, in the series order `rebuild` declared.
 function seriesOf(view) {
-  const steps = view.steps;
-  const xs = steps.map((s) => s.step);
+  const steps = view.steps, xs = steps.map((s) => s.step);
+  const col = (f) => steps.map((s) => s[f] ?? null);
+  const loss = col('loss'), pass1 = col('pass1');
+  // On a k-pass step loss = pass-1 + mean fused, so the train-time fused gap
+  // is loss − 2·pass-1; one-pass steps carry no fused pass.
+  const trainGap = steps.map((s) => (s.k > 1 && s.loss != null && s.pass1 != null ? s.loss - 2 * s.pass1 : null));
+  // Cumulative tokens from the step records and the geometry: a pass executes
+  // layers / cell cell-equivalents on a flat column and 2 + r · core / cell
+  // under l, so cell-tokens are the matched-compute axis.
+  const setup = view.run.meta.run || {};
+  const per = (num(setup.batch_rows) ?? 0) * (num(setup.seq_len) ?? 0);
+  const layers = num(setup.layers) ?? 12, cell = num(setup.routing_block_size) ?? 4, core = layers - 2 * cell;
+  const looped = has(view, 'l');
+  let cumPred = 0, cumPass = 0, cumCell = 0;
+  const cum = steps.map((s) => {
+    const k = s.k ?? 1, cells = looped ? 2 + (s.r ?? 1) * core / cell : layers / cell;
+    cumPred += per; cumPass += k * per; cumCell += k * cells * per;
+    return [cumPred, cumPass, cumCell];
+  });
   const sites = routeSites(view);
   const at = (key, field) => {
     const list = key ? view.evals.get(key) || [] : [];
     return [list.map((e) => e.step), list.map((e) => e[field] ?? null)];
   };
-  const vals = view.evals.get('val') || [];
-  const contract = view.evals.get('contract') || [];
-  const depth = view.evals.get('depth') || [];
+  const headline = (field) => [at(sites.payload, field), at(sites.attn, field), at(sites.mlp, field)];
+  const ev = (list, ...fields) => [[list.map((e) => e.step), ...fields.map((f) => list.map((e) => finite(typeof f === 'function' ? f(e) : e[f])))]];
+  const vals = view.evals.get('val') || [], contract = view.evals.get('contract') || [], depth = view.evals.get('depth') || [];
+  const last = latestRouteStep(view);
+  const profile = (...fields) => [[SITES.map((_, i) => i),
+    ...fields.map((f) => SITES.map((s) => finite((view.evals.get(`route|${s.name}`) || []).find((e) => e.step === last)?.[f]))),
+  ]];
   return {
-    nll: [[xs, steps.map((s) => s.loss), steps.map((s) => s.pass1)]],
-    val: [[vals.map((e) => e.step), vals.map((e) => e.val), vals.map((e) => e.val_fused)]],
-    lr: [[
-      xs,
-      steps.map((s) => s.lr_normuonh),
-      steps.map((s) => s.lr_nadam),
-    ]],
-    gnorm: [[xs, steps.map((s) => s.gnorm)]],
-    route: [at(sites.payload, 'max'), at(sites.attn, 'max'), at(sites.mlp, 'max')],
-    seed: [at(sites.payload, 'seed'), at(sites.attn, 'seed'), at(sites.mlp, 'seed')],
-    null: [at(sites.payload, 'nul'), at(sites.attn, 'nul'), at(sites.mlp, 'nul')],
-    nullrms: [at(sites.payload, 'nulrms'), at(sites.attn, 'nulrms'), at(sites.mlp, 'nulrms')],
-    headjs: [at(sites.payload, 'headjs'), at(sites.attn, 'headjs'), at(sites.mlp, 'headjs')],
-    contract: [[contract.map((e) => e.step), contract.map((e) => e.loss0), contract.map((e) => e.loss8)]],
-    upd: [[contract.map((e) => e.step), contract.map((e) => e.upd8)]],
-    depth: [[depth.map((e) => e.step), depth.map((e) => e.loss_one), depth.map((e) => e.loss_mean), depth.map((e) => e.loss_max)]],
-    depthupd: [[depth.map((e) => e.step), depth.map((e) => e.upd_max)]],
+    nll: [[xs, loss, ema(loss, EMA_SPAN), pass1, ema(pass1, EMA_SPAN)]],
+    val: ev(vals, 'val', 'val_fused'),
+    lr: [[xs, col('lr_normuonh'), col('lr_nadam')]],
+    gnorm: [[xs, col('gnorm')]],
+    tput: [[xs, col('tok_s'), col('pass_tok_s'), col('cell_tok_s')]],
+    cum: [[xs, cum.map((c) => c[0]), cum.map((c) => c[1]), cum.map((c) => c[2])]],
+    siteMass: profile('nul', 'seed'),
+    siteSharp: profile('max', 'headjs'),
+    siteNullrms: profile('nulrms'),
+    seed: headline('seed'), null: headline('nul'), route: headline('max'), headjs: headline('headjs'), nullrms: headline('nulrms'),
+    gap: [...ev(vals, (e) => e.val_fused - e.val), [xs, ema(trainGap, EMA_SPAN)]],
+    k: [[xs, rolling(col('k'), ROLL)]],
+    drift: ev(contract, (e) => e.loss8 - e.loss0),
+    upd: ev(contract, 'upd8'),
+    depth: ev(depth, 'loss_one', 'loss_mean', 'loss_max'),
+    depthgain: ev(depth, (e) => e.loss_mean - e.loss_one, (e) => e.loss_max - e.loss_one),
+    depthupd: ev(depth, 'upd_max'),
+    r: [[xs, rolling(col('r'), ROLL)]],
   };
 }
 function render(view) {
   renderTiles(view);
-  renderConfig(view.run);
+  renderConfig(view);
+  SITES.splice(0, SITES.length, ...orderedSites(shownViews()));
+  const letters = shownLetters();
+  for (const sec of document.querySelectorAll('section.mech[data-letter]')) sec.hidden = !letters.has(sec.dataset.letter);
+  const sums = summaries(view);
+  for (const el of document.querySelectorAll('[id^="sum-"]')) el.textContent = sums[el.id.slice(4)] ?? '';
   const mine = seriesOf(view);
   const others = overlayTags().map((t) => seriesOf(viewOf(t)));
   const merged = {};
   for (const key of Object.keys(mine)) merged[key] = [...mine[key], ...others.flatMap((o) => o[key])];
   const lastX = view.steps.length ? view.steps[view.steps.length - 1].step : null;
   const vals = view.evals.get('val') || [];
+  const lastEval = vals.length ? vals[vals.length - 1].step : null;
+  // A reference line spans the joined x range as one more column after every run's series.
+  const withRef = (data, value) => spanRefs(data, { [data.length]: value });
   setData('p-nll', join(merged.nll), lastX);
-  setData('p-val', join(merged.val), vals.length ? vals[vals.length - 1].step : null);
+  setData('p-val', join(merged.val), lastEval);
   setData('p-lr', join(merged.lr), lastX);
   setData('p-gnorm', join(merged.gnorm), lastX);
-  setData('p-route', join(merged.route), lastX);
+  setData('p-tput', join(merged.tput), lastX);
+  setData('p-cum', join(merged.cum), lastX);
+  setData('p-site-mass', join(merged.siteMass));
+  setData('p-site-sharp', join(merged.siteSharp));
+  setData('p-site-nullrms', join(merged.siteNullrms));
   setData('p-seed', join(merged.seed), lastX);
   setData('p-null', join(merged.null), lastX);
-  setData('p-nullrms', join(merged.nullrms), lastX);
+  setData('p-route', join(merged.route), lastX);
   setData('p-headjs', join(merged.headjs), lastX);
-  setData('p-contract', join(merged.contract), lastX);
+  setData('p-nullrms', join(merged.nullrms), lastX);
+  setData('p-gap', withRef(join(merged.gap), 0), lastX);
+  setData('p-k', join(merged.k), lastX);
+  setData('p-drift', withRef(join(merged.drift), 0), lastX);
   setData('p-upd', join(merged.upd), lastX);
   setData('p-depth', join(merged.depth), lastX);
+  setData('p-depthgain', withRef(join(merged.depthgain), 0), lastX);
   setData('p-depthupd', join(merged.depthupd), lastX);
+  setData('p-r', withRef(join(merged.r), num(view.run.meta.run?.loop_iterations)), lastX);
 }
 
 M.configure({
@@ -339,14 +524,14 @@ M.configure({
     const stepSeconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
     return Number.isFinite(stepSeconds) ? Math.ceil(stepSeconds + 1) : 5;
   },
-  metaEvents: ['run', 'schedule', 'resume', 'fork'],
+  metaEvents: ['run', 'schedule', 'execution', 'resume', 'fork'],
   title: (run) => `delta · ${run.tag}`,
   meta: (view) => {
     const setup = view.run.meta.run;
     if (!setup) return '';
     const params = num(setup.params);
     return esc([
-      setup.condition ? `condition ${setup.condition}` : null,
+      setup.condition ? `condition ${setup.condition}` : 'plain decoder',
       setup.dim != null ? `d ${setup.dim} × L ${setup.layers}` : null,
       params ? `${(params / 1e6).toFixed(1)}M params` : null,
       setup.seq_len != null ? `batch ${setup.batch_rows}×${setup.seq_len}` : `batch ${setup.batch_rows}`,
