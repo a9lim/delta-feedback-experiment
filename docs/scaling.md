@@ -121,6 +121,12 @@ The default recipe is 10,745 steps of 327,680 predicted tokens, or
 [design.md](design.md#training); the pass mixture targets 1.28 expected
 pass-tokens per predicted token with `f`.
 
+A finished run extends to a longer ratio with `--continue`, which restores
+the last snapshot the longer schedule reproduces and pays only for the new
+heat and cooldown: at the screen, 25x to 50x restores step 8,059 of
+10,745 and trains 13,430 of the 50x recipe's 21,489 steps, and 50x to
+100x restores step 16,117 and trains 26,861 of 42,978.
+
 Under `l` at the default draw, `r_mean = 4` and `r_max = 8`:
 
 | Statistic | Value |

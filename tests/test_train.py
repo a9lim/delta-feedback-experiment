@@ -771,6 +771,41 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
         run(tmp_path, "conf", ["--condition", "ar", "--resume"])
 
 
+def test_continuation_reproduces_the_longer_run(tmp_path, capsys):
+    """A finished eight-step arf run continued to sixteen starts from the last
+    snapshot both schedules reproduce, the feedback boundary at step 4, and
+    from there is the fresh sixteen-step run exactly."""
+    base = [*condition_args("arf"), "--warmup-frac", "0"]
+    run(tmp_path, "src", base)
+    full = run(tmp_path, "full", [*base, "--steps", "16"])
+    capsys.readouterr()
+    longer = run(tmp_path, "src-16", [*base, "--continue", "src", "--steps", "16"])
+    assert longer["step"] == 16
+    assert longer["loss"] == full["loss"]
+    assert longer["val"] == full["val"]
+    out = capsys.readouterr().out.splitlines()
+    record = next(line for line in out if line.startswith("continue"))
+    assert "source=src" in record and "step=04/16" in record and "src.pt.4" in record
+    assert any(line.startswith("run") for line in out)
+    assert not any(line.startswith("resume") for line in out)
+    steps = [int(line.split("step=")[1].split("/")[0]) for line in out if line.startswith("step ")]
+    assert steps == list(range(5, 17))
+    # The continuation protects its own boundaries under the longer schedule.
+    snapshots = (tmp_path / "runs").glob("src-16.pt.*")
+    assert {int(p.name.rsplit(".", 1)[1]) for p in snapshots} == {8, 12, 16}
+
+
+def test_continuation_keeps_every_setting_but_the_length(tmp_path):
+    base = condition_args("arf")
+    run(tmp_path, "src2", base)
+    with pytest.raises(ValueError, match="longer schedule"):
+        run(tmp_path, "src2-same", [*base, "--continue", "src2"])
+    with pytest.raises(ValueError, match="keeps every setting"):
+        run(tmp_path, "src2-dim", [*base, "--continue", "src2", "--steps", "16", "--dim", "64"])
+    with pytest.raises(SystemExit):
+        parse_run_args(["x", "--resume", "--continue", "src2"])
+
+
 def rewrite_latest_version(tmp_path, tag, version):
     snapshots = list((tmp_path / "runs").glob(f"{tag}.pt.*"))
     path = max(snapshots, key=lambda item: int(item.name.rsplit(".", 1)[1]))

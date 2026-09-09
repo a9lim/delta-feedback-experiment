@@ -84,6 +84,10 @@ delta train screen-delta-arf-400x-s1 --condition arf --tokens-per-param 400 \
   --seed 1 --data-seed 0 --data-dir /data/delta/tokens
 delta train flagship-delta-arfl-s1 --condition arfl --scale flagship --tokens-per-param 400 \
   --seed 1 --data-seed 0 --data-dir /data/delta/tokens
+# Extend a finished run to a longer schedule under a new tag: its stable
+# phase resumes from the last snapshot the longer schedule reproduces.
+delta queue screen-delta-arf-s1-50x --continue screen-delta-arf-s1 --tokens-per-param 50 \
+  --data-dir /data/delta/tokens
 
 # Inspect and control the detached queue.
 delta status

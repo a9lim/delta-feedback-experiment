@@ -19,6 +19,7 @@ import argparse
 import contextlib
 import gc
 import math
+from types import SimpleNamespace
 from fractions import Fraction
 import sys
 import time
@@ -176,6 +177,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="continue the tag from its latest snapshot",
     )
+    parser.add_argument(
+        "--continue",
+        dest="continue_from",
+        metavar="TAG",
+        default=None,
+        help=(
+            "extend a finished run under this tag: restore TAG's last snapshot "
+            "that the longer schedule reproduces and train on, every setting "
+            "but the schedule length inherited from it"
+        ),
+    )
 
     scale = parser.add_argument_group("scale")
     scale.add_argument(
@@ -327,6 +339,24 @@ def mix(*parts: int) -> int:
 def feedback_boundary(args, total: int) -> int:
     """Last one-pass step; feedback conditions draw k > 1 on every later step."""
     return round(args.feedback_start * total)
+
+
+def continuation_step(source, source_schedule: Schedule, args, schedule: Schedule) -> int:
+    """The last step of a finished run that a longer schedule reproduces.
+
+    Up to it every step was warmup or heat under both schedules and on the
+    same side of both feedback boundaries, so a run restored from its snapshot
+    there and trained on under the longer schedule is the longer run from that
+    step on, apart from the warmup it inherited. When the feedback boundary
+    moves that is the boundary itself, the last one-pass state; otherwise it
+    is the cooldown boundary.
+    """
+    fork = min(source_schedule.heat_end, schedule.heat_end)
+    old = feedback_boundary(source, source_schedule.total)
+    new = feedback_boundary(args, schedule.total)
+    if old != new:
+        fork = min(fork, old, new)
+    return fork
 
 
 def draw_passes(args, step: int, total: int) -> int:
@@ -1142,7 +1172,9 @@ def resolve_run_args(
         pinned.add("batch_rows")
     if "steps" in explicit and "tokens_per_param" in explicit:
         parser.error("give --steps or --tokens-per-param, not both")
-    if "steps" not in explicit and not args.resume:
+    if args.resume and args.continue_from:
+        parser.error("--resume continues this tag; --continue extends another")
+    if "steps" not in explicit and not (args.resume or args.continue_from):
         args.steps = schedule_steps(args)
         if "tokens_per_param" in explicit:
             pinned.add("steps")
@@ -1233,6 +1265,55 @@ def train(argv: list[str] | None = None) -> dict:
                 f"{schedule_steps(args)} steps at the checkpoint's geometry; "
                 f"its schedule is {args.steps}"
             )
+    elif args.continue_from:
+        source = args.continue_from
+        found = runs.snapshots(source, args.out_dir)
+        if not found:
+            raise FileNotFoundError(f"no snapshot of {source} under {args.out_dir}")
+        latest_path = found[-1][1]
+        payload = checkpoints.read(latest_path, CONTRACT, map_location="cpu")
+        saved = payload["args"]
+        missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
+        if missing:
+            raise ValueError(f"{latest_path}: checkpoint lacks settings {missing}")
+        # A continuation is the same run with a longer schedule: every
+        # state-defining field but the length carries over, and typing a
+        # different one is a different experiment.
+        carried = tuple(field for field in EXACT_FIELDS if field != "steps")
+        conflicts = checkpoints.mismatched_fields(saved, args, carried, only=pinned)
+        if conflicts:
+            raise ValueError(
+                f"--continue {source} changes {conflicts}; a continuation keeps "
+                "every setting but the schedule length"
+            )
+        checkpoints.inherit(
+            args,
+            saved,
+            exact_fields=carried,
+            runtime_fields=RUNTIME_FIELDS,
+            explicit=pinned,
+        )
+        if args.steps is None:
+            args.steps = schedule_steps(args)
+        source_args = SimpleNamespace(**saved)
+        source_schedule = build_schedule(source_args)
+        longer = build_schedule(args)
+        if longer.total <= source_schedule.total:
+            raise ValueError(
+                f"--continue {source} needs a longer schedule than its "
+                f"{source_schedule.total} steps, not {longer.total}"
+            )
+        fork = continuation_step(source_args, source_schedule, args, longer)
+        eligible = [(step, p) for step, p in found if step <= fork]
+        if not eligible:
+            raise ValueError(
+                f"{source} has no snapshot at or before step {fork}, the last "
+                "step the longer schedule reproduces"
+            )
+        path = eligible[-1][1]
+        if path != latest_path:
+            payload = checkpoints.read(path, CONTRACT, map_location="cpu")
+        CONTRACT.check_resumable(path, payload["version"])
 
     if args.batch_rows % args.micro_rows:
         raise ValueError("batch-rows must be a multiple of micro-rows")
@@ -1267,6 +1348,7 @@ def train(argv: list[str] | None = None) -> dict:
         start_step = checkpoints.restore(
             payload, CONTRACT, model, pair, current_optimizer_groups=False
         )
+    if args.resume:
         # The spool folds the log at this boundary; it needs the source path.
         telemetry.log(
             "resume", step=telemetry.step_address(start_step, total), path=str(path)
@@ -1281,6 +1363,13 @@ def train(argv: list[str] | None = None) -> dict:
             routing_block_size=model.cfg.routing_block_size,
             **{name: getattr(args, name) for name in EXACT_FIELDS},
         )
+        if args.continue_from:
+            telemetry.log(
+                "continue",
+                source=args.continue_from,
+                step=telemetry.step_address(start_step, total),
+                path=str(path),
+            )
 
     autocast = (
         torch.autocast("cuda", dtype=torch.bfloat16)

@@ -101,6 +101,8 @@ change it everywhere at once.
   `--tokens-per-param`: the preset fills the geometry and batch, the ratio
   derives the step count from the flat stack's active parameters at that
   scale, rounded up, and every condition at a scale shares the schedule.
+  `--continue TAG` extends a finished run to a longer schedule from the last
+  snapshot both schedules reproduce, every other setting inherited.
 - Pass-1 validation is the common number. Conditions with `f` also report the fused
   number and the self-composition trace.
 - Independently trained runs differ like two seeds even when paired, so a

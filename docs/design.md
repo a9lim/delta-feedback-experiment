@@ -170,6 +170,7 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
 | `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule (25 is the screen recipe, 400 the Prime recipes) |
 | `--steps` | derived | schedule length, typed instead of derived |
+| `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | by scale | predictions per row, rows per step, and the microbatch; the scale keeps 327,680 predictions per step, as does a retyped `--seq-len` alone |
 | `--seed`, `--data-seed` | | initialization pairing and the keyed data/feedback streams |
 | `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the two group learning rates |
@@ -197,8 +198,17 @@ evaluation cadence, snapshot cadence, and evaluation-row count may change.
 Each run keeps the latest two snapshots plus protected ones at the cooldown
 boundary, the feedback boundary (the last one-pass state), and the end of the
 run, so cooldown and feedback variants can fork from the exact pre-boundary
-state. The queue stores arguments, not Git state; a source change never stops
-an active child, and the worker refreshes before the next job.
+state. `--continue TAG` is their built-in use: it extends a finished run to
+a longer schedule under a new tag, `--tokens-per-param 50` from a 25x run,
+by restoring TAG's last snapshot at or before the last step both schedules
+reproduce and training on under the longer schedule with every other setting
+inherited. That step is the feedback boundary when the boundary moves and the
+cooldown boundary otherwise, so from it on the continuation is the longer run
+exactly, apart from the warmup it inherited; at the screen a 25x `arf` run
+continued to 50x restores step 8,059 and trains 13,430 new steps
+of a 21,489-step schedule. The queue stores arguments, not Git state; a
+source change never stops an active child, and the worker refreshes before
+the next job.
 
 ## Evaluation
 

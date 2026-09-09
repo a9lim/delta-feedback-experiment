@@ -85,6 +85,18 @@ the number every table here reports. The count rounds up, which moves the
 screen's 400x pair from 171,909 to 171,910 steps. A resume validates what
 `--scale` or `--tokens-per-param` pinned and inherits the rest.
 
+Then `--continue TAG`, a9's ask for the WSD continuation the protected
+snapshots were kept for: a finished run extended to a longer schedule under
+a new tag. The fork step is the last step both schedules reproduce, heat in
+both and on the same side of both feedback boundaries, which is the feedback
+boundary when it moves and the cooldown boundary otherwise; the continuation
+restores the source's last snapshot at or before it, inherits every setting
+but the length, and from there is the longer run exactly apart from the
+inherited warmup. The tiny end-to-end test shows an eight-step `arf` run
+continued to sixteen matching the fresh sixteen-step run's loss and
+validation bit for bit. At the screen, 25x to 50x trains 13,430 new
+steps instead of 21,489.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the
