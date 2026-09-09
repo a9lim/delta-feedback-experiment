@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 import statistics
@@ -436,7 +437,14 @@ def cuda_gate() -> None:
     # Exercise causal FlexAttention and explicit GQA prefix-cache decoding.
     # BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
-    def decode_parity(condition: str, layers: int, **extra) -> float:
+    def decode_parity(
+        condition: str,
+        layers: int,
+        *,
+        bf16: bool = True,
+        bound: float = 0.04,
+        **extra,
+    ) -> float:
         decode_cfg = condition_config(
             condition,
             vocab_size=1000,
@@ -454,11 +462,18 @@ def cuda_gate() -> None:
         torch.manual_seed(0)
         decode_model = DeltaModel(decode_cfg).cuda().eval()
         decode_tokens = torch.randint(0, 1000, (2, 12), device="cuda")
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        autocast = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if bf16
+            else contextlib.nullcontext()
+        )
+        with torch.no_grad(), autocast:
             full = decode_model.forward_column(
                 decode_model.embed_tokens(decode_tokens)
             ).h_top
-            cache = KVCache(decode_cfg, 2, "cuda", torch.bfloat16)
+            cache = KVCache(
+                decode_cfg, 2, "cuda", torch.bfloat16 if bf16 else torch.float32
+            )
             prefill = decode_model.forward_column(
                 decode_model.embed_tokens(decode_tokens[:, :5]), cache=cache
             )
@@ -479,7 +494,7 @@ def cuda_gate() -> None:
         # model's branches representative rather than nearly inert; the
         # independently gated projection and recurrence components remain
         # below their tighter bounds above.
-        if relative >= 0.04:
+        if relative >= bound:
             raise AssertionError(
                 f"{condition!r} cache parity drift: {relative:.4f}"
             )
@@ -488,9 +503,19 @@ def cuda_gate() -> None:
 
     plain_decode_rel = decode_parity("", 3)
     hybrid_decode_rel = decode_parity("a", 4)
-    # The loop decodes through one core cache track per iteration.
+    # The loop decodes through one core cache track per iteration. BF16 drift
+    # between the parallel and single-column paths grows with executed depth:
+    # about 7% for the flat twelve-layer column on this geometry and 9% at
+    # two iterations, against 3.5% at four layers. The track wiring is
+    # therefore checked in FP32, where every twelve-layer condition sits near
+    # 0.2%.
     loop_decode_rel = decode_parity(
-        "arfl", 12, loop_iterations=2, loop_max_iterations=2
+        "arfl",
+        12,
+        bf16=False,
+        bound=0.01,
+        loop_iterations=2,
+        loop_max_iterations=2,
     )
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
