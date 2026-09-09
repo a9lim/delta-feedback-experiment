@@ -169,36 +169,41 @@ three: the loop about doubles the recipe's compute at matched data.
 
 Training memory and step time are measured, not derived
 ([runtime qualification](runtime-qualification.md#the-loop), record
-`data/summary/loop-stage-2026-09-09.json`). Capturing the twenty-four train
-graphs and the evaluation graph took 67 s and peaked at 15.21 GiB allocated
-and 23.02 GiB reserved, against 13.85 and 22.99 GiB for the flat column's four
-graphs. Eager three-pass microbatches peak at 12.74 GiB raw at `r = 1` and
-4.02 GiB checkpointed at `r = 8`; the one-pass microbatch at `r = 8` peaks
-at 13.11 GiB raw. The trainer's activation policy counts executed layers,
-`8 + 4r` per pass at the screen, against a measured raw budget of forty
-layer-passes (ten cells: one pass through `r = 8`, two passes through
-`r = 3`), and checkpoints every mode deeper than that. Replay per four-row
-microbatch, in milliseconds:
+`data/summary/loop-stage-2026-09-09.json`), at one 4,096-token row per
+microbatch. Capturing the twenty-four train graphs and the evaluation graph
+took 119 s and peaked at 15.85 GiB allocated and 22.92 GiB reserved, against
+14.45 and 23.02 GiB for the flat column's four graphs. Eager three-pass
+microbatches peak at 13.33 GiB raw at `r = 1` and 4.08 GiB checkpointed at
+`r = 8`; the one-pass microbatch at `r = 8` peaks at 13.70 GiB raw. The
+trainer's activation policy counts executed layers, `8 + 4r` per pass at the
+screen, against a measured raw budget of forty layer-passes (ten cells: one
+pass through `r = 8`, two passes through `r = 3`), and checkpoints every
+mode deeper than that. Replay per microbatch, in milliseconds:
 
 | Passes \ `r` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 53.5 | 67.9 | 82.4 | 96.9 | 111.3 | 125.8 | 140.1 | 154.6 |
-| 2 | 107.8 | 136.7 | 165.4 | 248.4 | 286.3 | 324.3 | 362.2 | 400.2 |
-| 3 | 162.2 | 259.3 | 316.5 | 373.5 | 430.6 | 487.6 | 544.8 | 601.6 |
+| 1 | 67.2 | 83.0 | 98.6 | 114.4 | 130.1 | 145.9 | 161.7 | 177.5 |
+| 2 | 135.3 | 167.0 | 198.7 | 291.1 | 332.9 | 374.6 | 416.4 | 458.4 |
+| 3 | 205.2 | 313.4 | 376.0 | 438.8 | 501.5 | 564.1 | 626.7 | 690.3 |
 
-One pass costs one cell, 14.4 ms, per iteration all the way to the cap. The
+One pass costs one cell, 15.8 ms, per iteration all the way to the cap. The
 jumps at `r = 4` for two passes and `r = 2` for three are where checkpointing
 switches on and recomputes each block once. At the schedule's realized draws
-a step's replay averages 7.6, 18.1, and 29.1 s at one, two, and three
-passes. With one second of optimizer, clipping, shadow, and staging overhead
-per step, which projects the flat three-pass step to 41.7 h against the
+a step's replay averages 14.4, 33.9, and 54.6 s at one, two, and three
+passes. One 4,096-token row replays 26% slower than the four 1,024-token
+rows it replaced for the flat column at `r = 1`, 15% slower at `r = 8`, and
+17% slower per token at the schedule's draws; the likely cause, unmeasured,
+is the occupancy of the chunked PKDA kernels with one sequence per
+microbatch, with the dense layers' 4x attention work on top. With one second
+of optimizer, clipping, shadow, and staging overhead per step, the overhead
+that projected the old geometry's flat three-pass run to 41.7 h against
 42.3 h measured, the schedule projects to:
 
 | Recipe | `arfl` | `arf` |
 |---|---:|---:|
-| default mixture | 34.8 h | ~19 h |
-| two passes on every step | 57.0 h | ~28 h |
-| three passes on every step | 89.8 h | 42.3 h |
+| default mixture | 39.0 h | 22.5 h |
+| two passes on every step | 65.2 h | 34.2 h |
+| three passes on every step | 103.7 h | 50.8 h |
 
 ## The bridge
 

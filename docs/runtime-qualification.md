@@ -141,14 +141,15 @@ runtime above:
 
 The captured `(pass count, r)` family is not part of the probe; it is
 measured by `scripts/loop_memory_stage.py` and captured again by each run.
-The 2026-09-09 staging record for `arfl` at the default recipe: eager
-one-, two-, and three-pass microbatches peak at 5.27, 9.20, and 12.74 GiB
-allocated raw at `r = 1`; at `r = 8` the one-pass microbatch peaks at
-13.11 GiB raw and the two- and three-pass microbatches at 3.39 and 4.02 GiB
-checkpointed; the twenty-four train graphs and the evaluation graph capture
-in 67 s at 15.21 GiB allocated and 23.02 GiB reserved; replay runs from
-53.5 ms (one pass, `r = 1`, the flat column's own time) to 601.6 ms (three
-passes, `r = 8`) per four-row microbatch, the full table in
+The 2026-09-09 staging record for `arfl` at the default recipe, one
+4,096-token row per microbatch: eager one-, two-, and three-pass
+microbatches peak at 5.46, 9.59, and 13.33 GiB allocated raw at `r = 1`; at
+`r = 8` the one-pass microbatch peaks at 13.70 GiB raw and the two- and
+three-pass microbatches at 3.43 and 4.08 GiB checkpointed; the twenty-four
+train graphs and the evaluation graph capture in 119 s at 15.85 GiB
+allocated and 22.92 GiB reserved; replay runs from 67.2 ms (one pass,
+`r = 1`, the flat column's own time) to 690.3 ms (three passes, `r = 8`)
+per microbatch, the full table in
 [scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
 Reproduce with:
 

@@ -4,6 +4,73 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-09 — One context and one batch for the ladder; the old specimens cleared
+
+With the muP change already forcing reruns, a9 asked whether the context
+(1,024 / 4,096 / 8,192 across the three geometries) and the batch (FBT's
+300K, realized as 327,680) should be uniform. Both are now: every scale
+trains 128 rows of 4,096 predictions, `2^19` per step, one row per
+microbatch.
+
+Context: 4,096 is the bridge's setting and the bridge is the publication
+organism, so the ladder's rungs now differ only in size. FineWeb-Edu
+documents average about 1,030 tokens under this tokenizer (from the parquet
+count in the entry below), so a 1,024 row was one document and the
+recurrent state never saw a second; at 4,096 it sees about four. The cost at
+the screen is small, since only the three dense layers scale with row
+length, about five percent more compute, and memory is neutral because one
+4,096 row is the old four-row microbatch. Uniform 8,192 would double the
+screen's microbatch memory past the graph pool; 2,048 has no owner.
+
+Batch: FBT trained at 300K and moved to 1.2M for its 1T baseline, which is
+the standard result that the efficient batch grows with the token budget.
+DeepSeek's fit `B = 0.29 C^0.33` puts the screen's 25x optimum near 0.32M,
+so 327,680 was accidentally right at the screen and under everywhere else:
+bridge 25x near 0.66M, flagship 400x near 3M. `2^18` keeps the screen tuned
+and leaves the flagship at 1.68M sequential steps; `2^19` puts the screen at
+1.6x its fitted optimum, inside the flat basin, and every larger rung under
+its optimum, where token-efficiency is unharmed. The geometry is clean at
+every scale: 128 one-row microbatches on Jobe, 8 ranks x 16 accumulation on
+Prime. Batch is the one knob muP does not transfer, so any rate sweep
+belongs at this batch; the rates stay 6e-3 / 3e-4.
+
+The ripple: screen 25x is 6,716 steps (warmup 134, feedback boundary
+5,037), bridge 25x 19,867 (warmup 397), flagship 400x 840,795 (warmup
+1,051), with the flagship's aligned budget byte-identical to before since
+`2^19 / 327,680 = 1.6` exactly. Warmup tokens are unchanged. The held-out
+evaluation is 128 rows, one batch of predictions, as before in tokens. The
+store is untouched: rows are re-cut from the same stream prefix, and the
+57B screen store's target rounds to the same figure.
+
+Cleared the same afternoon: the three old specimens and
+`screen-delta-arl-s1` (29 GB of snapshots, moved to recovery by
+`delta clear all` and then deleted), the old store `/data/delta/tokens`,
+and the smoke store; the cutover waiter was killed since nothing was left
+for it to wait on. The keyed `sample-350BT` build continues.
+
+Re-measured the loop's cost at the new geometry with the GPU idle
+(`scripts/loop_memory_stage.py`, record `data/summary/loop-stage-2026-09-09.json`,
+the old-geometry record replaced). Memory is neutral, as expected for the
+same 4,096 tokens per microbatch: capture peaks at 15.85 GiB allocated
+against 15.21, and the activation policy's thresholds land on the same
+modes. Time is not: one 4,096-token row replays 26% slower than four
+1,024-token rows for the flat column at `r = 1` (67.2 against 53.5 ms) and
+15% slower at `r = 8`, and at the schedule's draws a step costs 17% more
+per token, so the default-mixture `arfl` projects to 39.0 h from 34.8 h.
+The likely cause, unmeasured, is occupancy: the chunked PKDA kernels
+parallelize over sequences and heads, and one row of ten heads is ten
+blocks where four rows were forty, with the three dense layers at 4x the
+attention work on top. The bridge and flagship always had one-row
+microbatches, so this is a screen-only change in wall-clock and a
+candidate for a two-row microbatch where the raw modes leave room.
+
+On the way, `delta stop` turned out never to reach the trainer: the worker
+had inherited SIGINT ignored from its launcher, Python keeps an inherited
+ignore, and `screen-delta-arl-s1` ran fifty minutes past its stop request.
+The worker now restores the default handling before its first job, and a
+cancelled child still running 120 s after the signal has its group killed,
+noted as `TAG KILLED`.
+
 ## 2026-09-09 — muP for the NAdam group, pinned to the flagship width
 
 a9 asked whether the NAdam parameters should be muP'd, given that NorMuonH is

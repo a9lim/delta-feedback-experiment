@@ -3,10 +3,10 @@
     "condition": "arfl",
     "seed": 1,
     "data_seed": 0,
-    "seq_len": 1024,
-    "batch_rows": 320,
-    "micro_rows": 4,
-    "steps": 10745,
+    "seq_len": 4096,
+    "batch_rows": 128,
+    "micro_rows": 1,
+    "steps": 6716,
     "warmup_frac": 0.02,
     "cooldown_frac": 0.2,
     "feedback_start": 0.75,
@@ -36,239 +36,239 @@
       "k": 1,
       "r": 1,
       "checkpoint": false,
-      "loss": 12.076559066772461,
-      "seconds": 31.499,
-      "allocated_gib": 5.265,
-      "reserved_gib": 5.863
+      "loss": 12.531148910522461,
+      "seconds": 71.599,
+      "allocated_gib": 5.458,
+      "reserved_gib": 6.047
     },
     {
       "stage": "eager",
       "k": 2,
       "r": 1,
       "checkpoint": false,
-      "loss": 24.152446746826172,
-      "seconds": 0.147,
-      "allocated_gib": 9.201,
-      "reserved_gib": 9.473
+      "loss": 25.07176399230957,
+      "seconds": 0.174,
+      "allocated_gib": 9.59,
+      "reserved_gib": 9.84
     },
     {
       "stage": "eager",
       "k": 3,
       "r": 1,
       "checkpoint": false,
-      "loss": 24.154376983642578,
-      "seconds": 0.212,
-      "allocated_gib": 12.74,
-      "reserved_gib": 13.092
+      "loss": 25.06930923461914,
+      "seconds": 0.239,
+      "allocated_gib": 13.329,
+      "reserved_gib": 13.654
     },
     {
       "stage": "eager",
       "k": 1,
       "r": 8,
       "checkpoint": false,
-      "loss": 12.060417175292969,
-      "seconds": 0.2,
-      "allocated_gib": 13.106,
-      "reserved_gib": 13.836
+      "loss": 12.50137710571289,
+      "seconds": 0.208,
+      "allocated_gib": 13.702,
+      "reserved_gib": 14.443
     },
     {
       "stage": "eager",
       "k": 2,
       "r": 8,
       "checkpoint": true,
-      "loss": 24.114852905273438,
-      "seconds": 0.472,
-      "allocated_gib": 3.387,
-      "reserved_gib": 4.428
+      "loss": 25.010540008544922,
+      "seconds": 0.492,
+      "allocated_gib": 3.428,
+      "reserved_gib": 4.537
     },
     {
       "stage": "eager",
       "k": 3,
       "r": 8,
       "checkpoint": true,
-      "loss": 24.117631912231445,
-      "seconds": 0.704,
-      "allocated_gib": 4.018,
-      "reserved_gib": 5.225
+      "loss": 25.016246795654297,
+      "seconds": 0.741,
+      "allocated_gib": 4.084,
+      "reserved_gib": 5.293
     },
     {
       "stage": "capture",
-      "seconds": 66.6,
+      "seconds": 119.4,
       "train_graphs": 24,
       "eval_graphs": 1,
-      "allocated_gib": 15.205,
-      "reserved_gib": 23.02,
+      "allocated_gib": 15.853,
+      "reserved_gib": 22.916,
       "replays": [
         {
           "k": 1,
           "r": 1,
           "checkpoint": false,
-          "ms": 53.5,
-          "loss": 0.15095758438110352
+          "ms": 67.2,
+          "loss": 0.09789840877056122
         },
         {
           "k": 1,
           "r": 2,
           "checkpoint": false,
-          "ms": 67.9,
-          "loss": 0.15092964470386505
+          "ms": 83.0,
+          "loss": 0.09782806038856506
         },
         {
           "k": 1,
           "r": 3,
           "checkpoint": false,
-          "ms": 82.3,
-          "loss": 0.15088029205799103
+          "ms": 98.6,
+          "loss": 0.09774892032146454
         },
         {
           "k": 1,
           "r": 4,
           "checkpoint": false,
-          "ms": 96.7,
-          "loss": 0.15084333717823029
+          "ms": 114.4,
+          "loss": 0.09771119803190231
         },
         {
           "k": 1,
           "r": 5,
           "checkpoint": false,
-          "ms": 111.2,
-          "loss": 0.15081001818180084
+          "ms": 130.1,
+          "loss": 0.09768693149089813
         },
         {
           "k": 1,
           "r": 6,
           "checkpoint": false,
-          "ms": 125.8,
-          "loss": 0.1507846713066101
+          "ms": 145.9,
+          "loss": 0.09767080843448639
         },
         {
           "k": 1,
           "r": 7,
           "checkpoint": false,
-          "ms": 140.2,
-          "loss": 0.15076851844787598
+          "ms": 161.7,
+          "loss": 0.09765882790088654
         },
         {
           "k": 1,
           "r": 8,
           "checkpoint": false,
-          "ms": 154.7,
-          "loss": 0.15076084434986115
+          "ms": 177.5,
+          "loss": 0.09765104204416275
         },
         {
           "k": 2,
           "r": 1,
           "checkpoint": false,
-          "ms": 107.9,
-          "loss": 0.30181142687797546
+          "ms": 135.3,
+          "loss": 0.19575345516204834
         },
         {
           "k": 2,
           "r": 2,
           "checkpoint": false,
-          "ms": 136.8,
-          "loss": 0.3019135892391205
+          "ms": 167.0,
+          "loss": 0.19557183980941772
         },
         {
           "k": 2,
           "r": 3,
           "checkpoint": false,
-          "ms": 165.5,
-          "loss": 0.3017251789569855
+          "ms": 198.7,
+          "loss": 0.19570021331310272
         },
         {
           "k": 2,
           "r": 4,
           "checkpoint": true,
-          "ms": 248.4,
-          "loss": 0.30173811316490173
+          "ms": 291.1,
+          "loss": 0.195615753531456
         },
         {
           "k": 2,
           "r": 5,
           "checkpoint": true,
-          "ms": 286.4,
-          "loss": 0.3016998767852783
+          "ms": 332.9,
+          "loss": 0.1952660083770752
         },
         {
           "k": 2,
           "r": 6,
           "checkpoint": true,
-          "ms": 324.4,
-          "loss": 0.30152931809425354
+          "ms": 374.6,
+          "loss": 0.19541415572166443
         },
         {
           "k": 2,
           "r": 7,
           "checkpoint": true,
-          "ms": 362.4,
-          "loss": 0.30155736207962036
+          "ms": 416.4,
+          "loss": 0.1954057812690735
         },
         {
           "k": 2,
           "r": 8,
           "checkpoint": true,
-          "ms": 400.3,
-          "loss": 0.3014496862888336
+          "ms": 458.4,
+          "loss": 0.19542869925498962
         },
         {
           "k": 3,
           "r": 1,
           "checkpoint": false,
-          "ms": 162.1,
-          "loss": 0.30188336968421936
+          "ms": 205.2,
+          "loss": 0.19583377242088318
         },
         {
           "k": 3,
           "r": 2,
           "checkpoint": true,
-          "ms": 259.3,
-          "loss": 0.3018372654914856
+          "ms": 313.4,
+          "loss": 0.19565840065479279
         },
         {
           "k": 3,
           "r": 3,
           "checkpoint": true,
-          "ms": 316.3,
-          "loss": 0.3018588125705719
+          "ms": 376.0,
+          "loss": 0.1954832524061203
         },
         {
           "k": 3,
           "r": 4,
           "checkpoint": true,
-          "ms": 373.3,
-          "loss": 0.3017284572124481
+          "ms": 438.8,
+          "loss": 0.1953338086605072
         },
         {
           "k": 3,
           "r": 5,
           "checkpoint": true,
-          "ms": 431.0,
-          "loss": 0.3015967011451721
+          "ms": 501.5,
+          "loss": 0.19544395804405212
         },
         {
           "k": 3,
           "r": 6,
           "checkpoint": true,
-          "ms": 488.2,
-          "loss": 0.3016071915626526
+          "ms": 564.1,
+          "loss": 0.19543614983558655
         },
         {
           "k": 3,
           "r": 7,
           "checkpoint": true,
-          "ms": 545.3,
-          "loss": 0.3015854060649872
+          "ms": 626.7,
+          "loss": 0.19537673890590668
         },
         {
           "k": 3,
           "r": 8,
           "checkpoint": true,
-          "ms": 602.1,
-          "loss": 0.3015230596065521
+          "ms": 690.3,
+          "loss": 0.19537916779518127
         }
       ],
-      "projected_replay_hours": 31.78,
+      "projected_replay_hours": 37.18,
       "note": "replay only: the optimizer, clipping, shadow refresh, evaluation, and snapshots add to every step"
     }
   ]
