@@ -117,7 +117,12 @@ an active child; the worker refreshes before the next queued job and runs its
 probe from the current checkout. `delta stop queue` removes every pending job
 but leaves the active run and worker untouched; it is the complement of
 `delta stop live`, which stops only the active run and preserves the pending
-queue.
+queue. A stop is SIGINT: the trainer snapshots the completed step and the tag
+resumes from it. A child that has not exited 120 s later is killed and the
+marker records `TAG KILLED`; `delta stop` holds that deadline itself when no
+worker is alive. The worker restores Python's SIGINT handling before its first
+job, so a launcher that ignored the signal (`nohup`, a backgrounded command in
+a non-interactive shell) cannot leave a run that no stop can reach.
 
 The default Jobe run uses 10,745 steps, 320 rows per step, and 1,024
 predictions per row: 3,520,921,600 predicted tokens. Linear warmup occupies the
