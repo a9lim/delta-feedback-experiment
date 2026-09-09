@@ -89,7 +89,10 @@ change it everywhere at once.
 
 ## Useful bookkeeping
 
-- Conditions trained with the same seed and data seed share tokenizer, stream,
+- The stream is a keyed document shuffle of FineWeb-Edu `sample-350BT` under
+  the base Qwen3 tokenizer; every store is a prefix of it, and a sidecar maps
+  every document back to its parquet row and crawl. Conditions trained with
+  the same seed and data seed share tokenizer, stream,
   row order, schedule, optimizer, batch geometry, and keyed feedback
   randomness; conditions on the same trunk letter pair every parameter they
   share byte-identically, each letter's private weights from that letter's own

@@ -5,8 +5,9 @@ resumed must be bit-identical to an uninterrupted one — the property the
 whole paired-comparison design leans on for multi-day jobe runs.
 """
 
-import sys
-from types import ModuleType
+import json
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -17,15 +18,19 @@ from delta_feedback_experiment.cli import tokenize_command
 from delta_feedback_experiment.data import (
     CANONICAL_CONFIG,
     CANONICAL_DATA_PACKAGES,
-    CANONICAL_DATASET,
     CANONICAL_DATASET_REVISION,
+    CANONICAL_SHUFFLE_SEED,
     CANONICAL_TARGET_TOKENS,
-    CANONICAL_TOKENIZER,
     CANONICAL_TOKENIZER_REVISION,
+    CANONICAL_TOKENS_PER_DOC,
     CANONICAL_VAL_TOKENS,
+    LocalSource,
+    Shuffle,
     TokenData,
     data_package_versions,
+    source_address,
     tokenize,
+    verify,
     write_synthetic,
 )
 from delta_feedback_experiment.optim import (
@@ -134,59 +139,195 @@ def test_data_build_versions_are_exact(monkeypatch):
     monkeypatch.setattr(data_module, "version", installed.__getitem__)
     assert data_package_versions() == installed
 
-    installed["datasets"] = "0.0.0"
-    with pytest.raises(RuntimeError, match="datasets==5.0.1"):
+    installed["pyarrow"] = "0.0.0"
+    with pytest.raises(RuntimeError, match="pyarrow==25.0.1"):
         data_package_versions()
 
 
-def test_tokenize_materializes_pinned_hf_stream(tmp_path, monkeypatch):
-    calls = {}
-    datasets = ModuleType("datasets")
-    transformers = ModuleType("transformers")
+@pytest.mark.parametrize("size", [1, 2, 3, 7, 64, 1000, 4097])
+def test_shuffle_is_a_keyed_bijection(size):
+    everything = np.arange(size)
+    shuffle = Shuffle(size, seed=CANONICAL_SHUFFLE_SEED)
+    positions = shuffle(everything)
+    assert sorted(positions.tolist()) == everything.tolist()
+    assert np.array_equal(shuffle.inverse(positions), everything)
+    assert np.array_equal(shuffle(everything), positions)  # stateless
+    assert np.array_equal(shuffle(everything[::7]), positions[::7])  # batch-free
+    if size >= 64:
+        assert not np.array_equal(positions, everything)
+        assert not np.array_equal(Shuffle(size, seed=1)(everything), positions)
+    with pytest.raises(ValueError):
+        shuffle([size])
 
-    def load_dataset(dataset, *, name, split, streaming, revision):
-        calls["dataset"] = (dataset, name, split, streaming, revision)
-        return iter([{"text": "a"}, {"text": "b"}, {"text": "c"}])
 
-    class FakeTokenizer:
-        eos_token_id = 3
+# -- a tiny parquet source with a character tokenizer --------------------------
 
-        def __call__(self, texts, *, add_special_tokens):
-            assert not add_special_tokens
-            return {"input_ids": [[1, 2] for _ in texts]}
+EOS = 3
 
-    class FakeAutoTokenizer:
-        @classmethod
-        def from_pretrained(cls, name, *, revision):
-            calls["tokenizer"] = (name, revision)
-            return FakeTokenizer()
 
-    datasets.load_dataset = load_dataset
-    transformers.AutoTokenizer = FakeAutoTokenizer
-    monkeypatch.setitem(sys.modules, "datasets", datasets)
-    monkeypatch.setitem(sys.modules, "transformers", transformers)
-    monkeypatch.setattr(
-        data_module, "data_package_versions", lambda: dict(CANONICAL_DATA_PACKAGES)
+class CharTokenizer:
+    eos_token_id = EOS
+
+    def __call__(self, texts, *, add_special_tokens):
+        assert not add_special_tokens
+        return {"input_ids": [[4 + ord(c) % 90 for c in text] for text in texts]}
+
+
+def char_tokenizer():
+    return CharTokenizer()
+
+
+def char_ids(text: str) -> list[int]:
+    return CharTokenizer()([text], add_special_tokens=False)["input_ids"][0] + [EOS]
+
+
+DUMPS = ("CC-MAIN-2013-20", "CC-MAIN-2019-35", "CC-MAIN-2024-10")
+
+
+def parquet_source(root: Path, files: int = 3, rows: int = 40) -> LocalSource:
+    """Files of single-crawl runs, like FineWeb-Edu's, with one empty text."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    (root / "sample" / "tiny").mkdir(parents=True)
+    for f in range(files):
+        texts, dumps = [], []
+        for i in range(rows):
+            texts.append("" if (f, i) == (1, 5) else f"d{f}-{i}-" + "x" * ((7 * i + 3 * f) % 25))
+            dumps.append(DUMPS[(i // 14 + f) % len(DUMPS)])
+        table = pa.table({"text": texts, "dump": dumps})
+        pq.write_table(table, root / "sample" / "tiny" / f"{f:03d}.parquet", row_group_size=17)
+    return LocalSource(root)
+
+
+def build(out: Path, source: LocalSource, **overrides) -> dict:
+    settings = dict(
+        target_tokens=600,
+        val_tokens=200,
+        seed=3,
+        tokens_per_doc=10,
+        source=source,
+        tokenizer=char_tokenizer,
+        check_packages=False,
+        config="sample-tiny",
     )
+    settings.update(overrides)
+    return tokenize(out, **settings)
 
-    meta = tokenize(tmp_path / "tokens", target_tokens=9, val_tokens=3, batch_docs=1)
 
-    assert calls["dataset"] == (
-        CANONICAL_DATASET,
-        CANONICAL_CONFIG,
-        "train",
-        True,
-        CANONICAL_DATASET_REVISION,
-    )
-    assert calls["tokenizer"] == (
-        CANONICAL_TOKENIZER,
-        CANONICAL_TOKENIZER_REVISION,
-    )
-    assert meta["revision"] == CANONICAL_DATASET_REVISION
-    assert meta["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION
-    assert meta["packages"] == CANONICAL_DATA_PACKAGES
-    assert meta["val_tokens"] == 3
-    assert meta["train_tokens"] == 6
+def stream(directory: Path, split: str) -> np.ndarray:
+    data = TokenData.load(directory, split, 1)
+    return np.asarray(data.read(0, data.total_tokens))
+
+
+def test_tokenize_writes_a_shuffled_prefix_with_provenance(tmp_path):
+    import pyarrow.parquet as pq
+
+    source = parquet_source(tmp_path / "source")
+    out = tmp_path / "tokens"
+    meta = build(out, source)
+    index = json.loads((out / "source.json").read_text())
+
+    assert meta["universe_docs"] == 120
+    assert meta["selected_docs"] == 60
+    assert meta["eos_id"] == EOS
+    assert meta["config"] == "sample-tiny"
+    assert not (out / "parts").exists()
+    assert verify(out)["train"]["docs"] == meta["train_docs"]
+
+    rows = {}
+    for path in {f["path"] for f in index["files"]}:
+        table = pq.ParquetFile(source.root / path).read(columns=["text", "dump"])
+        rows[path] = (table.column("text").to_pylist(), table.column("dump").to_pylist())
+
+    seen = []
+    for split in ("val", "train"):
+        tokens = stream(out, split)
+        docs = TokenData.load(out, split, 1).docs
+        assert tokens.size == meta[f"{split}_tokens"]
+        assert tokens[-1] == EOS  # splits end at document boundaries
+        starts = docs["start"].tolist() + [tokens.size]
+        for record, start, end in zip(docs, starts, starts[1:]):
+            path, row = source_address(index, int(record["source"]))
+            text, dump = rows[path][0][row], rows[path][1][row]
+            assert text, "an empty document was written"
+            assert tokens[start:end].tolist() == char_ids(text)
+            assert meta["dumps"][record["dump"]] == dump
+            seen.append(int(record["source"]))
+    assert meta["val_tokens"] >= 200 and meta["val_tokens"] + meta["train_tokens"] >= 600
+    assert len(seen) == len(set(seen)) <= 60
+    assert seen != sorted(seen)  # the stream is not in source order
+    assert 45 not in seen  # file 1 row 5, the empty text, is never written
+    crawls = [meta["dumps"][d] for d in TokenData.load(out, "train", 1).docs["dump"]]
+    assert len(set(crawls[:8])) > 1  # neighbours come from different crawls
+
+
+@dataclass
+class FlakySource:
+    """A local source whose second fetch fails once."""
+
+    inner: LocalSource
+    marker: Path
+
+    def list_files(self):
+        return self.inner.list_files()
+
+    def row_groups(self, path):
+        return self.inner.row_groups(path)
+
+    def fetch(self, path):
+        if path.endswith("001.parquet") and self.marker.exists():
+            self.marker.unlink()
+            raise OSError("simulated download failure")
+        return self.inner.fetch(path)
+
+    def release(self, path):
+        return None
+
+
+def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path):
+    source = parquet_source(tmp_path / "source")
+    short = build(tmp_path / "short", source)
+    long = build(tmp_path / "long", source, target_tokens=900)
+    assert long["selected_docs"] == 90 > short["selected_docs"]
+    assert np.array_equal(stream(tmp_path / "short", "val"), stream(tmp_path / "long", "val"))
+    short_train, long_train = stream(tmp_path / "short", "train"), stream(tmp_path / "long", "train")
+    assert long_train.size > short_train.size
+    assert np.array_equal(short_train, long_train[: short_train.size])
+    short_docs = TokenData.load(tmp_path / "short", "train", 1).docs
+    long_docs = TokenData.load(tmp_path / "long", "train", 1).docs
+    assert np.array_equal(short_docs, long_docs[: short_docs.size])
+
+    marker = tmp_path / "fail-once"
+    marker.touch()
+    flaky = FlakySource(source, marker)
+    with pytest.raises(OSError, match="simulated"):
+        build(tmp_path / "resumed", flaky)
+    assert (tmp_path / "resumed" / "parts" / "0000.index.npy").exists()
+    assert not (tmp_path / "resumed" / "parts" / "0001.index.npy").exists()
+    resumed = build(tmp_path / "resumed", flaky)
+    assert resumed["train_tokens"] == short["train_tokens"]
+    assert np.array_equal(stream(tmp_path / "resumed", "train"), short_train)
+    with pytest.raises(FileExistsError):
+        build(tmp_path / "resumed", source)
+
+
+def test_tokenize_reports_an_exhausted_selection(tmp_path):
+    source = parquet_source(tmp_path / "source")
+    with pytest.raises(RuntimeError, match="selection exhausted"):
+        build(tmp_path / "tokens", source, tokens_per_doc=100)
+
+
+def test_verify_catches_a_broken_document_boundary(tmp_path):
+    write_synthetic(tmp_path, train_tokens=1200, val_tokens=120, vocab=97)
+    assert verify(tmp_path)["val"]["docs"] == data_module.read_meta(tmp_path)["val_docs"]
+    docs = TokenData.load(tmp_path, "train", 16).docs
+    assert docs is not None and docs["start"][0] == 0
+    shard = np.memmap(tmp_path / "train.0000.bin", dtype=np.uint32, mode="r+")
+    shard[int(docs["start"][1]) - 1] = 5
+    shard.flush()
+    with pytest.raises(RuntimeError, match="no EOS"):
+        verify(tmp_path)
 
 
 def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
@@ -201,6 +342,10 @@ def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
 
     assert captured["target_tokens"] == CANONICAL_TARGET_TOKENS
     assert captured["val_tokens"] == CANONICAL_VAL_TOKENS
+    assert captured["seed"] == CANONICAL_SHUFFLE_SEED
+    assert captured["tokens_per_doc"] == CANONICAL_TOKENS_PER_DOC
+    assert captured["workers"] == 1
+    assert captured["scratch"] is None
     assert captured["config"] == CANONICAL_CONFIG
     assert captured["revision"] == CANONICAL_DATASET_REVISION
     assert captured["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION

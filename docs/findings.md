@@ -68,6 +68,14 @@ That is the opposite of an opaque cross-column channel.
 - **NorMuonH 2e-2 is too hot.** The same recipe at 2e-2 finished 0.037 nats
   worse than at 6e-3, with its paired pass-1 training loss running 0.22 above
   `ar` through the second half of the heat. 6e-3 is now the default.
+- **The specimens' training curves carry the source's crawl order.** Every
+  run's detrended pass-1 training loss swells and dips with a 742-step period
+  and a 0.1-nat peak-to-trough, identical across runs (residual correlation
+  0.99 at lag zero between any two). The source parquet files are single-crawl
+  runs of about 60M tokens read in order, so each stretch of training was one
+  CommonCrawl dump, and the held-out slice was the head of one 2013 crawl.
+  The stream is now a keyed document shuffle of `sample-350BT` with the base
+  tokenizer's EOS; the three specimens above trained on the old order.
 
 ## Downstream
 

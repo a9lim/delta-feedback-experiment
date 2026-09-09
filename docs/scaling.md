@@ -193,7 +193,7 @@ ladder's rungs differ in context as well as size.
 
 ```bash
 delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 ```
 
 `--scale bridge` is the column, row length, and batch above; the 25x schedule
@@ -305,12 +305,17 @@ It compares the complete `arf` package against its shared hybrid baseline.
 
 Data staging on Prime: after choosing a provider and location and before
 provisioning the H100 node, create a provider-local persistent disk sized for
-the compiled stream and run artifacts, attach it to a cheap compatible
-staging instance, install the `data-build` extra, and run `delta tokenize` from
-the pinned Hugging Face dataset and tokenizer into the mounted path. The
-resulting `meta.json` and byte checksums match Jobe's prefix; then detach the
-disk and attach it to the H100 node. No live Hugging Face reads during
-training and no re-hosted copy of the store.
+the compiled stream and run artifacts (the bridge ladder's 167B-token store
+is about 690 GB, the screen's 57B about 230 GB), attach it to a cheap
+compatible staging instance with a second scratch disk of the same size for
+the build's parts, install the `data-build` extra, and run
+`delta tokenize --target 167e9 --scratch SCRATCH --workers N` into the
+mounted path. The build reads all 1 TB of `sample-350BT` once, tokenizes the
+selected half, and needs a few hours on a many-core instance. The resulting
+store is byte-identical to Jobe's over Jobe's length (`delta verify`, then
+compare `val.bin` and the shared shards by checksum); then detach the disk
+and attach it to the H100 node. No live Hugging Face reads during training
+and no re-hosted copy of the store.
 
 The single-process trainer expresses this schedule already. Distributed
 execution needs exact row sharding, DDP accumulation with synchronized global

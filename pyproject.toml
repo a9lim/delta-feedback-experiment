@@ -17,10 +17,10 @@ dependencies = [
 
 [project.optional-dependencies]
 data-build = [
-    "datasets==5.0.1",
     "transformers==5.16.1",
-    "tokenizers==0.23.1",
-    "huggingface-hub==1.29.0",
+    "tokenizers==0.23.2",
+    "huggingface-hub==1.30.0",
+    "pyarrow==25.0.1",
 ]
 cuda = [
     "cut-cross-entropy",

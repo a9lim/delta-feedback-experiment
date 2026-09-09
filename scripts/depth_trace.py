@@ -1,6 +1,6 @@
 """Fixed-r sweep of a loop snapshot: loss, update size, and router mass by iteration.
 
-    python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+    python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 
 Runs ``depth_trace`` on held-out rows in both label assignments (all plain,
 and prefix-1 fused when the condition has ``f``), records the core routers'

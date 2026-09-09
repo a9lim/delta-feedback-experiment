@@ -19,7 +19,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--data-dir", default="/data/delta/tokens")
+    parser.add_argument("--data-dir", default="/data/delta/tokens-350B")
     parser.add_argument("--head-only", action="store_true")
     options = parser.parse_args()
     options.output.mkdir(parents=True, exist_ok=True)

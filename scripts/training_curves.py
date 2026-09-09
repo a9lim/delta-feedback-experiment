@@ -183,7 +183,7 @@ def main() -> None:
             ax.plot(e["step"], e["val_fused"] - e["val"], "s--", color=col, ms=3, lw=1.2, label=f"{lab}: fused − pass 1")
             summary["runs"].setdefault(lab, {})["fused_minus_pass1"] = [[float(s), float(v)] for s, v in zip(e["step"], e["val_fused"] - e["val"])]
     fs.zero_line(ax)
-    ax.set(xlabel="optimizer step", ylabel="CE difference", title="Paired differences (same 32 rows)")
+    ax.set(xlabel="optimizer step", ylabel="CE difference", title="Paired differences (same held-out rows)")
     ax.set_ylim(-0.06, 0.12)
     if boundary:
         fs.mark_step(ax, boundary, "feedback", y=0.98)

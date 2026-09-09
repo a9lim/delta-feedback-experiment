@@ -56,19 +56,46 @@ the prelude, the last the coda, and the one between them the tied core, run
 
 ## Data
 
-The corpus is `HuggingFaceFW/fineweb-edu`, configuration `sample-100BT`, in
-its canonical streaming order at dataset commit
-`87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`, tokenized with `Qwen/Qwen3-0.6B`
-at commit `c1899de289a04d12100db370d81485cdf75e47ca`. The `data-build` extra
+The corpus is `HuggingFaceFW/fineweb-edu`, configuration `sample-350BT` (the
+472 parquet files under `sample/350BT`) at dataset commit
+`87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`, tokenized with
+`Qwen/Qwen3-0.6B-Base` at commit `da87bfb608c14b7cf20ba1ce41287e8de496c0cd`.
+The base tokenizer's EOS, `<|endoftext|>` (151643), closes every non-empty
+document; the chat tokenizer shares every other id but ends on `<|im_end|>`,
+which an instruct-tuned descendant would want free. The `data-build` extra
 pins the four packages that compile the stream and `meta.json` records their
-realized versions. Every non-empty document is followed by EOS.
+realized versions.
 
-`delta tokenize` materializes the stream as a local contiguous uint32 store so
-that step-addressed rows, validation, and resume never depend on network or
-iterator state. The held-out validation slice is the stream head; training
-follows in contiguous shards. One row is a non-overlapping `seq_len + 1`
-window, so 1,025 stored tokens give 1,024 predictions. Rows may cross
-document boundaries. Step `n` addresses:
+The source files are not shuffled: each is a sequence of single-crawl runs of
+about 60M tokens, so read in order they put one CommonCrawl dump into every
+180 or so screen steps and a 0.1-nat swell into every training curve
+([journal, 2026-09-09](journal.md)). The universe is every document of the
+source, addressed by its row in file order (`source.json`); a keyed Feistel
+bijection (`Shuffle`, seed 0) sends addresses to stream positions, so
+neighbouring documents come from unrelated files and crawls, and a store of
+any size is a prefix of one stream: the 57B-token screen store on Jobe is
+byte-identical to the first 57B tokens of the 167B-token bridge store the
+Prime ladder needs.
+
+`delta tokenize` builds a prefix in three resumable stages: index the
+source's row groups; select the documents whose position falls below
+`--target / --tokens-per-doc` and tokenize them, one file at a time, into
+per-file parts; write the parts in stream order into a local contiguous
+uint32 store, so that step-addressed rows, validation, and resume never
+depend on network or iterator state. The held-out slice is the stream's first
+documents, 30M tokens of whole documents; training follows in contiguous
+shards. A sidecar per split (`val.docs.npy`, `train.docs.npy`; `DOC_DTYPE`)
+records every document's start offset, universe address, which names the
+parquet row holding its text, URL, and score, and its crawl as an index into
+`meta["dumps"]`. `delta verify DIR` checks a store against its meta and
+sidecars.
+
+One row is a non-overlapping `seq_len + 1` window, so 1,025 stored tokens give
+1,024 predictions. Rows may cross document boundaries, and attention crosses
+them too: with shuffled documents the neighbours are unrelated, which is the
+honest packing regime, and an intra-document mask would be an architecture
+question for PKDA's recurrent state rather than a data one. Step `n`
+addresses:
 
 ```text
 first_row(n) = (n - 1) * batch_rows
@@ -79,9 +106,10 @@ jitter are additionally keyed by the microbatch's first global row. None of
 them depend on ambient RNG state, so a resume returns to the same row and the
 same draws.
 
-The canonical stream target is 57B stored tokens including the held-out
-prefix, enough for the 400x Prime schedule in [scaling.md](scaling.md) with
-about 584M tokens of headroom.
+The default build target is 57B stored tokens including the held-out slice,
+enough for the screen's 400x schedule in [scaling.md](scaling.md) with about
+584M tokens of headroom; the bridge's 400x rung needs `--target 167e9` from
+the same stream.
 
 ## Training
 
@@ -221,9 +249,11 @@ the next job.
 
 ### Language-model numbers
 
-Every evaluation point reports pass-1 held-out cross-entropy as `val`.
-Conditions with `f` also report `val_fused`, a second pass with plain-prefix
-length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
+Every evaluation point reports pass-1 held-out cross-entropy as `val` over
+the slice's first `--eval-rows` rows, 512 by default: 524,288 predictions at
+the screen, a quarter of the standard error of the 32 rows it replaces, a
+forward-only few seconds every `--eval-every` steps. Conditions with `f` also report `val_fused`, a
+second pass with plain-prefix length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
 Decoding has three modes, each at one fixed `r` under `l`:
 
 - **Standard:** one plain prompt prefill, no feedback during decode.

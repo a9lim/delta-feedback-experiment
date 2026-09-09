@@ -16,7 +16,7 @@ Held-out diagnostics on one snapshot of a condition with `f`:
 * a 30-iteration fully fused self-composition trace.
 
 Usage:
-    python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+    python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 """
 
 from __future__ import annotations

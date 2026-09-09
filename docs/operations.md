@@ -54,40 +54,47 @@ Foreground training and queueing are alternative ways to run a condition.
 # Portable invariant suite; includes the full CUDA gate on a CUDA host.
 delta probe
 
-# Materialize the canonical 57B stream from pinned HF dataset/tokenizer commits.
-delta tokenize --out /data/delta/tokens
+# Build the screen's 57B-token prefix of the shuffled stream from the pinned
+# dataset and tokenizer commits; the bridge ladder's store is --target 167e9
+# of the same stream. Resumable; reads all of sample-350BT once (hours).
+delta tokenize --out /data/delta/tokens-350B --scratch /data/delta/scratch --workers 3
+delta verify /data/delta/tokens-350B
+# Retire a superseded store once the spool no longer reads it (--wait polls;
+# without --delete it only reports). Runs trained on it cannot resume after.
+python scripts/store_cutover.py --new /data/delta/tokens-350B \
+  --old /data/delta/tokens --wait --delete
 
 # Run or queue one condition: letters from arfl in any order, empty for the
 # plain gated GQA decoder (`delta train --help` lists the letters).
 delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 delta queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 delta queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 delta queue example-arfl-s1 --condition arfl --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 
 # Every planned run is --condition, --scale, and --tokens-per-param: the
 # preset fills the geometry and batch, the ratio derives the schedule (25 is
 # the screen recipe, 400 the Prime recipes; docs/scaling.md has each budget).
 # The bridge on Jobe, and the memory staging to run before it:
 delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 delta queue bridge-delta-arfl-s1 --condition arfl --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 python scripts/loop_memory_stage.py --out data/summary/loop-stage-bridge-DATE.json \
   --condition arfl --scale bridge
 # The 400x recipes, which the single-process trainer expresses and Prime's
 # unbuilt distributed path would run:
 delta train screen-delta-arf-400x-s1 --condition arf --tokens-per-param 400 \
-  --seed 1 --data-seed 0 --data-dir /data/delta/tokens
+  --seed 1 --data-seed 0 --data-dir /data/delta/tokens-350B
 delta train flagship-delta-arfl-s1 --condition arfl --scale flagship --tokens-per-param 400 \
-  --seed 1 --data-seed 0 --data-dir /data/delta/tokens
+  --seed 1 --data-seed 0 --data-dir /data/delta/tokens-350B
 # Extend a finished run to a longer schedule under a new tag: its stable
 # phase resumes from the last snapshot the longer schedule reproduces.
 delta queue screen-delta-arf-s1-50x --continue screen-delta-arf-s1 --tokens-per-param 50 \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 
 # Inspect and control the detached queue.
 delta status
@@ -136,39 +143,39 @@ index](../figures/README.md) maps them.
 
 ```bash
 # Routing: per-site/group source mass, entropy, query geometry (any r).
-python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 
 # Payload enrichment swaps (r with f): trained router, top-only, uniform, forced source.
-python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
-python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens --head 2
+python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
+python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B --head 2
 
 # Fused pass against pass 1 on one feedback snapshot: position, surprise, and
 # frequency structure, gate and seed statistics, self-composition.
-python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 
 # Loop depth trace (l): loss after each iteration count, core update sizes,
 # and core router mass by iteration, plain and fused.
-python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 
 # Entry interventions: gate temperature, seed scale, embedding bypass,
 # zero or foreign payload.
-python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 
 # Impulse response, payload-head ablation, split-validated ensemble, and
 # pass-1 versus fused-pass gradient alignment.
-python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 
 # Two checkpoints on the same rows: per-token loss structure, predictor
 # divergence, mixtures, residual-stream CKA, payload redundancy.
 python scripts/compare_conditions.py --reference runs/A.pt.STEP --feedback runs/B.pt.STEP \
-  --data-dir /data/delta/tokens
+  --data-dir /data/delta/tokens-350B
 
 # Paired weight-space divergence from the shared initialization (CPU).
 python scripts/weight_divergence.py runs/A.pt.STEP runs/B.pt.STEP
 
 # Continue a feedback snapshot with dense feedback passes (or --passes 1 as
 # the plain-only erosion control) at a fraction of the stable learning rate.
-python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/delta/tokens \
+python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B \
   --steps 150 --passes 2 --out figures/fused-TAG/dense_all.json
 
 # Downstream zero-shot tasks (workspace `transformer_experiments.downstream`),

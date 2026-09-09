@@ -4,6 +4,61 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-09 — The loss bumps are the source's crawl order; the stream becomes a keyed document shuffle
+
+a9 noticed that every run's training loss drifts up and down over a few
+hundred steps and suspected the data. Detrending each run's pass-1 training
+loss (a 21-step mean minus a 401-step trend) over steps 900–4,590, which the
+three runs on the old stream share:
+
+| pair | residual correlation at lag 0 |
+|---|---:|
+| `arf-s1-highLR` x `arf-s1` | 0.996 |
+| `arf-s1-highLR` x `arl-s1` | 0.987 |
+| `arf-s1` x `arl-s1` | 0.991 |
+
+Different learning rate, different condition, identical bumps at identical
+steps: the residual is the data, not the optimizer. Its autocorrelation peaks
+at 742 and 1,492 steps, its std is 0.027 nats, its peak-to-trough about 0.1,
+and each cycle holds one dip of about 0.05 nats lasting about 175 steps.
+
+The mechanism is in the source files. `sample-100BT` file `000_00001` (727k
+documents, 727 row groups of 1,000, 756M GPT-2 tokens) is thirteen
+contiguous single-dump runs of about 60M tokens: four crawls (2013-20,
+2017-26, 2020-05, 2023-14) in turn, twice, then the next four. One cycle is
+245M GPT-2 tokens; 742 steps of 328,000 stored tokens is 243M, and the
+Qwen/GPT-2 token ratio measured on that file is 0.993. Rows were read in
+source order (`first_row = (n - 1) * batch_rows`, no shuffle at any level),
+so every 60M-token stretch of training was one CommonCrawl dump and the dip
+is one crawl being easier than its neighbours. The held-out slice was the
+head of the stream: the first half of one 2013 crawl run. The in-run eval
+read 32 rows of it, 32,768 predictions, a standard error about the size of
+the bumps.
+
+Two more things surfaced on the way. The store's EOS was the chat
+tokenizer's `<|im_end|>` (151645); `Qwen/Qwen3-0.6B-Base` shares every id and
+ends on `<|endoftext|>` (151643), which is the convention an instruct-tuned
+descendant would expect. And Jobe's store held 35B train tokens of a
+`sample-100BT` that is only about 99B Qwen tokens in total, while the bridge's
+400x rung needs 167B: the Prime ladder needed a new source anyway.
+
+What changed, all at once: the stream is now a keyed Feistel shuffle of every
+document in `sample-350BT` (346B tokens, of which `sample-100BT` was itself a
+sample), under the base tokenizer, with any build a byte-identical prefix of
+one stream; `delta tokenize` indexes the source's row groups, selects and
+tokenizes the documents whose position falls below `target / tokens-per-doc`
+one file at a time, and writes them in stream order with a per-split sidecar
+of document starts, universe addresses, and crawls; `delta verify` checks a
+store; `datasets` left the `data-build` extra for `pyarrow` and the pins
+moved to what Jobe runs; `--eval-rows` defaults to 512; and
+`scripts/store_cutover.py` retires a store once the spool stops reading it.
+The Jobe rebuild to `/data/delta/tokens-350B` runs beside
+`screen-delta-arl-s1`, which stays on the old store until it lands; the
+three finished specimens keep their old-order comparability among
+themselves and are not comparable token by token with anything trained on
+the new stream. The bridge store on Prime is `--target 167e9` of the same
+stream.
+
 ## 2026-09-09 — The core generalizes to any cell count; the larger loop is the larger geometry tied
 
 a9 asked whether the `arfl` scaling sketch should be reworked: it was

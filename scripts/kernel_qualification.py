@@ -82,7 +82,7 @@ def main() -> None:
     parser.add_argument("--write-reference", action="store_true")
     parser.add_argument("--first-row", type=int, default=100000)
     parser.add_argument("--step", type=int, default=9000)
-    parser.add_argument("--data-dir", type=Path, default=Path("/data/delta/tokens"))
+    parser.add_argument("--data-dir", type=Path, default=Path("/data/delta/tokens-350B"))
     parser.add_argument("--passes", type=int, nargs="+", default=[1, 2, 3])
     options = parser.parse_args()
     if options.write_reference and options.reference.exists():

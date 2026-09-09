@@ -9,7 +9,7 @@ co-adapted perturbations: they bound what the trained fused pathway depends
 on, not what an alternative design would achieve.
 
 Usage:
-    python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/tokens
+    python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
 """
 
 from __future__ import annotations

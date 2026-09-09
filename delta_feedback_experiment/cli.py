@@ -21,7 +21,8 @@ USAGE = """\
 delta — delta-feedback experiment operator
 
   delta train TAG [FLAGS]  train one condition directly (delta train --help)
-  delta tokenize [FLAGS]   build the fixed token stream (once)
+  delta tokenize [FLAGS]   build a prefix of the shuffled token stream (once)
+  delta verify DIR         check a token store against its meta and sidecars
   delta probe              run the offline invariant suite
   delta queue TAG [FLAGS]  append a training job to the detached spool
   delta queue FILE         append jobs from a file (TAG FLAGS per line)
@@ -86,24 +87,61 @@ def tokenize_command(argv: list[str]) -> None:
     from .data import (
         CANONICAL_CONFIG,
         CANONICAL_DATASET_REVISION,
+        CANONICAL_SHUFFLE_SEED,
         CANONICAL_TARGET_TOKENS,
         CANONICAL_TOKENIZER_REVISION,
+        CANONICAL_TOKENS_PER_DOC,
         CANONICAL_VAL_TOKENS,
     )
 
-    parser = argparse.ArgumentParser("delta tokenize")
+    parser = argparse.ArgumentParser(
+        "delta tokenize",
+        description=(
+            "Build the shuffled stream's first --target stored tokens: index "
+            "the pinned parquet source, select and tokenize the documents "
+            "whose stream position falls below --target / --tokens-per-doc, "
+            "then write the held-out slice, the train shards, and the document "
+            "sidecars. Resumable; refuses to overwrite a finished store."
+        ),
+    )
     parser.add_argument("--out", default="data/tokens")
     parser.add_argument(
         "--target",
         type=float,
         default=CANONICAL_TARGET_TOKENS,
-        help="total tokenization target, including the held-out prefix",
+        help="stored tokens to write, held-out slice included (57e9 covers the "
+        "screen's 400x schedule; the bridge's needs 167e9)",
     )
     parser.add_argument(
         "--val",
         type=float,
         default=CANONICAL_VAL_TOKENS,
-        help="held-out tokens from the stream head",
+        help="held-out tokens: the shuffled stream's first documents",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=CANONICAL_SHUFFLE_SEED,
+        help="key of the document shuffle; stores sharing it are prefixes of "
+        "one stream",
+    )
+    parser.add_argument(
+        "--tokens-per-doc",
+        type=int,
+        default=CANONICAL_TOKENS_PER_DOC,
+        help="lower bound on the mean document length that sizes the "
+        "selection; the build fails if the selection runs out",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="files tokenized concurrently; each downloads its own",
+    )
+    parser.add_argument(
+        "--scratch",
+        default=None,
+        help="download directory, removed on success (default OUT/scratch)",
     )
     parser.add_argument("--config", default=CANONICAL_CONFIG)
     parser.add_argument("--revision", default=CANONICAL_DATASET_REVISION)
@@ -115,10 +153,28 @@ def tokenize_command(argv: list[str]) -> None:
         args.out,
         target_tokens=int(args.target),
         val_tokens=int(args.val),
+        seed=args.seed,
+        tokens_per_doc=args.tokens_per_doc,
+        workers=args.workers,
+        scratch=args.scratch,
         config=args.config,
         revision=args.revision,
         tokenizer_revision=args.tokenizer_revision,
     )
+
+
+def verify_command(argv: list[str]) -> None:
+    import json
+
+    parser = argparse.ArgumentParser(
+        "delta verify",
+        description="Check a token store against its meta and sidecars.",
+    )
+    parser.add_argument("directory")
+    args = parser.parse_args(argv)
+    from .data import verify
+
+    print(json.dumps(verify(args.directory), indent=2))
 
 
 def probe_command(argv: list[str]) -> None:
@@ -141,6 +197,8 @@ def main() -> None:
         train(rest)
     elif command == "tokenize":
         tokenize_command(rest)
+    elif command == "verify":
+        verify_command(rest)
     elif command == "probe":
         probe_command(rest)
     elif command == "queue":

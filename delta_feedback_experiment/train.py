@@ -311,7 +311,12 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument("--device", default=None)
     runtime.add_argument("--eval-every", type=int, default=250)
     runtime.add_argument("--snapshot-every", type=int, default=500)
-    runtime.add_argument("--eval-rows", type=int, default=32)
+    runtime.add_argument(
+        "--eval-rows",
+        type=int,
+        default=512,
+        help="held-out rows per evaluation, from the slice's head",
+    )
     runtime.add_argument(
         "--head-flush-every",
         type=int,
