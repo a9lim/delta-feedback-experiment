@@ -43,6 +43,8 @@ alongside overrides its field, and `--tokens-per-param` derives the schedule
 length from the flat full stack's active count at that scale, rounded up to
 whole steps, so every condition at a scale shares one schedule. 25 is the
 screen recipe and 400 the Prime recipes; `--steps` types a length instead.
+Warmup is 2% of the 25x length at the scale whatever the ratio, 215, 636,
+and 1,682 steps; cooldown is 20% of the run.
 
 Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x C`. Under
 `l` the first cell is the prelude, the last the coda, and the cells between
@@ -123,7 +125,8 @@ pass-tokens per predicted token with `f`.
 
 A finished run extends to a longer ratio with `--continue`, which restores
 the last snapshot the longer schedule reproduces and pays only for the new
-heat and cooldown: at the screen, 25x to 50x restores step 8,059 of
+heat and cooldown; warmup is fixed per scale, so the continuation of a run
+at or above 25x is the longer run exactly: at the screen, 25x to 50x restores step 8,059 of
 10,745 and trains 13,430 of the 50x recipe's 21,489 steps, and 50x to
 100x restores step 16,117 and trains 26,861 of 42,978.
 
@@ -244,8 +247,8 @@ Prime 8 ranks x microbatch 1 x accumulation 10. `--scale bridge` with
 | Optimizer steps | 31,787 | 508,587 |
 | Aligned budget | 10,415,964,160 predicted tokens | 166,653,788,160 predicted tokens |
 | Predicted tokens per active parameter | 25.0003 | 400.0003 |
-| Warmup | steps 1–636 | steps 1–10,172 |
-| Stable heat | steps 637–25,430 | steps 10,173–406,870 |
+| Warmup | steps 1–636 | steps 1–636 |
+| Stable heat | steps 637–25,430 | steps 637–406,870 |
 | Cooldown | steps 25,431–31,787 | steps 406,871–508,587 |
 | Feedback boundary | after step 23,840 | after step 381,440 |
 | Expected pass-tokens | about 13.33B | about 213.3B |
@@ -281,8 +284,8 @@ from Jobe.
 
 | Phase | Steps | Passes, `arf` |
 |---|---:|---|
-| Warmup | 1–3,438 | one |
-| Stable heat | 3,439–137,528 | one through 128,932, then two or three |
+| Warmup | 1–215 | one |
+| Stable heat | 216–137,528 | one through 128,932, then two or three |
 | Cooldown | 137,529–171,910 | two or three |
 
 The pair is 112.66B predicted tokens and about 128.44B expected pass-tokens.
@@ -365,8 +368,8 @@ semantics.
 | Unrounded target | 440,818,598,400 predicted tokens |
 | Optimizer steps | 1,345,272 |
 | Aligned budget | 440,818,728,960 predicted tokens |
-| Warmup | steps 1–26,905 |
-| Stable heat | steps 26,906–1,076,218 |
+| Warmup | steps 1–1,682 |
+| Stable heat | steps 1,683–1,076,218 |
 | Cooldown | steps 1,076,219–1,345,272 |
 | Feedback boundary | after step 1,008,954 |
 | Whole-run pass mixture | expected 75% / 22% / 3% |

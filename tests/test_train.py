@@ -521,9 +521,24 @@ def test_fresh_screen_budgets_match_active_parameter_ratios():
 
     prime = parse_run_args(["x", "--tokens-per-param", "400"])
     schedule = build_schedule(prime)
-    assert schedule.spans == (3438, 0, 134_090, 34_382)
+    assert schedule.spans == (215, 0, 137_313, 34_382)
     assert feedback_boundary(prime, schedule.total) == 128_932
     assert schedule.heat_end == 137_528
+
+
+def test_warmup_is_fixed_per_scale():
+    """The warmup fraction applies to the shorter of the run and the 25x
+    recipe at its geometry: a longer run keeps the 25x warmup, a shorter run
+    keeps the fraction."""
+    def warmup(argv):
+        return build_schedule(parse_run_args(["x", *argv])).warmup_steps
+    assert warmup([]) == 215
+    assert warmup(["--tokens-per-param", "400"]) == 215
+    assert warmup(["--tokens-per-param", "50", "--condition", "arfl"]) == 215
+    assert warmup(["--steps", "100"]) == 2
+    assert warmup(["--scale", "bridge"]) == 636
+    assert warmup(["--scale", "bridge", "--tokens-per-param", "400"]) == 636
+    assert warmup(["--scale", "flagship", "--tokens-per-param", "400"]) == 1_682
 
 
 def test_scale_presets_and_ratio_derive_the_schedule():
@@ -786,6 +801,7 @@ def test_continuation_reproduces_the_longer_run(tmp_path, capsys):
     out = capsys.readouterr().out.splitlines()
     record = next(line for line in out if line.startswith("continue"))
     assert "source=src" in record and "step=04/16" in record and "src.pt.4" in record
+    assert "exact=True" in record
     assert any(line.startswith("run") for line in out)
     assert not any(line.startswith("resume") for line in out)
     steps = [int(line.split("step=")[1].split("/")[0]) for line in out if line.startswith("step ")]

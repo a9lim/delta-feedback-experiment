@@ -139,9 +139,14 @@ cell-tokens beside pass-tokens.
 ### Schedule
 
 Both parameter groups share one warmup-stable-cooldown multiplier. Warmup
-occupies `round(warmup_frac * steps)` updates and rises linearly; cooldown
-occupies `round(cooldown_frac * steps)` updates with multiplier `1 - sqrt(u)`
-for local progress `u`, reaching zero at the last step. Defaults are 0.02 and
+rises linearly over `round(warmup_frac * min(steps, steps at 25x))` updates:
+the fraction applies to the shorter of the run and the 25x recipe at its
+geometry, so warmup is fixed per scale, 215 steps at the screen, 636 at the
+bridge, 1,682 at the flagship, and a longer run does not spend more of it.
+Warmup guards the optimizer's first steps at the batch and learning rate,
+which do not depend on the horizon; cooldown does, and occupies
+`round(cooldown_frac * steps)` updates with multiplier `1 - sqrt(u)` for
+local progress `u`, reaching zero at the last step. Defaults are 0.02 and
 0.20. The default 10,745-step Jobe schedule:
 
 | Phase | Steps | Passes with `f` |
@@ -178,7 +183,7 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--three-pass` | 0.12 | probability of three passes after the boundary; 1 makes every feedback step three-pass |
 | `--loop-iterations`, `--loop-max-iterations` | 4, 8 | `l`: mean and cap of the per-step core iteration draw; the mean is also the fixed evaluation and decode count |
 | `--jitter` | 0.02 | payload jitter half-width |
-| `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape |
+| `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
 | `--resume` | | continues a tag from its latest v25 snapshot |
 
@@ -203,8 +208,10 @@ a longer schedule under a new tag, `--tokens-per-param 50` from a 25x run,
 by restoring TAG's last snapshot at or before the last step both schedules
 reproduce and training on under the longer schedule with every other setting
 inherited. That step is the feedback boundary when the boundary moves and the
-cooldown boundary otherwise, so from it on the continuation is the longer run
-exactly, apart from the warmup it inherited; at the screen a 25x `arf` run
+cooldown boundary otherwise. Warmup is fixed per scale, so from that step on
+a continuation of any run at or above 25x is the longer run exactly, and a
+shorter source differs only in the warmup it inherited, which the `continue`
+record reports as `exact`; at the screen a 25x `arf` run
 continued to 50x restores step 8,059 and trains 13,430 new steps
 of a 21,489-step schedule. The queue stores arguments, not Git state; a
 source change never stops an active child, and the worker refreshes before

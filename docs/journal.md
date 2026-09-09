@@ -97,6 +97,17 @@ continued to sixteen matching the fresh sixteen-step run's loss and
 validation bit for bit. At the screen, 25x to 50x trains 13,430 new
 steps instead of 21,489.
 
+a9 then asked whether warmup should scale with the run or be fixed per
+scale, proposing 2% of the 25x length. Adopted as the fraction applied to
+the shorter of the run and the 25x recipe at its geometry: warmup guards the
+optimizer's first steps at the batch and learning rate, which do not depend
+on the horizon, while cooldown and the feedback boundary stay fractions of
+the run. No existing schedule changes, since every specimen is at or below
+25x; the 400x recipes lose most of their warmup, 3,438 to 215 at the screen
+and 26,905 to 1,682 at the flagship; and a continuation of any run at or
+above 25x is now the longer run exactly, which the `continue` record reports
+as `exact`.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the

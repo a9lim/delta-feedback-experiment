@@ -1133,11 +1133,12 @@ def reference_active(args) -> int:
     return total - model.embed_tokens.weight.numel()
 
 
-def schedule_steps(args) -> int:
+def schedule_steps(args, tokens_per_param: float | None = None) -> int:
     """Steps that reach ``tokens_per_param`` predicted tokens per reference
     active parameter, rounded up to whole steps so the target is never
-    undershot."""
-    target = Fraction(str(args.tokens_per_param)) * reference_active(args)
+    undershot; the ratio defaults to the run's own."""
+    ratio = args.tokens_per_param if tokens_per_param is None else tokens_per_param
+    target = Fraction(str(ratio)) * reference_active(args)
     return math.ceil(target / (args.batch_rows * args.seq_len))
 
 
@@ -1200,7 +1201,12 @@ def build_schedule(args) -> Schedule:
     """WSD as the shared four-phase Schedule (no preheat), with ratio
     nudges so integer spans land exactly."""
     total = args.steps
-    warmup = round(args.warmup_frac * total)
+    # Warmup is fixed per scale: the fraction applies to the shorter of the
+    # run and the 25x recipe at its geometry, so a longer run keeps the 25x
+    # run's warmup and is that run's continuation exactly, while a shorter
+    # one keeps the fraction. Cooldown and the feedback boundary stay
+    # fractions of the run.
+    warmup = round(args.warmup_frac * min(total, schedule_steps(args, DEFAULT_TOKENS_PER_PARAM)))
     cooldown = round(args.cooldown_frac * total)
     heat = total - warmup - cooldown
     if heat < 1:
@@ -1368,6 +1374,7 @@ def train(argv: list[str] | None = None) -> dict:
                 "continue",
                 source=args.continue_from,
                 step=telemetry.step_address(start_step, total),
+                exact=source_schedule.warmup_steps == schedule.warmup_steps,
                 path=str(path),
             )
 
