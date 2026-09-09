@@ -54,7 +54,7 @@ initializations and compared:
 | `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA]` cells |
 | `r` | MHDB residual reads of the seed and block deltas before every sublayer; with `f`, a routed payload |
 | `f` | Full-bandwidth feedback: the FBT entry and a payload for the next column |
-| `l` | Huginn loop: the middle cell becomes a tied core iterated a drawn number of times per column ([depth-architecture.md](docs/depth-architecture.md)) |
+| `l` | Huginn loop: the cells between the first and last become one tied core iterated a drawn number of times per column ([depth-architecture.md](docs/depth-architecture.md)) |
 
 `--condition arfl` is the full built stack and `arf` the flat column; `ar`
 and `af` each drop one package; `a` is the bare hybrid trunk; the empty

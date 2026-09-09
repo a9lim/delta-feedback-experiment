@@ -20,8 +20,8 @@ routing; `block_routing` is the flag and `r` the letter.
 
 The small organism is what we train. The larger column is the same
 architecture at six cells and width 1,536, with its budget worked out in
-[scaling.md](scaling.md); distributed training at that geometry is not
-implemented.
+[scaling.md](scaling.md), and the larger loop is that column with its middle
+four cells tied; distributed training at that geometry is not implemented.
 
 | Field | Small organism | Larger geometry |
 |---|---:|---:|

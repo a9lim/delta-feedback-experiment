@@ -11,6 +11,7 @@ mean mass on each source by iteration at the cap, and writes
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -123,8 +124,11 @@ def main() -> None:
     axes[0].set_ylabel("held-out loss after r iterations")
     axes[1].set_ylabel("mean ||core update|| at iteration r")
     if routes:
-        labels = ("null", "seed", "block0", "partial1")
-        for label, color in zip(labels, (fs.BLUE, fs.ORANGE, fs.AQUA, "0.3"), strict=True):
+        labels: list[str] = []
+        for by_iteration in routes.values():
+            for masses in by_iteration.values():
+                labels += [label for label in masses if label not in labels]
+        for label, color in zip(labels, itertools.cycle(fs.SERIES)):
             series = []
             for iteration in range(cap):
                 masses = [

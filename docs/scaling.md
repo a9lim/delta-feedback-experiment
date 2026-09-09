@@ -82,51 +82,46 @@ behavior, memory, and throughput at that geometry.
 
 ## Larger loop
 
-One `arfl` run at the larger width with the screen's depth: three cells,
-one each for prelude, core, and coda, and a deeper draw.
+One `arfl` run at the larger geometry: the six cells of the larger `arf`
+above with the middle four tied as the core, so the loop and the flat specimen
+have the same 1,335,420,192 parameters, the same 1,102,046,496 active
+non-embedding, and the same 400x schedule, and at `r = 1` the loop is the flat
+specimen. The draw is the screen's.
 
 | Field | Value |
 |---|---:|
 | Residual width / SwiGLU intermediate | 1,536 / 6,656 |
 | PKDA heads x width, projection width | 20 x 128, 2,560 |
 | Global query / KV heads, head width | 16 / 8, 96 |
-| Unique layers / cells | 12 / 3 |
+| Unique layers / cells | 24 / 6: prelude, four core cells, coda |
 | Context | 8,192 |
-| `r_mean` / `r_max` | 16 / 32 |
-| Compute depth per pass | `4 + 4r + 4` layers, mean 70.2, cap 136 |
+| `r_mean` / `r_max` | 4 / 8 |
+| Compute depth per pass | `4 + 16r + 4` layers, mean 70.1, cap 136 |
 
-| Component | Parameters |
-|---|---:|
-| Tied embedding and readout | 233,373,696 |
-| 12 SwiGLU channel mixers | 368,050,176 |
-| 9 PKDA mixers | 152,148,816 |
-| 3 gated global GQA mixers, including Q/K norms | 28,312,128 |
-| FBT fusion, `f` | 4,718,592 |
-| Trunk, entry, and payload norms | 43,008 |
-| 24 within-column routers and one payload router | 115,200 |
-| **Total** | **786,761,616** |
-| **Active non-embedding** | **553,387,920** |
-
-Under the cap the draw gives `E[r] = 15.56`, median 14, `P(r = 1) = 0.1%`,
-`P(r = 32) = 5.8%`, and 17.56 expected cells per pass. Metrics use fixed
-`r = 16`; the sweep runs to 32.
+The parameter table is the larger geometry's; the loop's forty-eight
+within-column routers are the flat column's. Under the cap the draw gives
+`E[r] = 3.88`, median 4, `P(r = 1) = 10.3%`, `P(r = 8) = 8.0%`, and `2 + 4r`
+cells per pass, 17.5 expected. Metrics use fixed `r = 4`; the sweep runs to 8.
 
 | Quantity | Value |
 |---|---:|
 | Global batch | 327,680 predictions |
-| Optimizer steps | 675,523 |
-| Aligned budget | 221,355,376,640 predicted tokens (400.000377 per active parameter) |
-| Warmup / stable heat / cooldown | steps 1–13,510 / 13,511–540,418 / 540,419–675,523 |
-| Feedback boundary | after step 506,642 |
-| Expected pass-tokens | about 283.3B |
-| Expected cell-tokens | about 4.97T |
+| Optimizer steps | 1,345,272 |
+| Aligned budget | 440,818,728,960 predicted tokens |
+| Warmup / stable heat / cooldown | as the larger geometry |
+| Feedback boundary | after step 1,008,954 |
+| Expected pass-tokens | about 564.25B |
+| Expected cell-tokens | about 9.88T |
 
-The larger geometry spends about 3.39T cell-tokens, so this run uses about
-1.5x as many cell-tokens with half the active parameters; that is accounting,
-not measured device time. Per sequence at 8,192 context one cell's mixer
-cache is 27.9 MiB; every decode mode holds `2 + r` cells at the request's
-`r`, 502 MiB at `r = 16` and 949 MiB at the cap. The three-cell fused decode
-cache belongs to `L`.
+The larger geometry spends about 3.39T cell-tokens, so the loop spends about
+2.9x the cell-tokens and, with the head executed once per pass, about 2.6x the
+arithmetic; that is accounting, not measured device time. The two runs pair as
+the screen's do: byte-identical initialization, the same stream, row order,
+schedule, and pass-count, prefix, and jitter draws, with the `r` draw the
+loop's only extra randomness. Per sequence at 8,192 context one cell's mixer
+cache is 27.9 MiB; every decode mode holds `2 + 4r` cells at the request's
+`r`, 502 MiB at `r = 4` and 949 MiB at the cap. The shared fused decode cache
+belongs to `L`.
 
 ## When one of these would be worth it
 

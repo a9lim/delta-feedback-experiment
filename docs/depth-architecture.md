@@ -50,15 +50,18 @@ the same source banks, so `arfl` at one iteration coincides with `arf` in
 values, routes, losses, and gradients.
 
 The rule generalizes: a model of `4n` layers holds its first and last cells
-and loops the `4(n - 2)` layers between them as one core cell. `l` requires
-whole cells and at least three of them. Only the three-cell geometry is
-specified and trained; with more cells the core would be one cell of more
-than four layers, and the unlooped condition would have more block sources
-than the loop, so the one-iteration coincidence is a three-cell fact.
+and loops the `c = n - 2` cells between them, in order, as one tied core. `l`
+requires whole cells and at least three of them. Each core cell keeps its own
+block delta, accumulated across iterations, so the looped column has exactly
+the unlooped column's cells and block sources and the one-iteration
+coincidence holds at every cell count. The three-cell geometry is the one
+trained; the larger loop in [scaling.md](scaling.md#larger-loop) ties four
+cells.
 
-A `k`-pass batch at iteration count `r` costs `k (2 + r)` cell evaluations per
-predicted token. Results report **cell-tokens** beside pass-tokens: `arf`
-spends three cell-tokens per pass-token, `arfl` spends `2 + r`.
+A `k`-pass batch at iteration count `r` costs `k (2 + c r)` cell evaluations
+per predicted token. Results report **cell-tokens** beside pass-tokens: `arf`
+spends three cell-tokens per pass-token, `arfl` spends `2 + c r`, which is
+`2 + r` at the screen.
 
 ## Column
 
@@ -106,13 +109,24 @@ logits = tied_readout(final_norm(h))
 Each `mhdb` call prepends its site's learned null. Every cell measures its
 partial from its own entry; the core's entry is pinned to the prelude output
 for all `r` iterations, so the core is one cell of `4r` layers whose partial
-accumulates across iterations. There is no adapter and no random initial state:
+accumulates across iterations.
+
+With `c` core cells the core runs cells `R_1 … R_c` in order on every
+iteration, and each keeps its own delta `Delta_R_j`, accumulated across
+iterations: cell `j` measures from an origin pinned at its first entry and
+advanced by whatever the other core cells add between its visits. Its bank at
+every site is the seed, `Delta_P`, every other core cell's delta so far, and
+its own as the live partial; the coda and the payload read
+`Delta_R_1 … Delta_R_c` in place of `Delta_R`, whose sum they are. With one
+core cell nothing runs between visits, the origin is the prelude output, and
+this rule is the one above. There is no adapter and no random initial state:
 the seed and prelude delta are re-readable at every iteration through the
 routers. At a fused position the token enters only through the FBT gate, as in
 `arf`; a plain position seeds from the embedding itself.
 
-In code, `forward_column` runs the prelude, the core `iterations` times, and
-the coda as three routing cells; `ColumnOutput` carries `iterations`,
+In code, `forward_column` runs the prelude, the core cells `iterations`
+times, and the coda as `2 + c` routing cells, numbered as the unlooped column
+numbers them; `ColumnOutput` carries `iterations`,
 `core_entry`, and `core_state`, and a core site's route weights are keyed by
 iteration (`L4i2.attn`).
 
@@ -127,9 +141,10 @@ holds in every cell:
 h_top = seed + Delta_P + Delta_R + Delta_C
 ```
 
-The shell is chosen because it has no mechanism that forces a nonzero update: a
-branch-output norm would pin every iteration's update size and make a fixed
-point unreachable by construction. Whether the tied core actually contracts is
+with `Delta_R` the sum of the core cells' deltas. The shell is chosen because
+it has no mechanism that forces a nonzero update: a branch-output norm would
+pin every iteration's update size and make a fixed point unreachable by
+construction. Whether the tied core actually contracts is
 not assumed. Hyperball radii bound the NorMuonH matrices, but norm scales,
 router values, and the NAdam-owned gates and controls are not radius-bounded,
 so whether it contracts is measured: the depth trace below is the guard, and a
@@ -171,9 +186,9 @@ decode trajectory; `r` never changes within a request. Metrics use
 
 Routers follow `architecture.md` exactly: zero-initialized width-`D` query,
 full-width RMS key statistics, raw values, one softmax per routing group, a
-site-local null prepended to every bank. The core's eight sites are shared
-across iterations because they are core weights. The core is one cell, so its
-bank is a cell's bank:
+site-local null prepended to every bank. A core cell's eight sites are shared
+across iterations because they are core weights. At the screen the core is one
+cell, so its bank is a cell's bank:
 
 | Site | Sources after the null |
 |---|---|
@@ -197,11 +212,22 @@ residual is the state; the routers are the learned input injection of the seed
 and the prelude. Per-iteration deltas are never sources: an iteration boundary
 is a boundary in weights, not in state.
 
-The core partial is exactly absent at one site, the attention entry of
-iteration 1, where the core has not yet moved. A router scores whatever
+A core cell's partial is exactly absent at one site, its attention entry on
+iteration 1, where the cell has not yet moved. A router scores whatever
 sources it is handed, so that site reads a three-source bank exactly as the
 unlooped cell entry does, and from iteration 2 on the same router reads the
 partial as a fourth source. No placeholder and no presence mask are involved.
+
+With `c` core cells the bank keeps the unlooped column's names. Core cell `j`
+at iteration `i` reads the seed, `Delta_P`, the deltas so far of the cells
+before it from this iteration and of the cells after it from the previous
+one, and its own accumulated delta as the partial; the coda and the payload
+read `Delta_R_1 … Delta_R_c`. On the first iteration the cells after `j` have
+written nothing and are absent, so the first iteration's banks are the
+unlooped column's banks exactly, and on the last iteration a cell that has
+finished enters the bank as its completed block delta. A core cell's delta is
+never reset and never split by iteration: it is the tensor the coda reads,
+caught midway.
 
 ## Input injection and column start
 
@@ -325,9 +351,8 @@ after every iteration; the fused sweep runs both passes at each count. The
 trainer logs a `depth` record at every evaluation point with the loss at one
 iteration, at `r_mean`, and at `r_max`, and the last update norm.
 `scripts/depth_trace.py` runs the sweep on a snapshot over more rows, in both
-label assignments, together with the core routers' mass on the null, seed,
-`Delta_P`, and the core partial by iteration, which is the learned
-input-injection profile.
+label assignments, together with the core routers' mass on every source by
+iteration, which is the learned input-injection profile.
 
 The payload self-composition trace of `design.md` runs at `r = r_mean` and
 tests the horizontal channel exactly as it does for `arf`. The recurrent-depth
@@ -340,8 +365,8 @@ active non-embedding.
 
 Per sequence at 1,024 context, one cell's mixer cache is 3.456 MiB (three FP32
 PKDA matrix and diagonal states plus BF16 convolution histories, 1.956 MiB; one
-BF16 KV cache, 1.500 MiB). Every decode mode holds `2 + r` cells at the
-request's `r`:
+BF16 KV cache, 1.500 MiB). Every decode mode holds `2 + c r` cells at the
+request's `r`, `2 + r` at the screen:
 
 | Fixed `r` | Cells cached | Cache |
 |---|---:|---:|
@@ -382,7 +407,8 @@ per step, which projects the flat three-pass step to 41.7 h against the
 
 ## Larger geometry
 
-The wider loop budget and geometry are in [scaling.md](scaling.md#larger-loop).
+The larger loop, the larger geometry with its middle four cells tied, is in
+[scaling.md](scaling.md#larger-loop).
 
 ## The `L` letter: a shared core cache
 
@@ -532,7 +558,7 @@ Building `L` touches the following together:
 |---|---|---|
 | Recurrent-depth language models | tied core between prelude and coda, log-normal Poisson iteration draw, same-depth per-iteration caches, effective-depth accounting | adapter by router reads of the prelude output at every core site; random initial state by the prelude output; sandwich norms by the unchanged pre-norm shell; zero-shot warm start by the trained payload; truncated backpropagation by full backpropagation; zero-shot cache sharing kept for `L` as a trained channel with a budget of one |
 | Full-Bandwidth Transformer | asymmetric fusion, payload, Jacobi passes, prefix mixin, jitter, pass mixture, loss | — |
-| This project | one-cell core partial, iteration-tagged route sites and cache tracks, cell-token accounting, the depth trace; for `L`, plain/fused position labels governing both channels and the fused-position PKDA read with own-term substitution | — |
+| This project | per-cell core deltas accumulated across iterations, iteration-tagged route sites and cache tracks, cell-token accounting, the depth trace; for `L`, plain/fused position labels governing both channels and the fused-position PKDA read with own-term substitution | — |
 
 ## Not in this specification
 
@@ -542,7 +568,7 @@ from the previous column, trained or zero-shot; a raw embedding path into the
 core; a payload landing at the core entry, which is a different design rather
 than a loop variant; a shared-cache budget above one; per-iteration halting
 readouts and pause tokens, which belong to a separate specification; adaptive
-exit as anything but a diagnostic; a decode `r` that varies within a request;
-and any loop mapping onto the six-cell larger reference. `l` on the plain
+exit as anything but a diagnostic; and a decode `r` that varies within a
+request. `l` on the plain
 trunk or without `r` builds and pairs like every other subset, and is
 unstudied: without `r` the core has no input injection at all.

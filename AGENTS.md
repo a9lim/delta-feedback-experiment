@@ -73,13 +73,14 @@ change it everywhere at once.
   `payload_norm(h_top + route(null, seed, block deltas))`.
 - Feedback passes are causal and differentiable across passes; the payload is
   never detached.
-- Under `l` the first cell is the prelude, the last the coda, and the cell
+- Under `l` the first cell is the prelude, the last the coda, and the cells
   between them one tied core run `r` times per column, `r` drawn once per
-  step from a log-normal Poisson with mean 4 and cap 8. The core's partial is
-  measured from the prelude output across iterations, mixing is same-depth
-  (iteration `i` reads iteration-`i` writes, one decode cache track per
-  iteration), and the payload is the only channel between columns. At `r = 1`
-  a looped condition is its unlooped condition exactly.
+  step from a log-normal Poisson with mean 4 and cap 8. Each core cell keeps
+  its own block delta across iterations, the screen's one core cell measuring
+  from the prelude output; mixing is same-depth (iteration `i` reads
+  iteration-`i` writes, one decode cache track per iteration), and the
+  payload is the only channel between columns. At `r = 1` a looped condition
+  is its unlooped condition exactly, at any cell count.
 - NorMuonH owns ordinary hidden matrices, initialized `Normal(0, 1/sqrt(d_in))`
   with fixed realized Frobenius radii; NAdam owns gates, embeddings, norms,
   routing parameters, PKDA controls, convolutions, and vectors in one group.

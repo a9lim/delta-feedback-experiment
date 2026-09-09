@@ -145,7 +145,8 @@ class ModelConfig:
 
     loop: bool = False
     """``l``: the cells between the first and last become one tied core that
-    runs ``iterations`` times per column (``docs/depth-architecture.md``)."""
+    runs ``iterations`` times per column, each core cell keeping its own block
+    delta across iterations (``docs/depth-architecture.md``)."""
 
     loop_iterations: int = 4
     """``l``: mean of the per-step iteration draw, and the fixed count that
@@ -192,9 +193,8 @@ class ModelConfig:
 
     @property
     def routing_blocks(self) -> int:
-        """Number of completed block deltas emitted by a full column."""
-        if self.loop:
-            return 3
+        """Number of completed block deltas emitted by a full column: one per
+        cell, looped or not."""
         return (self.layers + self.routing_block_size - 1) // self.routing_block_size
 
     @property
@@ -1458,41 +1458,82 @@ class DeltaModel(nn.Module):
         size = cfg.routing_block_size
         core_entry = core_state = None
         if cfg.loop:
-            # Prelude, tied core, coda: three cells, the core one cell of
-            # ``iterations x core layers`` whose partial accumulates from the
-            # prelude output across iterations. An iteration boundary is a
-            # boundary in weights, not in state.
+            # Prelude, tied core, coda. The core is every cell between them,
+            # run in order ``iterations`` times. Each core cell keeps its own
+            # block delta, accumulated across iterations, and every core site
+            # reads every core cell's delta so far, its own as the live
+            # partial. An iteration boundary is a boundary in weights, not in
+            # state, and at one iteration the column is the unlooped column.
             prelude = self.blocks[:size]
-            core = self.blocks[size : cfg.layers - size]
             coda = self.blocks[cfg.layers - size :]
+            core = [
+                self.blocks[start : start + size]
+                for start in range(size, cfg.layers - size, size)
+            ]
             h, delta = self._run_cell(
                 prelude, h, 0, sources, source_names, accumulators, **runtime
             )
             h = complete(h, delta, 0)
             core_entry = h
+            origins: list[Tensor | None] = [None] * len(core)
+            deltas: list[Tensor | None] = [None] * len(core)
+            exits: list[Tensor | None] = [None] * len(core)
+            last = iterations - 1
             for iteration in range(iterations):
                 if cache is not None:
                     cache.iteration = iteration
-                h, delta = self._run_cell(
-                    core,
-                    h,
-                    1,
-                    sources,
-                    source_names,
-                    accumulators,
-                    entry=None if iteration == 0 else core_entry,
-                    partial=None if iteration == 0 else delta,
-                    label=f"i{iteration}",
-                    **runtime,
-                )
+                for index, blocks in enumerate(core):
+                    cell = 1 + index
+                    if iteration == 0:
+                        origin, entry, partial = h, None, None
+                    else:
+                        # The cell's delta is measured from an origin pinned at
+                        # its first entry and advanced by whatever the other
+                        # core cells added between its visits. With one core
+                        # cell nothing runs between visits and the origin stays
+                        # the prelude output.
+                        origin = origins[index]
+                        if h is not exits[index]:
+                            origin = origin + (h - exits[index])
+                        entry, partial = origin, deltas[index]
+                    passed, passed_names = sources, source_names
+                    if sources is not None:
+                        # The other core cells' deltas so far: the cells before
+                        # this one from this iteration, the cells after it from
+                        # the previous one. A cell completed on the last
+                        # iteration is already in the bank.
+                        extra = [
+                            (f"block{1 + other}", deltas[other])
+                            for other in range(len(core))
+                            if other != index
+                            and deltas[other] is not None
+                            and not (iteration == last and other < index)
+                        ]
+                        passed = [*sources, *(tensor for _, tensor in extra)]
+                        passed_names = [*source_names, *(name for name, _ in extra)]
+                    h, delta = self._run_cell(
+                        blocks,
+                        h,
+                        cell,
+                        passed,
+                        passed_names,
+                        accumulators,
+                        entry=entry,
+                        partial=partial,
+                        label=f"i{iteration}",
+                        **runtime,
+                    )
+                    origins[index], deltas[index], exits[index] = origin, delta, h
+                    if iteration == last:
+                        if index == len(core) - 1:
+                            core_state = h
+                        h = complete(h, delta, cell)
             if cache is not None:
                 cache.iteration = 0
-            core_state = h
-            h = complete(h, delta, 1)
             h, delta = self._run_cell(
-                coda, h, 2, sources, source_names, accumulators, **runtime
+                coda, h, 1 + len(core), sources, source_names, accumulators, **runtime
             )
-            h = complete(h, delta, 2)
+            h = complete(h, delta, 1 + len(core))
         else:
             for cell in range(cfg.routing_blocks):
                 blocks = self.blocks[cell * size : (cell + 1) * size]

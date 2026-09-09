@@ -41,7 +41,7 @@ has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
 emits no payload; `f` without `r` emits `payload_norm(h_top)`; `r` with `f`
 uses the fused seed as a routing source and enriches the payload with routed
 sources. `l` adds no parameters: it holds the first and last cells and runs
-the cell between them as one tied core, so every looped condition has its
+the cells between them as one tied core, so every looped condition has its
 unlooped condition's counts. The specimens so far are `ar` and `arf` runs.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every

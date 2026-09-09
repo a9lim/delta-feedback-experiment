@@ -4,6 +4,54 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-09 — The core generalizes to any cell count; the larger loop is the larger geometry tied
+
+a9 asked whether the `arfl` scaling sketch should be reworked: it was
+striking that the larger loop had only 553M active parameters against the
+larger `arf`'s 1.1B, and the question was whether to widen or deepen toward
+parity, with 4/8/4 at a draw of 8/16 or 4/8 as the candidate. What the
+arithmetic and the running specimen said:
+
+- The 553M was an accounting artifact. The sketch executed about 3.4B
+  parameters and 70 layers per pass; it was cheap because the 400x rule prices
+  unique parameters, so the token budget halved. 4/4/4 at `r_mean` 16, 4/8/4
+  at 8, and 4/16/4 at 4 all execute the same 70 layers and 3.4B parameters
+  per pass; they differ only in how much of that computation is unique weight,
+  and every ~1B looped specimen costs about 2.3–2.6x the flat 1B's arithmetic
+  whatever the shape (scripts in the session scratchpad, exact counts from
+  `DeltaModel` on the meta device).
+- The 16/32 draw was the one part without evidence. `screen-delta-arl-s1` at
+  step 3500 puts the loss on the depth-trace rows at 3.806 / 3.748 / 3.755 for
+  `r` = 1 / 4 / 8: about 0.05 nats from one iteration to the trained mean and
+  nothing past it, with the core's update at `r = 8` still at norm 1.5, down
+  from 14 at step 250. Against its paired `ar` at matched data it leads 3.463
+  to 3.477. At 16/32 the `r = 1` case is drawn on 0.07% of steps, so the
+  coincidence with `arf` would never be exercised.
+
+a9 chose the larger geometry with its middle four cells tied at the screen's
+4/8 draw: exact parameter parity, the same schedule, and the screen's own
+pairing carried up, at about 2.6x the flat run's arithmetic. That needed a
+core of more than one cell, which the spec had ruled a three-cell fact, and
+a9 supplied the rule: fill the core cells' deltas progressively on the first
+iteration, then loop back and keep adding to each cell's own delta. Each core
+cell keeps its own block delta across iterations; a core site reads the seed,
+the prelude delta, every other core cell's delta so far, and its own as the
+live partial; the coda and payload read one delta per core cell. On the first
+iteration the cells ahead are absent, so the banks are the flat column's, and
+at one iteration the column is the flat column at any cell count. With one
+core cell it is exactly the previous rule.
+
+Landed together: `forward_column` runs the core cells in order with each
+cell's delta measured from an origin pinned at its first entry and advanced
+by what the other cells add between visits, `routing_blocks` is one per cell
+for every condition, and the depth-trace script labels whatever sources the
+core routers read. The three-cell screen is bitwise unchanged across 3,102
+observables at `r` = 1, 2, 3 for `arl`, `arfl`, and `afl` (values, payloads,
+core state, route weights and names, losses, every gradient) against the
+previous commit, the `r = 1` coincidence is tested at four and five cells,
+and a two-core-cell test pins the banks by name. `scaling.md`'s larger loop is
+now the tied larger geometry, and the loop pages describe the general rule.
+
 ## 2026-09-09 — Round seven: the loop's cost, measured, and what moves it
 
 a9 paused `screen-delta-arl-s1` at step 1846 for a seventh speed round, the

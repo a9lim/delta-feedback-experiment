@@ -95,6 +95,9 @@ def test_condition_grammar():
     assert looped.core_layers == range(4, 8)
     assert looped.routing_blocks == 3
     assert looped.executed_layers(1) == 12 and looped.executed_layers(3) == 20
+    deeper = condition_config("arfl", **(TINY_LOOP | {"layers": 20}))
+    assert deeper.core_layers == range(4, 16) and deeper.routing_blocks == 5
+    assert deeper.executed_layers(1) == 20 and deeper.executed_layers(3) == 44
     assert not condition_config("arf", **TINY).is_core_layer(1)
 
 
@@ -844,12 +847,14 @@ def test_hybrid_cache_owns_only_global_kv_and_fixed_pkda_states():
 
 
 def test_loop_at_one_iteration_is_the_unlooped_condition():
-    """At r = 1 the column executes the same twelve layers with the same
-    parameters and the same banks: values, routes, losses, and gradients
-    coincide with the condition without l."""
-    for condition in ("al", "afl", "arl", "arfl"):
-        looped = tiny(condition).train()
-        flat = tiny(condition.replace("l", ""), layers=12).train()
+    """At r = 1 the column executes the same layers with the same parameters
+    and the same banks: values, routes, losses, and gradients coincide with
+    the condition without l, at three cells and with a multi-cell core."""
+    cases = [(condition, 12) for condition in ("al", "afl", "arl", "arfl")]
+    cases += [("arl", 16), ("arfl", 20)]
+    for condition, layers in cases:
+        looped = tiny(condition, layers=layers).train()
+        flat = tiny(condition.replace("l", ""), layers=layers).train()
         toks = tokens()
         n_passes = 2 if looped.cfg.feedback_active else 1
         prefix = torch.ones((1, toks.shape[0]), dtype=torch.long) * 3
@@ -916,6 +921,45 @@ def test_loop_banks_sites_and_telescoping():
     assert torch.allclose(out.h_top, rebuilt, atol=1e-5)
     assert torch.allclose(out.core_state - out.core_entry, out.sources[2], atol=1e-5)
     assert torch.allclose(out.core_entry, out.sources[0] + out.sources[1], atol=1e-5)
+
+
+def test_loop_core_cells_keep_their_own_deltas():
+    """With more than one core cell each cell's block delta accumulates across
+    iterations under its own name. A core site reads the cells before it from
+    this iteration and the cells after it from the previous one, its own as
+    the live partial; on the last iteration a finished cell is in the bank.
+    The residual telescopes over the seed and one delta per cell."""
+    model = tiny("arfl", layers=16)
+    with torch.no_grad():
+        for name, parameter in model.named_parameters():
+            if "query" in name:
+                parameter.normal_(std=1.0)
+    out = forward(model, tokens(), want_weights=True, iterations=3)
+    assert out.source_names == ("seed", "block0", "block1", "block2", "block3")
+    names = out.route_source_names
+    assert names["L4i0.attn"] == ("null", "seed", "block0")
+    assert names["L4i0.mlp"] == ("null", "seed", "block0", "partial1")
+    assert names["L8i0.attn"] == ("null", "seed", "block0", "block1")
+    assert names["L8i0.mlp"] == ("null", "seed", "block0", "block1", "partial2")
+    assert names["L4i1.attn"] == ("null", "seed", "block0", "block2", "partial1")
+    assert names["L8i1.attn"] == ("null", "seed", "block0", "block1", "partial2")
+    assert names["L4i2.attn"] == ("null", "seed", "block0", "block2", "partial1")
+    assert names["L8i2.mlp"] == ("null", "seed", "block0", "block1", "partial2")
+    assert names["L12.attn"] == ("null", "seed", "block0", "block1", "block2")
+    assert names["L15.mlp"] == ("null", "seed", "block0", "block1", "block2", "partial3")
+    assert names["payload"] == ("null", "seed", "block0", "block1", "block2", "block3")
+    rebuilt = out.sources[0] + torch.stack(out.sources[1:]).sum(0)
+    assert torch.allclose(out.h_top, rebuilt, atol=1e-5)
+    core_delta = out.sources[2] + out.sources[3]
+    assert torch.allclose(out.core_state - out.core_entry, core_delta, atol=1e-5)
+    # Each cell's delta is its own: the first core cell's delta at one
+    # iteration is what it wrote on iteration 0, which a deeper run then
+    # continues rather than replaces.
+    one = forward(model, tokens(), want_weights=True, iterations=1)
+    assert torch.equal(one.core_entry, out.core_entry)
+    assert not torch.allclose(one.sources[2], out.sources[2])
+    assert torch.equal(one.route_weights["L4i0.attn"], out.route_weights["L4i0.attn"])
+    assert torch.equal(one.route_weights["L8i0.mlp"], out.route_weights["L8i0.mlp"])
 
 
 def test_loop_same_depth_iterations_are_a_prefix():
