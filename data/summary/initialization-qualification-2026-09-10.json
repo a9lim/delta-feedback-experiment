@@ -1,0 +1,35 @@
+{
+  "date": "2026-09-10",
+  "model_commit": "d8851c5d1eef6fdf6e894f256ba31065ae7d3357",
+  "baseline_commit": "275bed45f8acb8481d63dcd97a45d3cf006bb6c0",
+  "workspace_commit": "f24196f8f469b6ee9221c2a6178e88a635bcf648",
+  "base_normal_init_std": 0.02,
+  "width_rule": "BASE_NORMAL_INIT_STD * sqrt(1536 / D) for NAdam gate/control matrices",
+  "checkpoint_version": 26,
+  "local": {
+    "pytest_passed": 239,
+    "pytest_skipped_cuda": 16,
+    "focused_after_ruff_cleanup_passed": 53,
+    "ruff": "passed",
+    "baseline_comparison_widths": [768, 1152, 1536],
+    "only_gate_control_matrices_changed": true,
+    "flagship_initialization_byte_identical": true,
+    "rng_state_preserved": true,
+    "baseline_state_dict_load_exact": true
+  },
+  "jobe": {
+    "pytest_passed": 255,
+    "ruff": "passed",
+    "integrated_cuda_gate": "failed",
+    "failure": "'a' cache parity drift: 0.0517",
+    "metric": "norm(full_hidden - cached_hidden) / norm(full_hidden)",
+    "relative_l2_rounded": 0.0517,
+    "bound": 0.04,
+    "condition": "a",
+    "dim": 128,
+    "layers": 4,
+    "dtype": "bfloat16",
+    "log": "/home/jobe/Work/transformer-experiments/delta-feedback-experiment/logs/init-width-2026-09-10.probe.log",
+    "full_screen_graph_qualification_completed": false
+  }
+}

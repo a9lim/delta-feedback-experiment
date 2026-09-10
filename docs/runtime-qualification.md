@@ -4,7 +4,7 @@ Analysis depends on the measured computation matching the trained
 computation. This page records the CUDA execution path and its engineering
 evidence.
 
-The current execution measurements are dated 2026-09-09 on Jobe's RTX 4090
+The execution timing measurements below are dated 2026-09-09 on Jobe's RTX 4090
 with PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and standard GIL-enabled
 CPython 3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. Records carry
 exact sources and inputs; Hopper has not been through the same checks.
@@ -13,15 +13,22 @@ exact sources and inputs; Hopper has not been through the same checks.
 
 | Record | What it establishes |
 |---|---|
+| [Initialization qualification](../data/summary/initialization-qualification-2026-09-10.json) | Width-scaled gate/control initialization, unchanged flagship and RNG streams, passing test suites and Ruff; integrated CUDA gate stopped at the BF16 cache comparison |
 | [Current execution optimizations](../data/summary/runtime-optimizations-2026-09-09.json) | Flash SDPA, packed projection gradients, PKDA tiling, selective block retention, full loop timings and accumulated-gradient comparisons |
 | [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Environment migration and its dependency/capture checks |
 | [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Earlier paired six-update diagnostic from a trained checkpoint |
 | [Earlier execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces and component measurements on the earlier stack |
 | [Loop staging baseline](../data/summary/loop-stage-2026-09-09.json) | Pre-optimization memory and timing measurements |
 
-The current portable suite passes 164 tests with 16 CUDA cases skipped; Jobe
-passes all 180 tests and the integrated `delta probe` CUDA gate. Its four
-train/eval graphs peak at 14.46 GiB allocated and 22.96 GiB reserved, with
+The width-scaled initializer passes 239 portable tests with 16 CUDA cases
+skipped, all 255 tests on Jobe, and Ruff on both machines. The integrated
+`delta probe` gate stops at the four-layer, width-128 `a` model's BF16
+full-sequence versus cached-decode comparison: relative hidden-state L2 error
+0.0517 against a 0.04 bound. The cause has not been isolated and the bound is
+unchanged; full screen graph qualification for this initializer is incomplete.
+
+The 2026-09-09 execution record's four train/eval graphs peak at 14.46 GiB
+allocated and 22.96 GiB reserved, with
 one/two/three-pass replay at 64.6/129.9/195.9 ms. The loop-versus-flat gradient
 error is 1.64%, matching its 1.64% repeat floor; checkpoint staging leaves
 0.02 GiB of residual device allocation. Snapshots remain v26. Keep GPU work
