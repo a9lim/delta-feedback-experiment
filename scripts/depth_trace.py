@@ -1,6 +1,6 @@
 """Fixed-r sweep of a loop snapshot: loss, update size, and router mass by iteration.
 
-    python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
+    python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 
 Runs ``depth_trace`` on held-out rows in both label assignments (all plain,
 and prefix-1 fused when the condition has ``f``), records the core routers'
@@ -50,7 +50,7 @@ def core_route_mass(model, rows, iterations: int) -> dict[str, dict[int, dict[st
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("snapshot")
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--micro", type=int, default=4)
     parser.add_argument(

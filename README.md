@@ -105,7 +105,7 @@ Directions on the bench, none decided:
   whether within-column refinement changes what the payload carries.
 - Separate a persistent state stream from a read-only prediction stream, the
   Free Pause Tokens idea assessed in [literature](docs/literature.md).
-- Give the model a task that needs the channel, rather than hoping FineWeb
+- Give the model a task that needs the channel, rather than hoping web text
   induces one.
 
 ## Start here

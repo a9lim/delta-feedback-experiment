@@ -37,7 +37,7 @@ from delta_feedback_experiment.train import (
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="/data/delta/tokens-350B")
+    parser.add_argument("--data-dir", default="/data/delta/dclm-100b")
     parser.add_argument("--updates", type=int, default=12)
     parser.add_argument("--label", default="current")
     parser.add_argument("--gemm-backends")

@@ -9,7 +9,7 @@ co-adapted perturbations: they bound what the trained fused pathway depends
 on, not what an alternative design would achieve.
 
 Usage:
-    python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
+    python scripts/entry_sweeps.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ BYPASS_WEIGHTS = (1.0, 4.0, 14.0)
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=64)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--device", default=None)

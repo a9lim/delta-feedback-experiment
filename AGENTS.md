@@ -92,9 +92,14 @@ change it everywhere at once.
 
 ## Useful bookkeeping
 
-- The stream is a keyed document shuffle of FineWeb-Edu `sample-350BT` under
-  the base Qwen3 tokenizer; every store is a prefix of it, and a sidecar maps
-  every document back to its parquet row and crawl. Conditions trained with
+- Sources are named by `--source`: the default `dclm-100b` preserves its
+  publisher-shuffled order for screen/Jobe; `dclm` shuffles the full source
+  for larger stores. FineWeb-Edu full/350B/100B/10B sources remain selectable.
+  `--shuffle` / `--no-shuffle` override ordering. Stores live at
+  `DATA_ROOT/SOURCE`, on Jobe `/data/delta/dclm-100b` or `/data/delta/dclm`.
+  Prefix identity requires the same source, revision, tokenizer, ordering
+  and seed; it does not hold between the subset and full DCLM. A sidecar maps
+  every document to its pinned parquet file and row. Conditions trained with
   the same seed and data seed share tokenizer, stream,
   row order, schedule, optimizer, batch geometry, and keyed feedback
   randomness; conditions on the same trunk letter pair every parameter they

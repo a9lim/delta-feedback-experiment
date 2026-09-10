@@ -8,7 +8,7 @@ measures erosion of the fused mode; ``--trainable fusion`` restricts updates to
 the FBT interface.  The output is a JSON trace.
 
 Usage:
-    python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B \\
+    python scripts/dense_feedback_continue.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b \\
         --steps 150 --passes 2 --out figures/fused-TAG/dense_all.json
 """
 
@@ -53,7 +53,7 @@ def evaluate(model, data_val, rows, micro, device):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--passes", type=int, default=2)
     parser.add_argument("--trainable", choices=("all", "fusion"), default="all")

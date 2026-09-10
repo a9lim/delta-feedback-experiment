@@ -191,7 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="shared randomness stream; identical across paired conditions",
     )
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--out-dir", default="runs")
     parser.add_argument(
         "--resume",

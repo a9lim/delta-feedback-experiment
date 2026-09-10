@@ -4,6 +4,34 @@ Dated working notes: hypotheses, measurements, and readings as they happened.
 Newer entries supersede older ones; the distilled picture lives in
 [findings.md](findings.md). Git history keeps what gets cut.
 
+## 2026-09-10 — Named sources and optional document shuffling
+
+DCLM is the main corpus: the screen and Jobe use
+`HuggingFaceFW/dclm_100BT-shuffled` in its published order; larger stores use
+full `mlfoundations/dclm-baseline-1.0-parquet` with a keyed document shuffle.
+The sources are explicit `--source` presets, alongside FineWeb-Edu's full,
+350B, 100B and 10B selections. `--shuffle` / `--no-shuffle` override the
+source default. Store paths are `DATA_ROOT/SOURCE`, including
+`/data/delta/dclm-100b` on Jobe.
+
+The distinction is physical: the 100B release has 100 already shuffled
+parquet files, while full DCLM has 27,938 files totaling 7.42 TB. In the first
+full-source file's 61,000 documents, adjacent hostnames match 31.0% of the
+time versus 0.43% expected under a random permutation of those documents;
+one run spans 218 documents from one host. That bounded sample establishes
+source clustering, not a corpus-wide estimate. Preserving the subset's
+published order lets a small build download only the files intersecting its
+selected prefix, avoiding a full-source scan and shuffled assembly.
+
+The existing FineWeb-Edu build was stopped and its project tokens and
+scratch deleted. The replacement budget is screen 100 tokens per parameter:
+26,861 steps, 14,082,899,968 predictions, a rounded 15B-token store including
+the held-out slice and headroom. The source and ordering are recorded in
+both partial-build settings and finished metadata. Sidecars map to pinned
+file/row addresses; DCLM has no crawl field, while FineWeb-Edu's crawl remains
+recoverable from its source row. Different source presets do not promise a
+common prefix or a common held-out slice.
+
 ## 2026-09-09 — One context and one batch for the ladder; the old specimens cleared
 
 With the muP change already forcing reruns, a9 asked whether the context

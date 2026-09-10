@@ -16,7 +16,7 @@ Writes ``route_report.json`` and figures under ``figures/route-TAG/`` and
 prints a per-site table.
 
 Usage:
-    python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
+    python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 """
 
 from __future__ import annotations
@@ -158,7 +158,7 @@ def site_matrix(means, route_names, cfg, passes=(0, 1)):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--device", default=None)

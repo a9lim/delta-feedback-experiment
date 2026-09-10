@@ -17,14 +17,15 @@ import torch
 from delta_feedback_experiment import data as data_module
 from delta_feedback_experiment.cli import stream_target, tokenize_command
 from delta_feedback_experiment.data import (
-    CANONICAL_CONFIG,
     CANONICAL_DATA_PACKAGES,
-    CANONICAL_DATASET_REVISION,
     CANONICAL_SHUFFLE_SEED,
     CANONICAL_TARGET_TOKENS,
     CANONICAL_TOKENIZER_REVISION,
     CANONICAL_TOKENS_PER_DOC,
     CANONICAL_VAL_TOKENS,
+    DEFAULT_SOURCE,
+    SOURCES,
+    HubSource,
     LocalSource,
     Shuffle,
     TokenData,
@@ -161,6 +162,47 @@ def test_shuffle_is_a_keyed_bijection(size):
         shuffle([size])
 
 
+def test_shuffle_can_preserve_source_order():
+    addresses = np.array([0, 9, 3, 9, 99])
+    identity = Shuffle(100, seed=42, enabled=False)
+    assert np.array_equal(identity(addresses), addresses)
+    assert np.array_equal(identity.inverse(addresses), addresses)
+    with pytest.raises(ValueError):
+        identity([100])
+
+
+@pytest.mark.parametrize(
+    "name,dataset,revision,prefix,shuffle",
+    [
+        ("dclm", "mlfoundations/dclm-baseline-1.0-parquet", "817d6752765f6a41261085171dd546b104f60626", "filtered", True),
+        ("dclm-100b", "HuggingFaceFW/dclm_100BT-shuffled", "2fa015e4044ec442a0734e89658cdcc538d10dd4", "data", False),
+        ("fineweb-edu", "HuggingFaceFW/fineweb-edu", "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9", "data", True),
+        ("fineweb-edu-350b", "HuggingFaceFW/fineweb-edu", "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9", "sample/350BT", True),
+        ("fineweb-edu-100b", "HuggingFaceFW/fineweb-edu", "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9", "sample/100BT", True),
+        ("fineweb-edu-10b", "HuggingFaceFW/fineweb-edu", "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9", "sample/10BT", True),
+    ],
+)
+def test_hub_source_discovers_the_pinned_named_source(tmp_path, monkeypatch, name, dataset, revision, prefix, shuffle):
+    from types import SimpleNamespace
+
+    import huggingface_hub
+
+    specification = SOURCES[name]
+    assert (specification.dataset, specification.revision, specification.prefix, specification.shuffle) == (
+        dataset, revision, prefix, shuffle
+    )
+    calls = []
+
+    def list_repo_tree(repo_id, **kwargs):
+        calls.append((repo_id, kwargs))
+        return [SimpleNamespace(path=f"{prefix}/{p}") for p in ("nested/002.parquet", "README.md", "nested", "000.parquet")]
+
+    monkeypatch.setattr(huggingface_hub, "HfApi", lambda: SimpleNamespace(list_repo_tree=list_repo_tree))
+    source = HubSource(dataset, prefix, revision, tmp_path)
+    assert source.list_files() == [f"{prefix}/000.parquet", f"{prefix}/nested/002.parquet"]
+    assert calls == [(dataset, {"repo_type": "dataset", "path_in_repo": prefix, "revision": revision, "recursive": True})]
+
+
 # -- a tiny parquet source with a character tokenizer --------------------------
 
 EOS = 3
@@ -182,22 +224,26 @@ def char_ids(text: str) -> list[int]:
     return CharTokenizer()([text], add_special_tokens=False)["input_ids"][0] + [EOS]
 
 
-DUMPS = ("CC-MAIN-2013-20", "CC-MAIN-2019-35", "CC-MAIN-2024-10")
-
-
 def parquet_source(root: Path, files: int = 3, rows: int = 40) -> LocalSource:
-    """Files of single-crawl runs, like FineWeb-Edu's, with one empty text."""
+    """Tiny DCLM-shaped parquet files, with varying lengths and one empty text."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    (root / "sample" / "tiny").mkdir(parents=True)
+    directory = root / "filtered" / "shard_00000"
+    directory.mkdir(parents=True)
     for f in range(files):
-        texts, dumps = [], []
+        texts = []
         for i in range(rows):
             texts.append("" if (f, i) == (1, 5) else f"d{f}-{i}-" + "x" * ((7 * i + 3 * f) % 25))
-            dumps.append(DUMPS[(i // 14 + f) % len(DUMPS)])
-        table = pa.table({"text": texts, "dump": dumps})
-        pq.write_table(table, root / "sample" / "tiny" / f"{f:03d}.parquet", row_group_size=17)
+        table = pa.table({
+            "text": texts,
+            "url": [f"https://example.com/{f}/{i}" for i in range(rows)],
+            "id": [f"{f}-{i}" for i in range(rows)],
+            "language": ["en"] * rows,
+            "language_score": [0.99] * rows,
+            "fasttext_score": [0.95] * rows,
+        })
+        pq.write_table(table, directory / f"{f:03d}.parquet", row_group_size=17)
     return LocalSource(root)
 
 
@@ -210,7 +256,7 @@ def build(out: Path, source: LocalSource, **overrides) -> dict:
         "source": source,
         "tokenizer": char_tokenizer,
         "check_packages": False,
-        "config": "sample-tiny",
+        "shuffle": True,
     }
     settings.update(overrides)
     return tokenize(out, **settings)
@@ -232,36 +278,54 @@ def test_tokenize_writes_a_shuffled_prefix_with_provenance(tmp_path):
     assert meta["universe_docs"] == 120
     assert meta["selected_docs"] == 60
     assert meta["eos_id"] == EOS
-    assert meta["config"] == "sample-tiny"
+    assert "config" not in meta and "dumps" not in meta
+    assert set(index) == {"files"}
     assert not (out / "parts").exists()
     assert verify(out)["train"]["docs"] == meta["train_docs"]
 
     rows = {}
     for path in {f["path"] for f in index["files"]}:
-        table = pq.ParquetFile(source.root / path).read(columns=["text", "dump"])
-        rows[path] = (table.column("text").to_pylist(), table.column("dump").to_pylist())
+        table = pq.ParquetFile(source.root / path).read(columns=["text", "url", "id"])
+        rows[path] = table.to_pylist()
 
     seen = []
     for split in ("val", "train"):
         tokens = stream(out, split)
         docs = TokenData.load(out, split, 1).docs
+        assert docs.dtype.names == ("start", "source")
         assert tokens.size == meta[f"{split}_tokens"]
         assert tokens[-1] == EOS  # splits end at document boundaries
         starts = docs["start"].tolist() + [tokens.size]
         for record, start, end in zip(docs, starts, starts[1:]):
             path, row = source_address(index, int(record["source"]))
-            text, dump = rows[path][0][row], rows[path][1][row]
+            original = rows[path][row]
+            text = original["text"]
             assert text, "an empty document was written"
             assert tokens[start:end].tolist() == char_ids(text)
-            assert meta["dumps"][record["dump"]] == dump
+            file_number = int(Path(path).stem)
+            assert original["id"] == f"{file_number}-{row}"
+            assert original["url"] == f"https://example.com/{file_number}/{row}"
             seen.append(int(record["source"]))
     assert meta["val_target"] == 200 >= meta["val_tokens"] > 150
     assert meta["train_tokens"] >= 400 and meta["target_tokens"] == 600
     assert len(seen) == len(set(seen)) <= 60
     assert seen != sorted(seen)  # the stream is not in source order
     assert 45 not in seen  # file 1 row 5, the empty text, is never written
-    crawls = [meta["dumps"][d] for d in TokenData.load(out, "train", 1).docs["dump"]]
-    assert len(set(crawls[:8])) > 1  # neighbours come from different crawls
+
+
+@pytest.mark.parametrize("source_name", ["dclm", "dclm-100b"])
+def test_tokenize_resolves_the_source_default_order(tmp_path, source_name):
+    source = parquet_source(tmp_path / "source")
+    out = tmp_path / "tokens"
+    build(out, source, source_name=source_name, shuffle=None)
+    addresses = np.concatenate([
+        TokenData.load(out, split, 1).docs["source"] for split in ("val", "train")
+    ])
+    if SOURCES[source_name].shuffle:
+        assert not np.all(np.diff(addresses) > 0)
+    else:
+        expected = np.delete(np.arange(120), 45)  # the fixture's empty document
+        assert np.array_equal(addresses, expected[:addresses.size])
 
 
 @pytest.mark.parametrize("write_buffer", [1, 97, 512])
@@ -271,10 +335,9 @@ def test_tokenize_workers_produce_identical_store_bytes(tmp_path, monkeypatch, w
 
     source = parquet_source(tmp_path / "source", files=5)
     # Exercise an empty token part alongside variable-length nonempty documents.
-    pq.write_table(
-        pa.table({"text": [""] * 40, "dump": [DUMPS[0]] * 40}),
-        source.root / "sample" / "tiny" / "004.parquet",
-    )
+    empty_path = source.root / "filtered" / "shard_00000" / "004.parquet"
+    table = pq.read_table(empty_path)
+    pq.write_table(table.set_column(0, "text", pa.array([""] * 40)), empty_path)
     serial = tmp_path / "serial"
     parallel = tmp_path / "parallel"
     monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
@@ -337,7 +400,6 @@ def test_select_prefetch_overlaps_tokenization_and_stays_one_file_ahead(tmp_path
         bases=tuple(data_module.file_bases(index)),
         row_groups=tuple(tuple(file["row_groups"]) for file in index["files"]),
         paths=tuple(paths),
-        dumps=tuple(index["dumps"]),
     )
     monkeypatch.setattr(data_module, "_TOKENIZERS", {})
     data_module._select_files(configuration, list(range(len(paths))))
@@ -355,9 +417,6 @@ class FlakySource:
     def list_files(self):
         return self.inner.list_files()
 
-    def dumps(self):
-        return self.inner.dumps()
-
     def row_groups(self, path):
         return self.inner.row_groups(path)
 
@@ -372,10 +431,11 @@ class FlakySource:
 
 
 @pytest.mark.parametrize("workers", [1, 2])
-def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path, workers):
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path, workers, shuffle):
     source = parquet_source(tmp_path / "source")
-    short = build(tmp_path / "short", source)
-    long = build(tmp_path / "long", source, target_tokens=900)
+    short = build(tmp_path / "short", source, shuffle=shuffle)
+    long = build(tmp_path / "long", source, target_tokens=900, shuffle=shuffle)
     assert long["selected_docs"] == 90 > short["selected_docs"]
     assert np.array_equal(stream(tmp_path / "short", "val"), stream(tmp_path / "long", "val"))
     short_train, long_train = stream(tmp_path / "short", "train"), stream(tmp_path / "long", "train")
@@ -389,10 +449,10 @@ def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path, workers):
     marker.touch()
     flaky = FlakySource(source, marker)
     with pytest.raises(OSError, match="simulated"):
-        build(tmp_path / "resumed", flaky, workers=workers)
+        build(tmp_path / "resumed", flaky, workers=workers, shuffle=shuffle)
     assert (tmp_path / "resumed" / "parts" / "0000.index.npy").exists()
     assert not (tmp_path / "resumed" / "parts" / "0001.index.npy").exists()
-    resumed = build(tmp_path / "resumed", flaky, workers=workers)
+    resumed = build(tmp_path / "resumed", flaky, workers=workers, shuffle=shuffle)
     assert resumed["train_tokens"] == short["train_tokens"]
     assert np.array_equal(stream(tmp_path / "resumed", "train"), short_train)
     assert {p.name: p.read_bytes() for p in (tmp_path / "resumed").iterdir()} == {
@@ -406,6 +466,103 @@ def test_tokenize_reports_an_exhausted_selection(tmp_path):
     source = parquet_source(tmp_path / "source")
     with pytest.raises(RuntimeError, match="selection exhausted"):
         build(tmp_path / "tokens", source, tokens_per_doc=100)
+
+
+@pytest.mark.parametrize("changed", [
+    {"source_name": "dclm"},
+    {"shuffle": False},
+    {"seed": 4},
+    {"revision": "another-revision"},
+    {"target_tokens": 900},
+    {"tokens_per_doc": 11},
+    {"tokenizer_revision": "another-tokenizer-revision"},
+])
+def test_tokenize_partial_build_rejects_changed_settings(tmp_path, monkeypatch, changed):
+    source = parquet_source(tmp_path / "source")
+    marker = tmp_path / "fail-once"
+    marker.touch()
+    flaky = FlakySource(source, marker)
+    out = tmp_path / "tokens"
+    with pytest.raises(OSError, match="simulated"):
+        build(out, flaky)
+    assert (out / "build.json").is_file()
+    before = {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()}
+
+    with monkeypatch.context() as patch:
+        patch.setattr(flaky, "fetch", lambda path: pytest.fail("incompatible partial build fetched a source"))
+        with pytest.raises(ValueError, match="partial build:"):
+            build(out, flaky, **changed)
+    assert {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
+    build(out, flaky)
+    assert not (out / "build.json").exists()
+
+
+def test_source_index_resumes_completed_footer_reads(tmp_path):
+    source = parquet_source(tmp_path / "source")
+    paths = source.list_files()
+    calls = []
+    marker = tmp_path / "fail-once"
+    marker.touch()
+
+    class InterruptedIndex:
+        def list_files(self):
+            return paths
+
+        def row_groups(self, path):
+            calls.append(path)
+            if path == paths[1] and marker.exists():
+                marker.unlink()
+                raise OSError("simulated footer failure")
+            return source.row_groups(path)
+
+    cache = tmp_path / "index-cache"
+    with pytest.raises(OSError, match="simulated footer"):
+        data_module.index_source(InterruptedIndex(), cache)
+    assert (cache / "00000.json").exists()
+    assert not (cache / "00001.json").exists()
+    assert (cache / "00002.json").exists()
+    calls.clear()
+    resumed = data_module.index_source(InterruptedIndex(), cache)
+    assert calls == [paths[1]]
+    assert resumed == data_module.index_source(source)
+
+
+def test_unshuffled_selection_fetches_only_intersecting_files(tmp_path):
+    inner = parquet_source(tmp_path / "source", files=5)
+    fetched = []
+
+    class RecordingSource:
+        def list_files(self):
+            return inner.list_files()
+
+        def row_groups(self, path):
+            return inner.row_groups(path)
+
+        def fetch(self, path):
+            fetched.append(path)
+            return inner.fetch(path)
+
+        def release(self, path):
+            return None
+
+    source = RecordingSource()
+    out = tmp_path / "tokens"
+    build(out, source, target_tokens=900, shuffle=False)
+    paths = inner.list_files()
+    assert fetched == paths[:3]  # positions [0, 90) intersect three 40-row files
+    docs = TokenData.load(out, "train", 1).docs
+    first = int(docs["source"][-1]) + 1
+    assert first >= 40
+    assert np.all(np.diff(docs["source"]) > 0)
+    fetched.clear()
+    build(out, source, target_tokens=1500, shuffle=False, extend=True)
+    assert fetched == [
+        path for which, path in enumerate(paths)
+        if which * 40 < 150 and (which + 1) * 40 > first
+    ]
+    build(tmp_path / "fresh", inner, target_tokens=1500, shuffle=False)
+    for name in ("val.bin", "val.docs.npy", "train.0000.bin", "train.docs.npy"):
+        assert (out / name).read_bytes() == (tmp_path / "fresh" / name).read_bytes()
 
 
 def test_verify_catches_a_broken_document_boundary(tmp_path):
@@ -437,23 +594,60 @@ def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
     assert captured["workers"] == 1
     assert captured["readers"] == 8
     assert captured["scratch"] is None
-    assert captured["config"] == CANONICAL_CONFIG
-    assert captured["revision"] == CANONICAL_DATASET_REVISION
+    assert captured["source_name"] == DEFAULT_SOURCE == "dclm-100b"
+    assert captured["shuffle"] is None
+    assert captured["revision"] is None
     assert captured["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION
     assert captured["extend"] is False
 
 
+@pytest.mark.parametrize("source_name", list(SOURCES))
+@pytest.mark.parametrize("flag,expected", [(None, None), ("--shuffle", True), ("--no-shuffle", False)])
+def test_tokenize_command_source_and_shuffle_overrides(tmp_path, monkeypatch, source_name, flag, expected):
+    captured = {}
+    monkeypatch.setattr(data_module, "tokenize", lambda out, **kwargs: captured.update(kwargs))
+    args = ["--out", str(tmp_path / "tokens"), "--source", source_name, "--revision", "explicit-revision"]
+    if flag:
+        args.append(flag)
+    tokenize_command(args)
+    assert captured["source_name"] == source_name
+    assert captured["shuffle"] is expected
+    assert captured["revision"] == "explicit-revision"
+
+
+def test_tokenize_command_rejects_retired_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(data_module, "tokenize", lambda *args, **kwargs: pytest.fail("retired CLI flag reached the builder"))
+    with pytest.raises(SystemExit) as raised:
+        tokenize_command(["--out", str(tmp_path / "tokens"), "--config", "sample-350BT"])
+    assert raised.value.code == 2
+    assert "unrecognized arguments: --config" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("args,expected", [
+    ([], "data/dclm-100b"),
+    (["--source", "dclm"], "data/dclm"),
+    (["--data-root", "/data/delta", "--source", "dclm-100b"], "/data/delta/dclm-100b"),
+    (["--data-root", "/data/delta", "--source", "dclm", "--out", "/custom/store"], "/custom/store"),
+])
+def test_tokenize_command_derives_output_from_source(monkeypatch, args, expected):
+    outputs = []
+    monkeypatch.setattr(data_module, "tokenize", lambda out, **kwargs: outputs.append(out))
+    tokenize_command(args)
+    assert outputs == [expected]
+
+
 @pytest.mark.parametrize("workers", [1, 2])
-def test_tokenize_continue_lands_on_the_fresh_build(tmp_path, monkeypatch, workers):
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_tokenize_continue_lands_on_the_fresh_build(tmp_path, monkeypatch, workers, shuffle):
     source = parquet_source(tmp_path / "source")
     monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
     monkeypatch.setattr(data_module, "WRITE_BUFFER_TOKENS", 97)
-    build(tmp_path / "grown", source, workers=workers, readers=8)
-    fresh = build(tmp_path / "fresh", source, target_tokens=900, readers=1)
+    build(tmp_path / "grown", source, workers=workers, readers=8, shuffle=shuffle)
+    fresh = build(tmp_path / "fresh", source, target_tokens=900, readers=1, shuffle=shuffle)
     with pytest.raises(ValueError, match="shuffle_seed"):
-        build(tmp_path / "grown", source, target_tokens=900, seed=4, extend=True)
+        build(tmp_path / "grown", source, target_tokens=900, seed=4, extend=True, shuffle=shuffle)
     grown = build(
-        tmp_path / "grown", source, target_tokens=900, extend=True, workers=workers, readers=8
+        tmp_path / "grown", source, target_tokens=900, extend=True, workers=workers, readers=8, shuffle=shuffle
     )
     assert {
         p.name: p.read_bytes() for p in (tmp_path / "grown").iterdir() if p.name != "meta.json"
@@ -472,11 +666,98 @@ def test_tokenize_continue_lands_on_the_fresh_build(tmp_path, monkeypatch, worke
     assert not (tmp_path / "grown" / "parts").exists()
     assert verify(tmp_path / "grown")["train"]["tokens"] == fresh["train_tokens"]
     # A target the store already covers is a no-op.
-    assert build(tmp_path / "grown", source, target_tokens=700, extend=True) == grown
+    assert build(tmp_path / "grown", source, target_tokens=700, extend=True, shuffle=shuffle) == grown
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_tokenize_continue_recovers_an_interrupted_append(tmp_path, monkeypatch, shuffle):
+    source = parquet_source(tmp_path / "source")
+    monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
+    monkeypatch.setattr(data_module, "WRITE_BUFFER_TOKENS", 97)
+    out = tmp_path / "resumed"
+    initial = build(out, source, shuffle=shuffle)
+    before = sum(p.stat().st_size for p in out.glob("train.*.bin"))
+    original_write = data_module._ShardWriter.write
+
+    def append_then_fail(writer, array):
+        original_write(writer, array)
+        if writer.handle is not None:
+            writer.handle.flush()
+        raise OSError("simulated append failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(data_module._ShardWriter, "write", append_then_fail)
+        with pytest.raises(OSError, match="simulated append"):
+            build(out, source, target_tokens=900, extend=True, shuffle=shuffle)
+    assert sum(p.stat().st_size for p in out.glob("train.*.bin")) > before
+    assert data_module.read_meta(out)["train_tokens"] == initial["train_tokens"]
+    build(out, source, target_tokens=900, extend=True, shuffle=shuffle)
+
+    # Match every byte against an uninterrupted extension, including metadata.
+    control = tmp_path / "control"
+    build(control, source, shuffle=shuffle)
+    build(control, source, target_tokens=900, extend=True, shuffle=shuffle)
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == {
+        p.name: p.read_bytes() for p in control.iterdir()
+    }
+    # Its shards, sidecars, and source index also match a fresh larger build.
+    fresh = tmp_path / "fresh"
+    build(fresh, source, target_tokens=900, shuffle=shuffle)
+    assert {p.name: p.read_bytes() for p in out.iterdir() if p.name != "meta.json"} == {
+        p.name: p.read_bytes() for p in fresh.iterdir() if p.name != "meta.json"
+    }
+
+
+@pytest.mark.parametrize("committed_target", [600, 900])
+@pytest.mark.parametrize("retry_completed_target", [False, True])
+def test_tokenize_recovers_post_commit_cleanup_failure(
+    tmp_path, monkeypatch, committed_target, retry_completed_target
+):
+    source = parquet_source(tmp_path / "source")
+    monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
+    monkeypatch.setattr(data_module, "WRITE_BUFFER_TOKENS", 97)
+    out = tmp_path / "resumed"
+    if committed_target > 600:
+        build(out, source)
+    original_rmtree = data_module.shutil.rmtree
+
+    def fail_cleanup(path, *args, **kwargs):
+        if Path(path) == out / "parts":
+            raise OSError("simulated post-commit cleanup failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(data_module.shutil, "rmtree", fail_cleanup)
+        with pytest.raises(OSError, match="post-commit cleanup"):
+            build(out, source, target_tokens=committed_target, extend=committed_target > 600)
+    committed = data_module.read_meta(out)
+    assert committed["target_tokens"] == committed_target
+    assert (out / "build.json").is_file()
+    assert (out / "parts").is_dir()
+    if retry_completed_target:
+        assert build(out, source, target_tokens=committed_target, extend=True) == committed
+        assert not (out / "build.json").exists()
+        assert not (out / "parts").exists()
+    build(out, source, target_tokens=1200, extend=True)
+
+    control = tmp_path / "control"
+    build(control, source)
+    if committed_target > 600:
+        build(control, source, target_tokens=committed_target, extend=True)
+    build(control, source, target_tokens=1200, extend=True)
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == {
+        p.name: p.read_bytes() for p in control.iterdir()
+    }
+    fresh = tmp_path / "fresh"
+    build(fresh, source, target_tokens=1200)
+    assert {p.name: p.read_bytes() for p in out.iterdir() if p.name != "meta.json"} == {
+        p.name: p.read_bytes() for p in fresh.iterdir() if p.name != "meta.json"
+    }
 
 
 def test_stream_target_rounds_the_schedule_up_to_a_billion():
     assert stream_target("screen", 25, CANONICAL_VAL_TOKENS) == 4_000_000_000
+    assert stream_target("screen", 100, CANONICAL_VAL_TOKENS) == 15_000_000_000
     assert stream_target("screen", 400, CANONICAL_VAL_TOKENS) == CANONICAL_TARGET_TOKENS
     assert stream_target("bridge", 400, CANONICAL_VAL_TOKENS) == 167_000_000_000
 

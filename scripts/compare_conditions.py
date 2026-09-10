@@ -19,7 +19,7 @@ tables are binned on the *reference* model's loss and entropy; read the
 
 Usage:
     python scripts/compare_conditions.py --reference runs/A.pt.10745 --feedback runs/B.pt.10745 \\
-        --data-dir /data/delta/tokens-350B
+        --data-dir /data/delta/dclm-100b
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--reference", type=Path, required=True, help="reference snapshot (any condition; its pass 1 is used)")
     parser.add_argument("--feedback", type=Path, required=True, help="feedback snapshot (a condition with f)")
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--calib-rows", type=int, default=64, help="leading rows used to choose mixture weights")
     parser.add_argument("--micro-rows", type=int, default=4)

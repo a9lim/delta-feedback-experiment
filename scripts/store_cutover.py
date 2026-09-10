@@ -1,6 +1,6 @@
 """Retire old token stores once nothing on the spool reads them.
 
-    python scripts/store_cutover.py --new /data/delta/tokens-350B \\
+    python scripts/store_cutover.py --new /data/delta/dclm-100b \\
         --old /data/delta/tokens --old /data/delta/tokens-smoke [--wait] [--delete]
 
 Verifies the new store, then refuses while an active or pending job's

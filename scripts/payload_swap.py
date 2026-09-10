@@ -11,8 +11,8 @@ alternatives are handicapped: read the landscape's shape (which family helps,
 which hurts, how peaked), not absolute gaps.
 
 Usage:
-    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
-    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B --head 2
+    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
+    python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b --head 2
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from delta_feedback_experiment.model import multipass, multipass_loss
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=32)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--device", default=None)

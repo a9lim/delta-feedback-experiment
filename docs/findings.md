@@ -76,8 +76,9 @@ That is the opposite of an opaque cross-column channel.
   0.99 at lag zero between any two). The source parquet files are single-crawl
   runs of about 60M tokens read in order, so each stretch of training was one
   CommonCrawl dump, and the held-out slice was the head of one 2013 crawl.
-  The stream is now a keyed document shuffle of `sample-350BT` with the base
-  tokenizer's EOS, the parametrization is muP-pinned to the flagship width,
+  New stores use the published shuffle of DCLM-100B on Jobe and a keyed
+  shuffle of full DCLM for larger budgets, with the base tokenizer's EOS.
+  The parametrization is muP-pinned to the flagship width,
   and every scale trains 128 rows of 4,096; the three specimens above trained
   on the old order under the old geometry, and their snapshots are gone.
 

@@ -56,42 +56,67 @@ the prelude, the last the coda, and the one between them the tied core, run
 
 ## Data
 
-The corpus is `HuggingFaceFW/fineweb-edu`, configuration `sample-350BT` (the
-472 parquet files under `sample/350BT`) at dataset commit
-`87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`, tokenized with
+The source is chosen with `delta tokenize --source NAME`. All sources use
 `Qwen/Qwen3-0.6B-Base` at commit `da87bfb608c14b7cf20ba1ce41287e8de496c0cd`.
 The base tokenizer's EOS, `<|endoftext|>` (151643), closes every non-empty
-document; the chat tokenizer shares every other id but ends on `<|im_end|>`,
-which an instruct-tuned descendant would want free. The `data-build` extra
-pins the four packages that compile the stream and `meta.json` records their
-realized versions.
+document. The `data-build` extra pins the four packages that compile the
+stream; `meta.json` records their realized versions.
 
-The source files are not shuffled: each is a sequence of single-crawl runs of
-about 60M tokens, so read in order they put one CommonCrawl dump into every
-180 or so screen steps and a 0.1-nat swell into every training curve
-([journal, 2026-09-09](journal.md)). The universe is every document of the
-source, addressed by its row in file order (`source.json`); a keyed Feistel
-bijection (`Shuffle`, seed 0) sends addresses to stream positions, so
-neighbouring documents come from unrelated files and crawls, and a store of
-any size is a prefix of one stream: the 57B-token screen store on Jobe is
-byte-identical to the first 57B tokens of the 167B-token bridge store the
-Prime ladder needs.
+| Source | Dataset and parquet directory | Default ordering |
+|---|---|---|
+| `dclm-100b` (default; screen and Jobe) | `HuggingFaceFW/dclm_100BT-shuffled`, `data/` | Published order |
+| `dclm` (larger stores and flagship) | `mlfoundations/dclm-baseline-1.0-parquet`, `filtered/` | Keyed document shuffle |
+| `fineweb-edu` | `HuggingFaceFW/fineweb-edu`, `data/` | Keyed document shuffle |
+| `fineweb-edu-350b` | Same dataset, `sample/350BT/` | Keyed document shuffle |
+| `fineweb-edu-100b` | Same dataset, `sample/100BT/` | Keyed document shuffle |
+| `fineweb-edu-10b` | Same dataset, `sample/10BT/` | Keyed document shuffle |
 
-`delta tokenize` builds a prefix in three resumable stages: index the
-source's row groups; select the documents whose position falls below
-`--target / --tokens-per-doc` and tokenize them, one file at a time, into
-per-file parts; write the parts in stream order into a local contiguous
-uint32 store, so that step-addressed rows, validation, and resume never
-depend on network or iterator state. The held-out slice is the stream's first
-documents up to 30M tokens; training follows in contiguous shards until it
-holds the target less the slice's cap, ending on a document boundary.
-`delta tokenize --continue` extends a finished store to a larger target in
-place, selecting from the position after its last document and appending,
-and lands on the bytes a fresh build at that target writes. A sidecar per split (`val.docs.npy`, `train.docs.npy`; `DOC_DTYPE`)
-records every document's start offset, universe address, which names the
-parquet row holding its text, URL, and score, and its crawl as an index into
-`meta["dumps"]`. `delta verify DIR` checks a store against its meta and
-sidecars.
+The pinned revisions are `2fa015e4044ec442a0734e89658cdcc538d10dd4` for
+`dclm-100b`, `817d6752765f6a41261085171dd546b104f60626` for `dclm`, and
+`87f09149ef4734204d70ed1d046ddc9ca3f2b8f9` for the FineWeb-Edu sources.
+The [100B subset](https://huggingface.co/datasets/HuggingFaceFW/dclm_100BT-shuffled)
+has already been globally shuffled by its publisher with seed 42.
+`--shuffle` applies our keyed document shuffle to any source;
+`--no-shuffle` preserves any source's published file/row order. The full
+[DCLM release](https://huggingface.co/datasets/mlfoundations/dclm-baseline-1.0-parquet)
+retains source clustering and defaults to shuffling.
+
+The universe is every document under the chosen source prefix, addressed by
+its row in sorted file order (`source.json`). With shuffling enabled, a keyed
+Feistel bijection (`Shuffle`, seed 0) sends addresses to stream positions.
+Without it, the address is the position. Every store built with the same
+source, revision, tokenizer, ordering mode and seed is a prefix of one stream.
+**Different sources do not promise matching prefixes:** the screen's 100B
+subset and the flagship's full DCLM are distinct data streams. Their validation
+slices also differ, so their losses are not a paired data comparison.
+
+`delta tokenize` indexes source row groups, selects documents whose position
+falls below `--target / --tokens-per-doc`, tokenizes those documents into
+per-file parts, and assembles them in stream order. The default
+`--tokens-per-doc 900` is a conservative mean-length estimate used to size
+that selection; it never truncates documents. A selection that runs short
+fails. Published-order builds download only files intersecting the selected
+prefix. Shuffled builds scan the full source. Both produce a contiguous
+uint32 store, so training rows, validation and resume are local reads.
+
+The held-out slice contains the stream's first documents up to 30M tokens;
+training follows until it holds the target less that cap, ending on a
+document boundary. A screen at 100 tokens per parameter requires 14.083B
+predicted tokens and a rounded 15B-token store. `--data-root ROOT` places the
+store at `ROOT/NAME` (default `data/dclm-100b`); `--out` overrides that path.
+On Jobe the root is `/data/delta`, so the subset store is
+`/data/delta/dclm-100b` and a full-source store is `/data/delta/dclm`.
+
+`delta tokenize --continue` appends to a finished store under matching source
+and ordering settings, landing on the bytes a fresh build at that target
+writes. Partial builds bind those settings in `build.json`; source footer
+indexing and token parts are resumable. An interrupted extension discards
+its uncommitted tail before appending again. Each split's sidecar
+(`val.docs.npy`, `train.docs.npy`; `DOC_DTYPE`) records document start and
+universe address. That address resolves to the pinned parquet file and row
+holding its text, URL, ID, scores and any source-specific metadata, including
+crawl information where available. `delta verify DIR` checks the store's
+counts, source index, sidecars and sampled EOS boundaries.
 
 Each of the `--workers` encoding processes prefetches one upcoming source
 file while encoding its current file, bounding downloaded scratch to at most
@@ -340,5 +365,5 @@ ablation keeps `h_top` and so keeps most of the payload channel.
 Adaptive pause or halting tokens, token-conditioned payload queries, multiple
 explicit previous-column payloads, per-layer cross-column banks, alternative
 optimizers, long-context continuation, instruction tuning, and any task
-beyond next-token prediction on FineWeb-Edu. Several of these are candidate
+beyond next-token prediction on web text. Several of these are candidate
 moves in [findings.md](findings.md).

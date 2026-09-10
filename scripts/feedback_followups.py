@@ -13,7 +13,7 @@
   the fused-pass loss on fresh training rows, per parameter family.
 
 Usage:
-    python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
+    python scripts/feedback_followups.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 """
 
 from __future__ import annotations
@@ -56,7 +56,7 @@ def family(name: str) -> str:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--calib-rows", type=int, default=64)
     parser.add_argument("--impulse-rows", type=int, default=64)

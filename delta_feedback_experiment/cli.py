@@ -22,7 +22,7 @@ USAGE = """\
 delta — delta-feedback experiment operator
 
   delta train TAG [FLAGS]  train one condition directly (delta train --help)
-  delta tokenize [FLAGS]   build a prefix of the shuffled token stream (once)
+  delta tokenize [FLAGS]   build a source token stream prefix (once)
   delta verify DIR         check a token store against its meta and sidecars
   delta probe              run the offline invariant suite
   delta queue TAG [FLAGS]  append a training job to the detached spool
@@ -86,26 +86,48 @@ STOP_PHASE = "train run"
 
 def tokenize_command(argv: list[str]) -> None:
     from .data import (
-        CANONICAL_CONFIG,
-        CANONICAL_DATASET_REVISION,
         CANONICAL_SHUFFLE_SEED,
         CANONICAL_TARGET_TOKENS,
         CANONICAL_TOKENIZER_REVISION,
         CANONICAL_TOKENS_PER_DOC,
         CANONICAL_VAL_TOKENS,
+        DEFAULT_SOURCE,
+        SOURCES,
     )
 
     parser = argparse.ArgumentParser(
         "delta tokenize",
         description=(
-            "Build the shuffled stream's first --target stored tokens: index "
-            "the pinned parquet source, select and tokenize the documents "
+            "Build a reproducible prefix of --source: index "
+            "the pinned parquet files, select and tokenize the documents "
             "whose stream position falls below --target / --tokens-per-doc, "
             "then write the held-out slice, the train shards, and the document "
             "sidecars. Resumable; refuses to overwrite a finished store."
         ),
     )
-    parser.add_argument("--out", default="data/tokens")
+    parser.add_argument(
+        "--data-root",
+        default="data",
+        help="parent directory for source stores (default data)",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        help="explicit output directory (default DATA_ROOT/SOURCE)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=tuple(SOURCES),
+        default=DEFAULT_SOURCE,
+        help="pinned dataset and file subset (default dclm-100b, already shuffled)",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="shuffle documents across the source; default off for dclm-100b, "
+        "on for other sources; --no-shuffle keeps published file/row order",
+    )
     parser.add_argument(
         "--target",
         type=float,
@@ -132,21 +154,21 @@ def tokenize_command(argv: list[str]) -> None:
         "--val",
         type=float,
         default=CANONICAL_VAL_TOKENS,
-        help="held-out tokens: the shuffled stream's first documents",
+        help="held-out tokens: the chosen stream's first documents",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=CANONICAL_SHUFFLE_SEED,
-        help="key of the document shuffle; stores sharing it are prefixes of "
-        "one stream",
+        help="key of the optional document shuffle; prefix matching also "
+        "requires the same source, revision, tokenizer and ordering mode",
     )
     parser.add_argument(
         "--tokens-per-doc",
         type=int,
         default=CANONICAL_TOKENS_PER_DOC,
-        help="lower bound on the mean document length that sizes the "
-        "selection; the build fails if the selection runs out",
+        help="conservative mean document length used to size the selection; "
+        "does not truncate documents; the build fails if the selection runs out",
     )
     parser.add_argument(
         "--workers",
@@ -165,8 +187,11 @@ def tokenize_command(argv: list[str]) -> None:
         default=None,
         help="download directory, removed on success (default OUT/scratch)",
     )
-    parser.add_argument("--config", default=CANONICAL_CONFIG)
-    parser.add_argument("--revision", default=CANONICAL_DATASET_REVISION)
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="override the selected source's pinned revision",
+    )
     parser.add_argument("--tokenizer-revision", default=CANONICAL_TOKENIZER_REVISION)
     args = parser.parse_args(argv)
     if (args.scale is None) != (args.tokens_per_param is None):
@@ -180,7 +205,7 @@ def tokenize_command(argv: list[str]) -> None:
     from .data import tokenize
 
     tokenize(
-        args.out,
+        args.out or str(Path(args.data_root) / args.source),
         target_tokens=target,
         val_tokens=int(args.val),
         seed=args.seed,
@@ -188,7 +213,8 @@ def tokenize_command(argv: list[str]) -> None:
         workers=args.workers,
         readers=args.readers,
         scratch=args.scratch,
-        config=args.config,
+        source_name=args.source,
+        shuffle=args.shuffle,
         revision=args.revision,
         tokenizer_revision=args.tokenizer_revision,
         extend=args.extend,

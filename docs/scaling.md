@@ -54,9 +54,10 @@ Warmup is 2% of the 25x length at the scale whatever the ratio, 134, 397,
 and 1,051 steps; cooldown is 20% of the run.
 
 The context and the batch are uniform across the ladder on purpose. Rows of
-4,096 hold about four FineWeb-Edu documents where 1,024 held one, so the
-recurrent state and the dense read see a second document at every scale,
-and the ladder's rungs differ only in size. The batch of `2^19` follows the
+4,096 give the recurrent state and dense read room for multiple web
+documents at every scale. Screen/Jobe use the published shuffle of the
+100B DCLM subset; stores exceeding that subset use shuffled full DCLM.
+The source change prevents token-by-token comparisons across those stores. The batch of `2^19` follows the
 standard result that the efficient batch grows with the token budget rather
 than the model: the DeepSeek fit `B = 0.29 C^0.33` puts the screen's 25x
 optimum near 0.32M tokens, the bridge's near 0.66M, and the flagship's 400x
@@ -229,7 +230,7 @@ on Prime between the screen pair and the flagship.
 
 ```bash
 delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/tokens-350B
+  --data-dir /data/delta/dclm-100b
 ```
 
 `--scale bridge` is the column, row length, and batch above; the 25x schedule
@@ -380,15 +381,18 @@ output filesystem must also hold the selected token parts under `OUT/parts`;
 budget roughly 2.2 times the finished store plus headroom. `--scratch` holds
 downloaded parquet files, not token parts. Attach the disk to a compatible
 CPU staging instance, install the `data-build` extra, and run
-`delta tokenize --out OUT --scale bridge --tokens-per-param 400 --scratch SCRATCH --workers N --readers 8`.
-The build reads all 1 TB of `sample-350BT` once and tokenizes the selected
-documents. Measure download and assembly throughput on the chosen provider
+`delta tokenize --source dclm --data-root ROOT --scale bridge --tokens-per-param 400 --scratch SCRATCH --workers N --readers 8`.
+The full-source shuffle reads the pinned DCLM release (27,938 parquet files,
+7.42 TB) and tokenizes selected documents into `ROOT/dclm`. The default
+`dclm-100b` source is suitable for smaller Jobe stores but cannot supply
+the bridge's 167B or flagship's 441B target. Measure download and assembly throughput on the chosen provider
 before estimating build time; more CPU cores alone do not establish it.
 [Data-build performance](data-build-performance.md) gives the measurements
 and tuning procedure. The resulting
-store is byte-identical to Jobe's over Jobe's length (`delta verify`, then
-compare `val.bin` and the shared shards by checksum); then detach the disk
-and attach it to the H100 node. No live Hugging Face reads during training
+store should pass `delta verify`; checksum comparisons apply only against
+another build of the same source, ordering, pins and seed. The full-source
+store does not share a prefix or validation slice with Jobe's `dclm-100b`
+store. Then detach the disk and attach it to the H100 node. No live Hugging Face reads during training
 and no re-hosted copy of the store.
 
 The single-process trainer expresses this schedule already. Distributed

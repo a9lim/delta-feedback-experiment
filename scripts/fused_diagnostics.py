@@ -16,7 +16,7 @@ Held-out diagnostics on one snapshot of a condition with `f`:
 * a 30-iteration fully fused self-composition trace.
 
 Usage:
-    python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/tokens-350B
+    python scripts/fused_diagnostics.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 """
 
 from __future__ import annotations
@@ -82,7 +82,7 @@ def binned(values, edges, columns: dict[str, np.ndarray]) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("snapshot", type=Path)
-    parser.add_argument("--data-dir", default="data/tokens")
+    parser.add_argument("--data-dir", default="data/dclm-100b")
     parser.add_argument("--rows", type=int, default=256)
     parser.add_argument("--micro-rows", type=int, default=4)
     parser.add_argument("--self-rows", type=int, default=8)
