@@ -1,0 +1,64 @@
+{
+  "date": "2026-09-10",
+  "baseline_commit": "da5282133a9a66456b2e8bb1a6b9f6c230b37c31",
+  "implementation_commit": "e9d1d544ec387c4024858ed55cf246cf02a03fcf",
+  "test_commit": "82a7423fefec2dd6eeab7691f1ed939b015d8c9e",
+  "device": "NVIDIA GeForce RTX 4090",
+  "torch": "2.14.0+cu132",
+  "cuda": "13.2",
+  "checkpoint_version": 26,
+  "change": "Cached CUDA PKDA uses the full-row fused FP32 convolution, SiLU, and QK normalization with raw projected history and one final Q/K/V cast.",
+  "cause": "The separate autocast convolution rounded weights and intermediate activations to BF16 before SiLU and QK normalization, unlike the full-row fused kernel.",
+  "metric": "norm(full_hidden - cached_hidden) / norm(full_hidden)",
+  "original_failure": {
+    "condition": "a",
+    "layers": 4,
+    "dim": 128,
+    "dtype": "bfloat16",
+    "relative_l2_rounded": 0.0517015,
+    "bound": 0.04
+  },
+  "focused_probe": {
+    "method": "Execute the unchanged decode_parity function extracted from cuda_gate without the rest of the integrated probe.",
+    "seed": 0,
+    "batch": 2,
+    "length": 12,
+    "prefill": 5,
+    "dim": 128,
+    "plain_bf16": {
+      "condition": "",
+      "layers": 3,
+      "relative_l2": 0.014215163886547089,
+      "bound": 0.04,
+      "passed": true
+    },
+    "pkda_bf16": {
+      "condition": "a",
+      "layers": 4,
+      "relative_l2": 0.030808590352535248,
+      "bound": 0.04,
+      "passed": true
+    },
+    "loop_fp32": {
+      "condition": "arfl",
+      "layers": 12,
+      "loop_iterations": 2,
+      "relative_l2": 0.0030601585749536753,
+      "bound": 0.01,
+      "passed": true
+    }
+  },
+  "focused_tests": {
+    "jobe": "python -m pytest tests/test_pkda_cache.py -q",
+    "jobe_passed": 5,
+    "convolution_size_prefix_batch_cases": [[1, 1, 2], [2, 65, 1], [4, 1, 2], [4, 5, 2], [4, 65, 2]],
+    "invariants": ["raw projected history with exact values at matching GEMM partitions", "bounded history storage", "Q/K/V relative L2 error below 1e-4"],
+    "local": "python -m pytest tests/test_model.py -q -k 'cached or initialization or base_init'",
+    "local_passed": 11,
+    "ruff_local": "passed",
+    "ruff_jobe": "passed"
+  },
+  "full_suite_rerun_for_cache_fix": false,
+  "full_screen_graph_qualification_rerun_for_cache_fix": false,
+  "scope": "Focused numerical and cache-state verification; no training-quality or performance claim."
+}

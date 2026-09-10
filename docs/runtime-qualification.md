@@ -13,19 +13,24 @@ exact sources and inputs; Hopper has not been through the same checks.
 
 | Record | What it establishes |
 |---|---|
-| [Initialization qualification](../data/summary/initialization-qualification-2026-09-10.json) | Width-scaled gate/control initialization, unchanged flagship and RNG streams, passing test suites and Ruff; integrated CUDA gate stopped at the BF16 cache comparison |
+| [Cached PKDA precision](../data/summary/cache-parity-2026-09-10.json) | Shared convolution precision brings the four-layer BF16 cache error to 3.08% within the unchanged 4% bound; focused cache-history and decode checks pass |
+| [Initialization qualification](../data/summary/initialization-qualification-2026-09-10.json) | Width-scaled gate/control initialization, unchanged flagship and RNG streams, passing test suites and Ruff |
 | [Current execution optimizations](../data/summary/runtime-optimizations-2026-09-09.json) | Flash SDPA, packed projection gradients, PKDA tiling, selective block retention, full loop timings and accumulated-gradient comparisons |
 | [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Environment migration and its dependency/capture checks |
 | [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Earlier paired six-update diagnostic from a trained checkpoint |
 | [Earlier execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces and component measurements on the earlier stack |
 | [Loop staging baseline](../data/summary/loop-stage-2026-09-09.json) | Pre-optimization memory and timing measurements |
 
-The width-scaled initializer passes 239 portable tests with 16 CUDA cases
-skipped, all 255 tests on Jobe, and Ruff on both machines. The integrated
-`delta probe` gate stops at the four-layer, width-128 `a` model's BF16
-full-sequence versus cached-decode comparison: relative hidden-state L2 error
-0.0517 against a 0.04 bound. The cause has not been isolated and the bound is
-unchanged; full screen graph qualification for this initializer is incomplete.
+The width-scaled initializer passed 239 portable tests with 16 CUDA cases
+skipped and all 255 tests on Jobe. CUDA cached PKDA now shares the full-row
+fused convolution/SiLU/QK-normalization kernel, retaining FP32 arithmetic until
+the final Q/K/V cast. This removes extra BF16 rounding from the cached path.
+The four-layer, width-128 `a` model's full-sequence versus cached-decode
+relative hidden-state L2 error is 0.03081, within the unchanged 0.04 bound.
+Plain-decoder BF16 and looped-model FP32 comparisons also pass, as do five
+focused CUDA projection/history cases, eleven portable cache/initialization
+cases, and Ruff on both machines. The full suite and full screen graph gate
+were not rerun for this cache fix; the timing evidence below is from September 9.
 
 The 2026-09-09 execution record's four train/eval graphs peak at 14.46 GiB
 allocated and 22.96 GiB reserved, with
