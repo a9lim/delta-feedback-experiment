@@ -239,7 +239,9 @@ class PreconditionedKDA(nn.Module):
                 qkv = torch.cat((prefix, qkv), dim=1)
                 if output_final_state:
                     final = tuple(
-                        part.transpose(1, 2).contiguous()
+                        part.transpose(1, 2).clone(
+                            memory_format=torch.contiguous_format
+                        )
                         for part in qkv[:, -history:].split(
                             self.projection_size, dim=-1
                         )

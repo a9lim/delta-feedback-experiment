@@ -10,9 +10,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("conv_size,prefix", [(1, 1), (4, 1), (4, 5), (4, 65)])
+@pytest.mark.parametrize(
+    "conv_size,prefix,batch", [(1, 1, 2), (2, 65, 1), (4, 1, 2), (4, 5, 2), (4, 65, 2)]
+)
 @torch.no_grad()
-def test_cached_pkda_qkv_matches_full_row_and_projection_history(conv_size, prefix):
+def test_cached_pkda_qkv_matches_full_row_and_projection_history(
+    conv_size, prefix, batch
+):
     torch.manual_seed(0)
     cfg = condition_config(
         "a",
@@ -28,7 +32,7 @@ def test_cached_pkda_qkv_matches_full_row_and_projection_history(conv_size, pref
         pkda_conv_size=conv_size,
     )
     attn = DeltaModel(cfg).cuda().eval().blocks[0].attn
-    x = torch.randn(2, prefix + 3, cfg.dim, device="cuda")
+    x = torch.randn(batch, prefix + 3, cfg.dim, device="cuda")
     with torch.autocast("cuda", dtype=torch.bfloat16):
         full = attn._project(x, None, False)[:3]
         pieces = [[] for _ in full]
@@ -50,6 +54,10 @@ def test_cached_pkda_qkv_matches_full_row_and_projection_history(conv_size, pref
                         :, :, -(conv_size - 1) :
                     ]
                     torch.testing.assert_close(stored, expected, rtol=0, atol=0)
+                    assert (
+                        stored.untyped_storage().nbytes()
+                        == stored.numel() * stored.element_size()
+                    )
             else:
                 assert history is None
 
