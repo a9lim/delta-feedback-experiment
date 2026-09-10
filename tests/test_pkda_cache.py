@@ -36,6 +36,13 @@ def test_cached_pkda_qkv_matches_full_row_and_projection_history(
     with torch.autocast("cuda", dtype=torch.bfloat16):
         full = attn._project(x, None, False)[:3]
         pieces = [[] for _ in full]
+        weights = torch.cat(
+            [
+                projection.weight
+                for projection in (attn.q_proj, attn.k_proj, attn.v_proj)
+            ]
+        )
+        raw_pieces = []
         history = None
         for start, end in [
             (0, prefix),
@@ -46,13 +53,18 @@ def test_cached_pkda_qkv_matches_full_row_and_projection_history(
                 track.append(value)
             if conv_size > 1:
                 # The cache stores projected inputs, before convolution/SiLU.
-                for stored, projection in zip(
-                    history, (attn.q_proj, attn.k_proj, attn.v_proj), strict=True
+                # Match the GEMM partition: changing its row count can round a
+                # BF16 projection differently even before convolution.
+                raw_pieces.append(torch.nn.functional.linear(x[:, start:end], weights))
+                raw_full = torch.cat(raw_pieces, dim=1)
+                for stored, raw in zip(
+                    history,
+                    raw_full.split(attn.projection_size, dim=-1),
+                    strict=True,
                 ):
-                    raw = projection(x[:, :end]).transpose(1, 2)
-                    expected = torch.nn.functional.pad(raw, (conv_size - 1, 0))[
-                        :, :, -(conv_size - 1) :
-                    ]
+                    expected = torch.nn.functional.pad(
+                        raw.transpose(1, 2), (conv_size - 1, 0)
+                    )[:, :, -(conv_size - 1) :]
                     torch.testing.assert_close(stored, expected, rtol=0, atol=0)
                     assert (
                         stored.untyped_storage().nbytes()
