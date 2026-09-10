@@ -38,7 +38,7 @@
 <section class="mech" id="sec-train">
   <h3>training <small id="sum-train"></small></h3>
   <div class="grid two">
-    <div class="chart"><h2>train NLL <small>nats per step · solid loss · dashed pass-1 · faint raw, full EMA 200 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
+    <div class="chart"><h2>train NLL <small>nats per step · solid loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
     <div class="chart"><h2>held-out NLL <small>nats at eval cadence · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-val"></div></div>
   </div>
   <div class="grid two">
@@ -79,7 +79,7 @@
 <section class="mech" data-letter="f" hidden>
   <h3>f · feedback <small id="sum-f"></small></h3>
   <div class="grid two">
-    <div class="chart"><h2>fused gap <small>fused − pass-1 · ● held-out at eval cadence · dashed train EMA 200 on multi-pass steps · signed, linear</small></h2><div class="plot" id="p-gap"></div></div>
+    <div class="chart"><h2>fused gap <small>fused − pass-1 · ● held-out at eval cadence · dashed train on multi-pass steps · signed, linear</small></h2><div class="plot" id="p-gap"></div></div>
     <div class="chart"><h2>passes per step <small>k · rolling mean over 200 steps · one before the boundary, two or three after</small></h2><div class="plot" id="p-k"></div></div>
   </div>
   <div class="grid two">
@@ -113,13 +113,13 @@
 // every condition shares, then one section per letter (a, r, f, l) shown when
 // a displayed run has it.  Every generic mechanism — parsing, lineage,
 // polling, uPlot setup — comes from the chassis.
-const { P, hue, alpha, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
+const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         fmtAge, esc, tile, pace, gpuTile, configGroup, scheduleFields,
         makeChart, setData, bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs,
         state, runFor } = M;
 
 const LETTERS = ['a', 'r', 'f', 'l'];
-const EMA_SPAN = 200, ROLL = 200;
+const ROLL = 200;
 
 // ---------------------------------------------------------------- records
 // step: loss/pass1/k (+r under l)/two learning rates/gnorm/throughputs/mem/
@@ -232,13 +232,7 @@ function siteAxis() {
   };
 }
 
-// ---------------------------------------------------------------- smoothing
-// Exponential moving average over the non-null entries; nulls stay null.
-function ema(values, span) {
-  const a = 2 / (span + 1);
-  let acc = null;
-  return values.map((v) => { if (v == null) return null; acc = acc == null ? v : a * v + (1 - a) * acc; return acc; });
-}
+// ---------------------------------------------------------------- derived values
 // Trailing mean over the last `window` non-null entries.
 function rolling(values, window) {
   const out = new Array(values.length).fill(null), buf = [];
@@ -390,8 +384,7 @@ function rebuild() {
 
   // training
   step('p-nll', perRun((c, t) => [
-    line(`loss${t}`, alpha(c, 0.3)), line(`loss ema${t}`, c),
-    dashed(`pass-1${t}`, alpha(c, 0.3)), dashed(`pass-1 ema${t}`, c)]), { yScale: yLog, marks });
+    line(`loss${t}`, c), dashed(`pass-1${t}`, c)]), { yScale: yLog, marks });
   step('p-val', perRun((c, t) => [line(`val${t}`, c, PTS), dashed(`val fused${t}`, c, PTS)]), { yScale: yLog });
   step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dashed(`NAdam width${t}`, c, v3), dotted(`NAdam${t}`, c, v3)]), { yScale: yLog });
   step('p-gnorm', perRun((c, t) => [line(`gnorm${t}`, c, v3)]), { yScale: yLog });
@@ -410,7 +403,7 @@ function rebuild() {
   headline('p-nullrms', { yScale: yLog });
 
   // f · feedback
-  step('p-gap', [...perRun((c, t) => [line(`val gap${t}`, c, vs), dashed(`train gap ema${t}`, c, { value: vs.value })]), ref('0')]);
+  step('p-gap', [...perRun((c, t) => [line(`val gap${t}`, c, vs), dashed(`train gap${t}`, c, { value: vs.value })]), ref('0')]);
   step('p-k', perRun((c, t) => [line(`k mean${t}`, c, v3)]));
   step('p-drift', [...perRun((c, t) => [line(`drift${t}`, c, vs)]), ref('0')]);
   step('p-upd', perRun((c, t) => [line(`‖Δh‖${t}`, c, PTS)]), { yScale: yLog });
@@ -456,7 +449,7 @@ function seriesOf(view) {
     ...fields.map((f) => SITES.map((s) => finite((view.evals.get(`route|${s.name}`) || []).find((e) => e.step === last)?.[f]))),
   ]];
   return {
-    nll: [[xs, loss, ema(loss, EMA_SPAN), pass1, ema(pass1, EMA_SPAN)]],
+    nll: [[xs, loss, pass1]],
     val: ev(vals, 'val', 'val_fused'),
     lr: [[xs, col('lr_normuonh'), col('lr_nadam_width'), col('lr_nadam')]],
     gnorm: [[xs, col('gnorm')]],
@@ -466,7 +459,7 @@ function seriesOf(view) {
     siteSharp: profile('max', 'headjs'),
     siteNullrms: profile('nulrms'),
     seed: headline('seed'), null: headline('nul'), route: headline('max'), headjs: headline('headjs'), nullrms: headline('nulrms'),
-    gap: [...ev(vals, (e) => e.val_fused - e.val), [xs, ema(trainGap, EMA_SPAN)]],
+    gap: [...ev(vals, (e) => e.val_fused - e.val), [xs, trainGap]],
     k: [[xs, rolling(col('k'), ROLL)]],
     drift: ev(contract, (e) => e.loss8 - e.loss0),
     upd: ev(contract, 'upd8'),
