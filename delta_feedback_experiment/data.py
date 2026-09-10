@@ -39,6 +39,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from itertools import pairwise
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Protocol
 
@@ -436,7 +437,7 @@ def _select_file(
 def _select_files(build: _Build, pending: list[int]) -> None:
     """One worker, with at most one upcoming file downloading during encoding.
 
-    The fetch thread lives inside the worker, after the process pool forks.
+    The fetch thread lives inside the worker, after the process pool starts.
     Completed parts remain the resume markers; a prefetched source file left
     by a failure is reusable on the next attempt.
     """
@@ -470,7 +471,11 @@ def _select(build: _Build, workers: int) -> None:
     os.environ.setdefault(
         "RAYON_NUM_THREADS", str(max(1, (os.cpu_count() or 2) // (2 * workers)))
     )
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # Tokenizer/Arrow/Hub initialization can leave native threads in the parent.
+    # Spawn avoids inheriting their locks into the encoding workers.
+    with ProcessPoolExecutor(
+        max_workers=workers, mp_context=get_context("spawn")
+    ) as pool:
         chunks = [pending[i::workers] for i in range(min(workers, len(pending)))]
         for _ in pool.map(_select_files, [build] * len(chunks), chunks):
             pass

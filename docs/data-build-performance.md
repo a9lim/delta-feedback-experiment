@@ -7,7 +7,8 @@ tokenizer does not fix download waits or random-read amplification.
 ## Current execution
 
 Each `--workers` process encodes one source file and prefetches at most one
-upcoming file in a thread. Completed part indices remain the resume markers;
+upcoming file in a thread. Encoding processes use `spawn` so that parent
+tokenizer/Arrow/Hub threads and locks are not inherited. Completed part indices remain the resume markers;
 an interrupted download or encode leaves completed parts reusable. At most
 two source files per worker occupy download scratch. Multiple workers divide
 half the host's logical CPU threads between their Rust tokenizers by default;
@@ -37,10 +38,10 @@ assembly load, measured:
 
 | Gather mode | Output MB/s | Disk bytes / output byte |
 |---|---:|---:|
-| Default mmap advice, one reader | 10.6–11.0 | 24.5–25.4 |
+| Default mmap advice, one reader | 10.4–11.0 | 24.5–25.8 |
 | Random advice, one reader | 18.5–19.5 | about 1.6 |
 | Random advice, four readers | 46.5–47.5 | about 1.6 |
-| Random advice, eight readers | 54.3–55.6 | about 1.6 |
+| Random advice, eight readers | 53.4–55.9 | about 1.6 |
 
 Timing samples used distinct seeded document selections and reversed mode
 order. Separate repeated-input SHA-256 checks agreed exactly; the warm-cache
