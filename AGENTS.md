@@ -97,6 +97,8 @@ change it everywhere at once.
   for larger stores. FineWeb-Edu full/350B/100B/10B sources remain selectable.
   `--shuffle` / `--no-shuffle` override ordering. Stores live at
   `DATA_ROOT/SOURCE`, on Jobe `/data/delta/dclm-100b` or `/data/delta/dclm`.
+  The trainer uses the same `--data-root` / `--source` pair; both inherit
+  independently on resume or continuation unless explicitly overridden.
   Prefix identity requires the same source, revision, tokenizer, ordering
   and seed; it does not hold between the subset and full DCLM. A sidecar maps
   every document to its pinned parquet file and row. Conditions trained with

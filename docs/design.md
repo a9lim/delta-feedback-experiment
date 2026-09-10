@@ -106,6 +106,9 @@ predicted tokens and a rounded 15B-token store. `--data-root ROOT` places the
 store at `ROOT/NAME` (default `data/dclm-100b`); `--out` overrides that path.
 On Jobe the root is `/data/delta`, so the subset store is
 `/data/delta/dclm-100b` and a full-source store is `/data/delta/dclm`.
+The trainer uses the same `--data-root` and `--source` pair. Resume and
+continuation inherit each setting independently unless it is retyped; the
+store path is resolved after that inheritance.
 
 `delta tokenize --continue` appends to a finished store under matching source
 and ordering settings, landing on the bytes a fresh build at that target

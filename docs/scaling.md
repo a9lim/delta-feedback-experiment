@@ -230,7 +230,7 @@ on Prime between the screen pair and the flagship.
 
 ```bash
 delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 ```
 
 `--scale bridge` is the column, row length, and batch above; the 25x schedule

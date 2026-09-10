@@ -80,34 +80,34 @@ delta tokenize --source dclm --data-root /data/delta \
 # Run or queue one condition: letters from arfl in any order, empty for the
 # plain gated GQA decoder (`delta train --help` lists the letters).
 delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 delta queue example-arf-s1 --condition arf --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 delta queue example-plain-s1 --condition "" --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 delta queue example-arfl-s1 --condition arfl --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 
 # Every planned run is --condition, --scale, and --tokens-per-param: the
 # preset fills the geometry and batch, the ratio derives the schedule (25 is
 # the screen recipe, 400 the Prime recipes; docs/scaling.md has each budget).
 # The bridge on Jobe, and the memory staging to run before it:
 delta queue bridge-delta-arf-s1 --condition arf --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 delta queue bridge-delta-arfl-s1 --condition arfl --scale bridge --seed 1 --data-seed 0 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 python scripts/loop_memory_stage.py --out data/summary/loop-stage-bridge-DATE.json \
   --condition arfl --scale bridge
 # The 400x recipes, which the single-process trainer expresses and Prime's
 # unbuilt distributed path would run:
 delta train screen-delta-arf-400x-s1 --condition arf --tokens-per-param 400 \
-  --seed 1 --data-seed 0 --data-dir /data/delta/dclm-100b
+  --seed 1 --data-seed 0 --data-root /data/delta --source dclm-100b
 delta train flagship-delta-arfl-s1 --condition arfl --scale flagship --tokens-per-param 400 \
-  --seed 1 --data-seed 0 --data-dir /data/delta/dclm
+  --seed 1 --data-seed 0 --data-root /data/delta --source dclm
 # Extend a finished run to a longer schedule under a new tag: its stable
 # phase resumes from the last snapshot the longer schedule reproduces.
 delta queue screen-delta-arf-s1-50x --continue screen-delta-arf-s1 --tokens-per-param 50 \
-  --data-dir /data/delta/dclm-100b
+  --data-root /data/delta --source dclm-100b
 
 # Inspect and control the detached queue.
 delta status

@@ -19,13 +19,17 @@ import sys
 import time
 from pathlib import Path
 
+import torch
+from transformer_experiments import checkpoints, runs
+
 from delta_feedback_experiment.cli import SPOOL
 from delta_feedback_experiment.data import verify
+from delta_feedback_experiment.train import build_parser
 
 
 def busy(old: list[Path]) -> list[str]:
     """Spool jobs, active or pending, whose arguments name an old store."""
-    names = {str(path) for path in old}
+    names = {path.resolve() for path in old}
     reasons = []
     active = SPOOL.layout.active
     candidates = [("active", active)] if active.exists() else []
@@ -33,7 +37,34 @@ def busy(old: list[Path]) -> list[str]:
     for state, path in candidates:
         job = json.loads(path.read_text())
         words = [word for vector in job.get("argv", []) for word in vector]
-        if any(word in names for word in words):
+        parser = build_parser()
+        args = parser.parse_args([job["tag"], *words])
+        explicit = checkpoints.explicit_destinations(parser, words)
+        if (args.resume or args.continue_from) and not {
+            "data_root",
+            "source",
+        } <= explicit:
+            snapshots = Path(args.out_dir)
+            if not snapshots.is_absolute():
+                snapshots = SPOOL.layout.root / snapshots
+            try:
+                snapshot = runs.latest_snapshot(
+                    args.continue_from or args.tag, snapshots
+                )
+                # Only inspect saved settings; mapped tensors need not be read.
+                saved = torch.load(
+                    snapshot, map_location="cpu", weights_only=False, mmap=True
+                )["args"]
+                for field in ("data_root", "source"):
+                    if field not in explicit:
+                        setattr(args, field, saved[field])
+            except (FileNotFoundError, KeyError, ValueError, RuntimeError, EOFError):
+                reasons.append(f"{state} reader unresolved: {job['tag']}")
+                continue
+        directory = Path(args.data_root) / args.source
+        if not directory.is_absolute():
+            directory = SPOOL.layout.root / directory
+        if directory.resolve() in names:
             reasons.append(f"{state} reader: {job['tag']}")
     return reasons
 
@@ -68,12 +99,19 @@ def main(argv: list[str] | None = None) -> None:
         reasons = busy(old)
         if not reasons:
             break
-        print("waiting on " + "; ".join(reasons) if args.wait else "blocked by " + "; ".join(reasons))
+        print(
+            "waiting on " + "; ".join(reasons)
+            if args.wait
+            else "blocked by " + "; ".join(reasons)
+        )
         if not args.wait:
             sys.exit(1)
         time.sleep(300)
     for path in old:
-        print(f"{path}: {size(path) / 1e9:.1f} GB", "removed" if args.delete else "would be removed")
+        print(
+            f"{path}: {size(path) / 1e9:.1f} GB",
+            "removed" if args.delete else "would be removed",
+        )
         if args.delete:
             shutil.rmtree(path)
 

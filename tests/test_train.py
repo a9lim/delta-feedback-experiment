@@ -110,7 +110,7 @@ TINY_ARGS = [
 
 
 def corpus(tmp_path):
-    directory = tmp_path / "tokens"
+    directory = tmp_path / DEFAULT_SOURCE
     write_synthetic(directory, train_tokens=1200, val_tokens=120, vocab=97)
     return directory
 
@@ -1177,6 +1177,26 @@ def test_resolved_arguments_pin_what_the_operator_fixed():
     assert {"seq_len", "batch_rows"} <= pinned
 
 
+def test_trainer_uses_named_source_paths():
+    args = parse_run_args(["x"])
+    assert args.data_root == "data"
+    assert args.source == DEFAULT_SOURCE
+    assert not hasattr(args, "data_dir")
+    parser = build_parser()
+    args, pinned = resolve_run_args(
+        parser, ["x", "--data-root", "/data/delta", "--source", "fineweb-edu-10b"]
+    )
+    assert Path(args.data_root) / args.source == Path("/data/delta/fineweb-edu-10b")
+    assert {"data_root", "source"} <= pinned
+
+
+@pytest.mark.parametrize("flags", [["--data-dir", "/data/old"], ["--source", "unknown"]])
+def test_trainer_rejects_retired_or_unknown_data_arguments(flags):
+    with pytest.raises(SystemExit) as raised:
+        parse_run_args(["x", *flags])
+    assert raised.value.code == 2
+
+
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
     assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 6e-3
@@ -1300,13 +1320,15 @@ def test_iteration_draw_statistics():
 
 def run(tmp_path, tag, extra):
     directory = (
-        corpus(tmp_path) if not (tmp_path / "tokens").exists() else tmp_path / "tokens"
+        corpus(tmp_path) if not (tmp_path / DEFAULT_SOURCE).exists() else tmp_path / DEFAULT_SOURCE
     )
     return train(
         [
             tag,
-            "--data-dir",
-            str(directory),
+            "--data-root",
+            str(directory.parent),
+            "--source",
+            directory.name,
             "--out-dir",
             str(tmp_path / "runs"),
             *TINY_ARGS,
@@ -1377,6 +1399,42 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
         run(tmp_path, "conf", ["--condition", "arf", "--resume", "--dim", "64"])
     with pytest.raises(ValueError, match="conflicts"):
         run(tmp_path, "conf", ["--condition", "ar", "--resume"])
+
+
+def test_resume_inherits_data_root_and_source_independently(tmp_path, monkeypatch):
+    saved_root = tmp_path / "saved-data"
+    saved_source = "dclm"
+    write_synthetic(saved_root / saved_source, train_tokens=1200, val_tokens=120, vocab=97)
+    out = tmp_path / "runs"
+    train([
+        "inherit-data", "--data-root", str(saved_root), "--source", saved_source,
+        "--out-dir", str(out), *TINY_ARGS, "--condition", "", "--max-steps", "2",
+    ])
+    checkpoint = torch.load(next(out.glob("inherit-data.pt.*")), map_location="cpu", weights_only=False)
+    assert checkpoint["version"] == 26
+    assert checkpoint["args"]["data_root"] == str(saved_root)
+    assert checkpoint["args"]["source"] == saved_source
+    assert "data_dir" not in checkpoint["args"]
+
+    class ReachedDataLoad(Exception):
+        pass
+
+    observed = []
+
+    def observe_data_path(path):
+        observed.append(Path(path))
+        raise ReachedDataLoad
+
+    monkeypatch.setitem(train.__globals__, "read_meta", observe_data_path)
+    relocated = tmp_path / "relocated-data"
+    for flags, expected in [
+        ([], saved_root / saved_source),
+        (["--data-root", str(relocated)], relocated / saved_source),
+        (["--source", DEFAULT_SOURCE], saved_root / DEFAULT_SOURCE),
+    ]:
+        with pytest.raises(ReachedDataLoad):
+            train(["inherit-data", "--resume", "--out-dir", str(out), "--device", "cpu", *flags])
+        assert observed[-1] == expected
 
 
 def test_continuation_reproduces_the_longer_run(tmp_path, capsys):

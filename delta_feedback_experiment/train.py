@@ -31,7 +31,7 @@ import torch
 from transformer_experiments import checkpoints, runs, telemetry
 from transformer_experiments.schedule import Schedule
 
-from .data import TokenData, read_meta
+from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
     CONDITION_LETTERS,
     DeltaModel,
@@ -134,7 +134,8 @@ EXACT_FIELDS = (
 """State-defining settings: a resume takes these from the checkpoint."""
 
 RUNTIME_FIELDS = (
-    "data_dir",
+    "data_root",
+    "source",
     "out_dir",
     "device",
     "eval_every",
@@ -191,7 +192,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="shared randomness stream; identical across paired conditions",
     )
-    parser.add_argument("--data-dir", default="data/dclm-100b")
+    parser.add_argument(
+        "--data-root",
+        default="data",
+        help="parent directory of token stores; reads DATA_ROOT/SOURCE (default data)",
+    )
+    parser.add_argument(
+        "--source",
+        choices=tuple(SOURCES),
+        default=DEFAULT_SOURCE,
+        help="token-store source under --data-root (default dclm-100b)",
+    )
     parser.add_argument("--out-dir", default="runs")
     parser.add_argument(
         "--resume",
@@ -1363,13 +1374,14 @@ def train(argv: list[str] | None = None) -> dict:
     schedule = build_schedule(args)
     total = schedule.total
 
-    meta = read_meta(args.data_dir)
+    data_directory = Path(args.data_root) / args.source
+    meta = read_meta(data_directory)
     if meta["vocab_size"] > args.vocab_size:
         raise ValueError(
             f"data vocab {meta['vocab_size']} exceeds model vocab {args.vocab_size}"
         )
-    data_train = TokenData.load(args.data_dir, "train", args.seq_len)
-    data_val = TokenData.load(args.data_dir, "val", args.seq_len)
+    data_train = TokenData.load(data_directory, "train", args.seq_len)
+    data_val = TokenData.load(data_directory, "val", args.seq_len)
     needed = total * args.batch_rows
     if needed > data_train.rows:
         raise ValueError(f"schedule needs {needed} rows, stream has {data_train.rows}")
@@ -1398,6 +1410,8 @@ def train(argv: list[str] | None = None) -> dict:
         telemetry.log(
             "run",
             tag=args.tag,
+            data_root=args.data_root,
+            source=args.source,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
             grad_clip=GRAD_CLIP_NORM,
