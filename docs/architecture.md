@@ -118,6 +118,11 @@ produces five non-overlapping control slices:
 4. one preconditioner-gain logit per head;
 5. the rank-128 hidden input to the output gate.
 
+CUDA full rows and cached decoding share one fused convolution/SiLU/QK-norm
+kernel, keeping those operations in FP32 until the final Q/K/V cast. Cached
+rows prepend their raw projected history, discard the history's outputs, and
+retain the final three projected inputs for the next call.
+
 Packing changes neither parameter ownership nor optimizer semantics. On CUDA,
 the corresponding backward packs the five slice gradients directly into one
 contiguous buffer before the shared projection GEMM.

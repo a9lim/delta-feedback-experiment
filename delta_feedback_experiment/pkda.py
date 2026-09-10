@@ -214,17 +214,10 @@ class PreconditionedKDA(nn.Module):
         conv_state: tuple[Tensor, Tensor, Tensor] | None,
         output_final_state: bool,
     ) -> tuple[Tensor, Tensor, Tensor, tuple[Tensor, Tensor, Tensor] | None]:
-        if (
-            x.is_cuda
-            and conv_state is None
-            and not output_final_state
-            and fla_ops_available()
-        ):
-            # Dense training/prefill has no per-projection cache state. Collapse
-            # the three projections into one GEMM over the concatenated weights
-            # and all three identical short convolutions into one Triton launch;
-            # parameters stay separate so initialization, optimizer ownership,
-            # checkpoint names, and cached decoding remain unchanged.
+        if x.is_cuda and fla_ops_available():
+            # Full rows and cached decoding share the FP32 convolution/SiLU/
+            # QK-normalization boundary, casting only the final Q/K/V to the
+            # projection dtype. Cached rows prepend their raw projection history.
             qkv = sink_linear(
                 x,
                 (self.q_proj.weight, self.k_proj.weight, self.v_proj.weight),
@@ -232,6 +225,25 @@ class PreconditionedKDA(nn.Module):
                 self.qkv_shadow,
                 packed_sink=self.packed_qkv_sink,
             )
+            history = self.conv_size - 1
+            prefix_length = (
+                history if conv_state is not None or output_final_state else 0
+            )
+            final = None
+            if prefix_length:
+                prefix = (
+                    torch.cat(conv_state, dim=1).transpose(1, 2)
+                    if conv_state is not None
+                    else qkv.new_zeros(x.shape[0], history, 3 * self.projection_size)
+                )
+                qkv = torch.cat((prefix, qkv), dim=1)
+                if output_final_state:
+                    final = tuple(
+                        part.transpose(1, 2).contiguous()
+                        for part in qkv[:, -history:].split(
+                            self.projection_size, dim=-1
+                        )
+                    )
             weight = torch.cat(
                 (
                     self.q_conv.weight.squeeze(1),
@@ -244,8 +256,8 @@ class PreconditionedKDA(nn.Module):
             # convolution kernel, whose backward recomputes its pre-activation
             # in place instead of relaunching the forward. The kernel writes Q,
             # K, and V as three contiguous slabs and takes their three gradients
-            # back, so the recurrence reads them without contiguity copies and
-            # the backward never concatenates them.
+            # back. Full rows reach the recurrence without contiguity copies;
+            # cached rows discard the prepended history's outputs.
             q, k, v = pkda_qkv_conv(
                 qkv,
                 weight,
@@ -254,7 +266,12 @@ class PreconditionedKDA(nn.Module):
                 QK_NORM_EPS,
             )
             shape = (*x.shape[:2], self.num_heads, self.head_dim)
-            return q.view(shape), k.view(shape), v.view(shape), None
+            return (
+                q[:, prefix_length:].reshape(shape),
+                k[:, prefix_length:].reshape(shape),
+                v[:, prefix_length:].reshape(shape),
+                final,
+            )
 
         states = conv_state or (None, None, None)
         q, q_state = self._causal_conv(

@@ -582,7 +582,7 @@ def cuda_gate() -> None:
         raise AssertionError("packed-control gradient assembly drift")
     del control, control_ref, cotangents, control_parts, reference_parts
 
-    # Exercise causal FlexAttention and explicit GQA prefix-cache decoding.
+    # Exercise causal Flash attention and explicit GQA prefix-cache decoding.
     # BF16 changes with block partitioning, so the
     # invariant is close recurrence rather than bit identity.
     def decode_parity(
@@ -652,11 +652,9 @@ def cuda_gate() -> None:
     plain_decode_rel = decode_parity("", 3)
     hybrid_decode_rel = decode_parity("a", 4)
     # The loop decodes through one core cache track per iteration. BF16 drift
-    # between the parallel and single-column paths grows with executed depth:
-    # about 7% for the flat twelve-layer column on this geometry and 9% at
-    # two iterations, against 3.5% at four layers. The track wiring is
-    # therefore checked in FP32, where every twelve-layer condition sits near
-    # 0.2%.
+    # between the parallel and single-column paths grows with executed depth.
+    # Check the track wiring in FP32 to separate cache semantics from that
+    # accumulated rounding error.
     loop_decode_rel = decode_parity(
         "arfl",
         12,
