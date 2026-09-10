@@ -152,7 +152,13 @@ def tokenize_command(argv: list[str]) -> None:
         "--workers",
         type=int,
         default=1,
-        help="files tokenized concurrently; each downloads its own",
+        help="files tokenized concurrently; each worker prefetches one next file",
+    )
+    parser.add_argument(
+        "--readers",
+        type=int,
+        default=8,
+        help="concurrent document reads during shuffled assembly (default 8)",
     )
     parser.add_argument(
         "--scratch",
@@ -180,6 +186,7 @@ def tokenize_command(argv: list[str]) -> None:
         seed=args.seed,
         tokens_per_doc=args.tokens_per_doc,
         workers=args.workers,
+        readers=args.readers,
         scratch=args.scratch,
         config=args.config,
         revision=args.revision,

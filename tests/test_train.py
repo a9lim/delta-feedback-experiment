@@ -8,6 +8,7 @@ whole paired-comparison design leans on for multi-day jobe runs.
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 
 import numpy as np
 import pytest
@@ -263,6 +264,87 @@ def test_tokenize_writes_a_shuffled_prefix_with_provenance(tmp_path):
     assert len(set(crawls[:8])) > 1  # neighbours come from different crawls
 
 
+@pytest.mark.parametrize("write_buffer", [1, 97, 512])
+def test_tokenize_workers_produce_identical_store_bytes(tmp_path, monkeypatch, write_buffer):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    source = parquet_source(tmp_path / "source", files=5)
+    # Exercise an empty token part alongside variable-length nonempty documents.
+    pq.write_table(
+        pa.table({"text": [""] * 40, "dump": [DUMPS[0]] * 40}),
+        source.root / "sample" / "tiny" / "004.parquet",
+    )
+    serial = tmp_path / "serial"
+    parallel = tmp_path / "parallel"
+    monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
+    expected = build(serial, source, readers=1)
+    monkeypatch.setattr(data_module, "WRITE_BUFFER_TOKENS", write_buffer)
+    assert expected == build(parallel, source, workers=2, readers=8)
+    serial_files = {p.name: p.read_bytes() for p in serial.iterdir() if p.is_file()}
+    parallel_files = {p.name: p.read_bytes() for p in parallel.iterdir() if p.is_file()}
+    assert serial_files == parallel_files  # shards, sidecars, source index, metadata
+    assert len(list(parallel.glob("train.*.bin"))) > 1
+    assert verify(parallel)["train"]["tokens"] == expected["train_tokens"]
+
+
+@pytest.mark.parametrize("readers", [0, -1])
+def test_tokenize_rejects_nonpositive_readers(tmp_path, readers):
+    source = parquet_source(tmp_path / "source")
+    with pytest.raises(ValueError, match="readers"):
+        build(tmp_path / "tokens", source, readers=readers)
+
+
+def test_select_prefetch_overlaps_tokenization_and_stays_one_file_ahead(tmp_path, monkeypatch):
+    source = parquet_source(tmp_path / "source", files=4)
+    paths = source.list_files()
+    fetched = [Event() for _ in paths]
+    released = [Event() for _ in paths]
+
+    class ObservedSource:
+        def fetch(self, path):
+            which = paths.index(path)
+            # Fetching file i requires tokenization of i-2 to have completed:
+            # only the current file and one upcoming file may be in flight.
+            if which >= 2:
+                assert released[which - 2].is_set(), "prefetch ran more than one file ahead"
+            fetched[which].set()
+            return source.fetch(path)
+
+        def release(self, path):
+            released[paths.index(path)].set()
+
+    class ObservedTokenizer(CharTokenizer):
+        def __call__(self, texts, *, add_special_tokens):
+            which = int(next(text for text in texts if text)[1])
+            if which + 1 < len(paths):
+                assert fetched[which + 1].wait(5), "next fetch did not overlap tokenization"
+            if which + 2 < len(paths):
+                assert not fetched[which + 2].is_set(), "unbounded lookahead"
+            return super().__call__(texts, add_special_tokens=add_special_tokens)
+
+    parts = tmp_path / "parts"
+    parts.mkdir()
+    index = data_module.index_source(source)
+    configuration = data_module._Build(
+        source=ObservedSource(),
+        tokenizer=ObservedTokenizer,
+        parts=parts,
+        seed=3,
+        universe=160,
+        first=0,
+        selected=160,
+        bases=tuple(data_module.file_bases(index)),
+        row_groups=tuple(tuple(file["row_groups"]) for file in index["files"]),
+        paths=tuple(paths),
+        dumps=tuple(index["dumps"]),
+    )
+    monkeypatch.setattr(data_module, "_TOKENIZERS", {})
+    data_module._select_files(configuration, list(range(len(paths))))
+    assert all(event.is_set() for event in released)
+    assert len(list(parts.glob("*.index.npy"))) == len(paths)
+
+
 @dataclass
 class FlakySource:
     """A local source whose second fetch fails once."""
@@ -289,7 +371,8 @@ class FlakySource:
         return None
 
 
-def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path, workers):
     source = parquet_source(tmp_path / "source")
     short = build(tmp_path / "short", source)
     long = build(tmp_path / "long", source, target_tokens=900)
@@ -306,12 +389,15 @@ def test_tokenize_prefixes_agree_and_a_partial_build_resumes(tmp_path):
     marker.touch()
     flaky = FlakySource(source, marker)
     with pytest.raises(OSError, match="simulated"):
-        build(tmp_path / "resumed", flaky)
+        build(tmp_path / "resumed", flaky, workers=workers)
     assert (tmp_path / "resumed" / "parts" / "0000.index.npy").exists()
     assert not (tmp_path / "resumed" / "parts" / "0001.index.npy").exists()
-    resumed = build(tmp_path / "resumed", flaky)
+    resumed = build(tmp_path / "resumed", flaky, workers=workers)
     assert resumed["train_tokens"] == short["train_tokens"]
     assert np.array_equal(stream(tmp_path / "resumed", "train"), short_train)
+    assert {p.name: p.read_bytes() for p in (tmp_path / "resumed").iterdir()} == {
+        p.name: p.read_bytes() for p in (tmp_path / "short").iterdir()
+    }
     with pytest.raises(FileExistsError):
         build(tmp_path / "resumed", source)
 
@@ -349,6 +435,7 @@ def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
     assert captured["seed"] == CANONICAL_SHUFFLE_SEED
     assert captured["tokens_per_doc"] == CANONICAL_TOKENS_PER_DOC
     assert captured["workers"] == 1
+    assert captured["readers"] == 8
     assert captured["scratch"] is None
     assert captured["config"] == CANONICAL_CONFIG
     assert captured["revision"] == CANONICAL_DATASET_REVISION
@@ -356,13 +443,23 @@ def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
     assert captured["extend"] is False
 
 
-def test_tokenize_continue_lands_on_the_fresh_build(tmp_path):
+@pytest.mark.parametrize("workers", [1, 2])
+def test_tokenize_continue_lands_on_the_fresh_build(tmp_path, monkeypatch, workers):
     source = parquet_source(tmp_path / "source")
-    build(tmp_path / "grown", source)
-    fresh = build(tmp_path / "fresh", source, target_tokens=900)
+    monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
+    monkeypatch.setattr(data_module, "WRITE_BUFFER_TOKENS", 97)
+    build(tmp_path / "grown", source, workers=workers, readers=8)
+    fresh = build(tmp_path / "fresh", source, target_tokens=900, readers=1)
     with pytest.raises(ValueError, match="shuffle_seed"):
         build(tmp_path / "grown", source, target_tokens=900, seed=4, extend=True)
-    grown = build(tmp_path / "grown", source, target_tokens=900, extend=True)
+    grown = build(
+        tmp_path / "grown", source, target_tokens=900, extend=True, workers=workers, readers=8
+    )
+    assert {
+        p.name: p.read_bytes() for p in (tmp_path / "grown").iterdir() if p.name != "meta.json"
+    } == {
+        p.name: p.read_bytes() for p in (tmp_path / "fresh").iterdir() if p.name != "meta.json"
+    }
     for split in ("val", "train"):
         assert np.array_equal(stream(tmp_path / "grown", split), stream(tmp_path / "fresh", split))
         assert np.array_equal(

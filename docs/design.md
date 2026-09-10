@@ -93,6 +93,18 @@ parquet row holding its text, URL, and score, and its crawl as an index into
 `meta["dumps"]`. `delta verify DIR` checks a store against its meta and
 sidecars.
 
+Each of the `--workers` encoding processes prefetches one upcoming source
+file while encoding its current file, bounding downloaded scratch to at most
+two files per worker. `RAYON_NUM_THREADS` controls tokenizer threads per
+process; with multiple workers its default divides half the host's CPU
+threads between them. Assembly uses random-access mmap advice where supported
+and `--readers` concurrent document readers (default 8) into disjoint ranges
+of a roughly 64 MiB output buffer, followed by sequential shard writes.
+These settings change throughput, not document order, token bytes, or
+provenance. Assembly logs progress every 30 seconds.
+See [data-build performance](data-build-performance.md) for the measured
+bottleneck, tuning procedure, and storage requirements.
+
 One row is a non-overlapping `seq_len + 1` window, so 4,097 stored tokens give
 4,096 predictions. Rows may cross document boundaries, and attention crosses
 them too: with shuffled documents the neighbours are unrelated, which is the

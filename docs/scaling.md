@@ -375,12 +375,17 @@ It compares the complete `arf` package against its shared hybrid baseline.
 Data staging on Prime: after choosing a provider and location and before
 provisioning the H100 node, create a provider-local persistent disk sized for
 the compiled stream and run artifacts (the bridge ladder's 167B-token store
-is about 690 GB, the screen's 57B about 230 GB), attach it to a cheap
-compatible staging instance with a second scratch disk of the same size for
-the build's parts, install the `data-build` extra, and run
-`delta tokenize --scale bridge --tokens-per-param 400 --scratch SCRATCH --workers N`
-into the mounted path. The build reads all 1 TB of `sample-350BT` once, tokenizes the
-selected half, and needs a few hours on a many-core instance. The resulting
+is about 690 GB, the screen's 57B about 230 GB). During construction the
+output filesystem must also hold the selected token parts under `OUT/parts`;
+budget roughly 2.2 times the finished store plus headroom. `--scratch` holds
+downloaded parquet files, not token parts. Attach the disk to a compatible
+CPU staging instance, install the `data-build` extra, and run
+`delta tokenize --out OUT --scale bridge --tokens-per-param 400 --scratch SCRATCH --workers N --readers 8`.
+The build reads all 1 TB of `sample-350BT` once and tokenizes the selected
+documents. Measure download and assembly throughput on the chosen provider
+before estimating build time; more CPU cores alone do not establish it.
+[Data-build performance](data-build-performance.md) gives the measurements
+and tuning procedure. The resulting
 store is byte-identical to Jobe's over Jobe's length (`delta verify`, then
 compare `val.bin` and the shared shards by checksum); then detach the disk
 and attach it to the H100 node. No live Hugging Face reads during training

@@ -30,14 +30,17 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import mmap
 import os
 import shutil
 import time
-from concurrent.futures import ProcessPoolExecutor
+from collections.abc import Callable
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
+from itertools import pairwise
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Protocol
 
 import numpy as np
 import torch
@@ -47,6 +50,8 @@ META = "meta.json"
 SOURCE = "source.json"
 SHARD_TOKENS = 1 << 28
 """Tokens per train shard (~1 GiB as uint32)."""
+WRITE_BUFFER_TOKENS = 1 << 24
+"""Gather up to about 64 MiB before each sequential output write."""
 
 DOC_DTYPE = np.dtype([("start", "<i8"), ("source", "<i8"), ("dump", "<i2")])
 """One sidecar record: split-local start offset, universe address, dump id."""
@@ -221,7 +226,10 @@ class HubSource:
         from huggingface_hub import HfApi
 
         entries = HfApi().list_repo_tree(
-            self.dataset, repo_type="dataset", path_in_repo="data", revision=self.revision
+            self.dataset,
+            repo_type="dataset",
+            path_in_repo="data",
+            revision=self.revision,
         )
         names = [e.path.split("/")[-1] for e in entries]
         return sorted(name for name in names if "." not in name)
@@ -362,7 +370,9 @@ PART_DTYPE = np.dtype(
 _TOKENIZERS: dict[str, object] = {}
 
 
-def _select_file(build: _Build, which: int) -> tuple[int, int]:
+def _select_file(
+    build: _Build, which: int, local: Path | None = None
+) -> tuple[int, int]:
     """Tokenize one file's selected documents into its part; returns counts."""
     import pyarrow.parquet as pq
 
@@ -373,7 +383,8 @@ def _select_file(build: _Build, which: int) -> tuple[int, int]:
     eos = tokenizer.eos_token_id
     shuffle = Shuffle(build.universe, build.seed)
     path = build.paths[which]
-    local = build.source.fetch(path)
+    if local is None:
+        local = build.source.fetch(path)
     tokens_path = build.parts / f"{which:04d}.tokens.bin"
     index_path = build.parts / f"{which:04d}.index.npy"
     crawl_ids = {name: i for i, name in enumerate(build.dumps)}
@@ -422,15 +433,36 @@ def _select_file(build: _Build, which: int) -> tuple[int, int]:
     return docs, offset
 
 
+def _select_files(build: _Build, pending: list[int]) -> None:
+    """One worker, with at most one upcoming file downloading during encoding.
+
+    The fetch thread lives inside the worker, after the process pool forks.
+    Completed parts remain the resume markers; a prefetched source file left
+    by a failure is reusable on the next attempt.
+    """
+    if not pending:
+        return
+    with ThreadPoolExecutor(max_workers=1) as downloads:
+        fetched = downloads.submit(build.source.fetch, build.paths[pending[0]])
+        for i, which in enumerate(pending):
+            local = fetched.result()
+            if i + 1 < len(pending):
+                fetched = downloads.submit(
+                    build.source.fetch, build.paths[pending[i + 1]]
+                )
+            _select_file(build, which, local)
+
+
 def _select(build: _Build, workers: int) -> None:
     pending = [
         which
         for which in range(len(build.paths))
         if not (build.parts / f"{which:04d}.index.npy").exists()
     ]
+    if not pending:
+        return
     if workers <= 1:
-        for which in pending:
-            _select_file(build, which)
+        _select_files(build, pending)
         return
     # The Rust tokenizer threads every worker across all cores by default;
     # leave half the machine to whatever else is running.
@@ -439,7 +471,8 @@ def _select(build: _Build, workers: int) -> None:
         "RAYON_NUM_THREADS", str(max(1, (os.cpu_count() or 2) // (2 * workers)))
     )
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        for _ in pool.map(_select_file, [build] * len(pending), pending):
+        chunks = [pending[i::workers] for i in range(min(workers, len(pending)))]
+        for _ in pool.map(_select_files, [build] * len(chunks), chunks):
             pass
 
 
@@ -504,6 +537,31 @@ class _ShardWriter:
             self.shards += 1
 
 
+def _gather_tokens(
+    pieces: list[np.ndarray], pool: ThreadPoolExecutor, readers: int
+) -> np.ndarray:
+    """Fault in independent document ranges concurrently, retaining stream order."""
+    readers = min(readers, len(pieces))
+    if readers <= 1:
+        return np.concatenate(pieces)
+    offsets = np.empty(len(pieces) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum([piece.size for piece in pieces], out=offsets[1:])
+    output = np.empty(int(offsets[-1]), dtype=np.uint32)
+    bounds = np.linspace(0, len(pieces), readers + 1, dtype=int)
+    futures = [
+        pool.submit(
+            np.concatenate,
+            pieces[first:last],
+            out=output[offsets[first] : offsets[last]],
+        )
+        for first, last in pairwise(bounds)
+    ]
+    for future in futures:
+        future.result()
+    return output
+
+
 def _write(
     out: Path,
     parts: Path,
@@ -513,6 +571,7 @@ def _write(
     val_tokens: int,
     shuffle: Shuffle,
     extend: bool,
+    readers: int = 8,
 ) -> dict:
     """Walk the selection in stream order into val.bin, shards, and sidecars.
 
@@ -522,6 +581,8 @@ def _write(
     train shards and sidecar under the same rule, so it lands on the bytes a
     fresh build at the larger target would.
     """
+    started = time.monotonic()
+    telemetry.log("assemble", files=n_files, target=target_tokens, readers=readers)
     indices, maps = [], []
     for which in range(n_files):
         index_path = parts / f"{which:04d}.index.npy"
@@ -538,14 +599,18 @@ def _write(
         merged["dump"] = part["dump"]
         indices.append(merged)
         tokens_path = parts / f"{which:04d}.tokens.bin"
-        maps.append(
+        tokens = (
             np.memmap(tokens_path, dtype=np.uint32, mode="r")
             if tokens_path.stat().st_size
             else np.empty(0, dtype=np.uint32)
         )
-    index = (
-        np.concatenate(indices) if indices else np.empty(0, dtype=_MERGED_DTYPE)
-    )
+        # Stream order jumps between small documents across every source part.
+        # Sequential mmap readahead pulls in mostly unused neighbouring pages
+        # when the parts exceed RAM. The hint changes paging, never token bytes.
+        if tokens.size and hasattr(mmap, "MADV_RANDOM"):
+            tokens._mmap.madvise(mmap.MADV_RANDOM)
+        maps.append(tokens)
+    index = np.concatenate(indices) if indices else np.empty(0, dtype=_MERGED_DTYPE)
     index = index[np.argsort(index["position"], kind="stable")]
     del indices
     positions, parts_col = index["position"], index["part"]
@@ -567,32 +632,49 @@ def _write(
     count = 0
     buffer: list[np.ndarray] = []
     buffered = 0
+    initial_tokens = sum(writer.written for writer in writers.values())
+    next_report = started + 30
 
     def flush() -> None:
-        nonlocal buffer, buffered
+        nonlocal buffer, buffered, next_report
         if buffered:
-            writers[split].write(np.concatenate(buffer))
+            writers[split].write(_gather_tokens(buffer, reads, readers))
+            now = time.monotonic()
+            if now >= next_report:
+                written = sum(writer.written for writer in writers.values())
+                telemetry.log(
+                    "assemble_progress",
+                    train=writers["train"].written,
+                    target_train=train_target,
+                    tokens_per_second=(written - initial_tokens) / (now - started),
+                    elapsed_s=now - started,
+                )
+                next_report = now + 30
         buffer, buffered = [], 0
 
-    for i in range(index.size):
-        length = int(lengths[i])
-        if split == "val" and writers["val"].written + buffered + length > val_tokens:
-            flush()
-            writers["val"].close()
-            split = "train"
-            val_docs = count
-        if split == "train" and writers["train"].written + buffered >= train_target:
-            break
-        doc_start[count] = writers[split].written + buffered
-        doc_position[count] = positions[i]
-        doc_dump[count] = dumps[i]
-        count += 1
-        offset = int(offsets[i])
-        buffer.append(maps[int(parts_col[i])][offset : offset + length])
-        buffered += length
-        if buffered >= (1 << 24):
-            flush()
-    flush()
+    with ThreadPoolExecutor(max_workers=readers) as reads:
+        for i in range(index.size):
+            length = int(lengths[i])
+            if (
+                split == "val"
+                and writers["val"].written + buffered + length > val_tokens
+            ):
+                flush()
+                writers["val"].close()
+                split = "train"
+                val_docs = count
+            if split == "train" and writers["train"].written + buffered >= train_target:
+                break
+            doc_start[count] = writers[split].written + buffered
+            doc_position[count] = positions[i]
+            doc_dump[count] = dumps[i]
+            count += 1
+            offset = int(offsets[i])
+            buffer.append(maps[int(parts_col[i])][offset : offset + length])
+            buffered += length
+            if buffered >= WRITE_BUFFER_TOKENS:
+                flush()
+        flush()
     for writer in writers.values():
         writer.close()
     if split == "val":
@@ -629,6 +711,9 @@ def _write(
     counts["train_docs"] = int(train_docs.size)
     counts["train_tokens"] = writers["train"].written
     counts["unused_selected"] = int(index.size - count)
+    telemetry.log(
+        "assembled", train=counts["train_tokens"], elapsed_s=time.monotonic() - started
+    )
     return counts
 
 
@@ -654,6 +739,7 @@ def tokenize(
     seed: int = CANONICAL_SHUFFLE_SEED,
     tokens_per_doc: int = CANONICAL_TOKENS_PER_DOC,
     workers: int = 1,
+    readers: int = 8,
     source: Source | None = None,
     tokenizer: Callable[[], object] | None = None,
     tokenizer_name: str = CANONICAL_TOKENIZER,
@@ -677,6 +763,8 @@ def tokenize(
     a larger target under the same settings, selecting from the position
     after its last document and appending; a partial build resumes.
     """
+    if readers < 1:
+        raise ValueError("readers must be at least 1")
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     previous = None
@@ -733,6 +821,8 @@ def tokenize(
         seed=seed,
         target=target_tokens,
         val=val_tokens,
+        workers=workers,
+        readers=readers,
     )
 
     source_path = out / SOURCE
@@ -791,6 +881,7 @@ def tokenize(
         val_tokens=val_tokens,
         shuffle=shuffle,
         extend=previous is not None,
+        readers=readers,
     )
     if previous is None:
         meta = {
@@ -869,7 +960,9 @@ class TokenData:
         else:
             paths = sorted(directory.glob("train.*.bin"))
         docs = directory / f"{split}.docs.npy"
-        return cls([p for p in paths if p.exists()], seq_len, docs if docs.exists() else None)
+        return cls(
+            [p for p in paths if p.exists()], seq_len, docs if docs.exists() else None
+        )
 
     @property
     def docs(self) -> np.ndarray | None:
@@ -930,18 +1023,26 @@ def verify(directory: str | Path, *, sample_docs: int = 200_000) -> dict:
         if docs is None:
             raise RuntimeError(f"{split}: no sidecar")
         if docs.size != meta[f"{split}_docs"]:
-            raise RuntimeError(f"{split}: {docs.size:,} sidecar records, meta says {meta[f'{split}_docs']:,}")
+            raise RuntimeError(
+                f"{split}: {docs.size:,} sidecar records, meta says {meta[f'{split}_docs']:,}"
+            )
         starts = np.asarray(docs["start"])
-        if docs.size and (starts[0] != 0 or np.any(np.diff(starts) <= 0) or starts[-1] >= expected):
+        if docs.size and (
+            starts[0] != 0 or np.any(np.diff(starts) <= 0) or starts[-1] >= expected
+        ):
             raise RuntimeError(f"{split}: sidecar starts are not increasing from zero")
-        if docs.size and (docs["dump"].min() < 0 or docs["dump"].max() >= len(meta["dumps"])):
+        if docs.size and (
+            docs["dump"].min() < 0 or docs["dump"].max() >= len(meta["dumps"])
+        ):
             raise RuntimeError(f"{split}: sidecar dump ids outside meta['dumps']")
         later = starts[1:]
         if later.size:
             picked = rng.choice(later, min(sample_docs, later.size), replace=False)
             for start in np.sort(picked):
                 if int(data.read(int(start) - 1, 1)[0]) != meta["eos_id"]:
-                    raise RuntimeError(f"{split}: no EOS before the document at {start}")
+                    raise RuntimeError(
+                        f"{split}: no EOS before the document at {start}"
+                    )
         summary[split] = {"tokens": data.total_tokens, "docs": int(docs.size)}
     return summary
 
@@ -986,7 +1087,11 @@ def write_synthetic(
     train, train_docs = stream(train_tokens)
     per_shard = train_tokens // shards
     for index in range(shards):
-        piece = train[index * per_shard :] if index == shards - 1 else train[index * per_shard : (index + 1) * per_shard]
+        piece = (
+            train[index * per_shard :]
+            if index == shards - 1
+            else train[index * per_shard : (index + 1) * per_shard]
+        )
         piece.tofile(directory / f"train.{index:04d}.bin")
     np.save(directory / "train.docs.npy", train_docs)
     (directory / META).write_text(

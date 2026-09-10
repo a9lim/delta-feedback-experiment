@@ -120,6 +120,8 @@ Directions on the bench, none decided:
 - [operations.md](docs/operations.md): install, tokenize, train, queue,
   inspect. Run `delta probe` before training; Jobe's captured graph pool
   reserves about 23 GiB, so GPU work stays serial.
+- [data-build-performance.md](docs/data-build-performance.md): token-store
+  throughput, assembly measurements, and Prime staging/storage requirements.
 - [runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
 - [scaling.md](docs/scaling.md): the screen, the bridge, and the flagship,

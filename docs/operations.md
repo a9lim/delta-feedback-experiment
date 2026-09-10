@@ -60,7 +60,7 @@ delta probe
 # commits, sized for a planned run (rounded up to the next billion; the default
 # is the screen at 400x, 57B). Resumable; reads all of sample-350BT once (hours).
 delta tokenize --out /data/delta/tokens-350B --scale screen --tokens-per-param 400 \
-  --scratch /data/delta/scratch --workers 3
+  --scratch /data/delta/scratch --workers 3 --readers 8
 delta verify /data/delta/tokens-350B
 # Extend a finished store in place to a larger target; same bytes as a fresh
 # build at that target, so it reads the whole source again.
