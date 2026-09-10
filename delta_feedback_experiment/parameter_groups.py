@@ -26,7 +26,8 @@ def is_width_scaled_parameter(name: str, parameter: Tensor) -> bool:
 
     The GGQA gate matrices, the FBT token gate, and PKDA's packed control
     projection have fan-in ``D``, so their NAdam rate carries the muP width
-    ratio. Every other NAdam parameter has a fan-in that does not change
+    ratio and their initialization standard deviation its square root.
+    Every other NAdam parameter has a fan-in that does not change
     across geometries: the tied embedding's lookup, the router's fixed group
     width, PKDA's head-width expansions, the depthwise convolutions, and the
     vectors. The tied embedding's readout role has fan-in ``D`` too and takes

@@ -14,12 +14,12 @@ import pytest
 import torch
 
 from delta_feedback_experiment.model import (
-    depth_trace,
     BASE_NORMAL_INIT_STD,
     CONDITION_LETTERS,
     DeltaModel,
     KVCache,
     condition_config,
+    depth_trace,
     iterate_fused,
     multipass,
     multipass_loss,
@@ -189,7 +189,7 @@ def test_letters_only_add_parameters():
     for condition in BUILDABLE:
         assert {name for name, _ in tiny(condition + "l").named_parameters()} == {
             name
-            for name, _ in tiny(condition, **{"layers": 12}).named_parameters()
+            for name, _ in tiny(condition, layers=12).named_parameters()
         }, condition
     assert not any("blocks.0.attn.q_proj" in name for name in names[""])
     # Every dense attention layer owns a gate: all four on the plain trunk,
@@ -334,18 +334,74 @@ def test_normuonh_matrices_use_inverse_sqrt_fan_in_initialization():
     )
     assert rms(model.fuse_value.weight) == pytest.approx(1 / math.sqrt(32), rel=0.08)
 
-    # Semantic-scale matrices remain on their architecture-specific NAdam
-    # initialization rather than inheriting the Hyperball radius convention.
+    # NAdam matrices use the base scale or its gate/control width adjustment.
     assert rms(model.embed_tokens.weight) == pytest.approx(
         BASE_NORMAL_INIT_STD, rel=0.08
     )
-    assert rms(model.attention_gates[0].weight) == pytest.approx(
-        BASE_NORMAL_INIT_STD, rel=0.08
-    )
-    assert rms(model.fuse_gate.weight) == pytest.approx(BASE_NORMAL_INIT_STD, rel=0.08)
+    width_std = BASE_NORMAL_INIT_STD * math.sqrt(model.cfg.mup_ratio)
+    assert rms(model.attention_gates[0].weight) == pytest.approx(width_std, rel=0.08)
+    assert rms(model.fuse_gate.weight) == pytest.approx(width_std, rel=0.08)
     assert rms(model.blocks[0].attn.control_proj.weight) == pytest.approx(
-        BASE_NORMAL_INIT_STD, rel=0.08
+        width_std, rel=0.08
     )
+
+
+@pytest.mark.parametrize("dim", [768, 1152, 1536])
+@torch.no_grad()
+def test_gate_control_initialization_preserves_logit_variance_across_widths(dim):
+    """Unit-RMS inputs see the same direct and two-stage control variance at
+    every production width; embeddings and head-width expansions stay fixed."""
+    from delta_feedback_experiment.model import MUP_BASE_DIM
+
+    model = tiny("arf", seed=23, dim=dim, pkda_head_dim=128)
+    attn = model.blocks[0].attn
+
+    def output_rms(weight):
+        # Expected output RMS for an independent isotropic unit-RMS input.
+        return weight.square().sum(-1).mean().sqrt().item()
+
+    expected = BASE_NORMAL_INIT_STD * math.sqrt(MUP_BASE_DIM)
+    for weight in (
+        model.attention_gates[0].weight,
+        model.fuse_gate.weight,
+        *attn.control_proj.weight.split(attn.control_splits),
+    ):
+        assert output_rms(weight) == pytest.approx(expected, rel=0.08)
+
+    controls = attn.control_proj.weight.split(attn.control_splits)
+    for down, up in (
+        (controls[0], attn.decay_up.weight),
+        (controls[4], attn.output_gate_up.weight),
+    ):
+        assert output_rms(up @ down) == pytest.approx(
+            expected * BASE_NORMAL_INIT_STD * math.sqrt(128), rel=0.08
+        )
+
+    for weight in (
+        model.embed_tokens.weight,
+        attn.decay_up.weight,
+        attn.output_gate_up.weight,
+    ):
+        assert weight.square().mean().sqrt().item() == pytest.approx(
+            BASE_NORMAL_INIT_STD, rel=0.08
+        )
+
+
+def test_base_init_constant_tunes_nadam_matrices_only(monkeypatch):
+    from delta_feedback_experiment import model as model_module
+    from delta_feedback_experiment.parameter_groups import is_normuonh_parameter
+
+    baseline = tiny("arf", seed=23)
+    baseline_rng = torch.random.get_rng_state()
+    monkeypatch.setattr(model_module, "BASE_NORMAL_INIT_STD", 2 * BASE_NORMAL_INIT_STD)
+    tuned = tiny("arf", seed=23)
+    assert torch.equal(torch.random.get_rng_state(), baseline_rng)
+    baseline_parameters = dict(baseline.named_parameters())
+    for name, parameter in tuned.named_parameters():
+        expected = baseline_parameters[name]
+        if parameter.ndim == 2 and not is_normuonh_parameter(name, parameter):
+            expected = expected * 2
+        torch.testing.assert_close(parameter, expected, rtol=0, atol=0, msg=name)
 
 
 def test_readout_and_width_group_carry_the_mup_ratio():
@@ -909,7 +965,7 @@ def test_loop_at_one_iteration_is_the_unlooped_condition():
         toks = tokens()
         n_passes = 2 if looped.cfg.feedback_active else 1
         prefix = torch.ones((1, toks.shape[0]), dtype=torch.long) * 3
-        kwargs = dict(prefix_lens=prefix) if n_passes > 1 else {}
+        kwargs = {"prefix_lens": prefix} if n_passes > 1 else {}
         outs_l = multipass(
             looped, toks, n_passes, iterations=1, want_weights=True, **kwargs
         )

@@ -17,7 +17,7 @@ those roles to the organism.
 | Multi-head and Delta Attention Residuals | Grouped source selection and additive delta-source semantics | Addressable seed and block contributions, with a residual reconstruction identity |
 | Attention Residuals | Cumulative-state routing comparison | Clarifies how additive delta routing differs from replacing the residual read |
 | NorMuon / Hyperball / NAdam implementation | Matrix update direction, fixed realized radii, and semantic-scale optimization | A fixed training recipe across controls, with explicit parameter ownership |
-| Tensor Programs V, the spectral condition, and the mup shared readout | Width transfer for the NAdam group: the fan-in-`D` matrices and the tied readout carry `1536 / D`; NorMuonH's relative step needs no rule | A rate tuned at the flagship is the rate at every narrower geometry |
+| Tensor Programs V, the spectral condition, and the mup initializer/shared readout | Width transfer for NAdam rates, gate/control initialization, and the tied readout; NorMuonH's relative step needs no rule | Preserve initial control variance and express rates relative to the flagship |
 | Recurrent-depth language models | Prelude/tied-core/coda and the iteration draw for the `l` letter; zero-shot cache sharing as the trained `L` channel | An iteration axis, `l`, built; `L` specified |
 | Free Pause Tokens | Design comparison: separate persistent state from a read-only prediction stream | A candidate way to separate memory from prediction; assessed below |
 
@@ -36,6 +36,14 @@ for a tied embedding, a `1 / width` multiplier on the readout input with the
 embedding's own rate left alone. The departure is the reference width: the
 flagship rather than the smallest geometry, so `--lr-nadam` names the 1B
 rate and the screen is the scaled geometry.
+
+The mup initializer scales ordinary hidden-matrix standard deviations as
+`1 / sqrt(width_mult)`. The gate/control group follows this with
+`BASE_NORMAL_INIT_STD * sqrt(1536 / D)`. Extending that variance-preservation
+rule to every slice of PKDA's packed projection, including its fixed-rank
+bottlenecks, is a project choice. Embeddings and the fixed-head-width
+expansions retain the base standard deviation; the reference value 0.02 is a
+recipe choice, not a theoretical optimum.
 
 Source precedent motivates a component; the probe checks that we implemented
 the chosen equations; what the trained organism does with them is what the

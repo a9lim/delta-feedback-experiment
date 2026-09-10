@@ -46,7 +46,7 @@ from torch import Tensor, nn
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, sink_linear
-from .parameter_groups import is_normuonh_parameter
+from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
 
 try:  # Triton is deliberately a CUDA-only optimization dependency.
@@ -107,7 +107,12 @@ def parse_condition(text: str) -> str:
 
 
 BASE_NORMAL_INIT_STD = 0.02
-"""Sampling scale retained for embeddings and NAdam-owned dense matrices."""
+"""Base Gaussian standard deviation for NAdam-owned matrices.
+
+Embeddings and fixed-head-width expansions use this directly. Gate and control
+matrices with fan-in ``D`` multiply it by ``sqrt(MUP_BASE_DIM / D)``. Adjust
+this constant to tune both families; NorMuonH's fan-in scale is independent.
+"""
 
 MUP_BASE_DIM = 1536
 """The muP reference width: the flagship column of ``docs/scaling.md``.
@@ -115,8 +120,9 @@ MUP_BASE_DIM = 1536
 NorMuonH's relative step is width-invariant on its own. NAdam's is not: its
 per-coordinate step is the rate whatever the gradient, so a matrix with fan-in
 ``D`` moves its output by up to ``rate * D`` per step. The fan-in-``D`` NAdam
-matrices therefore run at ``lr_nadam * MUP_BASE_DIM / dim`` and the tied
-readout multiplies its logits by the same ratio, so the rate tuned at the
+matrices therefore run at ``lr_nadam * MUP_BASE_DIM / dim`` and initialize at
+``BASE_NORMAL_INIT_STD * sqrt(MUP_BASE_DIM / dim)``. The tied readout
+multiplies its logits by the width ratio, so the rate tuned at the
 flagship is the rate at every narrower geometry, and the flagship itself is
 the plain parametrization.
 """
@@ -1022,7 +1028,7 @@ class DeltaModel(nn.Module):
                 (self.fuse_value, self.fuse_gate),
                 factor_seed ^ 0x524543555252454E,
             )
-        self._scale_normuonh_initialization()
+        self._scale_initialization()
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, (nn.Linear, nn.Embedding)):
@@ -1050,17 +1056,20 @@ class DeltaModel(nn.Module):
             )
 
     @torch.no_grad()
-    def _scale_normuonh_initialization(self) -> None:
-        """Give each constrained matrix the Hyperball paper's fan-in scale.
+    def _scale_initialization(self) -> None:
+        """Apply NorMuonH fan-in and NAdam gate/control width scaling.
 
         Scaling the already sampled normal values is distributionally identical
         to drawing with the target standard deviation. It also preserves the
         common and factor-private paired random streams exactly.
         """
+        width_scale = math.sqrt(self.cfg.mup_ratio)
         for name, parameter in self.named_parameters():
             if is_normuonh_parameter(name, parameter):
                 target_std = 1 / math.sqrt(parameter.shape[1])
                 parameter.mul_(target_std / BASE_NORMAL_INIT_STD)
+            elif is_width_scaled_parameter(name, parameter):
+                parameter.mul_(width_scale)
 
     # -- pieces ----------------------------------------------------------------
 

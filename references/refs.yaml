@@ -202,3 +202,14 @@ references:
       forward, so a tied embedding keeps the input-embedding rate while its
       readout role carries the width ratio. The experiment's readout
       multiplies final_norm(h_top) by 1536 / D the same way.
+
+  - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/init.py#L18-L24
+    slug: microsoft-mup-initialization
+    note: >
+      The released initializer scales ordinary hidden-matrix standard
+      deviations by the inverse square root of the width multiplier. The
+      experiment uses BASE_NORMAL_INIT_STD * sqrt(1536 / D) for its NAdam
+      gate/control group. Applying that variance-preservation rule to all
+      PKDA control slices, including fixed-rank bottlenecks, is a project
+      choice. Embeddings and fixed-head-width expansions retain the base
+      standard deviation.

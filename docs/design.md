@@ -41,6 +41,13 @@ can be compared token by token. A looped condition pairs with its unlooped
 one the same way: the iteration draw is its own keyed sub-stream, so `arfl`
 and `arf` share every pass, prefix, and jitter draw.
 
+Initialization uses the single `BASE_NORMAL_INIT_STD = 0.02` constant in
+`delta_feedback_experiment/model.py` for the tied embedding and NAdam dense
+matrices. Gate/control matrices with fan-in `D` multiply that standard
+deviation by `sqrt(1536 / D)`; PKDA's fixed-head-width expansions and the
+embedding use it directly. NorMuonH matrices use `1 / sqrt(fan_in)`
+independently of the base constant.
+
 `l` needs whole cells and at least three of them. At one core iteration
 `arfl` is exactly `arf`: the same layers, parameters, banks, routes, losses,
 and gradients.

@@ -821,9 +821,26 @@ Building `L` touches the following together:
 ## Precision and initialization
 
 Each NorMuonH-owned matrix `W` with shape `[d_out, d_in]` is initialized from
-`Normal(0, 1 / sqrt(d_in))`, following the Hyperball parameterization. The tied
-embedding/readout and NAdam-owned dense matrices use `Normal(0, 0.02)`. The
-readout multiplies `final_norm(h_top)` by the muP width ratio `1536 / D`
+`Normal(0, 1 / sqrt(d_in))`, following the Hyperball parameterization. Normal
+distributions here are specified by standard deviation. The single tuning
+constant `BASE_NORMAL_INIT_STD = 0.02` in `delta_feedback_experiment/model.py`
+sets the base scale for NAdam-owned matrices:
+
+- GGQA gates, the FBT token gate, and PKDA's packed control projection use
+  `BASE_NORMAL_INIT_STD * sqrt(1536 / D)`: approximately 0.02828 at the
+  screen, 0.02309 at the bridge, and 0.02 at the flagship.
+- The tied embedding/readout and PKDA's fixed-head-width main-decay and
+  output-gate expansions use `BASE_NORMAL_INIT_STD` directly.
+
+For independent unit-RMS inputs, the width adjustment preserves the initial
+gate/control logit variance. Keeping the head-width expansions at the base
+scale also preserves the combined variance of PKDA's two-stage controls.
+The scaling uses the same parameter predicate as the NAdam width-scaled
+learning-rate group and draws no additional randomness. Changing the base
+constant changes these NAdam matrix scales; NorMuonH's fan-in scale stays
+independent of it.
+
+The readout multiplies `final_norm(h_top)` by the muP width ratio `1536 / D`
 before the tied classifier product, one at the flagship and two at the
 screen; the multiplier is a fixed part of the parametrization, not a
 parameter, and the CUDA classifier shadow reads the scaled input unchanged.
@@ -943,6 +960,7 @@ lookup. At the flagship every ratio is one.
 | | Screen | Bridge | Flagship |
 |---|---:|---:|---:|
 | Width ratio `1536 / D` | 2 | 4/3 | 1 |
+| Gate/control initialization standard deviation | 0.02828 | 0.02309 | 0.02 |
 | Width-scaled NAdam rate at `lr_nadam = 3e-4` | 6e-4 | 4e-4 | 3e-4 |
 | Readout multiplier | 2 | 4/3 | 1 |
 

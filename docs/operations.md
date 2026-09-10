@@ -191,6 +191,7 @@ python scripts/compare_conditions.py --reference runs/A.pt.STEP --feedback runs/
   --data-dir /data/delta/dclm-100b
 
 # Paired weight-space divergence from the shared initialization (CPU).
+# Use the initialization source revision and constants that trained both runs.
 python scripts/weight_divergence.py runs/A.pt.STEP runs/B.pt.STEP
 
 # Continue a feedback snapshot with dense feedback passes (or --passes 1 as

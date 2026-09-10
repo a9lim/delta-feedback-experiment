@@ -10,7 +10,7 @@ from __future__ import annotations
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 BLUE = "#2a78d6"
 ORANGE = "#eb6834"

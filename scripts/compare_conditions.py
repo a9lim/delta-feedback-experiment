@@ -36,7 +36,6 @@ import torch.nn.functional as F
 
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import shift_right
 
 POS_BINS = [(0, 0), (1, 3), (4, 15), (16, 63), (64, 255), (256, 511), (512, 1023)]
 MIX_W = (0.1, 0.2, 0.3, 0.4, 0.5)
@@ -159,10 +158,10 @@ def main() -> None:
                     ce[k].append(-lp[k].gather(-1, t[..., None]).squeeze(-1))
                 for a, b in (("m", "d1"), ("d1", "d2"), ("m", "d2")):
                     kl[f"{a}_{b}"].append((lp[a].exp() * (lp[a] - lp[b])).sum(-1))
-                for k in ent:
-                    ent[k].append(-(lp[k].exp() * lp[k]).sum(-1))
-                for k in arg:
-                    arg[k].append(lp[k].argmax(-1))
+                for k, values in ent.items():
+                    values.append(-(lp[k].exp() * lp[k]).sum(-1))
+                for k, values in arg.items():
+                    values.append(lp[k].argmax(-1))
                 for pair in PAIRS:
                     a, b = pair
                     for i, w in enumerate(MIX_W):

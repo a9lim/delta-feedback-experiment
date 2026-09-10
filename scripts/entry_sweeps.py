@@ -70,7 +70,7 @@ def main() -> None:
             logit = model.fuse_gate(model.gate_norm(e))
             value = model.fuse_value(ps)
 
-            def run(u):
+            def run(u, e=e, tgt=tgt):
                 out = model.forward_column(torch.where(plain1, e, u), need_payload=False)
                 return analysis.token_ce(model, out.h_top, tgt).sum().item()
 

@@ -87,7 +87,10 @@ change it everywhere at once.
   the matrices with fan-in `D` (GGQA gates, the FBT token gate, PKDA control
   projections) at `lr_nadam x 1536 / D`, everything else at `lr_nadam`, and
   the tied readout multiplies its logits by the same ratio. The flagship is
-  the muP reference width, so its ratio is one. No weight decay. The global
+  the muP reference width, so its ratio is one. `BASE_NORMAL_INIT_STD = 0.02`
+  in `model.py` is the NAdam matrix initialization knob: fan-in-`D` gates and
+  controls multiply it by `sqrt(1536 / D)`; embeddings and fixed-head-width
+  expansions use it directly. No weight decay. The global
   FP32 gradient is clipped to norm 10.0 before both steps.
 
 ## Useful bookkeeping

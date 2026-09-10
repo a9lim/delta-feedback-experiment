@@ -21,11 +21,9 @@ import json
 import re
 from pathlib import Path
 
-import numpy as np
-
 import figstyle as fs
 import matplotlib.pyplot as plt
-
+import numpy as np
 
 STEP_RE = re.compile(r"^(\w+)\s*\|")
 

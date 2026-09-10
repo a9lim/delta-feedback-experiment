@@ -32,7 +32,10 @@ import torch.nn.functional as F
 from transformer_experiments import downstream
 
 from delta_feedback_experiment import analysis
-from delta_feedback_experiment.data import CANONICAL_TOKENIZER, CANONICAL_TOKENIZER_REVISION
+from delta_feedback_experiment.data import (
+    CANONICAL_TOKENIZER,
+    CANONICAL_TOKENIZER_REVISION,
+)
 
 MODES = ("standard", "fused", "soft")
 

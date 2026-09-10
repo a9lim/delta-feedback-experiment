@@ -17,14 +17,13 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
-import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import figstyle as fs  # noqa: E402
+import figstyle as fs
 
-from delta_feedback_experiment.analysis import autocast, load_checkpoint  # noqa: E402
-from delta_feedback_experiment.data import TokenData  # noqa: E402
-from delta_feedback_experiment.model import depth_trace  # noqa: E402
+from delta_feedback_experiment.analysis import autocast, load_checkpoint
+from delta_feedback_experiment.data import TokenData
+from delta_feedback_experiment.model import depth_trace
 
 
 def core_route_mass(model, rows, iterations: int) -> dict[str, dict[int, dict[str, float]]]:

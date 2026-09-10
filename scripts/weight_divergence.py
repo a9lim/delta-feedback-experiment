@@ -6,6 +6,9 @@ snapshots share, the script measures how far each run moved from ``W0``, how
 far apart the two ended, and how aligned their total updates are.  NorMuonH
 matrices live on a fixed Frobenius sphere, so their movement is purely angular
 and the reconstruction of ``W0`` is checked against their invariant radii.
+Run this script from the initialization source revision that trained both
+snapshots, including its base initialization constant. The radius check alone
+cannot detect a different NAdam gate/control initialization.
 
 Usage:
     python scripts/weight_divergence.py runs/A.pt.10745 runs/B.pt.10745
@@ -74,7 +77,7 @@ def cos(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def angle(c: float) -> float:
-    return math.degrees(math.acos(max(-1.0, min(1.0, c)))) if c == c else float("nan")
+    return math.degrees(math.acos(max(-1.0, min(1.0, c)))) if not math.isnan(c) else float("nan")
 
 
 def initial_state(saved: dict) -> tuple[dict, set, set]:
@@ -166,7 +169,7 @@ def main() -> None:
     for key, e in sorted(grouped.items(), key=lambda t: (t[1]["layer"] if t[1]["layer"] is not None else -1, t[1]["family"])):
         if e["family"] not in MATRIX_FAMILIES:
             continue
-        print(f"  {str(e['layer']):<6}{e['family']:<14}{e['move_a']:>9.4f}{e['move_b']:>9.4f}{e['gap']:>9.4f}{e['cos_upd']:>9.4f}{e['angle_deg_a_0']:>8.2f}{e['angle_deg_b_0']:>8.2f}{e['angle_deg_a_b']:>8.2f}")
+        print(f"  {e['layer']!s:<6}{e['family']:<14}{e['move_a']:>9.4f}{e['move_b']:>9.4f}{e['gap']:>9.4f}{e['cos_upd']:>9.4f}{e['angle_deg_a_0']:>8.2f}{e['angle_deg_b_0']:>8.2f}{e['angle_deg_a_b']:>8.2f}")
     print("\n== unshared parameters ==")
     for n, e in unshared.items():
         print(f"  {n:<44} norm0={e['norm0']:.3f} norm={e['norm']:.3f} cos_to_init={e['cos_to_init']:.4f} move={e['move']:.4f}")

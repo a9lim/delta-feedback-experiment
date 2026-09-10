@@ -49,12 +49,12 @@ def cuda_gate() -> None:
         CONTRACT,
         CudaEvalRunner,
         CudaGraphTrainer,
-        parse_run_args,
-        build_schedule,
         automatic_checkpoint,
+        build_schedule,
         clip_gradients,
         evaluate,
         execution_fields,
+        parse_run_args,
         route_summary,
     )
 
@@ -473,7 +473,11 @@ def cuda_gate() -> None:
             accum_reference += probabilities.mT @ accum_e.float() / accum_rows
     del probabilities
 
-    def head_gradient(window: int | None) -> torch.Tensor:
+    def head_gradient(
+        window: int | None,
+        accum_c: torch.Tensor,
+        accum_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
         """The classifier gradient of every microbatch, summed in the sink."""
         sink = torch.zeros(accum_vocab, accum_dim, device="cuda")
         buffer = None if window is None else torch.zeros_like(accum_c)
@@ -503,18 +507,26 @@ def cuda_gate() -> None:
             raise AssertionError("the sunk classifier gradient reached autograd")
         return sink
 
-    def head_error(gradient: torch.Tensor) -> tuple[float, float]:
+    def head_error(
+        gradient: torch.Tensor, accum_reference: torch.Tensor
+    ) -> tuple[float, float]:
         difference = (gradient - accum_reference).norm() / accum_reference.norm()
         return difference.item(), (gradient.norm() / accum_reference.norm()).item()
 
-    per_micro_rel, per_micro_ratio = head_error(head_gradient(None))
-    repeat_rel, repeat_ratio = head_error(head_gradient(None))
+    per_micro_rel, per_micro_ratio = head_error(
+        head_gradient(None, accum_c, accum_batches), accum_reference
+    )
+    repeat_rel, repeat_ratio = head_error(
+        head_gradient(None, accum_c, accum_batches), accum_reference
+    )
     # The head's own run-to-run floor: the forward's LSE lock combines its
     # vocabulary tiles in whatever order they arrive.
     accum_floor = max(
         abs(repeat_rel - per_micro_rel), abs(repeat_ratio - per_micro_ratio), 1e-5
     )
-    once_rel, once_ratio = head_error(head_gradient(1))
+    once_rel, once_ratio = head_error(
+        head_gradient(1, accum_c, accum_batches), accum_reference
+    )
     if (
         abs(once_rel - per_micro_rel) > 8 * accum_floor
         or abs(once_ratio - per_micro_ratio) > 8 * accum_floor
@@ -524,7 +536,9 @@ def cuda_gate() -> None:
             f"path: rel {once_rel:.4e} versus {per_micro_rel:.4e}, norm ratio "
             f"{once_ratio:.6f} versus {per_micro_ratio:.6f}, floor {accum_floor:.1e}"
         )
-    flush_rel, flush_ratio = head_error(head_gradient(4))
+    flush_rel, flush_ratio = head_error(
+        head_gradient(4, accum_c, accum_batches), accum_reference
+    )
     # A four-microbatch window rounds its sum in BF16, which on these operands
     # costs 2.4e-4 of relative error and 9.4e-5 of norm; the bands below are
     # four times that, against a run-to-run floor of 1e-7. (On the trained
