@@ -304,9 +304,16 @@ class PreconditionedKDA(nn.Module):
         )
 
     def _controls(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        packed = F.linear(
-            x, shadowed_weight(self.control_proj.weight, self.control_shadow, x.dtype)
+        weight = shadowed_weight(
+            self.control_proj.weight, self.control_shadow, x.dtype
         )
+        channels = weight.shape[0]
+        if x.is_cuda and channels % 8:
+            # Align output rows before linear transposes the weight. Inductor's
+            # padding of the transposed operand can freeze strides that conflict
+            # with its selected GEMM template.
+            weight = F.pad(weight, (0, 0, 0, -channels % 8))
+        packed = F.linear(x, weight)[..., :channels]
         (
             decay_hidden,
             beta_logits,
