@@ -1283,6 +1283,12 @@ def train(argv: list[str] | None = None) -> dict:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
     args, pinned = resolve_run_args(parser, argv)
+    tags = (args.tag, args.continue_from) if args.continue_from else (args.tag,)
+    with runs.lock_tags(args.out_dir, *tags):
+        return _train(args, pinned)
+
+
+def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
     device = pick_device(args.device)
     if device.type == "cuda":
         # Ada's TF32 tensor cores materially accelerate NorMuonH's FP32 batched

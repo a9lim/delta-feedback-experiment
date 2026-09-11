@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from transformer_experiments import spool
@@ -34,6 +35,7 @@ delta — delta-feedback experiment operator
   delta stop TAG|live [--at STEP]
   delta stop queue|all
   delta clear TAG|all      move an idle tag's artifacts to recovery
+  delta move OLD NEW       rename an idle run and its artifacts
 """
 
 
@@ -82,6 +84,44 @@ LAYOUT = spool.Layout(
 SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="delta")
 
 STOP_PHASE = "train run"
+
+RUN_ARTIFACTS = (
+    *(f"figures/{kind}-{{tag}}" for kind in ("route", "fused", "downstream", "depth")),
+    *(
+        pattern
+        for kind in ("compare", "weights", "curves")
+        for pattern in (
+            f"figures/{kind}-{{tag}}-vs-*",
+            f"figures/{kind}-*-vs-{{tag}}",
+            f"figures/{kind}-*-vs-{{tag}}-vs-*",
+        )
+    ),
+)
+
+
+def move_command(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(
+        "delta move",
+        description=SPOOL.help("move").split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("source", metavar="OLD")
+    parser.add_argument("destination", metavar="NEW")
+    parser.add_argument(
+        "--out-dir", type=Path, help="snapshot directory (default runs)"
+    )
+    args = parser.parse_args(argv)
+    layout = replace(
+        SPOOL.layout,
+        snapshot_dir=args.out_dir or SPOOL.layout.snapshot_dir,
+        artifact_globs=RUN_ARTIFACTS,
+    )
+    try:
+        spool.Spool(layout, SPOOL.pipeline, prog="delta").move(
+            args.source, args.destination
+        )
+    except (ValueError, OSError) as error:
+        parser.exit(1, f"delta move: {error}\n")
 
 
 def tokenize_command(argv: list[str]) -> None:
@@ -288,6 +328,8 @@ def main() -> None:
         if len(rest) != 1:
             raise SystemExit("usage: delta clear TAG|all")
         SPOOL.clear(rest[0])
+    elif command == "move":
+        move_command(rest)
     else:
         print(USAGE, end="", file=sys.stderr)
         raise SystemExit(f"unknown command {command!r}")

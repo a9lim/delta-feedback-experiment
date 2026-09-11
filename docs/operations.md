@@ -118,6 +118,9 @@ delta stop queue
 delta stop all
 delta clear TAG
 delta clear all
+
+# Rename a finished or stopped run, keeping its saved trajectory.
+delta move screen-delta-r-s1 screen-delta-r-s1-nope
 ```
 
 The queue records exact arguments, not Git state. A source change never stops
@@ -131,6 +134,18 @@ marker records `TAG KILLED`; `delta stop` holds that deadline itself when no
 worker is alive. The worker restores Python's SIGINT handling before its first
 job, so a launcher that ignored the signal (`nohup`, a backgrounded command in
 a non-interactive shell) cannot leave a run that no stop can reach.
+
+`delta move OLD NEW` renames the run's snapshots, training/probe logs, and
+standard `figures/<kind>-<tag>` and comparison directories. It updates text
+records, continuation links in idle logs, and monitor status. Checkpoint bytes
+stay intact: the canonical `TAG.pt.STEP` filename supplies the current tag
+when loaded, while the serialized invocation remains as originally recorded.
+Rendered binary figures retain their existing labels until regenerated.
+Use `--out-dir DIR` for snapshots trained outside `runs/`; arbitrary custom
+analysis output paths and shared queue output are not renamed.
+Both tags must be idle and the destination unused; queued or active jobs
+referencing the source also block the move. Ordinary I/O failures roll back
+the changes, though a multi-file rename is not atomic against machine failure.
 
 The default Jobe run uses 6,716 steps, 128 rows per step, and 4,096
 predictions per row: 3,521,118,208 predicted tokens. Linear warmup occupies the

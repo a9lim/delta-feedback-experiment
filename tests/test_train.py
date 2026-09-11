@@ -6,7 +6,7 @@ whole paired-comparison design leans on for multi-day jobe runs.
 """
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 
@@ -1377,12 +1377,21 @@ def test_tiny_run_completes(tmp_path, capsys, condition):
 
 
 @pytest.mark.parametrize("condition", ["arf", "arfl"])
-def test_resume_is_exact(tmp_path, capsys, condition):
+@pytest.mark.parametrize("rename", [False, True], ids=["same-tag", "renamed"])
+def test_resume_is_exact(tmp_path, capsys, condition, rename):
     full = run(tmp_path, "full", condition_args(condition))
     scrambled = condition_args(condition[::-1])
     half = run(tmp_path, "half", [*scrambled, "--max-steps", "5"])
     assert half["step"] == 5
-    resumed = run(tmp_path, "half", [*condition_args(condition), "--resume"])
+    tag = "half"
+    if rename:
+        from transformer_experiments.spool import Spool
+
+        from delta_feedback_experiment.cli import LAYOUT, PIPELINE
+
+        Spool(replace(LAYOUT, root=tmp_path), PIPELINE).move("half", "renamed")
+        tag = "renamed"
+    resumed = run(tmp_path, tag, [*condition_args(condition), "--resume"])
     assert resumed["step"] == 8
     assert resumed["loss"] == full["loss"]
     assert resumed["val"] == full["val"]
