@@ -1,5 +1,7 @@
 """Layer selection, independent rotary math, and the compiled CUDA attention path."""
 
+import copy
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -90,6 +92,9 @@ def test_rope_rejects_an_unpaired_head_coordinate():
 
 @pytest.mark.parametrize("layer", [0, 3])
 @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA_ONLY)])
+@pytest.mark.filterwarnings(
+    "error:The AccumulateGrad node's stream does not match:UserWarning"
+)
 def test_gqa_normalizes_then_rotates_before_attention_and_captures(layer, device):
     torch.manual_seed(29)
     cuda = device == "cuda"
@@ -114,6 +119,8 @@ def test_gqa_normalizes_then_rotates_before_attention_and_captures(layer, device
         # Unequal gains catch a mistaken rotation-before-RMSNorm ordering.
         attention.q_norm.weight.uniform_(0.5, 1.5)
         attention.k_norm.weight.uniform_(0.5, 1.5)
+    reference_attention = copy.deepcopy(attention)
+    reference_gate = gate.detach().clone().requires_grad_()
     x = torch.randn(1, length, dim, device=device, requires_grad=True)
     upstream = torch.randn_like(x)
     inputs = (x, *attention.parameters(), gate)
@@ -140,12 +147,19 @@ def test_gqa_normalizes_then_rotates_before_attention_and_captures(layer, device
     else:
         actual, gradients = step()
 
+    # The captured graph retains its autograd leaves on the capture stream.
+    # Build the independent reference on fresh leaves on the current stream.
+    reference_x = x.detach().clone().requires_grad_()
+    reference_inputs = (
+        reference_x, *reference_attention.parameters(), reference_gate
+    )
+
     def reference():
-        q, k, v = F.linear(x, attention.qkv_proj.weight).split(
+        q, k, v = F.linear(reference_x, reference_attention.qkv_proj.weight).split(
             (attention.q_size, attention.kv_size, attention.kv_size), dim=-1
         )
-        q = attention.q_norm(q.view(1, length, heads, 96).transpose(1, 2))
-        k = attention.k_norm(k.view(1, length, kv_heads, 96).transpose(1, 2))
+        q = reference_attention.q_norm(q.view(1, length, heads, 96).transpose(1, 2))
+        k = reference_attention.k_norm(k.view(1, length, kv_heads, 96).transpose(1, 2))
         v = v.view(1, length, kv_heads, 96).transpose(1, 2)
         if layer != 3:
             q, k = complex_rotation(q), complex_rotation(k)
@@ -154,11 +168,14 @@ def test_gqa_normalizes_then_rotates_before_attention_and_captures(layer, device
         with sdpa_kernel(SDPBackend.FLASH_ATTENTION if cuda else SDPBackend.MATH):
             z = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
         z = z.transpose(1, 2).reshape(1, length, -1)
-        return F.linear(z * F.linear(x, gate).sigmoid(), attention.o_proj.weight)
+        return F.linear(
+            z * F.linear(reference_x, reference_gate).sigmoid(),
+            reference_attention.o_proj.weight,
+        )
 
     with torch.autocast(device, dtype=torch.bfloat16, enabled=cuda):
         expected = reference()
-        expected_gradients = torch.autograd.grad(expected, inputs, upstream)
+        expected_gradients = torch.autograd.grad(expected, reference_inputs, upstream)
     for value, target in zip(
         (actual, *gradients), (expected, *expected_gradients), strict=True
     ):
