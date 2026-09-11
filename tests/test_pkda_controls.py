@@ -5,6 +5,7 @@ import copy
 import pytest
 import torch
 import torch.nn.functional as F
+from torch._inductor.utils import fresh_cache
 
 from delta_feedback_experiment import INDUCTOR_MODE
 from delta_feedback_experiment.pkda import PreconditionedKDA
@@ -31,7 +32,7 @@ def test_compiled_screen_controls_match_unpadded_reference(training, caplog):
         )
 
     # Compile each mode so a cached graph cannot hide a scheduling conflict.
-    with torch._inductor.config.patch(force_disable_caches=True):
+    with fresh_cache():
         compiled = torch.compile(attention._controls, mode=INDUCTOR_MODE, fullgraph=True)
         with torch.set_grad_enabled(training), torch.autocast("cuda", torch.bfloat16):
             actual = compiled(x)
