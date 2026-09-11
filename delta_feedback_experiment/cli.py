@@ -128,7 +128,6 @@ def tokenize_command(argv: list[str]) -> None:
     from .data import (
         CANONICAL_SHUFFLE_SEED,
         CANONICAL_TARGET_TOKENS,
-        CANONICAL_TOKENIZER_REVISION,
         CANONICAL_TOKENS_PER_DOC,
         CANONICAL_VAL_TOKENS,
         DEFAULT_SOURCE,
@@ -232,7 +231,6 @@ def tokenize_command(argv: list[str]) -> None:
         default=None,
         help="override the selected source's pinned revision",
     )
-    parser.add_argument("--tokenizer-revision", default=CANONICAL_TOKENIZER_REVISION)
     args = parser.parse_args(argv)
     if (args.scale is None) != (args.tokens_per_param is None):
         parser.error("--scale and --tokens-per-param go together")
@@ -256,7 +254,6 @@ def tokenize_command(argv: list[str]) -> None:
         source_name=args.source,
         shuffle=args.shuffle,
         revision=args.revision,
-        tokenizer_revision=args.tokenizer_revision,
         extend=args.extend,
     )
 

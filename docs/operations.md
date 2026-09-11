@@ -55,6 +55,30 @@ upgrade, build into a new directory or reproduce the original store's build
 environment before extending it. Reading an existing store for training does
 not require its build package versions.
 
+## Format a conversation
+
+Load the experiment's tokenizer through its shared entry point so the two
+ChatML delimiters, template, and pinned identity are installed together:
+
+```python
+from delta_feedback_experiment.tokenizer import load_tokenizer
+
+tokenizer = load_tokenizer()
+messages = [
+    {"role": "researcher", "content": "State the hypothesis."},
+    {"role": "critic", "content": "Identify a counterexample."},
+    {"role": "critic", "content": "Then check the boundary case."},
+]
+token_ids = tokenizer.apply_chat_template(
+    messages, add_generation_prompt=True, next_role="researcher"
+)
+```
+
+Role names are ordinary text and stay as supplied, including repeated roles.
+Omitting `next_role` opens a `self` turn. `<|im_end|>` ends a message;
+`<|endoftext|>` is the separate pretraining document EOS. This loads tokenizer
+files only. The web-text pretraining pipeline does not apply ChatML.
+
 ## Operate
 
 Choose the command for the intended action; `TAG` and `STEP` are placeholders.
@@ -171,10 +195,10 @@ ratio, so the screen runs those at `6e-4` under a doubled readout. Both sides ap
 their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
-New snapshots use checkpoint contract v27. Resume, evaluation, and forks
-accept v27 for every condition and v26 only for conditions with `a`, whose
-computation is unchanged. A v26 non-`a` specimen needs its original source
-revision: loading it into the current RoPE trunk is rejected.
+Checkpoint v28 is the only accepted contract for resume, evaluation, and
+forks; it uses the pinned GPT-NeoX tokenizer with generic ChatML delimiters
+and a 50,304-row model vocabulary. Token stores must match that tokenizer
+identity; the source path alone does not make a store compatible.
 Protected snapshots persist at the
 cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
 limits the current invocation without changing the schedule.

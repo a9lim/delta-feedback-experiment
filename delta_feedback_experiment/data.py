@@ -48,6 +48,14 @@ import numpy as np
 import torch
 from transformer_experiments import telemetry
 
+from .tokenizer import (
+    SYNTHETIC_TOKENIZER_ID,
+    TOKENIZER_ID,
+    VOCAB_SIZE,
+    load_tokenizer,
+    tokenizer_metadata,
+)
+
 META = "meta.json"
 SOURCE = "source.json"
 BUILD = "build.json"
@@ -107,9 +115,6 @@ SOURCES = {
         )
     },
 }
-CANONICAL_TOKENIZER = "Qwen/Qwen3-0.6B-Base"
-CANONICAL_TOKENIZER_REVISION = "da87bfb608c14b7cf20ba1ce41287e8de496c0cd"
-VOCAB_SIZE = 151_936
 DATA_PACKAGES = ("transformers", "tokenizers", "huggingface-hub", "pyarrow")
 
 
@@ -353,16 +358,6 @@ def source_address(index: dict, address: int) -> tuple[str, int]:
     bases = file_bases(index)
     which = int(np.searchsorted(bases, address, side="right")) - 1
     return index["files"][which]["path"], address - bases[which]
-
-
-def load_tokenizer(
-    name: str = CANONICAL_TOKENIZER, revision: str = CANONICAL_TOKENIZER_REVISION
-):
-    from transformers import AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(name, revision=revision)
-    assert tokenizer.eos_token_id is not None
-    return tokenizer
 
 
 # -- the select stage ----------------------------------------------------------
@@ -815,8 +810,6 @@ def tokenize(
     readers: int = 8,
     source: Source | None = None,
     tokenizer: Callable[[], object] | None = None,
-    tokenizer_name: str = CANONICAL_TOKENIZER,
-    tokenizer_revision: str = CANONICAL_TOKENIZER_REVISION,
     source_name: str = DEFAULT_SOURCE,
     shuffle: bool | None = None,
     revision: str | None = None,
@@ -856,8 +849,10 @@ def tokenize(
         "dataset": spec.dataset,
         "source_prefix": spec.prefix,
         "revision": revision,
-        "tokenizer": tokenizer_name,
-        "tokenizer_revision": tokenizer_revision,
+        **(tokenizer_metadata() if tokenizer is None else {
+            "tokenizer": "synthetic", "tokenizer_revision": None, "vocab_size": VOCAB_SIZE,
+        }),
+        "tokenizer_id": TOKENIZER_ID if tokenizer is None else SYNTHETIC_TOKENIZER_ID,
         "shuffle": shuffle,
         "shuffle_seed": seed,
         "val_target": val_tokens,
@@ -898,7 +893,7 @@ def tokenize(
         scratch.mkdir(parents=True, exist_ok=True)
         source = HubSource(spec.dataset, spec.prefix, revision, scratch)
     if tokenizer is None:
-        tokenizer = _HubTokenizer(tokenizer_name, tokenizer_revision)
+        tokenizer = _HubTokenizer()
     eos = int(tokenizer().eos_token_id)
     telemetry.log(
         "tokenize",
@@ -906,8 +901,8 @@ def tokenize(
         dataset=spec.dataset,
         shuffle=shuffle,
         revision=revision,
-        tokenizer=tokenizer_name,
-        tokenizer_revision=tokenizer_revision,
+        tokenizer=settings["tokenizer"],
+        tokenizer_id=settings["tokenizer_id"],
         seed=seed,
         target=target_tokens,
         val=val_tokens,
@@ -1042,11 +1037,8 @@ def tokenize(
 
 @dataclass(frozen=True)
 class _HubTokenizer:
-    name: str
-    revision: str
-
     def __call__(self):
-        return load_tokenizer(self.name, self.revision)
+        return load_tokenizer()
 
 
 # -- reading -------------------------------------------------------------------
@@ -1071,6 +1063,7 @@ class TokenData:
     @classmethod
     def load(cls, directory: str | Path, split: str, seq_len: int) -> TokenData:
         directory = Path(directory)
+        read_meta(directory)
         if split == "val":
             paths = [directory / "val.bin"]
         else:
@@ -1227,6 +1220,7 @@ def write_synthetic(
             {
                 "format": STORE_FORMAT,
                 "tokenizer": "synthetic",
+                "tokenizer_id": SYNTHETIC_TOKENIZER_ID,
                 "tokenizer_revision": None,
                 "eos_id": eos,
                 "dataset": "synthetic",
@@ -1249,4 +1243,9 @@ def read_meta(directory: str | Path) -> dict:
     meta = json.loads((Path(directory) / META).read_text())
     if meta.get("format") != STORE_FORMAT:
         raise ValueError("unsupported token store format; rebuild with delta tokenize")
+    if meta.get("tokenizer_id") == TOKENIZER_ID:
+        if any(meta.get(key) != value for key, value in tokenizer_metadata().items()):
+            raise ValueError("token store tokenizer metadata differs; rebuild with delta tokenize")
+    elif meta.get("tokenizer_id") != SYNTHETIC_TOKENIZER_ID:
+        raise ValueError("token store uses a different tokenizer; rebuild with delta tokenize")
     return meta

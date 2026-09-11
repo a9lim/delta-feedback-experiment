@@ -38,52 +38,31 @@ boundaries and file/row provenance are preserved in either ordering mode.
 `assemble_progress` reports train tokens, the target, elapsed seconds, and
 average assembled tokens per second every 30 seconds.
 
-## Jobe evidence, September 10, 2026
+## Measuring the current build
 
-The former FineWeb-Edu 57B-token build completed all 472 source parts at
-04:36:47 EDT. It was stopped and its data deleted when the project switched
-to DCLM. These measurements describe that FineWeb-Edu working set. Its
-original assembly process produced about 11.5 MB/s while reading roughly
-280 MB/s from the NVMe drive. A stack sample found it in the buffer gather;
-process counters showed about 2,300 major page faults per second and only
-6% of one CPU used. Small shuffled documents were pulling in much larger
-neighbouring ranges from a working set larger than RAM.
+End-to-end build speed with the current GPT-NeoX/ChatML tokenizer is not yet
+measured. Record indexing, encoding, and assembly separately from the current
+build logs, including source pins, package versions, worker/thread counts,
+selected documents, token counts, and elapsed time.
 
-Bounded read-only gathers from the real 472-part store, under the concurrent
-assembly load, measured:
-
-| Gather mode | Output MB/s | Disk bytes / output byte |
-|---|---:|---:|
-| Default mmap advice, one reader | 10.4–11.0 | 24.5–25.8 |
-| Random advice, one reader | 18.5–19.5 | about 1.6 |
-| Random advice, four readers | 46.5–47.5 | about 1.6 |
-| Random advice, eight readers | 53.4–55.9 | about 1.6 |
-
-Timing samples used distinct seeded document selections and reversed mode
-order. Separate repeated-input SHA-256 checks agreed exactly; the warm-cache
-repeat is a correctness check, not a speed comparison. These are sampled
-gather rates, not complete-build or Prime benchmarks. Download prefetch
-overlap is verified by a synchronized test; its end-to-end speedup has not
-been measured. This does not establish throughput for either DCLM source.
-
-Reproduce the gather comparison while a build still has its completed parts:
+Compare read-only gathers while a build still has its completed parts:
 
 ```bash
 python scripts/token_assembly_bench.py OUT/parts --docs-per-part 32 --readers 8
 ```
 
-The script reads only, leaves shared caches alone, reports physical read
-bytes on Linux, and checks identical token hashes. Parts are deleted after a
-successful build, so this is a staging benchmark. Tests also compare exact
-store bytes across worker/reader counts, different flush sizes, shard
-boundaries, empty source parts, interrupted builds, and extension.
+The script leaves shared caches alone, reports physical read bytes on Linux,
+and checks identical token hashes. Use distinct seeded document selections
+and alternate comparison order. Parts are deleted after a successful build,
+so this is a staging benchmark. Hash equality is a correctness check and does
+not establish a speedup. Complete-build timing must include downloads and
+encoding as well as gathers.
 
 ## Prime staging
 
 Build on a CPU staging instance with local NVMe and sufficient network
 throughput, before attaching the finished store to the GPU node. Start with
-eight assembly readers; compare four/eight/sixteen on that actual disk rather
-than extrapolating Jobe's result. Increase encoding workers only while network
+eight assembly readers; compare four/eight/sixteen on that actual disk. Increase encoding workers only while network
 throughput or encoding throughput improves, with an explicit per-process
 Rust thread budget. Preserve tokenizer/source revisions, build package versions
 and ordering. Compare checksums only across builds of the same source;
@@ -91,18 +70,15 @@ the full DCLM store and Jobe's 100B subset do not
 share a promised prefix.
 
 Peak storage includes both selected token parts and the finished stream on
-the output filesystem. The measured FineWeb-Edu 57B build had 260.9 GB of parts and about 229 GB
-of final tokens/sidecars: roughly 490 GB before cleanup. `--scratch` only
-relocates source downloads. Budget roughly 2.2 times final size plus headroom
-for a comparable build; a separate scratch disk does not relocate `OUT/parts`.
+the output filesystem. `--scratch` only relocates source downloads, not
+`OUT/parts`. Allow roughly twice the final token-store size for token parts
+and final output, plus sidecars, selection headroom, and bounded download
+scratch; measure the actual peak before treating it as a capacity bound.
 
 Use `--source dclm` for the bridge's 167B and the flagship's 441B stores.
 The published 100B subset is a separate source for smaller builds; its name
-is a publisher token estimate, not an exact count with the Qwen tokenizer.
-A 15B-token store occupies about 60 GB of uint32 tokens plus sidecars, and
-construction also needs selected parts and bounded download scratch.
-The selection estimate determines extra staging, so the FineWeb-Edu peak
-ratio above is a planning guide, not a measured DCLM storage bound.
+is a publisher token estimate, not an exact count with the current tokenizer.
+A 15B-token store occupies about 60 GB of uint32 tokens plus sidecars.
 
 If larger stores remain I/O-bound after these changes, the next architectural
 step is an external shuffle by stream-position ranges: write documents into

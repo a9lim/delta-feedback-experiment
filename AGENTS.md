@@ -12,10 +12,9 @@ every four attention layers PKDA, `r` adds MHDB block-delta reads, `f` adds
 FBT feedback between token columns, and `l` makes the middle cell a tied core
 iterated a drawn number of times per column. `--condition arfl` is the full
 built stack and `arf` the flat column; the empty condition is the plain
-decoder. Three full-schedule specimens exist
-on Jobe (`screen-delta-ar-s1`, an `ar` run; `screen-delta-arf-s1-highLR` and
-`screen-delta-arf-s1`, `arf` runs); the current read of what they show is
-in `docs/findings.md`.
+decoder. There are no current trained specimens. The GPT-NeoX/ChatML
+15B-token DCLM-100B store is being rebuilt on Jobe; no training has been
+launched. `docs/findings.md` states the current evidence boundary.
 
 ## Documents
 
@@ -34,7 +33,7 @@ in `docs/findings.md`.
   [docs/runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
 - [docs/scaling.md](docs/scaling.md): the screen, the bridge, and the
-  flagship: geometry, accounting, budgets, the loop's measured cost, and the
+  flagship: geometry, accounting, budgets, runtime qualification needs, and the
   longer and larger recipes, worked out but not scheduled.
 - [docs/literature.md](docs/literature.md) and
   [references/refs.yaml](references/refs.yaml): sources and departures.
@@ -100,6 +99,14 @@ change it everywhere at once.
 
 ## Useful bookkeeping
 
+- The tokenizer is `EleutherAI/gpt-neox-20b` pinned at
+  `c292233c833e336628618a88a648727eb3dff0a7`, with 50,277 base IDs plus
+  `<|im_start|>` (50,277) and `<|im_end|>` (50,278). The tokenizer has
+  50,279 IDs and the model vocabulary is padded to 50,304 rows. Document EOS
+  is `<|endoftext|>` (0), separate from the ChatML message end. Generic ChatML
+  preserves arbitrary and repeated role strings; generation defaults to
+  `next_role="assistant"`. Loading the tokenizer loads no model weights.
+
 - Sources are named by `--source`: the default `dclm-100b` preserves its
   publisher-shuffled order for screen/Jobe; `dclm` shuffles the full source
   for larger stores. FineWeb-Edu full/350B/100B/10B sources remain selectable.
@@ -145,14 +152,12 @@ change it everywhere at once.
   activations and checkpoints the preceding blocks. The checkpoint wrapper
   stays outside block compilation, preserving its numerical boundaries.
   Every feedback pass and core iteration remains differentiable.
-- Jobe is the single-GPU CUDA surface. Keep GPU jobs serial; the captured
-  graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
-  the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
+- Jobe is the single-GPU CUDA surface. Keep GPU jobs serial.
+  `docs/runtime-qualification.md` tracks qualification of the current
+  tokenizer and head on PyTorch 2.14 / CUDA 13.2. Keep cyclic Python garbage
   collection outside train/eval graph capture.
-- New snapshots are v27. Resume, evaluation, and forks accept v27 for every
-  condition and v26 only for conditions with `a`, whose computation is
-  unchanged; v26 non-`a` snapshots are rejected. Every specimen records its
-  condition as letters.
+- Checkpoint v28 is the only accepted contract for resume, evaluation, and
+  forks. Every specimen records its condition as letters.
 - Before touching Jobe, look at `delta status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker
   refreshes before the next job and runs the current checkout's probe.

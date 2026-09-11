@@ -2,8 +2,9 @@
 
 Three geometries of the same architecture, every one configured for 4,096-token
 rows in batches of 128 rows, `2^19` predictions per step. The **screen** is
-the small organism we grow on Jobe: width 768, three cells, the specimens in
-[findings.md](findings.md). The **bridge** is the rung between: width 1,152,
+the small organism we grow on Jobe: width 768 and three cells. There are no
+current trained specimens; [findings.md](findings.md) states the evidence
+boundary. The **bridge** is the rung between: width 1,152,
 four cells, about three times the screen's active parameters and the
 geometric midpoint of the ladder. It is the largest column targeted for
 single-process training on Jobe and the one meant for publication as an
@@ -22,7 +23,7 @@ beside predicted tokens; equal steps are matched data, not matched compute.
 
 | Field | Screen | Bridge | Flagship |
 |---|---:|---:|---:|
-| Vocabulary, Qwen3 tokenizer | 151,936 | 151,936 | 151,936 |
+| Padded model vocabulary, GPT-NeoX + ChatML | 50,304 | 50,304 | 50,304 |
 | Residual width `D` | 768 | 1,152 | 1,536 |
 | Layers / four-layer cells | 12 / 3 | 16 / 4 | 24 / 6 |
 | SwiGLU intermediate width | 3,328 | 4,992 | 6,656 |
@@ -97,27 +98,27 @@ condition has its unlooped condition's counts:
 
 | Condition | Parameters | Active non-embedding |
 |---|---:|---:|
-| `""` (plain) | 237,032,448 | 120,345,600 |
-| `r` | 237,087,744 | 120,400,896 |
-| `f` | 238,214,400 | 121,527,552 |
-| `rf` | 238,272,000 | 121,585,152 |
-| `a` | 256,275,240 | 139,588,392 |
-| `ar` | 256,330,536 | 139,643,688 |
-| `af` | 257,457,192 | 140,770,344 |
-| `arf`, `arfl` | 257,514,792 | 140,827,944 |
+| `""` (plain) | 158,979,072 | 120,345,600 |
+| `r` | 159,034,368 | 120,400,896 |
+| `f` | 160,161,024 | 121,527,552 |
+| `rf` | 160,218,624 | 121,585,152 |
+| `a` | 178,221,864 | 139,588,392 |
+| `ar` | 178,277,160 | 139,643,688 |
+| `af` | 179,403,816 | 140,770,344 |
+| `arf`, `arfl` | 179,461,416 | 140,827,944 |
 
 The full stack by component:
 
 | Component | Parameters |
 |---|---:|
-| Tied embedding and readout | 116,686,848 |
+| Tied embedding and readout | 38,633,472 |
 | 12 SwiGLU channel mixers | 92,012,544 |
 | 9 PKDA mixers | 40,478,184 |
 | 3 gated global GQA mixers, including Q/K norms and gates | 7,078,464 |
 | FBT fusion, `f` | 1,179,648 |
 | Trunk, entry, and payload norms | 21,504 |
 | 24 within-column routers and one payload router | 57,600 |
-| **Total** | **257,514,792** |
+| **Total** | **179,461,416** |
 | **Active non-embedding** | **140,827,944** |
 
 Relative to unpreconditioned KDA, PKDA's two width-to-head projections and
@@ -139,8 +140,8 @@ request's `r`:
 | 8 | 10 | 79.6 MiB |
 
 Payload, logits, allocator overhead, and serving metadata are additional. This
-is decode-state accounting, not training memory; Jobe's captured training graph
-pool reserves about 23 GiB.
+is decode-state accounting; training memory depends on graph capture and
+requires qualification with the current vocabulary.
 
 ### Budget
 
@@ -171,57 +172,21 @@ Under `l` at the default draw, `r_mean = 4` and `r_max = 8`:
 So `arfl` spends 5.88 expected cell-tokens per pass-token against `arf`'s
 three: the loop about doubles the recipe's compute at matched data.
 
-### Cost of the loop at the screen
+### Runtime qualification
 
-The [RTX 4090 qualification record](../data/summary/runtime-optimizations-2026-09-09.json)
-measures the current screen at one 4,096-token row per microbatch. Capturing
-all twenty-four `arfl` training graphs and the evaluation graph took 92.5 s;
-the measured run peaked at 15.84 GiB allocated and 23.02 GiB reserved. These
-measurements use fresh initialization and synthetic tokens, so they establish
-execution cost rather than trained-model throughput or quality.
+The current 50,304-row head has not yet been assigned a measured training
+speed. Qualify the screen's full captured graph family, accumulated gradients,
+and complete optimizer updates on Jobe before projecting a schedule duration.
+The reproducible checks are in
+[runtime-qualification.md](runtime-qualification.md).
 
 The activation policy counts executed layers, `8 + 4r` per pass, against a
 raw budget of forty layer-passes: one pass through `r = 8`, two through
 `r = 3`, and three at `r = 1`. In deeper modes, each cell retains the
-activations of its final compiled block, including on every tied-core
-iteration. Earlier blocks in the cell are checkpointed as whole compiled
-blocks, with checkpointing outside compilation so retained and recomputed
-execution use the same numerical boundaries. All iterations and passes
-remain differentiable.
-
-Raw CUDA-graph replay per microbatch, in milliseconds:
-
-| Passes \ `r` | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 64.6 | 79.4 | 94.3 | 109.1 | 124.0 | 138.8 | 153.6 | 168.6 |
-| 2 | 130.2 | 159.8 | 189.4 | 264.7 | 302.3 | 339.8 | 377.0 | 414.4 |
-| 3 | 195.8 | 286.2 | 342.2 | 398.1 | 454.1 | 510.1 | 566.1 | 623.5 |
-
-The default seed-1 schedule draws 5,037 one-pass, 1,483 two-pass, and 196
-three-pass updates across its 6,716 steps. Projections sum each mode's
-unrounded replay time over its exact realized count and 128 microbatches per
-update. The all-two-pass and all-three-pass cases retain the same iteration
-draws but replace the pass count on every step.
-
-| Recipe | Looped replay | Flat `r = 1` replay proxy |
-|---|---:|---:|
-| default feedback mixture | 34.89 h | 19.79 h |
-| one pass on every step | 25.65 h | 15.41 h |
-| two passes on every step | 58.50 h | 31.08 h |
-| three passes on every step | 92.73 h | 46.75 h |
-
-The one-pass loop projection is an `arl` runtime proxy from the measured
-`arfl` one-pass path, which does not compute a payload. The flat projections
-use the measured `r = 1` path as a proxy for `arf` with feedback or `ar`
-without it. These are not independent captures of those conditions.
-
-Raw replay excludes input preparation, head-gradient-buffer flushes,
-optimizer work, evaluation, and snapshots. Resident 128-microbatch replays
-including keyed inputs and head-buffer flushes measured 34.01 s at two
-passes and `r = 4`, and 80.00 s at three passes and `r = 8`; those intervals
-also exclude optimizer work. A one-second planning allowance per update
-would add 1.87 h to a projected schedule. It is an allowance, not a measured
-training-loop overhead.
+activations of its final compiled block, including every tied-core iteration.
+Earlier blocks are checkpointed outside compilation. Every core iteration and
+feedback pass remains differentiable. This policy does not establish peak
+memory or execution time for the new head.
 
 ## The bridge
 
@@ -245,14 +210,14 @@ is derived, and `--tokens-per-param 400` gives the Prime schedule.
 
 | Component | Parameters |
 |---|---:|
-| Tied embedding and readout | 175,030,272 |
+| Tied embedding and readout | 57,950,208 |
 | 16 SwiGLU channel mixers | 276,037,632 |
 | 12 PKDA mixers | 116,552,400 |
 | 4 gated global GQA mixers, including Q/K norms and gates | 21,234,432 |
 | FBT fusion, `f` | 2,654,208 |
 | Trunk, entry, and payload norms | 41,472 |
 | 32 within-column routers and one payload router | 114,048 |
-| **Total** | **591,664,464** |
+| **Total** | **474,584,400** |
 | **Active non-embedding** | **416,634,192** |
 
 Relative to unpreconditioned KDA, PKDA's two width-to-head projections and
@@ -296,66 +261,18 @@ or `400` names them.
 | Expected pass-tokens | about 13.33B | about 213.3B |
 | Expected cell-tokens, `arf` / `arfl` | about 53.3B / 130.1B | about 853B / 2.08T |
 
-The [bridge runtime estimate](../data/summary/bridge-runtime-estimate-2026-09-09.json)
-works out four **independent** seed-1 runs, each starting at the beginning of
-the stream, with the default feedback schedule and exact realized iteration
-draws. These are extrapolations and arithmetic scenarios, not bridge timings.
+The bridge's training memory and throughput remain unqualified on both Jobe
+and H100. Staging its full graph family must establish memory before training.
+Screen measurements cannot establish bridge speed: the head, cell arithmetic,
+activation policy, and kernel efficiency scale differently.
 
-| Run | Steps | Predicted tokens | Jobe replay estimate | 8xH100, 40% / 20% model-FLOP utilization |
-|---|---:|---:|---:|---:|
-| 25x `arf` | 19,867 | 10,416,029,696 | 6.55 days | 4.27 / 8.54 h |
-| 25x `arfl` | 19,867 | 10,416,029,696 | 15.90 days | 8.65 / 17.30 h |
-| 100x `arf` | 79,467 | 41,663,594,496 | 26.21 days | 17.08 / 34.16 h |
-| 100x `arfl` | 79,467 | 41,663,594,496 | 63.60 days | 34.60 / 69.19 h |
-| **Four runs sequentially** | **198,668** | **104,159,248,384** | **112.26 days** | **64.59 / 129.19 h** |
-
-The Jobe estimate fits the measured screen replay time into head, cell,
-feedback-entry, and checkpoint-recompute costs, then scales each component
-by the bridge's arithmetic and substitutes its four flat cells or `2 + 2r`
-looped cells. It applies the current raw-activation threshold and cell-final
-retention policy. It assumes comparable component efficiency and that the
-bridge fits Jobe's 24 GiB; neither is established. Staging the complete graph
-family at this geometry must settle memory before these estimates can become
-an operational plan. Raw replay excludes input handling, head-gradient
-flushes, optimizer work, evaluation, and snapshots. Adding a one-second
-planning allowance per step gives roughly **7, 16, 27, and 65 days** in table
-order, or about **115 days** for all four; the allowance is not measured
-bridge overhead.
-
-The H100 scenarios divide model FLOPs by eight GPUs at
-[NVIDIA's 989 TFLOPS dense BF16 peak](https://github.com/NVIDIA/exemplar-performance#peak-theoretical-throughput)
-and the stated 40% or 20% utilization. The accounting includes projection
-and tied-head GEMMs, causal attention, and feedback fusion. The utilization
-assumption must absorb recurrence, routing, activation recomputation,
-communication, and other execution costs. Neither utilization is measured
-here, so the two scenarios are not guaranteed bounds. They assume one run
-uses all eight GPUs and the four runs execute sequentially: **2.69 or 5.38
-node-days**. The distributed training path is not implemented.
-
-With the current single-GPU trainer, four independent runs could instead
-occupy four GPUs concurrently on an eight-H100 node. Under the same 40% and
-20% scenarios, the 100x `arfl` run determines the completion time:
-**11.53 or 23.06 days**, with four GPUs unused. H100 execution still needs
-its own kernel and memory qualification.
-
-The 400x run is the flagship recipe at the bridge's size: about 0.17x the
-flagship's arithmetic flat and 0.34x looped, so the pair is the cheap first
-exercise of the distributed path and the middle rung of the ladder, screen
-pair at 56B tokens, bridge at 167B, flagship at 441B, on which a letter's
-gain can be seen to grow or shrink with scale before the flagship is rented.
-
-A ladder of ratios at the bridge by `--continue`, 25x to 100x to 200x to
-400x, restores each rung's feedback boundary and trains on: 25,430, 86,818,
-143,836, and 287,670 pass-steps counting the feedback phase at its expected
-2.12 passes, 543,754 in all, or 285B pass-tokens. For `arfl` at 7.5 GFLOPs
-per pass-token, the head once and the core cells `E[r]` times, that is about
-2.15e21 FLOPs, 1.34x a single 400x run and 0.74x four independent runs, for
-four finished specimens with cooldowns; the `arf` partner is about half. At
-40% of an H100's dense BF16 peak the loop's ladder is about 1,500 GPU-hours,
-eight days on one 8xH100 node once the distributed path exists, and its 25x
-rung alone is about 70 hours on a single H100 under that same utilization
-assumption. The single-process trainer expresses the recipe; H100 memory
-and throughput remain to be qualified.
+A continuation ladder, 25x to 100x to 200x to 400x, restores each rung's
+feedback boundary. At the expected 2.12 passes after that boundary, it costs
+25,430, 86,818, 143,836, and 287,670 pass-steps, about 285B pass-tokens in
+all. This is about 1.34 times the pass-tokens of a single 400x run and 0.74
+times four independent runs; the loop's additional cell-tokens follow its
+`2 + 2r` executed cells per pass. Convert this accounting to hardware time
+only after measuring the current execution path.
 
 ## Longer training at the same size
 
@@ -392,7 +309,7 @@ The full-source shuffle reads the pinned DCLM release (27,938 parquet files,
 `dclm-100b` source is suitable for smaller Jobe stores but cannot supply
 the bridge's 167B or flagship's 441B target. Measure download and assembly throughput on the chosen provider
 before estimating build time; more CPU cores alone do not establish it.
-[Data-build performance](data-build-performance.md) gives the measurements
+[Data-build performance](data-build-performance.md) gives the profiling
 and tuning procedure. The resulting
 store should pass `delta verify`; checksum comparisons apply only against
 another build of the same source, ordering, pins and seed. The full-source
@@ -428,14 +345,14 @@ throughput at that geometry.
 
 | Component | Parameters |
 |---|---:|
-| Tied embedding and readout | 233,373,696 |
+| Tied embedding and readout | 77,266,944 |
 | 24 SwiGLU channel mixers | 736,100,352 |
 | 18 PKDA mixers | 304,297,632 |
 | 6 gated global GQA mixers, including Q/K norms and gates | 56,624,256 |
 | FBT fusion, `f` | 4,718,592 |
 | Trunk, entry, and payload norms | 79,872 |
 | 48 within-column routers and one payload router | 225,792 |
-| **Total** | **1,335,420,192** |
+| **Total** | **1,179,313,440** |
 | **Active non-embedding** | **1,102,046,496** |
 
 The active non-embedding count is the denominator for the data budget.
@@ -484,7 +401,7 @@ one batch, at 400.000118 predicted tokens per active parameter.
 
 One `arfl` run at the flagship geometry: the six cells above with the middle
 four tied as the core, so the loop and the flat specimen have the same
-1,335,420,192 parameters, the same 1,102,046,496 active non-embedding, and
+1,179,313,440 parameters, the same 1,102,046,496 active non-embedding, and
 the same 400x schedule, and at `r = 1` the loop is the flat specimen. The
 draw is the screen's, `r_mean = 4` and `r_max = 8`, with the screen's
 statistics: `E[r] = 3.88`, median 4, `P(r = 1) = 10.3%`, `P(r = 8) = 8.0%`.
@@ -501,8 +418,8 @@ Compute depth per pass is `4 + 16r + 4` layers, mean 70.1 and cap 136, and
 | Expected cell-tokens | about 9.88T |
 
 The flagship spends about 3.39T cell-tokens, so the loop spends about 2.9x
-the cell-tokens and, with the head executed once per pass, about 2.6x the
-arithmetic; that is accounting, not measured device time. The two runs pair
+the cell-tokens. The head executes once per pass, so cell-token ratios alone
+do not give total arithmetic or device time. The two runs pair
 as the screen's do: byte-identical initialization, the same stream, row
 order, schedule, and pass-count, prefix, and jitter draws, with the `r` draw
 the loop's only extra randomness. Every decode mode holds `2 + 4r` cells at

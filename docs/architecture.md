@@ -14,7 +14,7 @@ of the `l` section and not built.
 What this page holds is invariant across geometries: equations, state, source
 identities, initialization, precision, and optimizer ownership. The widths,
 head counts, layer counts, parameter and cache accounting, and budgets of the
-two geometries we grow are in [scaling.md](scaling.md); the training recipe,
+three geometries we grow are in [scaling.md](scaling.md); the training recipe,
 data, schedule, and evaluation modes are in [design.md](design.md);
 [interpretability.md](interpretability.md) lists the scripts that use the
 named states; [literature.md](literature.md) separates source mechanisms from
@@ -641,12 +641,12 @@ log-partition penalty applies unchanged.
 
 Backpropagation is complete: every iteration of every pass is in the graph.
 The trainer's activation policy counts executed layers per pass against a
-measured raw budget. Deeper modes retain the final block of each four-layer
+configured raw budget. Deeper modes retain the final block of each four-layer
 cell and checkpoint its preceding three blocks. With `a`, the retained block
 is dense attention; without `a`, the same quarter of blocks is retained.
 The checkpoint wrapper stays outside each compiled block, so both retained
 and recomputed blocks use the same compilation boundaries. The budget and
-measured costs are in [scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
+runtime qualification needs are in [scaling.md](scaling.md#runtime-qualification).
 Every iteration remains differentiable.
 
 Optimizer ownership follows the partition below: the tied core's matrices are

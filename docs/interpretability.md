@@ -1,6 +1,6 @@
 # Looking inside
 
-The organism exists so that latent computation can be observed, explained,
+The organism is being grown so latent computation can be observed, explained,
 and intervened on. This page lists the analysis tools that exist today, keeps
 the axes of recurrence straight, and sketches the shape of the study the
 organism is being grown for. The current picture from these tools is in
@@ -81,9 +81,8 @@ Useful distinctions when perturbing the model:
 - Removing enrichment against removing the whole payload.
 - Losing behavior under disruption against recovering it with an informative
   state; the first is necessity, the second sufficiency.
-- A decodable variable against a used one. The seed decodes the token at 98%
-  and the payload is the readout basis; neither says the column uses them
-  beyond reconstruction.
+- A decodable variable against a used one. Recovering a token or readout
+  state from the payload does not establish how the column uses it.
 
 An identity patch is the execution control. A matched unrelated donor, a
 magnitude control, and a restoration where feasible separate a targeted

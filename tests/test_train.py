@@ -19,7 +19,6 @@ from delta_feedback_experiment.cli import stream_target, tokenize_command
 from delta_feedback_experiment.data import (
     CANONICAL_SHUFFLE_SEED,
     CANONICAL_TARGET_TOKENS,
-    CANONICAL_TOKENIZER_REVISION,
     CANONICAL_TOKENS_PER_DOC,
     CANONICAL_VAL_TOKENS,
     DEFAULT_SOURCE,
@@ -486,7 +485,6 @@ def test_tokenize_reports_an_exhausted_selection(tmp_path):
     {"revision": "another-revision"},
     {"target_tokens": 900},
     {"tokens_per_doc": 11},
-    {"tokenizer_revision": "another-tokenizer-revision"},
 ])
 def test_tokenize_partial_build_rejects_changed_settings(tmp_path, monkeypatch, changed):
     source = parquet_source(tmp_path / "source")
@@ -635,7 +633,6 @@ def test_tokenize_command_uses_canonical_defaults(tmp_path, monkeypatch):
     assert captured["source_name"] == DEFAULT_SOURCE == "dclm-100b"
     assert captured["shuffle"] is None
     assert captured["revision"] is None
-    assert captured["tokenizer_revision"] == CANONICAL_TOKENIZER_REVISION
     assert captured["extend"] is False
 
 
@@ -911,9 +908,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 27
-    assert CONTRACT.resumable == frozenset({26, 27})
-    assert CONTRACT.surface_version == 26
+    assert CONTRACT.version == 28
+    assert CONTRACT.resumable == frozenset({28})
+    assert CONTRACT.surface_version == 28
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(10.0)
@@ -1458,7 +1455,7 @@ def test_resume_inherits_data_root_and_source_independently(tmp_path, monkeypatc
         "--out-dir", str(out), *TINY_ARGS, "--condition", "", "--max-steps", "2",
     ])
     checkpoint = torch.load(next(out.glob("inherit-data.pt.*")), map_location="cpu", weights_only=False)
-    assert checkpoint["version"] == 27
+    assert checkpoint["version"] == 28
     assert checkpoint["args"]["data_root"] == str(saved_root)
     assert checkpoint["args"]["source"] == saved_source
     assert "data_dir" not in checkpoint["args"]
@@ -1528,39 +1525,25 @@ def rewrite_latest_version(tmp_path, tag, version):
     torch.save(payload, path)
 
 
-@pytest.mark.parametrize("version", range(9, 26))
+@pytest.mark.parametrize("version", range(9, 28))
 def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
     tag = f"legacy-v{version}"
     run(tmp_path, tag, ["--condition", "", "--max-steps", "5"])
     rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="resumable versions \\[26, 27\\]"):
+    with pytest.raises(ValueError, match="checkpoint version"):
         run(tmp_path, tag, ["--condition", "", "--resume"])
 
 
 @pytest.mark.parametrize("mode", ["--resume", "--continue"])
-def test_v26_non_a_cannot_resume_or_continue_as_rope(tmp_path, mode):
-    run(tmp_path, "nope", ["--condition", "r", "--max-steps", "5"])
-    rewrite_latest_version(tmp_path, "nope", 26)
-    flags = (
-        ["--resume"] if mode == "--resume" else ["--continue", "nope", "--steps", "16"]
-    )
-    tag = "nope" if mode == "--resume" else "nope-longer"
-    with pytest.raises(ValueError, match="v26 non-a checkpoint uses NoPE"):
+@pytest.mark.parametrize("condition", ["r", "arf"])
+def test_old_tokenizer_cannot_resume_or_continue(tmp_path, mode, condition):
+    base = condition_args(condition)
+    run(tmp_path, "old", [*base, "--max-steps", "5"])
+    rewrite_latest_version(tmp_path, "old", 27)
+    flags = ["--resume"] if mode == "--resume" else ["--continue", "old", "--steps", "16"]
+    tag = "old" if mode == "--resume" else "longer"
+    with pytest.raises(ValueError, match="checkpoint version"):
         run(tmp_path, tag, flags)
-
-
-def test_v26_a_resume_preserves_the_training_trajectory(tmp_path):
-    base = condition_args("arf")
-    full = run(tmp_path, "a-full", base)
-    run(tmp_path, "a-resume", [*base, "--max-steps", "5"])
-    rewrite_latest_version(tmp_path, "a-resume", 26)
-    resumed = run(tmp_path, "a-resume", [*base, "--resume"])
-    assert resumed["val"] == full["val"]
-    left = torch.load(tmp_path / "runs" / "a-full.pt.8", weights_only=False)
-    right = torch.load(tmp_path / "runs" / "a-resume.pt.8", weights_only=False)
-    assert right["version"] == 27
-    for name, value in left["state"].items():
-        assert torch.equal(value, right["state"][name]), name
 
 
 def test_multipass_checkpoint_parity():

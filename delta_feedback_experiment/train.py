@@ -49,29 +49,19 @@ from .optim import (
     apply_schedule,
     build_optimizers,
 )
+from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=27, resumable=frozenset({26, 27}), surface_version=26
+    version=28, resumable=frozenset({28}), surface_version=28
 )
 
 
 def read_checkpoint(path: str | Path) -> dict:
-    """Read current state, including v26 specimens whose ``a`` trunk is unchanged.
-
-    Version 26 non-``a`` weights trained with NoPE everywhere. Their tensor
-    shapes still fit, but interpreting them as RoPE would change the model.
-    All analysis, resume, and continuation entry points share this check.
-    """
+    """Read a snapshot whose vocabulary and model state have current meaning."""
     payload = checkpoints.read(path, CONTRACT, map_location="cpu")
     CONTRACT.check_resumable(path, payload["version"])
-    if payload["version"] == 26 and "a" not in parse_condition(
-        payload["args"]["condition"]
-    ):
-        raise ValueError(
-            f"{path}: v26 non-a checkpoint uses NoPE in every layer; "
-            "the current non-a trunk uses RoPE in three layers per cell. "
-            "Use its original code revision to load this specimen."
-        )
+    if payload["args"].get("tokenizer_id") not in (TOKENIZER_ID, SYNTHETIC_TOKENIZER_ID):
+        raise ValueError(f"{path}: checkpoint tokenizer identity differs from current code")
     return payload
 
 
@@ -124,6 +114,7 @@ DEFAULT_TOKENS_PER_PARAM = 25.0
 """The screen recipe's predicted tokens per reference active parameter."""
 
 EXACT_FIELDS = (
+    "tokenizer_id",
     "condition",
     "seed",
     "data_seed",
@@ -346,7 +337,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     trunk = parser.add_argument_group("trunk (state-defining)")
-    trunk.add_argument("--vocab-size", type=int, default=151936)
+    trunk.add_argument("--vocab-size", type=int, default=VOCAB_SIZE)
+    parser.set_defaults(tokenizer_id=TOKENIZER_ID)
     trunk.add_argument("--dim", type=int, default=768)
     trunk.add_argument("--layers", type=int, default=12)
     trunk.add_argument("--heads", type=int, default=8)
@@ -1401,6 +1393,11 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
 
     data_directory = Path(args.data_root) / args.source
     meta = read_meta(data_directory)
+    if payload is not None and args.tokenizer_id != meta["tokenizer_id"]:
+        raise ValueError("checkpoint and token store use different tokenizers")
+    args.tokenizer_id = meta["tokenizer_id"]
+    if args.tokenizer_id == TOKENIZER_ID and args.vocab_size != VOCAB_SIZE:
+        raise ValueError(f"NeoX ChatML requires model vocab {VOCAB_SIZE}")
     if meta["vocab_size"] > args.vocab_size:
         raise ValueError(
             f"data vocab {meta['vocab_size']} exceeds model vocab {args.vocab_size}"

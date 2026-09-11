@@ -32,9 +32,10 @@ import torch.nn.functional as F
 from transformer_experiments import downstream
 
 from delta_feedback_experiment import analysis
-from delta_feedback_experiment.data import (
-    CANONICAL_TOKENIZER,
-    CANONICAL_TOKENIZER_REVISION,
+from delta_feedback_experiment.tokenizer import (
+    TOKENIZER_ID,
+    load_tokenizer,
+    tokenizer_metadata,
 )
 
 MODES = ("standard", "fused", "soft")
@@ -89,11 +90,11 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    from transformers import AutoTokenizer
-
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     max_len = min(saved["seq_len"], max(args.buckets))
-    tokenizer = AutoTokenizer.from_pretrained(CANONICAL_TOKENIZER, revision=CANONICAL_TOKENIZER_REVISION)
+    if saved["tokenizer_id"] != TOKENIZER_ID:
+        raise ValueError("downstream text evaluation requires a NeoX ChatML snapshot")
+    tokenizer = load_tokenizer()
     tag = saved.get("tag", args.snapshot.stem)
     out_dir = args.out_dir or Path("figures") / f"downstream-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -115,7 +116,7 @@ def main() -> None:
     meta = {
         "snapshot": str(args.snapshot), "tag": tag, "condition": saved["condition"], "step": saved["step"], "mode": args.mode,
         "passes": scorer.passes,
-        "tokenizer": CANONICAL_TOKENIZER, "tokenizer_revision": CANONICAL_TOKENIZER_REVISION,
+        **tokenizer_metadata(), "tokenizer_id": TOKENIZER_ID,
         "device": str(scorer.device), "limit": args.limit, "batch_size": args.batch_size, "buckets": list(args.buckets),
     }
     out_path.write_text(json.dumps(downstream.to_json(results, **meta), indent=1) + "\n")

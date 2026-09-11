@@ -3,7 +3,7 @@
 This page describes how a specimen is grown: the condition letters and how
 conditions pair, the token stream, the optimizer batch, the feedback passes, the learning-rate schedule, and the numbers we look at afterwards.
 [Architecture](architecture.md) owns the equations;
-[scaling](scaling.md) owns the two geometries, their accounting, and their
+[scaling](scaling.md) owns the three geometries, their accounting, and their
 budgets; [interpretability](interpretability.md) owns the analysis scripts.
 
 ## Conditions
@@ -36,7 +36,7 @@ emits no payload; `f` without `r` emits `payload_norm(h_top)`; `r` with `f`
 uses the fused seed as a routing source and enriches the payload with routed
 sources. `l` adds no parameters: it holds the first and last cells and runs
 the cells between them as one tied core, so every looped condition has its
-unlooped condition's counts. The specimens so far are `ar` and `arf` runs.
+unlooped condition's counts.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every
 parameter they share byte-identically for a given seed
@@ -70,12 +70,25 @@ the prelude, the last the coda, and the one between them the tied core, run
 ## Data
 
 The source is chosen with `delta tokenize --source NAME`. All sources use
-`Qwen/Qwen3-0.6B-Base` at commit `da87bfb608c14b7cf20ba1ce41287e8de496c0cd`.
-The base tokenizer's EOS, `<|endoftext|>` (151643), closes every non-empty
-document. The `data-build` extra sets minimum versions for the four packages
-that compile the stream; `meta.json` records their realized versions. New
-stores can use newer packages. Resuming or extending a store requires its
-recorded build package versions so one store never mixes compilation stacks.
+`EleutherAI/gpt-neox-20b` at commit
+`c292233c833e336628618a88a648727eb3dff0a7`. Its 50,277 base IDs are extended
+with `<|im_start|>` (50,277) and `<|im_end|>` (50,278), giving 50,279 token
+IDs and a model vocabulary padded to 50,304 rows. Loading these tokenizer
+files loads no model weights. Document EOS is `<|endoftext|>` (0); every
+non-empty pretraining document ends with it. ChatML's message end is distinct.
+
+The generic ChatML template serializes each message as
+`<|im_start|>ROLE\nCONTENT<|im_end|>\n`. Roles remain exactly as supplied,
+including arbitrary names and repeated consecutive roles; the template does
+not enforce user/assistant alternation or inject a system message. With a
+generation prompt it appends `<|im_start|>NEXT_ROLE\n`, where `next_role`
+defaults to `self`. This formatting contract does not itself train
+conversational behavior; pretraining continues to use raw web documents.
+
+The `data-build` extra sets minimum versions for the four packages that
+compile the stream; `meta.json` records their realized versions. New stores
+can use newer packages. Resuming or extending a store requires its recorded
+build package versions so one store never mixes compilation stacks.
 
 | Source | Dataset and parquet directory | Default ordering |
 |---|---|---|
@@ -146,8 +159,8 @@ and `--readers` concurrent document readers (default 8) into disjoint ranges
 of a roughly 64 MiB output buffer, followed by sequential shard writes.
 These settings change throughput, not document order, token bytes, or
 provenance. Assembly logs progress every 30 seconds.
-See [data-build performance](data-build-performance.md) for the measured
-bottleneck, tuning procedure, and storage requirements.
+See [data-build performance](data-build-performance.md) for the profiling
+procedure and storage requirements.
 
 One row is a non-overlapping `seq_len + 1` window, so 4,097 stored tokens give
 4,096 predictions. Rows may cross document boundaries, and attention crosses
@@ -277,19 +290,16 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--jitter` | 0.02 | payload jitter half-width |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest supported snapshot: v27, or v26 with `a` |
-
-The specimens so far used the default recipe (`ar`) and
-`--feedback-start 0 --three-pass 1` (`arf`); see [findings.md](findings.md).
+| `--resume` | | continues a tag from its latest v28 snapshot |
 
 ### Checkpoints and queue
 
-New snapshots use checkpoint contract v27. Resume, evaluation, and forks
-accept v27 for every condition and v26 for conditions with `a`, whose
-computation is unchanged. A v26 snapshot without `a` is rejected because its
-all-NoPE trunk does not match the current RoPE/NoPE pattern. Every snapshot
-records its condition as letters. A snapshot holds the model, both
-optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
+Checkpoint v28 is the only accepted contract for resume, evaluation, and
+forks. It binds snapshots to the current GPT-NeoX/ChatML tokenizer and
+50,304-row head. The snapshot and token store carry the same deterministic
+`tokenizer_id`, derived from the pinned vocabulary, delimiter IDs, and full
+ChatML template; mismatches are rejected. Every snapshot records its condition
+as letters. A snapshot holds the model, both optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,
 evaluation cadence, snapshot cadence, and evaluation-row count may change.
@@ -316,9 +326,8 @@ the next job.
 ### Language-model numbers
 
 Every evaluation point reports pass-1 held-out cross-entropy as `val` over
-the slice's first `--eval-rows` rows, 512 by default: 524,288 predictions at
-the screen, a quarter of the standard error of the 32 rows it replaces, a
-forward-only few seconds every `--eval-every` steps. Conditions with `f` also report `val_fused`, a
+the slice's first `--eval-rows` rows, 128 by default: 524,288 predictions at
+the screen, every `--eval-every` steps. Conditions with `f` also report `val_fused`, a
 second pass with plain-prefix length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
 Decoding has three modes, each at one fixed `r` under `l`:
 
@@ -386,5 +395,5 @@ ablation keeps `h_top` and so keeps most of the payload channel.
 Adaptive pause or halting tokens, token-conditioned payload queries, multiple
 explicit previous-column payloads, per-layer cross-column banks, alternative
 optimizers, long-context continuation, instruction tuning, and any task
-beyond next-token prediction on web text. Several of these are candidate
-moves in [findings.md](findings.md).
+beyond next-token prediction on web text. The current evidence boundary is
+in [findings.md](findings.md).

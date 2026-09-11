@@ -2,14 +2,14 @@
 
 This is a nursery for a small recurrent language model with a latent channel
 between token columns. The eventual goal is a **model organism**: a model of
-roughly 250M parameters whose cross-token latent computation is real enough,
+roughly 180M parameters whose cross-token latent computation is real enough,
 and opaque enough, to be worth studying with interpretability and monitoring
 methods. That study is future work with its own design. This repository is
 where the organism gets grown: train variants, look inside, change the recipe
 or the architecture, repeat.
 
 Nothing here is pre-registered. Runs are experiments in the ordinary sense of
-trying things. [The journal](docs/journal.md) records what we saw as we went,
+trying things. [The journal](docs/journal.md) records the working state,
 [findings](docs/findings.md) keeps the distilled current picture, and the
 rest of the docs describe what the code does today.
 
@@ -82,34 +82,23 @@ hitting them is the job of the recipe and the architecture.
 
 ## Where things stand
 
-Three full-schedule specimens exist on Jobe, all seed 1 on the same rows:
-an `ar` run on the default recipe, and two `arf` runs trained with three
-feedback passes on every step from step 0, at two NorMuonH learning rates.
-All three predate the keyed stream, the muP parametrization, and the uniform
-4,096-token rows and `2^19` batch; they were cleared from Jobe on 2026-09-09
-and are due to be rerun.
+The tokenizer is pinned GPT-NeoX with two generic ChatML delimiters: 50,279
+token IDs and a 50,304-row tied embedding/readout. The screen's full stack
+has 179,461,416 parameters. ChatML preserves arbitrary role names and repeated
+roles; it supplies formatting for future conversational data, not instruction
+tuning or pretrained behavior.
 
-The current read, from [findings](docs/findings.md): the channel as trained is
-live, stable, and harmless, and it is token-legible. The first cell decodes
-the fused seed back onto the plain representation and the rest of the column
-runs as it would on a plain pass; the payload is linearly the readout state
-and the token is recoverable from the fused seed at 98%. A second fused
-prefill pass buys a small gain on long-range continuation and nothing on
-FineWeb tokens. That is the opposite of an opaque channel, which tells us what
-to grow next.
+There are no current trained specimens. The token store is being rebuilt on
+Jobe for a 15B-token target under this tokenizer, and training has not been
+launched. Checkpoint v28 is the only accepted format. The current CUDA path
+must be qualified with the new head before assigning it a measured training
+speed; [runtime qualification](docs/runtime-qualification.md) tracks that gate.
 
-Directions on the bench, none decided:
-
-- Redesign the entry so the previous column's state lands somewhere the
-  current column cannot simply cancel, for example at a core entry rather than
-  the seed.
-- Train the first `arfl` specimen, now that the tied core of
-  [architecture.md](docs/architecture.md#letter-l-the-tied-depth-loop) is built, and see
-  whether within-column refinement changes what the payload carries.
-- Separate a persistent state stream from a read-only prediction stream, the
-  Free Pause Tokens idea assessed in [literature](docs/literature.md).
-- Give the model a task that needs the channel, rather than hoping web text
-  induces one.
+The next scientific question is whether the current architecture and recipe
+grow a useful cross-column channel. [Findings](docs/findings.md) states the
+current evidence boundary, and the existing analysis tools can measure
+payload use, token recoverability, routing, and recurrence once a trained
+checkpoint exists.
 
 ## Start here
 
@@ -121,10 +110,9 @@ Directions on the bench, none decided:
 - [interpretability.md](docs/interpretability.md): the analysis scripts,
   what each one shows, and the shape of the future study.
 - [operations.md](docs/operations.md): install, tokenize, train, queue,
-  inspect. Run `delta probe` before training; Jobe's captured graph pool
-  reserves about 23 GiB, so GPU work stays serial.
+  inspect. Run `delta probe` before training and keep GPU work serial on Jobe.
 - [data-build-performance.md](docs/data-build-performance.md): token-store
-  throughput, assembly measurements, and Prime staging/storage requirements.
+  profiling, assembly tuning, and Prime staging/storage requirements.
 - [runtime-qualification.md](docs/runtime-qualification.md): the CUDA
   execution path and its numerical evidence.
 - [scaling.md](docs/scaling.md): the screen, the bridge, and the flagship,

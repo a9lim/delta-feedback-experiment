@@ -15,6 +15,7 @@ from delta_feedback_experiment.model import (
     sequence_ce,
 )
 from delta_feedback_experiment.optim import OptimizerPair, build_optimizers
+from delta_feedback_experiment.tokenizer import SYNTHETIC_TOKENIZER_ID
 from delta_feedback_experiment.train import CONTRACT
 
 TINY = {
@@ -35,7 +36,8 @@ def snapshot(tmp_path, condition="arf", seed=3):
     torch.manual_seed(seed)
     model = DeltaModel(condition_config(condition, max_seq_len=17, **TINY))
     args = SimpleNamespace(
-        condition=condition, seed=seed, seq_len=16, tag="tiny", **TINY
+        condition=condition, seed=seed, seq_len=16, tag="tiny",
+        tokenizer_id=SYNTHETIC_TOKENIZER_ID, **TINY
     )
     pair = OptimizerPair(build_optimizers(model))
     path = tmp_path / "tiny.pt.5"
@@ -61,31 +63,14 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path, condition):
     assert torch.equal(want, got)
 
 
-@pytest.mark.parametrize("condition", ["", "r", "f", "rf", "a", "ar", "af", "arf"])
-def test_v26_loads_only_unchanged_a_specimens(tmp_path, condition):
-    model, path = snapshot(tmp_path, condition)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["version"] = 26
-    torch.save(payload, path)
-    if "a" not in condition:
-        with pytest.raises(ValueError, match="v26 non-a checkpoint uses NoPE"):
-            analysis.load_checkpoint(path, "cpu")
-    else:
-        loaded, _ = analysis.load_checkpoint(path, "cpu")
-        tokens = torch.randint(0, 97, (2, 7))
-        with torch.no_grad():
-            expected = model.forward_column(model.embed_tokens(tokens)).h_top
-            actual = loaded.forward_column(loaded.embed_tokens(tokens)).h_top
-        assert torch.equal(actual, expected)
-
-
-@pytest.mark.parametrize("version", [25, 28])
-def test_analysis_rejects_unsupported_checkpoint_versions(tmp_path, version):
-    _, path = snapshot(tmp_path)
+@pytest.mark.parametrize("condition", ["", "arf"])
+@pytest.mark.parametrize("version", [25, 26, 27, 29])
+def test_analysis_rejects_other_checkpoint_versions(tmp_path, condition, version):
+    _, path = snapshot(tmp_path, condition)
     payload = torch.load(path, map_location="cpu", weights_only=False)
     payload["version"] = version
     torch.save(payload, path)
-    with pytest.raises(ValueError, match="unsupported checkpoint version"):
+    with pytest.raises(ValueError, match="checkpoint version"):
         analysis.load_checkpoint(path, "cpu")
 
 

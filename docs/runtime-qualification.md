@@ -4,57 +4,15 @@ Analysis depends on the measured computation matching the trained
 computation. This page records the CUDA execution path and its engineering
 evidence.
 
-The execution timing measurements below are dated 2026-09-09 on Jobe's RTX 4090
-with PyTorch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, and standard GIL-enabled
-CPython 3.13.15. The Mac uses PyTorch 2.14.0 and Python 3.13.15. Records carry
-exact sources and inputs; Hopper has not been through the same checks.
+The current contract uses the pinned GPT-NeoX/ChatML tokenizer, a 50,304-row
+head, and checkpoint v28. Its complete CUDA qualification is pending. Do not
+assign the new geometry a measured speed or memory footprint before running
+the current probe and production-shape capture on Jobe.
 
-## Evidence records
-
-| Record | What it establishes |
-|---|---|
-| [Partial RoPE qualification](../data/summary/partial-rope-2026-09-10.json) | Layer selection, independent rotation and gradient checks, production-width CUDA capture/replay, mixed RoPE/NoPE and looped cache parity, and checkpoint loading policy |
-| [Cached PKDA precision](../data/summary/cache-parity-2026-09-10.json) | Shared convolution precision brings the four-layer BF16 cache error to 3.08% within the unchanged 4% bound; focused cache-history and decode checks pass |
-| [Initialization qualification](../data/summary/initialization-qualification-2026-09-10.json) | Width-scaled gate/control initialization, unchanged flagship and RNG streams, passing test suites and Ruff |
-| [Current execution optimizations](../data/summary/runtime-optimizations-2026-09-09.json) | Flash SDPA, packed projection gradients, PKDA tiling, selective block retention, full loop timings and accumulated-gradient comparisons |
-| [Python/runtime qualification](../data/summary/python-runtime-2026-09-06.json) | Environment migration and its dependency/capture checks |
-| [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Earlier paired six-update diagnostic from a trained checkpoint |
-| [Earlier execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces and component measurements on the earlier stack |
-| [Loop staging baseline](../data/summary/loop-stage-2026-09-09.json) | Pre-optimization memory and timing measurements |
-
-Partial RoPE passed 292 portable tests (23 CUDA cases skipped) and all 315
-tests on Jobe, plus five added feedback-cache cases on both machines. The
-production-width attention check uses one 4,096-token row, eight query heads,
-four KV heads, and head width 96; fullgraph capture and replay agree with an
-independent complex-rotation reference in outputs and all gradients. Six
-`a` configurations retain bit-identical parameters, outputs, and gradients
-against the preceding source on CPU. The integrated CUDA gate also passes:
-four-layer BF16 decode errors are 1.85% for the mixed RoPE/NoPE decoder and
-3.08% for `a`, within the unchanged 4% bound; `arfl` and `rfl` pass the 1%
-FP32 loop-cache bound. Four train/eval graphs peak at 14.47 GiB allocated and
-22.99 GiB reserved. These checks establish execution and numerical agreement;
-they do not establish a training-quality gain or RoPE throughput overhead.
-
-The width-scaled initializer passed 239 portable tests with 16 CUDA cases
-skipped and all 255 tests on Jobe. CUDA cached PKDA now shares the full-row
-fused convolution/SiLU/QK-normalization kernel, retaining FP32 arithmetic until
-the final Q/K/V cast. This removes extra BF16 rounding from the cached path.
-The four-layer, width-128 `a` model's full-sequence versus cached-decode
-relative hidden-state L2 error is 0.03081, within the unchanged 0.04 bound.
-Plain-decoder BF16 and looped-model FP32 comparisons also pass, as do five
-focused CUDA projection/history cases, eleven portable cache/initialization
-cases, and Ruff on both machines. The full suite and full screen graph gate
-were not rerun for this cache fix; the timing evidence below is from September 9.
-Those earlier records predate the partial-RoPE path; its current numerical
-qualification is recorded separately above.
-
-The 2026-09-09 execution record's four train/eval graphs peak at 14.46 GiB
-allocated and 22.96 GiB reserved, with
-one/two/three-pass replay at 64.6/129.9/195.9 ms. The loop-versus-flat gradient
-error is 1.64%, matching its 1.64% repeat floor; checkpoint staging leaves
-0.02 GiB of residual device allocation. Keep GPU work serial on Jobe's
-24 GiB card. New snapshots use v27; loading accepts v27 for every condition
-and v26 only for conditions with `a`, whose computation is unchanged.
+The target runtime is Jobe's RTX 4090 with PyTorch 2.14.0+cu132, CUDA 13.2,
+Triton 3.8.0, and standard GIL-enabled CPython 3.13.15. Qualification records
+must identify exact project/vendor revisions and inputs. Hopper requires its
+own checks. Keep GPU work serial on Jobe's 24 GiB card.
 
 ## Maintained execution contract
 
@@ -118,8 +76,8 @@ analysis. CUDA training uses the same equations through the following path:
   tiling, and backward filtering equivalent to its late-filter decision.
 - One persistent BF16 classifier-gradient buffer for the head. The backward
   lock-adds every call's `dC` into it rather than zero-filling and returning a
-  233 MB tensor per microbatch, so the classifier receives no autograd
-  gradient; the trainer adds the buffer into the FP32 embedding sink and clears
+  full classifier-gradient tensor per microbatch, so the classifier receives
+  no autograd gradient; the trainer adds the buffer into the FP32 embedding sink and clears
   it whenever another microbatch would take it past `--head-flush-every` head
   calls, and once before the optimizer reads the step. One feedback pass is one
   head call, so the number of BF16 additions a flush carries does not change
@@ -141,7 +99,7 @@ analysis. CUDA training uses the same equations through the following path:
   writeback; ordinary per-parameter checkpoint state with no persistent packed
   duplicate. NAdam and global FP32 clipping follow
   [architecture.md](architecture.md).
-- Selective block activation retention above the measured work threshold.
+- Selective block activation retention above the configured work threshold.
   Each four-layer cell retains its final compiled block and checkpoints the
   preceding three. The checkpoint wrapper stays outside block compilation,
   preserving its numerical boundaries. The raw-work threshold is unchanged,
@@ -177,27 +135,19 @@ The CUDA gate checks the `l` letter three ways:
   forward and backward under the trainer's activation policy, with its peak
   allocation reported as `loop_cap_peak`.
 
-The captured `(pass count, r)` family is measured separately from the probe.
-At the screen geometry (`arfl`, one 4,096-token row per microbatch), all 24
-training graphs plus evaluation captured in 92.5 s, peaking at 15.84 GiB
-allocated and 23.02 GiB reserved. Raw replay ranges from 64.6 ms at one pass,
-`r = 1`, to 623.5 ms at three passes, `r = 8`. The full table and schedule
-projection are in [scaling.md](scaling.md#cost-of-the-loop-at-the-screen).
+The full captured `(pass count, r)` family must be measured separately from
+the probe at the screen geometry: one 4,096-token row per microbatch, all
+24 training graphs, and evaluation. Report capture time, peak allocated and
+reserved memory, raw replay time, and the time for 128 distinct synthetic
+rows including keyed input replay and head-gradient flushing. A complete
+training-update timing must additionally include optimizer work; report data
+loading, evaluation, and snapshot costs separately when projecting a run.
 
-For 128 distinct synthetic rows, the two-pass `r = 4` batch took 34.01 s
-versus 37.42 s on the baseline; three-pass `r = 8` took 80.00 s versus
-88.54 s. These include input replay and head-gradient flushing, excluding
-optimizer, data loading, evaluation, and snapshots. The realized default
-schedule projects to 34.89 replay hours, 6.35% less than the baseline.
-
-The accumulated-gradient relative L2 differences at `(k,r) = (1,1), (1,4),
-(2,4), (3,8)` are 2.83%, 3.63%, 4.67%, and 13.64%; corresponding baseline
-repeats differ by 1.79%, 2.25%, 2.84%, and 8.47%. All values are finite,
-gradient norm ratios remain within 0.032% of one, and the lowest cosine is
-0.9907. This is measurable numerical drift beyond repeat variation,
-particularly at the deepest mode. It is accepted engineering evidence, not
-bitwise equivalence or evidence about training quality. These comparisons
-start from paired fresh weights; no trained specimen was available.
+Compare accumulated FP32 gradients at `(k,r) = (1,1), (1,4), (2,4), (3,8)`
+with repeated baselines at the same settings. Finite values, relative L2,
+norm ratios, and cosine similarities distinguish numerical changes from the
+head's repeat variation. Synthetic fresh-weight checks establish execution
+properties and do not establish training quality.
 
 Reproduce the current graph family and gradient dumps with:
 
@@ -206,16 +156,14 @@ python scripts/loop_optimization_check.py --full-family --modes 1:1,1:2,1:3,1:4,
 python scripts/compare_loop_gradients.py /tmp/baseline-gradients /tmp/current-gradients --output /tmp/gradient-comparison.json
 ```
 
-## Short-update evidence and its limits
+## Short-update checks
 
-The current record compares the baseline and candidate through two optimizer
-updates on the same synthetic 128-row batch at two passes and `r = 4`.
-Both paths keep finite losses and gradients at the recipe's learning rates;
-the maximum loss difference is 0.000452 and gradient-norm relative difference
-0.120%. Fresh weights and repeated synthetic rows cannot establish
-training quality, retained capability, or equivalent learning trajectories.
-The older trained-checkpoint traces are linked as dated evidence for their
-own source revisions; they do not qualify this intervention.
+After isolated loss and gradient checks, exercise complete optimizer updates
+on the same synthetic 128-row batches at the recipe's learning rates. Record
+losses, gradient norms, and updated-parameter differences against a paired
+baseline. Fresh weights and repeated synthetic rows cannot establish retained
+capability or equivalent learning trajectories. Trained-input comparisons
+require a current checkpoint and matching token store.
 
 ## Backend constraints
 
@@ -234,9 +182,7 @@ variant order when timing captured forward/backward work. FlexAttention's
 prescaling and mask hints are comparison options, not training settings.
 
 NVGEMM is a diagnostic option through `kernel-bench`, not a training backend.
-The record documents candidate selection and compilation failures on Ada; it
-does not support adopting that backend. Re-run the probe after hardware or
-kernel changes.
+Re-run the probe after hardware or kernel changes.
 
 ## Reproduce a diagnostic
 
@@ -244,14 +190,13 @@ Run GPU checks serially after inspecting live status, the active log, and GPU
 ownership.
 
 ```bash
-python scripts/kernel_training_check.py runs/screen-delta-arf-s1-highLR.pt.10745 --updates 18
+python scripts/kernel_training_check.py runs/TAG.pt.STEP --updates 18
 python scripts/attention_check.py
 python scripts/attention_check.py --length 4097
 python scripts/gemm_backend_check.py --backends ATEN,TRITON --output-dir tmp/gemm-base
 ```
 
-Use the optimization record's exact baseline revision and explicit variant
-flags for a paired reproduction. Trained-input and full-gradient checks also
+Use exact baseline revisions and explicit variant flags for paired checks. Trained-input and full-gradient checks also
 live in `scripts/kernel_inputs.py` and `scripts/kernel_qualification.py`. A new
 intervention keeps the numerical, cache, and state-boundary invariants the
 probe checks.

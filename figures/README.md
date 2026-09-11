@@ -1,5 +1,8 @@
 # Figures
 
+There are no current trained-run figures. New analyses require a v28
+checkpoint and a matching GPT-NeoX/ChatML token store.
+
 Analysis scripts write their figures and a JSON record beside them under
 `figures/<kind>-<tag>/`. Those directories are ignored by git and regenerate
 from the snapshots and logs; the commands are in

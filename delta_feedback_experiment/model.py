@@ -49,6 +49,7 @@ from .attention import causal_attention, prefix_attention, rotary_qk
 from .cuda_kernels import ShadowOperand, sink_linear
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
+from .tokenizer import VOCAB_SIZE
 
 try:  # Triton is deliberately a CUDA-only optimization dependency.
     from .cuda_kernels import bespoke_route
@@ -142,7 +143,7 @@ class ModelConfig:
     per KV head. The groups do not align to mixer projections.
     """
 
-    vocab_size: int = 151936
+    vocab_size: int = VOCAB_SIZE
     dim: int = 768
     layers: int = 12
     heads: int = 8
@@ -1934,7 +1935,7 @@ def sequence_ce(
 ) -> tuple[Tensor, Tensor]:
     """(mean CE, mean z²) over [B, T] targets, chunked along the sequence.
 
-    The vocab-sized logits (151936 wide at screen scale) dominate
+    The vocab-sized logits (50304 wide at screen scale) dominate
     activation memory, so the head runs under activation checkpointing
     one sequence-chunk at a time — live logits are bounded to a single
     chunk in both forward and backward.
