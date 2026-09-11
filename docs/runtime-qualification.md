@@ -13,6 +13,7 @@ exact sources and inputs; Hopper has not been through the same checks.
 
 | Record | What it establishes |
 |---|---|
+| [Partial RoPE qualification](../data/summary/partial-rope-2026-09-10.json) | Layer selection, independent rotation and gradient checks, production-width CUDA capture/replay, mixed RoPE/NoPE and looped cache parity, and checkpoint loading policy |
 | [Cached PKDA precision](../data/summary/cache-parity-2026-09-10.json) | Shared convolution precision brings the four-layer BF16 cache error to 3.08% within the unchanged 4% bound; focused cache-history and decode checks pass |
 | [Initialization qualification](../data/summary/initialization-qualification-2026-09-10.json) | Width-scaled gate/control initialization, unchanged flagship and RNG streams, passing test suites and Ruff |
 | [Current execution optimizations](../data/summary/runtime-optimizations-2026-09-09.json) | Flash SDPA, packed projection gradients, PKDA tiling, selective block retention, full loop timings and accumulated-gradient comparisons |
@@ -20,6 +21,19 @@ exact sources and inputs; Hopper has not been through the same checks.
 | [FlexAttention migration](../data/summary/flexattention-runtime-2026-09-06.json) | Earlier paired six-update diagnostic from a trained checkpoint |
 | [Earlier execution optimizations](../data/summary/runtime-optimizations-2026-09-06.json) | Paired 18-update traces and component measurements on the earlier stack |
 | [Loop staging baseline](../data/summary/loop-stage-2026-09-09.json) | Pre-optimization memory and timing measurements |
+
+Partial RoPE passed 292 portable tests (23 CUDA cases skipped) and all 315
+tests on Jobe, plus five added feedback-cache cases on both machines. The
+production-width attention check uses one 4,096-token row, eight query heads,
+four KV heads, and head width 96; fullgraph capture and replay agree with an
+independent complex-rotation reference in outputs and all gradients. Six
+`a` configurations retain bit-identical parameters, outputs, and gradients
+against the preceding source on CPU. The integrated CUDA gate also passes:
+four-layer BF16 decode errors are 1.85% for the mixed RoPE/NoPE decoder and
+3.08% for `a`, within the unchanged 4% bound; `arfl` and `rfl` pass the 1%
+FP32 loop-cache bound. Four train/eval graphs peak at 14.47 GiB allocated and
+22.99 GiB reserved. These checks establish execution and numerical agreement;
+they do not establish a training-quality gain or RoPE throughput overhead.
 
 The width-scaled initializer passed 239 portable tests with 16 CUDA cases
 skipped and all 255 tests on Jobe. CUDA cached PKDA now shares the full-row
@@ -31,8 +45,8 @@ Plain-decoder BF16 and looped-model FP32 comparisons also pass, as do five
 focused CUDA projection/history cases, eleven portable cache/initialization
 cases, and Ruff on both machines. The full suite and full screen graph gate
 were not rerun for this cache fix; the timing evidence below is from September 9.
-These records predate the partial-RoPE path for conditions without `a` and
-do not establish its numerical parity or performance.
+Those earlier records predate the partial-RoPE path; its current numerical
+qualification is recorded separately above.
 
 The 2026-09-09 execution record's four train/eval graphs peak at 14.46 GiB
 allocated and 22.96 GiB reserved, with

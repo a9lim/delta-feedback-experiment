@@ -1,0 +1,121 @@
+{
+  "date": "2026-09-10",
+  "baseline_commit": "aff6745abd799f98403128da8b81141c31e1f195",
+  "implementation_commit": "4177fdcec02977ed560394a7a442dc7d97a39553",
+  "feedback_cache_test_commit": "3c58207dc34690149bf074ba4e989e43ad427ddb",
+  "change": {
+    "a_cell": [
+      "PKDA",
+      "PKDA",
+      "PKDA",
+      "NoPE-GGQA"
+    ],
+    "non_a_cell": [
+      "RoPE-GGQA",
+      "RoPE-GGQA",
+      "RoPE-GGQA",
+      "NoPE-GGQA"
+    ],
+    "rope": {
+      "theta": 10000,
+      "coordinates": "all adjacent pairs of each Q/K head, after learned RMSNorm",
+      "arithmetic": "FP32 phase and rotation, cast outputs to activation dtype",
+      "positions": "token-row positions reused across feedback passes and core iterations; new cached Q/K offset by cache.pos; cache stores rotated K"
+    },
+    "new_parameters": 0,
+    "checkpoint_write_version": 27,
+    "checkpoint_read_policy": "v27 for all conditions; v26 only for conditions with a; all other versions rejected"
+  },
+  "portable": {
+    "command": "python -m pytest -q",
+    "passed": 292,
+    "skipped_cuda": 23,
+    "ruff": "passed",
+    "diff_check": "passed",
+    "a_baseline": {
+      "conditions": [
+        "a",
+        "ar",
+        "af",
+        "arf",
+        "al",
+        "arfl"
+      ],
+      "method": "Import the prior model.py as a sibling module and compare identically seeded models at tiny 12-layer geometry, including two-pass feedback and two core iterations where applicable.",
+      "parameters": "bit-identical",
+      "outputs": "bit-identical",
+      "gradients": "bit-identical"
+    },
+    "additional_feedback_cache_tests": {
+      "command": "python -m pytest -q tests/test_model.py -k cached_feedback",
+      "passed": 5
+    },
+    "checkpoint_invariants": [
+      "current snapshots reconstruct identical outputs",
+      "v26 a resume reproduces an uninterrupted trajectory exactly",
+      "v26 non-a analysis, resume, and continuation reject the changed positional semantics"
+    ]
+  },
+  "cuda_tests": {
+    "device": "NVIDIA GeForce RTX 4090",
+    "command": "delta probe",
+    "passed": 315,
+    "focused_rope_tests": 16,
+    "attention_geometry": {
+      "batch": 1,
+      "length": 4096,
+      "dim": 768,
+      "heads": 8,
+      "kv_heads": 4,
+      "head_dim": 96
+    },
+    "reference": "FP64 complex rotations and native Flash attention, with nonuniform learned Q/K norm weights",
+    "checks": [
+      "RoPE and NoPE attention forward and all input/parameter gradients",
+      "fullgraph compilation and CUDA capture/replay after mutating inputs",
+      "finite values and gradients",
+      "relative L2 below 0.025 versus independent reference"
+    ],
+    "warnings": "Triton Python AST deprecations and an AccumulateGrad stream warning in the capture test; capture and replay completed successfully",
+    "environment": {
+      "python": "3.13.15",
+      "torch": "2.14.0+cu132",
+      "cuda": "13.2"
+    },
+    "additional_feedback_cache_tests": {
+      "commit": "3c58207dc34690149bf074ba4e989e43ad427ddb",
+      "command": "python -m pytest -q tests/test_model.py -k cached_feedback",
+      "passed": 5,
+      "ruff": "passed"
+    }
+  },
+  "integrated_cuda_gate": {
+    "status": "passed",
+    "exit_code": 0,
+    "summary": "cuda gate | prepare=59.9s | allocated=14.47GiB | reserved=22.99GiB | pkda_rel=0.0038 | conv_rel=0.0035 | norm_gate_rel=0.0032 | decode_rel=0.0185/0.0308/0.0031/0.0000 | loop_grad_rel=0.0165/floor=0.0164 | head_flush_rel=9.18e-03/micro=8.94e-03 | loop_cap_peak=13.71GiB | stage_residual=0.02GiB | graphs=4 | k=1/ckpt=0:64.6ms | k=2/ckpt=0:130.1ms | k=3/ckpt=0:196.2ms",
+    "prepare_seconds": 59.9,
+    "peak_allocated_gib": 14.47,
+    "peak_reserved_gib": 22.99,
+    "decode_relative_l2_rounded": {
+      "plain_4_layers_bf16": 0.0185,
+      "a_4_layers_bf16": 0.0308,
+      "arfl_12_layers_r2_fp32": 0.0031,
+      "rfl_12_layers_r2_fp32": 0.0,
+      "rounding_digits": 4,
+      "bf16_bound": 0.04,
+      "fp32_bound": 0.01
+    },
+    "loop_gradient_relative_l2": 0.0165,
+    "loop_repeated_flat_gradient_floor": 0.0164,
+    "stage_residual_gib": 0.02,
+    "graphs": 4,
+    "arf_train_replay_ms": {
+      "k1": 64.6,
+      "k2": 130.1,
+      "k3": 196.2
+    },
+    "allocation_warning": "The allocator emitted a failed 20 MiB allocation warning under memory pressure, then recovered; the full gate completed with exit code 0.",
+    "timing_scope": "Absolute arf graph replay timings from the existing integrated probe; not a RoPE overhead benchmark."
+  },
+  "scope": "Engineering and numerical qualification of positional encoding and checkpoint semantics. No training-quality claim or matched throughput comparison."
+}
