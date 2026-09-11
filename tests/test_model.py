@@ -903,7 +903,7 @@ def reference_decode(model, toks, prompt_len):
 def test_cached_feedback_decode_matches_exact_recurrence():
     """Sequential cached stepping equals the recurrence computed by full
     recomputation — the train/decode parity invariant, per feedback condition."""
-    for condition in ("af", "arf"):
+    for condition in ("f", "rf", "af", "arf"):
         model = tiny(condition)
         cfg = model.cfg
         toks = tokens(batch=2, length=12)
@@ -1143,8 +1143,9 @@ def test_loop_cached_decode_matches_full_forward():
         model.forward_column(model.embed_tokens(tokens()), cache=cache, iterations=2)
 
 
-def test_loop_cached_feedback_decode_matches_exact_recurrence():
-    model = tiny("arfl")
+@pytest.mark.parametrize("condition", ["fl", "rfl", "afl", "arfl"])
+def test_loop_cached_feedback_decode_matches_exact_recurrence(condition):
+    model = tiny(condition)
     toks = tokens(batch=2, length=12)
     prompt_len = 5
     cache = KVCache(model.cfg, batch=2, device=toks.device, dtype=torch.float32)

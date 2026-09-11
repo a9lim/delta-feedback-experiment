@@ -163,8 +163,11 @@ ratio, so the screen runs those at `6e-4` under a doubled readout. Both sides ap
 their specified Nesterov construction: NorMuonH before orthogonalization and
 NAdam through its scheduled first moment.
 
-Snapshots use checkpoint contract v26, and only v26 loads, for resume,
-evaluation, and forks alike. Protected snapshots persist at the
+New snapshots use checkpoint contract v27. Resume, evaluation, and forks
+accept v27 for every condition and v26 only for conditions with `a`, whose
+computation is unchanged. A v26 non-`a` specimen needs its original source
+revision: loading it into the current RoPE trunk is rejected.
+Protected snapshots persist at the
 cooldown boundary, the feedback boundary, and the end of the run. `--max-steps`
 limits the current invocation without changing the schedule.
 
