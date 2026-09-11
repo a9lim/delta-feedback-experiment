@@ -8,8 +8,8 @@ license = "CC-BY-SA-4.0"
 license-files = ["LICENSE"]
 authors = [{ name = "a9lim", email = "mx@a9l.im" }]
 dependencies = [
-    "transformer-experiments>=0.1,<0.2",
-    "torch>=2.14,<2.15",
+    "transformer-experiments>=0.1",
+    "torch>=2.14",
     "numpy",
     "transformers",
     "datasets",
@@ -17,18 +17,18 @@ dependencies = [
 
 [project.optional-dependencies]
 data-build = [
-    "transformers==5.16.1",
-    "tokenizers==0.23.2",
-    "huggingface-hub==1.30.0",
-    "pyarrow==25.0.1",
+    "transformers>=5.16.1",
+    "tokenizers>=0.23.2",
+    "huggingface-hub>=1.30.0",
+    "pyarrow>=25.0.1",
 ]
 cuda = [
     "cut-cross-entropy",
     "flash-linear-attention[cuda]",
 ]
 kernel-bench = [
-    "nvidia-cutlass-operators[torch]==0.2.0; sys_platform == 'linux'",
-    "nvidia-cutlass-dsl[cu13]==4.7.1; sys_platform == 'linux'",
+    "nvidia-cutlass-operators[torch]>=0.2.0; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]>=4.7.1; sys_platform == 'linux'",
 ]
 
 [project.scripts]

@@ -85,8 +85,9 @@ throughput, before attaching the finished store to the GPU node. Start with
 eight assembly readers; compare four/eight/sixteen on that actual disk rather
 than extrapolating Jobe's result. Increase encoding workers only while network
 throughput or encoding throughput improves, with an explicit per-process
-Rust thread budget. Preserve tokenizer/source pins and ordering. Compare checksums only across
-builds of the same source; the full DCLM store and Jobe's 100B subset do not
+Rust thread budget. Preserve tokenizer/source revisions, build package versions
+and ordering. Compare checksums only across builds of the same source;
+the full DCLM store and Jobe's 100B subset do not
 share a promised prefix.
 
 Peak storage includes both selected token parts and the finished stream on

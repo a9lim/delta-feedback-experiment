@@ -72,8 +72,10 @@ the prelude, the last the coda, and the one between them the tied core, run
 The source is chosen with `delta tokenize --source NAME`. All sources use
 `Qwen/Qwen3-0.6B-Base` at commit `da87bfb608c14b7cf20ba1ce41287e8de496c0cd`.
 The base tokenizer's EOS, `<|endoftext|>` (151643), closes every non-empty
-document. The `data-build` extra pins the four packages that compile the
-stream; `meta.json` records their realized versions.
+document. The `data-build` extra sets minimum versions for the four packages
+that compile the stream; `meta.json` records their realized versions. New
+stores can use newer packages. Resuming or extending a store requires its
+recorded build package versions so one store never mixes compilation stacks.
 
 | Source | Dataset and parquet directory | Default ordering |
 |---|---|---|
@@ -98,7 +100,8 @@ The universe is every document under the chosen source prefix, addressed by
 its row in sorted file order (`source.json`). With shuffling enabled, a keyed
 Feistel bijection (`Shuffle`, seed 0) sends addresses to stream positions.
 Without it, the address is the position. Every store built with the same
-source, revision, tokenizer, ordering mode and seed is a prefix of one stream.
+source, revision, tokenizer, build package versions, ordering mode and seed is
+a prefix of one stream.
 **Different sources do not promise matching prefixes:** the screen's 100B
 subset and the flagship's full DCLM are distinct data streams. Their validation
 slices also differ, so their losses are not a paired data comparison.
@@ -123,9 +126,9 @@ The trainer uses the same `--data-root` and `--source` pair. Resume and
 continuation inherit each setting independently unless it is retyped; the
 store path is resolved after that inheritance.
 
-`delta tokenize --continue` appends to a finished store under matching source
-and ordering settings, landing on the bytes a fresh build at that target
-writes. Partial builds bind those settings in `build.json`; source footer
+`delta tokenize --continue` appends to a finished store under matching source,
+build package versions and ordering settings, landing on the bytes a fresh
+build at that target writes. Partial builds bind those settings in `build.json`; source footer
 indexing and token parts are resumable. An interrupted extension discards
 its uncommitted tail before appending again. Each split's sidecar
 (`val.docs.npy`, `train.docs.npy`; `DOC_DTYPE`) records document start and

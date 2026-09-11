@@ -107,8 +107,9 @@ change it everywhere at once.
   `DATA_ROOT/SOURCE`, on Jobe `/data/delta/dclm-100b` or `/data/delta/dclm`.
   The trainer uses the same `--data-root` / `--source` pair; both inherit
   independently on resume or continuation unless explicitly overridden.
-  Prefix identity requires the same source, revision, tokenizer, ordering
-  and seed; it does not hold between the subset and full DCLM. A sidecar maps
+  Prefix identity requires the same source, revision, tokenizer, build package
+  versions, ordering and seed; it does not hold between the subset and full DCLM.
+  A sidecar maps
   every document to its pinned parquet file and row. Conditions trained with
   the same seed and data seed share tokenizer, stream,
   row order, schedule, optimizer, batch geometry, and keyed feedback

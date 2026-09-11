@@ -17,7 +17,6 @@ import torch
 from delta_feedback_experiment import data as data_module
 from delta_feedback_experiment.cli import stream_target, tokenize_command
 from delta_feedback_experiment.data import (
-    CANONICAL_DATA_PACKAGES,
     CANONICAL_SHUFFLE_SEED,
     CANONICAL_TARGET_TOKENS,
     CANONICAL_TOKENIZER_REVISION,
@@ -136,13 +135,25 @@ def test_token_data_stitches_shards(tmp_path):
         data.batch(data.rows, 1)
 
 
-def test_data_build_versions_are_exact(monkeypatch):
-    installed = dict(CANONICAL_DATA_PACKAGES)
+def test_data_build_records_newer_package_versions(monkeypatch):
+    installed = {
+        "transformers": "5.17.0",
+        "tokenizers": "0.23.2",
+        "huggingface-hub": "1.31.0",
+        "pyarrow": "25.0.1",
+    }
     monkeypatch.setattr(data_module, "version", installed.__getitem__)
     assert data_package_versions() == installed
 
-    installed["pyarrow"] = "0.0.0"
-    with pytest.raises(RuntimeError, match="pyarrow==25.0.1"):
+
+def test_data_build_reports_a_missing_package(monkeypatch):
+    def installed_version(package):
+        if package == "pyarrow":
+            raise data_module.PackageNotFoundError(package)
+        return "99.0.0"
+
+    monkeypatch.setattr(data_module, "version", installed_version)
+    with pytest.raises(RuntimeError, match="requires pyarrow; install the data-build extra"):
         data_package_versions()
 
 
@@ -495,6 +506,33 @@ def test_tokenize_partial_build_rejects_changed_settings(tmp_path, monkeypatch, 
     assert {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
     build(out, flaky)
     assert not (out / "build.json").exists()
+
+
+@pytest.mark.parametrize("state", ["partial", "complete"])
+def test_tokenize_preserves_each_stores_build_versions(tmp_path, monkeypatch, state):
+    source = parquet_source(tmp_path / "source")
+    packages = {"transformers": "5.16.1"}
+    monkeypatch.setattr(data_module, "data_package_versions", lambda: dict(packages))
+    out = tmp_path / "tokens"
+    if state == "partial":
+        marker = tmp_path / "fail-once"
+        marker.touch()
+        with pytest.raises(OSError, match="simulated"):
+            build(out, FlakySource(source, marker), check_packages=True)
+    else:
+        build(out, source, check_packages=True)
+    before = {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()}
+
+    packages["transformers"] = "5.17.0"
+    with pytest.raises(ValueError, match="partial build: packages|the store was built with"):
+        build(
+            out, source, check_packages=True,
+            target_tokens=900 if state == "complete" else 600,
+            extend=state == "complete",
+        )
+    assert {p.relative_to(out): p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
+    fresh = build(tmp_path / "fresh", source, check_packages=True)
+    assert fresh["packages"] == packages
 
 
 def test_source_index_resumes_completed_footer_reads(tmp_path):

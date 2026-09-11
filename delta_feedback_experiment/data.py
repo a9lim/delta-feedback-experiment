@@ -13,8 +13,8 @@ Layout under a store directory (default ``data/dclm-100b``):
 The universe is every document of the pinned parquet source, addressed by
 its row in file order. Optional keyed shuffling (:class:`Shuffle`) sends
 addresses to stream positions; otherwise published file/row order is kept.
-Within one source, ordering mode, tokenizer and seed, every store is a prefix
-of the same stream: a build that
+Within one source, ordering mode, tokenizer, build package versions and seed,
+every store is a prefix of the same stream: a build that
 stops at 57B tokens is byte-identical to the first 57B tokens of one that
 stops at 170B. Rows are non-overlapping ``seq_len+1``-token windows addressed
 by a global row index, so batch ``step`` is the same bytes for every
@@ -110,39 +110,20 @@ SOURCES = {
 CANONICAL_TOKENIZER = "Qwen/Qwen3-0.6B-Base"
 CANONICAL_TOKENIZER_REVISION = "da87bfb608c14b7cf20ba1ce41287e8de496c0cd"
 VOCAB_SIZE = 151_936
-CANONICAL_DATA_PACKAGES = {
-    "transformers": "5.16.1",
-    "tokenizers": "0.23.2",
-    "huggingface-hub": "1.30.0",
-    "pyarrow": "25.0.1",
-}
+DATA_PACKAGES = ("transformers", "tokenizers", "huggingface-hub", "pyarrow")
 
 
 def data_package_versions() -> dict[str, str]:
-    """Return and validate the exact packages that compile the token stream."""
+    """Record installed build versions; dependency lower bounds live in pyproject.toml."""
     installed = {}
-    for package, expected in CANONICAL_DATA_PACKAGES.items():
+    for package in DATA_PACKAGES:
         try:
             installed[package] = version(package)
         except PackageNotFoundError as exc:
             raise RuntimeError(
-                f"canonical data build requires {package}=={expected}; "
+                f"data build requires {package}; "
                 "install the data-build extra"
             ) from exc
-    mismatches = {
-        package: (CANONICAL_DATA_PACKAGES[package], actual)
-        for package, actual in installed.items()
-        if actual != CANONICAL_DATA_PACKAGES[package]
-    }
-    if mismatches:
-        detail = ", ".join(
-            f"{package}=={expected} (found {actual})"
-            for package, (expected, actual) in mismatches.items()
-        )
-        raise RuntimeError(
-            f"canonical data build package mismatch: {detail}; "
-            "install the data-build extra"
-        )
     return installed
 
 
@@ -850,8 +831,9 @@ def tokenize(
     ``target_tokens / tokens_per_doc`` and tokenize them into per-file parts;
     then write the parts in stream order, the held-out slice first. The
     stream is a pure function of the source, its revision, the tokenizer,
-    ordering mode and seed: matching builds agree on their common prefix. Refuses to run
-    if ``meta.json`` already exists unless ``extend`` continues that store to
+    build package versions, ordering mode and seed: matching builds agree on
+    their common prefix. Refuses to run if ``meta.json`` already exists unless
+    ``extend`` continues that store to
     a larger target under the same settings, selecting from the position
     after its last document and appending; a partial build resumes.
     """

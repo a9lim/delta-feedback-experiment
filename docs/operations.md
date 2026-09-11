@@ -40,12 +40,20 @@ its generated artifacts at `~/.cache/delta-feedback/torchinductor`; later
 probes and training processes reuse that cache. Set `DELTA_INDUCTOR_CACHE_DIR` only when
 the durable cache belongs elsewhere.
 
-Install the exact data-build stack on any staging host that materializes the
+Install the data-build requirements on any staging host that materializes the
 canonical token stream:
 
 ```bash
 uv pip install -e '.[data-build]'
 ```
+
+The project's version constraints are lower bounds, including the `data-build` and
+`kernel-bench` extras. Jobe's machine constraints select its qualified Torch
+wheel. Each token store records the build packages actually used; partial
+resumption and `--continue` require those recorded versions. After a package
+upgrade, build into a new directory or reproduce the original store's build
+environment before extending it. Reading an existing store for training does
+not require its build package versions.
 
 ## Operate
 
