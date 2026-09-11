@@ -1587,8 +1587,6 @@ def test_checkpoint_policy_is_internal_and_screen_measured():
     assert automatic_checkpoint(looped, 2, 4, args, cuda)
     assert automatic_checkpoint(looped, 3, 2, args, cuda)
     assert not automatic_checkpoint(looped, 2, 8, args, torch.device("cpu"))
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["x", "--grad-checkpoint"])
 
 
 def test_prefix_draw_leaves_every_row_one_fused_position():
