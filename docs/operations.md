@@ -70,7 +70,7 @@ messages = [
     {"role": "critic", "content": "Then check the boundary case."},
 ]
 token_ids = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True, next_role="researcher"
+    messages, add_generation_prompt=True, next_role="researcher", return_dict=False
 )
 ```
 

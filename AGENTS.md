@@ -105,7 +105,7 @@ change it everywhere at once.
   50,279 IDs and the model vocabulary is padded to 50,304 rows. Document EOS
   is `<|endoftext|>` (0), separate from the ChatML message end. Generic ChatML
   preserves arbitrary and repeated role strings; generation defaults to
-  `next_role="assistant"`. Loading the tokenizer loads no model weights.
+  `next_role="self"`. Loading the tokenizer loads no model weights.
 
 - Sources are named by `--source`: the default `dclm-100b` preserves its
   publisher-shuffled order for screen/Jobe; `dclm` shuffles the full source

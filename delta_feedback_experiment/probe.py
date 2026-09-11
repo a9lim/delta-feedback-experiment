@@ -706,8 +706,8 @@ def cuda_gate() -> None:
     # the screen geometry must give the same loss and, up to the CUDA path's
     # own nondeterminism, the same gradients. The head accumulates its BF16
     # gradient through locks, and that order reaches every parameter through
-    # the backward: the flat column against itself differs by about 1.8%
-    # relative, so the floor is measured here and the loop is held to it.
+    # the backward: the floor is measured from repeated flat-column gradients here,
+    # and the loop is held to it.
     parity_rows = torch.randint(
         0,
         args.vocab_size,
@@ -977,7 +977,7 @@ def cuda_gate() -> None:
         # lookup can reach at most its own micro_rows x seq_len ids; the
         # head's gradient reaches most of the vocabulary, so the width of the
         # sink is the head's contribution arriving.
-        # Reductions straight to [V]; a bool copy of the sink would be 116 MB.
+        # Reductions straight to [V]; a bool copy of the sink would be 39 MB.
         touched = int(
             ((head_sink.amax(dim=1) > 0) | (head_sink.amin(dim=1) < 0)).sum()
         )

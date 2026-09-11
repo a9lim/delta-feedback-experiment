@@ -4,10 +4,26 @@ Analysis depends on the measured computation matching the trained
 computation. This page records the CUDA execution path and its engineering
 evidence.
 
-The current contract uses the pinned GPT-NeoX/ChatML tokenizer, a 50,304-row
-head, and checkpoint v28. Its complete CUDA qualification is pending. Do not
-assign the new geometry a measured speed or memory footprint before running
-the current probe and production-shape capture on Jobe.
+The pinned GPT-NeoX/ChatML tokenizer, 50,304-row head, and checkpoint v28
+passed `delta probe` on Jobe at `e422d078` on 2026-09-11: 333 tests and the
+production-shape CUDA gate. The [machine-readable record](../data/summary/neox-tokenizer-qualification-2026-09-11.json)
+identifies exact source/vendor revisions, runtime, tokenizer identity, and
+printed numerical results.
+
+The gate captured three `arf` training graphs and one validation graph at
+width 768 and sequence length 4,096. Peak allocated memory was 12.99 GiB and
+reserved memory 22.99 GiB; the separate one-pass loop-cap check reached
+12.88 GiB allocated. One 20 MiB allocation request logged OOM during the
+probe; execution continued and exited successfully. The reserved pool still
+approaches card capacity, so GPU work remains serial.
+
+Median synthetic one-row replay times were 53.8, 108.4, and 163.3 ms for one,
+two, and three passes. These exclude optimizer, data-loading, validation,
+and snapshot work. They are not trained throughput or a measured tokenizer
+speedup. The loop-versus-flat gradient difference was 1.67%, matching the
+measured repeat floor; cache and head-gradient checks passed their bounds.
+The full 24-graph loop family and complete 128-row update throughput still
+need their own measurements.
 
 The target runtime is Jobe's RTX 4090 with PyTorch 2.14.0+cu132, CUDA 13.2,
 Triton 3.8.0, and standard GIL-enabled CPython 3.13.15. Qualification records

@@ -91,8 +91,9 @@ tuning or pretrained behavior.
 There are no current trained specimens. The token store is being rebuilt on
 Jobe for a 15B-token target under this tokenizer, and training has not been
 launched. Checkpoint v28 is the only accepted format. The current CUDA path
-must be qualified with the new head before assigning it a measured training
-speed; [runtime qualification](docs/runtime-qualification.md) tracks that gate.
+passed 333 tests and the production-shape CUDA probe;
+[runtime qualification](docs/runtime-qualification.md) records the numerical
+checks and distinguishes synthetic replay time from trained throughput.
 
 The next scientific question is whether the current architecture and recipe
 grow a useful cross-column channel. [Findings](docs/findings.md) states the
