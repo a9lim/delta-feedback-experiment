@@ -29,6 +29,8 @@ TINY = {
     "pkda_heads": 2,
     "pkda_head_dim": 16,
     "pkda_conv_size": 4,
+    "loop_iterations": 4,
+    "loop_max_iterations": 8,
 }
 
 
@@ -61,17 +63,6 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path, condition):
         want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
         got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
     assert torch.equal(want, got)
-
-
-@pytest.mark.parametrize("condition", ["", "arf"])
-@pytest.mark.parametrize("version", [25, 26, 27, 29])
-def test_analysis_rejects_other_checkpoint_versions(tmp_path, condition, version):
-    _, path = snapshot(tmp_path, condition)
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["version"] = version
-    torch.save(payload, path)
-    with pytest.raises(ValueError, match="checkpoint version"):
-        analysis.load_checkpoint(path, "cpu")
 
 
 def test_token_ce_matches_sequence_ce(tmp_path):

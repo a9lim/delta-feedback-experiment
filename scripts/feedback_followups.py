@@ -70,12 +70,12 @@ def main() -> None:
     torch.set_float32_matmul_precision("high")
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
-    if not model.cfg.feedback_active:
+    if not model.cfg.feedback:
         raise SystemExit("the follow-ups need a snapshot of a condition with f")
     cfg = model.cfg
     run = SimpleNamespace(**saved)
     T = saved["seq_len"]
-    tag = saved.get("tag", args.snapshot.stem)
+    tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"fused-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data = TokenData.load(args.data_dir, "val", T)
@@ -89,10 +89,12 @@ def main() -> None:
     starts = (64, 256, 512, 768)
     lags = (0, 1, 2, 4, 8, 16, 32, 64, 128)
     imp = {L: {t0: {lag: 0.0 for lag in lags} for t0 in starts} for L in (1, 8, 64)}
-    routed_payload = cfg.routing_active
-    head_abl = {f"head{h}_to_null": 0.0 for h in range(cfg.routing_heads)} if routed_payload else {}
-    if routed_payload:
-        head_abl["head2_shuffled_rows"] = 0.0
+    routed_payload = cfg.block_routing
+    head_abl = {
+        f"head{h}_{kind}": 0.0
+        for h in range(cfg.kv_heads)
+        for kind in ("to_null", "shuffled_rows")
+    } if routed_payload else {}
     fused_sum = 0.0
     n_imp = 0
     with torch.no_grad(), analysis.autocast(device):
@@ -113,21 +115,17 @@ def main() -> None:
                         imp[L][t0][lag] += d[:, t0 + L - 1 + lag].sum().item() if t0 + L - 1 + lag < T else float("nan")
             if routed_payload:
                 payload_sources = [out1.sources[0], *out1.sources[1:]]
-                routed, _ = model.payload_router(payload_sources, [None] * len(payload_sources), False)
-                hd = cfg.dim // cfg.routing_heads
+                routed, _ = model.payload_router(payload_sources, False)
+                hd = cfg.dim // cfg.kv_heads
                 null = model.payload_router.null.to(routed.dtype)
-                for h in range(cfg.routing_heads):
-                    r = routed.clone()
-                    r[..., h * hd : (h + 1) * hd] = null[h * hd : (h + 1) * hd]
-                    p = model.payload_norm(out1.h_top + r)
-                    out = model.forward_column(torch.where(plain1, e, model.fuse(shift_right(p), e)), need_payload=False)
-                    head_abl[f"head{h}_to_null"] += analysis.token_ce(model, out.h_top, tgt).sum().item()
-                r = routed.clone()
-                perm = torch.roll(torch.arange(tokens.shape[0], device=device), 1)
-                r[..., 2 * hd : 3 * hd] = routed[perm][..., 2 * hd : 3 * hd]
-                p = model.payload_norm(out1.h_top + r)
-                out = model.forward_column(torch.where(plain1, e, model.fuse(shift_right(p), e)), need_payload=False)
-                head_abl["head2_shuffled_rows"] += analysis.token_ce(model, out.h_top, tgt).sum().item()
+                shuffled = routed.roll(1, dims=0)
+                for h in range(cfg.kv_heads):
+                    for kind, replacement in (("to_null", null), ("shuffled_rows", shuffled)):
+                        r = routed.clone()
+                        r[..., h * hd : (h + 1) * hd] = replacement[..., h * hd : (h + 1) * hd]
+                        p = model.payload_norm(out1.h_top + r)
+                        out = model.forward_column(torch.where(plain1, e, model.fuse(shift_right(p), e)), need_payload=False)
+                        head_abl[f"head{h}_{kind}"] += analysis.token_ce(model, out.h_top, tgt).sum().item()
             n_imp += tokens.shape[0]
     rep["impulse"] = {str(L): {str(t0): {str(lag): v / n_imp for lag, v in d.items()} for t0, d in dd.items()} for L, dd in imp.items()}
     rep["impulse_fused_prefix1"] = fused_sum / (n_imp * T)
@@ -179,7 +177,7 @@ def main() -> None:
     model.grad_checkpoint = True
     fams = sorted({family(n) for n, _ in model.named_parameters()})
     acc: dict[str, dict[str, torch.Tensor]] = {"ell1": {}, "ell2": {}}
-    start_step = saved["steps"] + 1
+    start_step = saved["step"] + 1
     for which, n_passes in (("ell1", 1), ("ell2", 2)):
         model.zero_grad(set_to_none=True)
         for micro in range(args.gradient_micros):

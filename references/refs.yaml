@@ -1,215 +1,92 @@
-# Published mechanisms and explicit design comparisons for the recurrent model organism.
-# Roles and departures are explained in docs/literature.md. Fetched Markdown/PDF copies
-# are regenerable and remain untracked:
-#   python -m transformer_experiments.references
+# Sources for mechanisms implemented by the current model.
+# Fetch optional local paper copies with python -m transformer_experiments.references.
 references:
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals
     note: >
-      Defines the multi-head depth-routing operation: a width-D query is split
-      into contiguous feature groups, each group independently normalizes over
-      depth sources, and the routed groups are concatenated without an output
-      projection. The current design combines this headwise operation with
-      additive delta sources.
+      Grouped softmax over depth sources with contiguous feature heads; combined here with block deltas.
 
   - arxiv: "2605.18855"
     slug: luo2026-delta-attention-residuals
     note: >
-      Defines additive routing over residual deltas, with RMS-normalized keys,
-      raw values, zero-initialized queries, and per-sublayer or block-delta
-      source layouts. The current experiment uses one completed delta per
-      four-layer cell and one evolving current-cell partial delta at every
-      scale.
+      Additive residual-delta routing with RMS-normalized keys, raw values, and zero-initialized queries.
 
   - arxiv: "2510.26692"
     slug: kimi2025-kimi-linear
     note: >
-      Defines Kimi Delta Attention, its chunkwise and recurrent forms,
-      channel-wise decay, causal short convolutions, sigmoid output gate, NoPE
-      global-attention layers, the empirically selected 3:1 KDA-to-global MLA
-      cadence, fixed 128-dimensional key/value heads, and the width-1,536
-      scaling-law point with 20 heads. Its scaling convention reports active
-      parameters without embedding parameters. The small organism and optional
-      larger geometry keep the KDA substrate and cadence inside PKDA but use
-      dense global GQA instead of MLA.
-
-  - url: https://huggingface.co/moonshotai/Kimi-Linear-48B-A3B-Instruct/blob/e1df551a447157d4658b573f9a695d57658590e9/config.json
-    slug: kimi2025-kimi-linear-config
-    note: >
-      The released Kimi Linear configuration independently fixes BF16 model
-      dtype, normal initialization with standard deviation 0.02, 128-wide KDA
-      heads, convolution width 4, and a KDA projection width larger than the
-      residual width. It is released-model precedent for those operational
-      choices, not a geometry reproduction target.
+      KDA recurrence, short convolutions, channel-wise decay, output gates, and the three-to-one recurrent/global cell pattern.
 
   - arxiv: "2604.21100"
     slug: tumma2026-preconditioned-deltanet
     note: >
-      Defines Preconditioned KDA: an apply-to-key diagonal approximation to the
-      inverse key Gram, with independent preconditioner decay and gain, a
-      stable log-space squash onto [1/x, x], chunkwise and recurrent forms, and
-      language-model evidence at 340M and 1B. It supplies the preconditioner,
-      not the screen's head-count rule: the screen uses 10-by-128 to preserve
-      the larger geometry Kimi prior's 5/3 recurrent projection ratio. Both
-      scales use the x=1.5 PKDA parameterization rather than
-      unpreconditioned KDA.
+      Apply-to-key diagonal preconditioning with independent decay and gain and a bounded log-space squash.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/layers/precond_kda.py
     slug: fla2026-preconditioned-kda
     note: >
-      The upstream PrecondKDA reference layer defines the independent ATK gate
-      projections and initialization, bounded preconditioner, auxiliary A-state
-      cache, chunkwise training kernel, and fused-recurrent decoding kernel
-      that the small implementation reproduces and qualifies and the optional
-      larger geometry specifies. Its output norm defaults to epsilon 1e-5;
-      this experiment deliberately uses its unified model-wide epsilon 1e-6
-      instead.
+      Reference PKDA controls, initializations, and recurrent-state boundaries. This model uses RMSNorm epsilon 1e-6.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/modules/conv/short_conv.py
     slug: fla2026-short-convolution
     note: >
-      The released KDA/PKDA short convolution is a bias-free depthwise Conv1d
-      with causal history of kernel-size minus one and does not override the
-      framework Conv1d initialization. Both scales preserve those weight,
-      cache-shape, and initialization semantics.
+      Bias-free depthwise causal convolution with three cached positions and standard Conv1d initialization.
 
   - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/ops/precond_kda/chunk.py
     slug: fla2026-preconditioned-kda-chunk
     note: >
-      The upstream PKDA training operator fixes chunk size 64, returns outputs
-      in the activation dtype, retains FP32 recurrent boundary states, and
-      recomputes large intermediates in backward by default. These define the
-      kernel and precision contracts at both specified scales.
-
-  - url: https://huggingface.co/Qwen/Qwen3-Next-80B-A3B-Instruct/blob/main/config.json
-    slug: qwen2025-qwen3-next-config
-    note: >
-      The official released Qwen3-Next configuration sets the full-attention
-      interval to four and uses fewer KV than query heads in those global
-      layers. This is interval-four and GQA precedent only; Qwen3-Next uses
-      Gated DeltaNet where this experiment uses PKDA.
+      PKDA chunkwise training recurrence with FP32 boundary states and activation-dtype outputs.
 
   - url: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py
     slug: qwen2025-qwen3-next-attention
     note: >
-      The released Qwen3-Next attention implementation projects a gate beside
-      each query-head coordinate and applies its sigmoid elementwise to the
-      concatenated attention output before the output projection. Every hybrid
-      screen arm and the larger geometry adopt this gate; only the
-      external screen `vanilla` control remains ungated.
+      Elementwise sigmoid gating of concatenated global-attention heads before the output projection.
 
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer
     note: >
-      Defines latent feedback through the asymmetric state-value/token-gate
-      fusion, Jacobi multi-pass training, prefix mixin, recurrent-state jitter,
-      the 75/22/3 pass mixture, contraction diagnostics, depth scaling, and the
-      width-1,536 / intermediate-6,656 trunk geometry. The screen uses its
-      exact half-width intermediate of 3,328. It also supplies the shared
-      pretraining recipe used by every arm.
+      Asymmetric payload-value/token-gate fusion, Jacobi passes, prefix mixin, jitter, and the feedback training recipe.
 
   - arxiv: "2510.05491"
     slug: li2025-normuon
     note: >
-      Defines NorMuon: momentum, Newton-Schulz orthogonalization, neuron-wise
-      second-moment normalization, and global update rescaling. NorMuon
-      supplies the base matrix direction inside NorMuonH; Hyperball
-      normalization replaces its global rescaling before the parameter update.
+      Momentum, Newton-Schulz orthogonalization, and row-wise second-moment normalization for matrix updates.
 
   - url: https://github.com/zichongli5/NorMuon/blob/c6989a8354730695d9f5a9faa6c55eeb24865209/normuon.py#L35-L42
     slug: li2025-normuon-implementation
     note: >
-      The released NorMuon implementation updates the EMA momentum, forms the
-      default Nesterov direction by blending the current gradient with that
-      updated momentum, and only then applies Newton-Schulz orthogonalization.
-      NorMuonH preserves this ordering before its row normalization and
-      Hyperball projection.
+      Nesterov blending before orthogonalization, preserved by NorMuonH.
 
   - url: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/optim/nadam.py#L380-L531
     slug: pytorch291-nadam-implementation
     note: >
-      Defines the foreach NAdam update used for semantic-scale parameters:
-      fixed first and second moments, the scheduled Nesterov momentum cache,
-      cumulative momentum-product bias correction, and the default momentum
-      decay of 0.004. The experiment uses this implementation without weight
-      decay.
+      NAdam first and second moments, scheduled Nesterov momentum, and momentum-product bias correction.
 
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
     note: >
-      Initializes each constrained [d_out, d_in] matrix from a normal with
-      standard deviation 1/sqrt(d_in), then defines Hyperball's fixed realized
-      Frobenius radius, unit-Frobenius base update, dimensionless relative
-      step, and exact radial projection. The experiment applies this
-      initialization and constraint to every NorMuon matrix except the semantic
-      FBT token-gate projection, uses NAdam for all semantic-scale parameters,
-      and uses no weight decay.
-
-  - arxiv: "2603.15031"
-    slug: kimi2026-attention-residuals
-    note: >
-      Defines the cumulative-state Attention Residuals substrate needed to
-      distinguish replacement routing from the additive delta routing used in
-      this experiment.
+      Fan-in matrix initialization, fixed realized Frobenius radius, unit-norm update direction, and radial projection.
 
   - arxiv: "2502.05171"
     slug: geiping2025-recurrent-depth
     note: >
-      Defines the prelude/recurrent-core/coda decoder, the log-normal Poisson
-      draw of the iteration count, truncated backpropagation through the last
-      iterations, a KV cache budget shared across iterations, and the zero-shot
-      warm start of the next token's state. The `l` letter takes the tied core
-      and the iteration draw and keeps same-depth mixing; it replaces the
-      adapter with MHDB reads, the random initial state with the prelude
-      output, the sandwich norm with the unchanged pre-norm shell, and the
-      zero-shot warm start with the trained FBT payload. The zero-shot cache
-      sharing is the unbuilt `L` letter.
-
-  - arxiv: "2609.03807"
-    slug: langford2026-free-pause-tokens
-    note: >
-      Free Pause Tokens; the v1 HTML body is titled Almost Free State
-      Prediction Separation. Defines weight-shared state and prediction
-      streams, prediction-only queries over state keys/values without
-      prediction writes, and optional shared gated FFNs and late phasing.
-      A design comparison for delta-loop: it separates persistent memory from
-      prediction but does not supply recurrent depth. See docs/literature.md
-      for the integration assessment.
+      Prelude/tied-core/coda structure and log-normal Poisson iteration draw. This model uses full backpropagation and same-depth caches.
 
   - arxiv: "2203.03466"
     slug: yang2022-tensor-programs-v
     note: >
-      Defines maximal update parametrization and zero-shot hyperparameter
-      transfer across width, including the Adam rules used here: hidden and
-      output weights at a rate proportional to 1/fan_in, input weights and
-      vectors width-independent. The experiment applies the rule to the NAdam
-      group only, with the flagship width 1,536 as the reference rather than
-      the smallest geometry, so the screen is the scaled geometry.
+      Width scaling of Adam-family hidden-matrix rates; applied here to NAdam with reference width 1536.
 
   - arxiv: "2310.17813"
     slug: yang2023-spectral-condition
     note: >
-      States the spectral condition for feature learning: an update's spectral
-      norm proportional to sqrt(d_out / d_in) at every width. NorMuonH's
-      Hyperball step realizes it up to a constant fixed by the aspect ratio,
-      which is why the NorMuonH rate carries no width rule.
+      Spectral scaling condition used to interpret the width behavior of NorMuonH relative updates.
 
   - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/layer.py#L32-L37
     slug: microsoft-mup-shared-readout
     note: >
-      The released muP readout scales its input by output_mult / width_mult
-      before the linear map, and the shared-weight readout inherits that
-      forward, so a tied embedding keeps the input-embedding rate while its
-      readout role carries the width ratio. The experiment's readout
-      multiplies final_norm(h_top) by 1536 / D the same way.
+      Readout multiplier for tied embedding/readout weights, implemented here as 1536 / D.
 
   - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/init.py#L18-L24
     slug: microsoft-mup-initialization
     note: >
-      The released initializer scales ordinary hidden-matrix standard
-      deviations by the inverse square root of the width multiplier. The
-      experiment uses BASE_NORMAL_INIT_STD * sqrt(1536 / D) for its NAdam
-      gate/control group. Applying that variance-preservation rule to all
-      PKDA control slices, including fixed-rank bottlenecks, is a project
-      choice. Embeddings and fixed-head-width expansions retain the base
-      standard deviation.
+      Inverse-square-root width scaling for hidden-matrix initialization, applied here to NAdam gates and controls.

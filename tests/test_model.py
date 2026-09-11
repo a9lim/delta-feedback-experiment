@@ -91,7 +91,7 @@ def test_condition_grammar():
             assert config.condition == parse_condition(text)
     looped = condition_config("arfl", **TINY_LOOP)
     assert looped.loop and looped.hybrid
-    assert looped.routing_active and looped.feedback_active
+    assert looped.block_routing and looped.feedback
     assert looped.core_layers == range(4, 8)
     assert looped.routing_blocks == 3
     assert looped.executed_layers(1) == 12 and looped.executed_layers(3) == 20
@@ -129,8 +129,8 @@ def test_loop_geometry_and_iteration_bounds():
 
 def test_condition_flags():
     plain = condition_config("", **TINY)
-    assert not plain.routing_active
-    assert not plain.feedback_active
+    assert not plain.block_routing
+    assert not plain.feedback
     assert not plain.hybrid
     # The same three positions per cell use RoPE without a and PKDA with a.
     assert plain.global_attention_layers == tuple(range(TINY["layers"]))
@@ -142,31 +142,31 @@ def test_condition_flags():
     ] * 2
     hybrid = condition_config("a", **TINY)
     assert hybrid.hybrid
-    assert not hybrid.routing_active and not hybrid.feedback_active
+    assert not hybrid.block_routing and not hybrid.feedback
     assert hybrid.is_pkda_layer(0) and not hybrid.is_pkda_layer(3)
     assert hybrid.global_attention_layers == (3,)
     assert not any(hybrid.is_rope_layer(layer) for layer in range(8))
     routed = condition_config("ar", **TINY)
-    assert routed.routing_active
-    assert not routed.feedback_active
-    assert routed.routing_heads == TINY["kv_heads"]
+    assert routed.block_routing
+    assert not routed.feedback
+    assert routed.kv_heads == TINY["kv_heads"]
     assert routed.routing_block_size == 4
     fed = condition_config("af", **TINY)
-    assert fed.gated_entry
-    assert not fed.routing_active
+    assert fed.feedback
+    assert not fed.block_routing
     full = condition_config("arf", **TINY)
-    assert full.gated_entry
-    assert full.routing_active
+    assert full.feedback
+    assert full.block_routing
     # Letters compose independently of the trunk letter.
     plain_routed_fed = condition_config("rf", **TINY)
-    assert plain_routed_fed.routing_active and plain_routed_fed.feedback_active
+    assert plain_routed_fed.block_routing and plain_routed_fed.feedback
     assert not plain_routed_fed.hybrid
 
     screen = condition_config("a")
     assert screen.intermediate * 6 == screen.dim * 26
     assert screen.pkda_heads == 10
     assert screen.pkda_heads * screen.pkda_head_dim * 3 == screen.dim * 5
-    assert screen.routing_heads == 4
+    assert screen.kv_heads == 4
     assert screen.norm_eps == 1e-6
     assert DeltaModel(hybrid).blocks[0].attn.norm_eps == hybrid.norm_eps
 
@@ -616,9 +616,9 @@ def test_algebraic_router_matches_normalized_reference_in_fp32():
         router.query.normal_()
         router.key_norm.weight.uniform_(0.5, 1.5)
     sources = [torch.randn(2, 7, 32) for _ in range(5)]
-    routed, weights = router(sources, [None] * len(sources), True)
+    routed, weights = router(sources, True)
     values = torch.stack([router.null.expand_as(sources[0]), *sources])
-    h = model.cfg.routing_heads
+    h = model.cfg.kv_heads
     k = model.cfg.dim // h
     logits = torch.einsum(
         "hk,nbthk->nbth",
@@ -642,7 +642,7 @@ def test_routing_heads_can_select_different_sources():
     source1[..., 16:] = 1
     with torch.no_grad():
         router.query.fill_(8)
-    routed, weights = router([source0, source1], [None, None], True)
+    routed, weights = router([source0, source1], True)
     assert weights[:, 0, 0, 0].argmax().item() == 1
     assert weights[:, 0, 0, 1].argmax().item() == 2
     assert routed[..., :16].mean() > 0.99
@@ -653,7 +653,7 @@ def test_null_value_follows_activation_dtype_with_fp32_gradient():
     model = tiny("ar").train()
     router = model.blocks[0].attn_router
     source = torch.randn(1, 3, TINY["dim"], dtype=torch.bfloat16)
-    routed, _ = router([source], [None], False)
+    routed, _ = router([source], False)
     assert routed.dtype == torch.bfloat16
     routed.float().sum().backward()
     assert router.null.grad is not None
@@ -765,7 +765,7 @@ def test_multipass_matches_the_causally_equivalent_full_row_forward():
         toks = tokens()
         prefix = torch.ones((2, toks.shape[0]), dtype=torch.long) * 3
         jitter = torch.randn((2, *toks.shape, TINY["dim"])) * 0.02
-        n_passes = 3 if model.cfg.feedback_active else 1
+        n_passes = 3 if model.cfg.feedback else 1
         outs = multipass(
             model,
             toks,
@@ -970,7 +970,7 @@ def test_loop_at_one_iteration_is_the_unlooped_condition():
         looped = tiny(condition, layers=layers).train()
         flat = tiny(condition.replace("l", ""), layers=layers).train()
         toks = tokens()
-        n_passes = 2 if looped.cfg.feedback_active else 1
+        n_passes = 2 if looped.cfg.feedback else 1
         prefix = torch.ones((1, toks.shape[0]), dtype=torch.long) * 3
         kwargs = {"prefix_lens": prefix} if n_passes > 1 else {}
         outs_l = multipass(

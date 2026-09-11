@@ -8,17 +8,15 @@ Full-Bandwidth Transformer (FBT) feedback between token columns, and `l` ties
 the cells between the first and last into one core iterated within the
 column. `arfl` is the full built stack, `arf` the flat column, and the empty
 condition the plain decoder; dropping a letter removes that package from the
-computation. `L`, the loop's shared-cache extension, is specified at the end
-of the `l` section and not built.
+computation.
 
 What this page holds is invariant across geometries: equations, state, source
 identities, initialization, precision, and optimizer ownership. The widths,
 head counts, layer counts, parameter and cache accounting, and budgets of the
 three geometries we grow are in [scaling.md](scaling.md); the training recipe,
 data, schedule, and evaluation modes are in [design.md](design.md);
-[interpretability.md](interpretability.md) lists the scripts that use the
-named states; [literature.md](literature.md) separates source mechanisms from
-local choices.
+[interpretability.md](interpretability.md) lists the analysis interfaces, and
+[references/refs.yaml](../references/refs.yaml) identifies the sources.
 
 ## The column
 
@@ -46,8 +44,7 @@ Under `a` each cell is `[PKDA, PKDA, PKDA, NoPE-GGQA]`, so PKDA carries
 token-mixer state, order, and recency and every fourth layer supplies a gated
 dense causal global read. Without `a` each cell is `[RoPE-GGQA, RoPE-GGQA,
 RoPE-GGQA, NoPE-GGQA]`: the RoPE layers occupy exactly the PKDA sites. The
-pattern holds at every geometry and core iteration. There is no sliding
-window, MLA, or additive position embedding.
+pattern holds at every geometry and core iteration.
 
 On pass 1 and in Standard decoding the seed is the token embedding. The
 readout uses `final_norm(h_top)` times the muP readout multiplier `1536 / D`;
@@ -102,8 +99,7 @@ on this page holds inside the loop.
 Each PKDA layer is a Kimi Delta Attention recurrence with the stable diagonal
 apply-to-key preconditioner from Preconditioned DeltaNet. Its heads have
 key/value width 128, and its Q/K/V projection width is five thirds of the
-residual width at both geometries: the residual width does not constrain the
-recurrent projection width.
+residual width at all three scale presets.
 
 #### Projection and controls
 
@@ -229,8 +225,7 @@ diagnostics explicitly select math. The backend choice is scoped inside the
 compiled region and restores the caller's preferences. Cached decoding writes
 BF16 K/V explicitly, then uses compiled FlexAttention over the valid prefix;
 a one-token query sees every key in that prefix. Only the dense attention
-layers own KV storage: one per cell under `a`, every layer without it. The
-external `flash-attn` extension is not required.
+layers own KV storage: one per cell under `a`, every layer without it.
 
 ## Letter r: Multi-Head Delta Block routing
 
@@ -376,24 +371,9 @@ Each `mhdb` call above implicitly prepends its own learned null.
 
 Under `l` the column's first cell is a prelude, its last cell a coda, and the
 cells between them become one weight-tied core that runs `r` times per
-column, with `r` drawn once per optimizer step. Recurrent-depth language
-models supply the tied core and the iteration draw; the horizontal channel
-between columns stays exactly the FBT payload of `f`, and the mixer caches
-stay same-depth: iteration `i` of a column reads earlier columns'
-iteration-`i` writes, as they do in that paper's training. `l` adds no
-parameters.
-
-### Why
-
-The tied core adds a second axis of recurrence: what changes within a column
-as the same weights are reused, what an intervention at a particular iteration
-does, and which information is newly computed versus carried. The `arf`
-channel turned out token-legible ([findings.md](findings.md)); a core that
-refines a column over several iterations before the payload is emitted is one
-candidate way to give the channel something to carry. At `r = 1` the loop is
-exactly its unlooped condition, so the loop is the one thing an `arfl`
-specimen adds over an `arf` specimen. Every iteration-indexed trace says
-whether its index is core depth, Jacobi pass number, or token position.
+column, with `r` drawn once per optimizer step. The mixer caches stay
+same-depth: iteration `i` reads earlier columns' iteration-`i` writes.
+Under `f`, the FBT payload also crosses columns. `l` adds no parameters.
 
 ### The looped column
 
@@ -460,9 +440,8 @@ every site is the seed, `Delta_P`, every other core cell's delta so far, and
 its own as the live partial; the coda and the payload read
 `Delta_R_1 … Delta_R_c` in place of `Delta_R`, whose sum they are. With one
 core cell nothing runs between visits, the origin is the prelude output, and
-this rule is the one above. There is no adapter and no random initial state:
-the seed and prelude delta are re-readable at every iteration through the
-routers. At a fused position the token enters only through the FBT gate, as in
+this rule is the one above. The seed and prelude delta remain readable
+through the routers at every iteration. At a fused position the token enters only through the FBT gate, as in
 `arf`; a plain position seeds from the embedding itself.
 
 In code, `forward_column` runs the prelude, the core cells `iterations`
@@ -482,14 +461,9 @@ cell:
 h_top = seed + Delta_P + Delta_R + Delta_C
 ```
 
-with `Delta_R` the sum of the core cells' deltas. The shell is chosen because
-it has no mechanism that forces a nonzero update: a branch-output norm would
-pin every iteration's update size and make a fixed point unreachable by
-construction. Whether the tied core actually contracts is not assumed.
-Hyperball radii bound the NorMuonH matrices, but norm scales, router values,
-and the NAdam-owned gates and controls are not radius-bounded, so whether it
-contracts is measured: the depth trace below is the guard, and a diverging
-trace means the specification changes.
+with `Delta_R` the sum of the core cells' deltas. The depth trace measures whether the core contracts. Fixed NorMuonH matrix
+radii alone do not establish contraction: norms, router values, gates, and
+controls are unconstrained NAdam parameters.
 
 ### Iteration count
 
@@ -534,22 +508,16 @@ is a cell's bank:
 
 The core partial is `h - core_entry`, the core's progress since the prelude
 output, accumulated across iterations rather than reset at each; `Delta_R` is
-its value at core exit. The core's bank therefore has the shape and meaning of
-an `arf` second-cell bank at every iteration, and the tied routers answer one
-stationary question rather than one per iteration index. Every bank's non-null
-sources reconstruct the current residual exactly, so the uniform zero-query
-mixture stays collinear with the residual and pass-1 routing is functionally
-inert at initialization at every iteration. The residual is the state; the
-routers are the learned input injection of the seed and the prelude.
-Per-iteration deltas are never sources: an iteration boundary is a boundary in
-weights, not in state.
+its value at core exit. Every bank's non-null sources reconstruct the current residual, so the
+uniform zero-query mixture is collinear with that residual at initialization.
+The routers inject the seed and prelude output at every core site. Sources
+accumulate by cell, not by iteration.
 
 A core cell's partial is exactly absent at one site, its attention entry on
 iteration 1, where the cell has not yet moved. A router scores whatever
 sources it is handed, so that site reads a three-source bank exactly as the
 unlooped cell entry does, and from iteration 2 on the same router reads the
-partial as a fourth source. No placeholder and no presence mask are involved.
-
+partial as a fourth source.
 With `c` core cells the bank keeps the unlooped column's names. Core cell `j`
 at iteration `i` reads the seed, `Delta_P`, the deltas so far of the cells
 before it from this iteration and of the cells after it from the previous
@@ -560,48 +528,6 @@ unlooped column's banks exactly, and on the last iteration a cell that has
 finished enters the bank as its completed block delta. A core cell's delta is
 never reset and never split by iteration: it is the tensor the coda reads,
 caught midway.
-
-### Input injection and column start
-
-The recurrent-depth decoder computes `e = P(x)`, draws a random state `s_0`,
-iterates `s_i = R(e, s_(i-1))` where `R` opens with an adapter that maps the
-concatenation of the state and `e` back to the residual width once per
-iteration, and reads out `C(s_r)`. Its warm start is an inference-only
-substitution of the previous token's `s_r` for the noise. `arfl` realizes
-each piece differently:
-
-| Recurrent-depth decoder | `arfl` |
-|---|---|
-| injected input `e = P(x)` | `seed + Delta_P`, the prelude output |
-| adapter on `[s; e]`, once per iteration | router reads of seed and `Delta_P` at every core site |
-| separate latent stream `s` | the residual itself; `h_top = seed + Delta_P + Delta_R + Delta_C` |
-| random `s_0` | the prelude output |
-| zero-shot warm start from the previous token's `s_r` | the trained FBT payload at the seed |
-
-The two designs differ in one structural place: where the previous position's
-state enters. The recurrent-depth warm start hands the core its previous fixed
-point directly, untrained. Here the previous column enters at the seed,
-through the token-gated FBT fusion, and the prelude reprocesses the fused seed
-before the core starts, so the vertical iteration restarts from the prelude
-output at every column. The previous column's converged core state reaches the
-current core through one trained channel, the payload, compressed by the
-payload norm and the token gate.
-
-Two expressivity gaps against the adapter are known and accepted:
-
-- The router is a per-group convex mixture of raw values, and the branch's
-  projections are shared across every source; the adapter is a dedicated
-  linear map that can transform `e` independently of the state. The
-  recurrent-depth paper found additive re-injection matched concatenation at
-  small scale and lost at scale; the router is closer to addition with
-  learned gates.
-- The core carries no state across positions in its residual. Whether the
-  restart costs anything is a question for the trained specimen.
-
-Landing the previous column's state at the core entry, trained or zero-shot,
-would move the horizontal channel for the whole family and break `r = 1`
-coincidence with `arf`. It is a different design rather than a loop variant
-and is not specified here.
 
 ### Horizontal channel and mixing
 
@@ -614,9 +540,8 @@ Mixing is **same-depth** at every position: at core iteration `i` a position
 reads earlier positions' iteration-`i` writes of the current pass. Each
 iteration is one more full-sequence evaluation of the same core cells, so the
 PKDA chunk operator, causal GQA, and the router run unchanged; a PKDA state
-at iteration `i` starts from zero and advances across the pass's token order
-exactly as it does for a pass today. Plain and fused positions differ only in
-their seed, as in `arf`.
+at iteration `i` starts from zero and advances in token order. Plain and
+fused positions differ only in their seed, as in `arf`.
 
 Decoding keeps one core cache track per iteration: track `i` holds the PKDA
 matrix and diagonal states, the convolution histories, and the GQA K/V that
@@ -645,18 +570,17 @@ configured raw budget. Deeper modes retain the final block of each four-layer
 cell and checkpoint its preceding three blocks. With `a`, the retained block
 is dense attention; without `a`, the same quarter of blocks is retained.
 The checkpoint wrapper stays outside each compiled block, so both retained
-and recomputed blocks use the same compilation boundaries. The budget and
-runtime qualification needs are in [scaling.md](scaling.md#runtime-qualification).
-Every iteration remains differentiable.
+and recomputed blocks use the same compilation boundaries. Every iteration
+remains differentiable.
 
 Optimizer ownership follows the partition below: the tied core's matrices are
 NorMuonH parameters whose gradients sum across iterations and passes, with one
 fixed Hyperball radius each. The global FP32 gradient is clipped to norm 10.0
 before both steps.
 
-Execution follows the [runtime graph contract](runtime-qualification.md): one
-fixed-address train CUDA graph per reachable `(pass count, r)` pair, all
-sharing one pool, plus the no-grad evaluation graphs at `r = r_mean`.
+CUDA captures one fixed-address training graph per reachable `(pass count, r)`
+pair, sharing one pool, plus no-grad evaluation graphs at `r = r_mean`.
+See [operations.md](operations.md#cuda-execution) for the runtime path.
 
 `arfl` pairs with `arf`: byte-identical initialization of every parameter, the
 same stream, row order, schedule, and pass-count, prefix, and jitter draws. The
@@ -687,160 +611,7 @@ label assignments, together with the core routers' mass on every source by
 iteration, which is the learned input-injection profile.
 
 The payload self-composition trace of `design.md` runs at `r = r_mean` and
-tests the horizontal channel exactly as it does for `arf`. The recurrent-depth
-KL exit rule can run as a diagnostic; metrics use fixed `r`.
-
-### Not in this specification
-
-Left out: truncated backpropagation; branch-output or residual-state norms in
-the core; a random or learned initial core state; any warm start of the core
-from the previous column, trained or zero-shot; a raw embedding path into the
-core; a payload landing at the core entry, which is a different design rather
-than a loop variant; a shared-cache budget above one; per-iteration halting
-readouts and pause tokens, which belong to a separate specification; adaptive
-exit as anything but a diagnostic; and a decode `r` that varies within a
-request. `l` on the plain trunk or without `r` builds and pairs like every
-other subset, and is unstudied: without `r` the core has no input injection at
-all.
-
-### Letter L: a shared core cache, specified and unbuilt
-
-`L` is `l` plus a second trained horizontal channel: a shared core cache
-through which every core iteration of a fused position reads earlier
-positions' final-iteration mixer writes. It is the recurrent-depth "attend to
-later iterations of earlier tokens" mechanism trained rather than zero-shot.
-It is specified here and not built; `parse_condition` does not accept it yet.
-In the condition grammar a capital letter is its lowercase letter plus one
-package, and `l` and `L` are exclusive occupants of the loop slot, so `arfL`
-would name the full stack with the cache.
-
-#### Plain and fused positions
-
-Every executed position is either **plain** or **fused**, and under `L` the
-label governs both horizontal channels at once:
-
-- A plain position seeds from its embedding and mixes **same-depth**: at core
-  iteration `i` it reads earlier positions' iteration-`i` writes of the
-  current pass.
-- A fused position seeds from the FBT fusion and mixes **shared**: at every
-  core iteration it reads earlier positions' **final-iteration** writes plus
-  its own current-iteration write.
-
-Plain positions always form a prefix of the row, so a plain position only ever
-reads plain positions and same-depth mixing over the prefix is self-contained.
-Position 0 is always plain. The assignment per context:
-
-| Context | Plain | Fused |
-|---|---|---|
-| training pass 1 | every position | none |
-| training pass `k ≥ 2` | the drawn prefix | the suffix |
-| Standard decoding | prompt and every generated position | none |
-| Soft decoding | the prompt prefill | every generated position |
-| Fused decoding | the prompt prefill; position 0 of the fused prompt pass | the rest of the fused prompt pass; every generated position |
-
-"Final" means, in training pass `k ≥ 2`, pass `k-1`'s last iteration at each
-earlier position, whatever that position's label was in pass `k-1`; in
-decoding, each earlier position's last executed iteration. The prefix therefore
-keeps the meaning it has in `design.md`: a plain position computes exactly what
-pass 1 computes. The price is that a feedback pass evaluates each core mixer
-twice per iteration, once same-depth over the prefix and once shared, and
-selects by position. At `r = 1`, `arfL` differs from `arf` only by this
-shared mixing on feedback passes.
-
-#### Shared core cache
-
-A position's **write** at a core layer is everything later positions consume
-there. For PKDA: the pre-convolution Q/K/V projections that form later
-positions' convolution history, the post-convolution `k_t` and `v_t`, and the
-per-head transition controls `alpha_t`, `beta_t`, `alphaP_t`, `betaP_t`. For
-gated GQA: `k_t` after normalization and, at RoPE sites, rotation, plus `v_t`.
-The write bank of one pass, per
-core layer, holds the BF16 pre-convolution Q/K/V, the BF16 post-convolution K
-and V, the FP32 transition controls, and the BF16 GGQA K and V at every
-position.
-
-The bank is produced by the final core iteration of a pass at every position,
-is part of the pass's `ColumnOutput`, stays in the autograd graph, and is
-consumed by the next pass exactly as the payload is:
-
-```python
-outs = [forward_column(e, writes=None)]                 # pass 1: all plain
-for k in range(2, K + 1):
-    p = shift_right(outs[-1].payload + jitter[k - 2])
-    x = where(plain, e, fuse(p, e))
-    outs.append(forward_column(x, plain=plain, writes=outs[-1].writes))
-```
-
-**PKDA at a fused position.** Let `S̄_(t-1)`, `Ā_(t-1)` be the recurrent matrix
-and preconditioner state accumulated over positions `< t` from the write bank
-only, with the transition equations of the `a` section; at `t = 0` both are
-zero. Position `t` then applies its own current-iteration transition:
-
-```text
-A_t        = alphaP_t Ā_(t-1) + betaP_t (k_t ⊙ k_t)
-k_write_t  = B(A_t) ⊙ k_t
-S_tilde_t  = Diag(alpha_t) S̄_(t-1)
-S_t        = (I - beta_t k_write_t k_t^T) S_tilde_t + beta_t k_write_t v_t^T
-o_t        = S_t^T q_t
-           = S̄_(t-1)^T Diag(alpha_t) (q_t - beta_t (k_write_t · q_t) k_t)
-             + beta_t (k_write_t · q_t) v_t
-```
-
-The bank-side scan does not depend on the iteration, so its exclusive states
-and chunk factors are formed once per pass per layer; each iteration performs
-an exclusive read at the modified query and adds the own term. The convolution
-at position `t` uses its own current pre-convolution projections with the
-bank's projections as history. This is a new operator, forward and backward,
-with gradient flowing into the current writes and into the bank. Its parity
-oracle is the literal sequential recurrence over the bank followed by the own
-transition, run on the portable path.
-
-**Gated GQA at a fused position.** Position `t` attends over the bank's `K̄`,
-`V̄` at positions `< t` and over its own current `k_t`, `v_t`; the two softmax
-pieces are merged in FP32 by log-sum-exp with the layer's usual scale, and at
-`t = 0` only the own term exists. Gradient flows into both.
-
-No jitter is added directly to write tensors; later-pass writes are functions
-of the jittered payload seeds. Pass `k`'s loss reaches pass `k-1` through both
-the payload and the bank, and neither is ever detached.
-
-#### Jacobi horizon
-
-The shared cache inherits the payload's training horizon. A `k`-pass batch
-exposes chains of at most `k-1` transitions through both channels, while
-decoding runs unbounded chains in which each generated position's finals were
-themselves produced from a cache of mixed age: prompt finals from the prefill,
-generated finals from the decode trajectory. Training pass 2 reads pass-1
-finals, pass 3 reads pass-2 finals produced against pass-1 finals, and no
-training pass constructs a deeper joint distribution. This is the same mismatch
-the payload already has, and a two-channel version of the self-composition
-trace watches it: repeated fully fused prefill with prefix length 1 in which
-both the shifted payload and the write bank of the previous iteration advance,
-where a rising or oscillating trace outranks any one-step metric.
-
-#### Decoding and cost
-
-Fused decoding under `L` keeps one compact core cache that advances once per
-position after its final iteration, `2 + c` cells in all; Standard decoding
-keeps the `l` tracks. Training holds two write banks and the bank-side scan
-intermediates on top of `l`'s activations, and each feedback pass evaluates
-the core mixers twice per iteration, so `L` is more expensive than `l` in
-every mode.
-
-#### Building it
-
-Building `L` touches the following together:
-
-- `CONDITION_LETTERS` gains `L` as the loop slot's superset letter, exclusive
-  with `l`; `ModelConfig` gains the shared-cache flag; `ColumnOutput` gains
-  the write bank; `forward_column` takes a per-position plain mask and a
-  previous bank.
-- The workspace FLA fork gains the fused-position PKDA operator, forward and
-  backward; the gated GQA layer gains the two-piece merge. `delta probe`
-  checks each against its portable oracle.
-- The trainer threads the bank through the passes; the monitor gains the
-  two-channel sequence trace.
-- A checkpoint contract bump; the pages that describe `l` gain `L`.
+tests the horizontal channel at fixed core depth.
 
 ## Precision and initialization
 
@@ -967,19 +738,11 @@ The **base group** holds everything else NAdam owns:
 - RMSNorm weights, router queries and nulls, depthwise convolutions, biases,
   rates, time constants, and preconditioner centers.
 
-The split is muP for NAdam. NorMuonH's relative step is dimensionless and its
-update's spectral norm is `lr_normuonh * sqrt(d_out / min(d_out, d_in))`, the
-spectral condition up to a constant the aspect ratio fixes, so its rate
-transfers across widths on its own. NAdam moves every coordinate by about its
-rate whatever the gradient, so a matrix with fan-in `D` shifts its output by
-up to `rate * D` per step; the width-scaled group therefore runs at
-`lr_nadam * 1536 / D`, the muP rule for Adam-family hidden weights with the
-flagship as the reference width. Every other NAdam parameter has a fan-in the
-ladder holds fixed: one for the embedding lookup, 192 for a routing group, 128
-for the PKDA expansions, four for a convolution, one for a vector. The tied
-embedding's readout role has fan-in `D` as well and takes the ratio as the
-readout multiplier above rather than a scaled rate, which would also move its
-lookup. At the flagship every ratio is one.
+The width-scaled group runs at `lr_nadam * 1536 / D`; the base group runs
+at `lr_nadam`. The tied readout carries the same width ratio while its
+embedding lookup keeps the base learning rate. NorMuonH uses one relative
+learning rate across widths. These are the current width-transfer rules;
+their effectiveness is an experimental question.
 
 | | Screen | Bridge | Flagship |
 |---|---:|---:|---:|

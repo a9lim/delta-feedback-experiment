@@ -14,11 +14,11 @@ the rest).
 
 Conditioning on one model's own loss selects on that model's noise, so the
 tables are binned on the *reference* model's loss and entropy; read the
-``d_df1_mhdb`` column of those tables as regression toward the mean, and the
-``d_fused_df1`` column as a genuine independent conditioning.
+``d_feedback_pass1_reference`` column of those tables as regression toward the mean, and the
+``d_fused_feedback_pass1`` column as a genuine independent conditioning.
 
 Usage:
-    python scripts/compare_conditions.py --reference runs/A.pt.10745 --feedback runs/B.pt.10745 \\
+    python scripts/compare_conditions.py --reference runs/A.pt.STEP --feedback runs/B.pt.STEP \\
         --data-dir /data/delta/dclm-100b
 """
 
@@ -37,7 +37,6 @@ import torch.nn.functional as F
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
 
-POS_BINS = [(0, 0), (1, 3), (4, 15), (16, 63), (64, 255), (256, 511), (512, 1023)]
 MIX_W = (0.1, 0.2, 0.3, 0.4, 0.5)
 PAIRS = (("m", "d1"), ("d1", "d2"), ("m", "d2"))
 
@@ -97,13 +96,13 @@ def main() -> None:
     ref, saved_ref = analysis.load_checkpoint(args.reference, args.device)
     fb, saved_fb = analysis.load_checkpoint(args.feedback, args.device)
     device = next(fb.parameters()).device
-    if not fb.cfg.feedback_active:
+    if not fb.cfg.feedback:
         raise SystemExit("--feedback must be a snapshot of a condition with f")
     if saved_ref["seq_len"] != saved_fb["seq_len"]:
         raise SystemExit("the two snapshots have different sequence lengths")
     cfg = fb.cfg
     T = saved_fb["seq_len"]
-    tag_ref, tag_fb = saved_ref.get("tag", args.reference.stem), saved_fb.get("tag", args.feedback.stem)
+    tag_ref, tag_fb = saved_ref["tag"], saved_fb["tag"]
     out_dir = args.out_dir or Path("figures") / f"compare-{tag_ref}-vs-{tag_fb}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data = TokenData.load(args.data_dir, "val", T)
@@ -231,9 +230,9 @@ def main() -> None:
                 "htop_d1": out_d1.h_top,
                 "e": e_d,
             }
-            if cfg.routing_active:
+            if cfg.block_routing:
                 payload_sources = [out_d1.sources[0], *out_d1.sources[1:]]
-                routed, _ = fb.payload_router(payload_sources, [None] * len(payload_sources), False)
+                routed, _ = fb.payload_router(payload_sources, False)
                 coll["routed_d1"] = routed
             for k, table in srcs.items():
                 for name in common:
@@ -258,64 +257,62 @@ def main() -> None:
         "labels": {"m": f"{tag_ref} pass 1", "d1": f"{tag_fb} pass 1", "d2": f"{tag_fb} fused", "d3": f"{tag_fb} fused, iteration 2"},
     }
     report["means"] = {
-        "mhdb": float(K["ce_m"].mean()), "df_pass1": float(K["ce_d1"].mean()),
-        "df_fused": float(K["ce_d2"].mean()), "df_fused_iter2": float(K["ce_d3"].mean()),
-        "delta_df1_minus_mhdb": float(d_m_d1.mean()), "delta_df1_minus_mhdb_se": se(d_m_d1),
-        "delta_fused_minus_df1": float(d_d1_d2.mean()), "delta_fused_minus_df1_se": se(d_d1_d2),
-        "delta_fused_minus_mhdb": float(d_m_d2.mean()), "delta_iter2_minus_fused": float(d_d2_d3.mean()),
-        "first32rows_mhdb": float(K["ce_m"][: 32 * T].mean()), "first32rows_df1": float(K["ce_d1"][: 32 * T].mean()),
-        "first32rows_df_fused": float(K["ce_d2"][: 32 * T].mean()),
-        "kl_mhdb_to_df1": float(K["kl_m_d1"].mean()), "kl_df1_to_fused": float(K["kl_d1_d2"].mean()),
-        "kl_mhdb_to_fused": float(K["kl_m_d2"].mean()),
-        "acc_mhdb": float(K["acc_m"].mean()), "acc_df1": float(K["acc_d1"].mean()), "acc_fused": float(K["acc_d2"].mean()),
-        "argmax_agree_mhdb_df1": float(K["agree_m_d1"].mean()), "argmax_agree_df1_fused": float(K["agree_d1_d2"].mean()),
-        "corr_ce_mhdb_df1": float(np.corrcoef(K["ce_m"], K["ce_d1"])[0, 1]),
-        "corr_ce_df1_fused": float(np.corrcoef(K["ce_d1"], K["ce_d2"])[0, 1]),
-        "entropy_mhdb": float(K["ent_m"].mean()), "entropy_df1": float(K["ent_d1"].mean()),
-        "htop_rel_mhdb_df1": float(K["htop_rel_m_d1"].mean()), "htop_cos_mhdb_df1": float(K["htop_cos_m_d1"].mean()),
-        "htop_rel_df1_fused": float(K["htop_rel_d1_d2"][pos >= 1].mean()), "htop_cos_df1_fused": float(K["htop_cos_d1_d2"][pos >= 1].mean()),
+        "reference": float(K["ce_m"].mean()), "feedback_pass1": float(K["ce_d1"].mean()),
+        "fused": float(K["ce_d2"].mean()), "fused_iter2": float(K["ce_d3"].mean()),
+        "delta_feedback_pass1_minus_reference": float(d_m_d1.mean()), "delta_feedback_pass1_minus_reference_se": se(d_m_d1),
+        "delta_fused_minus_feedback_pass1": float(d_d1_d2.mean()), "delta_fused_minus_feedback_pass1_se": se(d_d1_d2),
+        "delta_fused_minus_reference": float(d_m_d2.mean()), "delta_iter2_minus_fused": float(d_d2_d3.mean()),
+        "kl_reference_to_feedback_pass1": float(K["kl_m_d1"].mean()), "kl_feedback_pass1_to_fused": float(K["kl_d1_d2"].mean()),
+        "kl_reference_to_fused": float(K["kl_m_d2"].mean()),
+        "acc_reference": float(K["acc_m"].mean()), "acc_feedback_pass1": float(K["acc_d1"].mean()), "acc_fused": float(K["acc_d2"].mean()),
+        "argmax_agree_reference_feedback_pass1": float(K["agree_m_d1"].mean()), "argmax_agree_feedback_pass1_fused": float(K["agree_d1_d2"].mean()),
+        "corr_ce_reference_feedback_pass1": float(np.corrcoef(K["ce_m"], K["ce_d1"])[0, 1]),
+        "corr_ce_feedback_pass1_fused": float(np.corrcoef(K["ce_d1"], K["ce_d2"])[0, 1]),
+        "entropy_reference": float(K["ent_m"].mean()), "entropy_feedback_pass1": float(K["ent_d1"].mean()),
+        "htop_rel_reference_feedback_pass1": float(K["htop_rel_m_d1"].mean()), "htop_cos_reference_feedback_pass1": float(K["htop_cos_m_d1"].mean()),
+        "htop_rel_feedback_pass1_fused": float(K["htop_rel_d1_d2"][pos >= 1].mean()), "htop_cos_feedback_pass1_fused": float(K["htop_cos_d1_d2"][pos >= 1].mean()),
     }
     m = pos >= 1
     report["delta_quantiles"] = {
-        "df1_minus_mhdb": quantiles(d_m_d1), "fused_minus_df1": quantiles(d_d1_d2[m]), "fused_minus_mhdb": quantiles(d_m_d2[m]),
+        "feedback_pass1_minus_reference": quantiles(d_m_d1), "fused_minus_feedback_pass1": quantiles(d_d1_d2[m]), "fused_minus_reference": quantiles(d_m_d2[m]),
     }
     report["frac_better"] = {
-        "df1_beats_mhdb": float((d_m_d1 < 0).mean()), "fused_beats_df1": float((d_d1_d2[m] < 0).mean()),
-        "fused_beats_mhdb": float((d_m_d2[m] < 0).mean()),
+        "feedback_pass1_beats_reference": float((d_m_d1 < 0).mean()), "fused_beats_feedback_pass1": float((d_d1_d2[m] < 0).mean()),
+        "fused_beats_reference": float((d_m_d2[m] < 0).mean()),
     }
     cols = {
-        "mhdb": K["ce_m"], "df1": K["ce_d1"], "fused": K["ce_d2"],
-        "d_df1_mhdb": d_m_d1, "d_fused_df1": d_d1_d2, "d_fused_mhdb": d_m_d2, "d_iter2_fused": d_d2_d3,
+        "reference": K["ce_m"], "feedback_pass1": K["ce_d1"], "fused": K["ce_d2"],
+        "d_feedback_pass1_reference": d_m_d1, "d_fused_feedback_pass1": d_d1_d2, "d_fused_reference": d_m_d2, "d_iter2_fused": d_d2_d3,
         "kl_m_d1": K["kl_m_d1"], "kl_d1_d2": K["kl_d1_d2"],
         "agree_m_d1": K["agree_m_d1"], "agree_d1_d2": K["agree_d1_d2"],
         "htop_rel_m_d1": K["htop_rel_m_d1"], "htop_rel_d1_d2": K["htop_rel_d1_d2"],
-        "frac_df1_better": (d_m_d1 < 0).astype(np.float64), "frac_fused_better": (d_d1_d2 < 0).astype(np.float64),
+        "frac_feedback_pass1_better": (d_m_d1 < 0).astype(np.float64), "frac_fused_better": (d_d1_d2 < 0).astype(np.float64),
         "gate_mean": K["gate_mean"],
     }
     rows = []
-    for lo, hi in POS_BINS:
+    for lo, hi in analysis.position_bins(T):
         mm = (pos >= lo) & (pos <= hi)
         row = {"bin": f"{lo}-{hi}", "n": int(mm.sum())}
         row.update({k: float(v[mm].mean()) for k, v in cols.items()})
-        row["d_df1_mhdb_se"] = se(d_m_d1[mm])
-        row["d_fused_df1_se"] = se(d_d1_d2[mm])
+        row["d_feedback_pass1_reference_se"] = se(d_m_d1[mm])
+        row["d_fused_feedback_pass1_se"] = se(d_d1_d2[mm])
         rows.append(row)
     report["position_bins"] = rows
     width = 32
     report["position_curve"] = [
         {
             "pos_lo": int(b * width),
-            "d_df1_mhdb": float(d_m_d1[(pos >= b * width) & (pos < (b + 1) * width)].mean()),
-            "d_df1_mhdb_se": se(d_m_d1[(pos >= b * width) & (pos < (b + 1) * width)]),
-            "d_fused_df1": float(d_d1_d2[(pos >= max(b * width, 1)) & (pos < (b + 1) * width)].mean()),
-            "d_fused_df1_se": se(d_d1_d2[(pos >= max(b * width, 1)) & (pos < (b + 1) * width)]),
-            "mhdb": float(K["ce_m"][(pos >= b * width) & (pos < (b + 1) * width)].mean()),
+            "d_feedback_pass1_reference": float(d_m_d1[(pos >= b * width) & (pos < (b + 1) * width)].mean()),
+            "d_feedback_pass1_reference_se": se(d_m_d1[(pos >= b * width) & (pos < (b + 1) * width)]),
+            "d_fused_feedback_pass1": float(d_d1_d2[(pos >= max(b * width, 1)) & (pos < (b + 1) * width)].mean()),
+            "d_fused_feedback_pass1_se": se(d_d1_d2[(pos >= max(b * width, 1)) & (pos < (b + 1) * width)]),
+            "reference": float(K["ce_m"][(pos >= b * width) & (pos < (b + 1) * width)].mean()),
         }
         for b in range(T // width)
     ]
     sub = {k: v[m] for k, v in cols.items()}
     edges = np.quantile(K["ce_m"][m], [0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99, 1.0])
-    report["by_mhdb_ce"] = binned(K["ce_m"][m], edges, sub)
+    report["by_reference_ce"] = binned(K["ce_m"][m], edges, sub)
     edges = np.quantile(K["prev_surprise_m"][m], [0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99, 1.0])
     report["by_prev_surprise"] = binned(K["prev_surprise_m"][m], edges, sub)
     edges = np.quantile(K["inp_freq"][m], [0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0])
@@ -323,7 +320,7 @@ def main() -> None:
     edges = np.quantile(K["tgt_freq"][m], [0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0])
     report["by_target_token_frequency"] = binned(K["tgt_freq"][m], edges, sub)
     edges = np.quantile(K["ent_m"][m], [0, 0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 0.99, 1.0])
-    report["by_mhdb_entropy"] = binned(K["ent_m"][m], edges, sub)
+    report["by_reference_entropy"] = binned(K["ent_m"][m], edges, sub)
 
     ens = {}
     for pair in PAIRS:
@@ -357,18 +354,18 @@ def main() -> None:
     report["feature_tokens"] = int(Fe["fn_d1"].shape[0])
 
     redundancy = {
-        "r2_payload_from_final_norm_df1": ridge_r2(Fe["fn_d1"], Fe["payload_d1"]),
-        "r2_payload_from_final_norm_mhdb": ridge_r2(Fe["fn_m"], Fe["payload_d1"]),
-        "r2_payload_from_htop_df1": ridge_r2(Fe["htop_d1"], Fe["payload_d1"]),
+        "r2_payload_from_final_norm_feedback_pass1": ridge_r2(Fe["fn_d1"], Fe["payload_d1"]),
+        "r2_payload_from_final_norm_reference": ridge_r2(Fe["fn_m"], Fe["payload_d1"]),
+        "r2_payload_from_htop_feedback_pass1": ridge_r2(Fe["htop_d1"], Fe["payload_d1"]),
         "r2_payload_from_embedding": ridge_r2(Fe["e"], Fe["payload_d1"]),
-        "r2_final_norm_df1_from_final_norm_mhdb": ridge_r2(Fe["fn_m"], Fe["fn_d1"]),
-        "r2_final_norm_mhdb_from_final_norm_df1": ridge_r2(Fe["fn_d1"], Fe["fn_m"]),
+        "r2_final_norm_feedback_pass1_from_final_norm_reference": ridge_r2(Fe["fn_m"], Fe["fn_d1"]),
+        "r2_final_norm_reference_from_final_norm_feedback_pass1": ridge_r2(Fe["fn_d1"], Fe["fn_m"]),
         "payload_rms": float(Fe["payload_d1"].square().mean().sqrt()),
         "payload_norm_weight_quantiles": quantiles(fb.payload_norm.weight.detach().float().cpu().numpy()),
     }
     if "routed_d1" in Fe:
         redundancy.update({
-            "r2_routed_from_final_norm_df1": ridge_r2(Fe["fn_d1"], Fe["routed_d1"]),
+            "r2_routed_from_final_norm_feedback_pass1": ridge_r2(Fe["fn_d1"], Fe["routed_d1"]),
             "r2_routed_from_embedding": ridge_r2(Fe["e"], Fe["routed_d1"]),
             "routed_rms_over_htop_rms": float((Fe["routed_d1"].square().mean(-1).sqrt() / Fe["htop_d1"].square().mean(-1).sqrt()).mean()),
             "routed_rms": float(Fe["routed_d1"].square().mean().sqrt()),
@@ -390,16 +387,16 @@ def main() -> None:
         print(f"  {k:<18}", {kk: round(vv, 3) for kk, vv in v.items()})
     print("  frac better:", report["frac_better"])
     print("\n== by position ==")
-    print(f"  {'bin':<10}{'n':>8}{'mhdb':>8}{'df1':>8}{'fused':>8}{'d_df1':>9}{'d_fus':>9}{'d_it2':>8}{'kl_md1':>8}{'kl_d12':>8}{'agr_md1':>8}{'rel_md1':>8}{'rel_d12':>8}")
+    print(f"  {'bin':<10}{'n':>8}{'reference':>8}{'feedback_pass1':>8}{'fused':>8}{'d_feedback_pass1':>9}{'d_fus':>9}{'d_it2':>8}{'kl_md1':>8}{'kl_d12':>8}{'agr_md1':>8}{'rel_md1':>8}{'rel_d12':>8}")
     for r in rows:
-        print(f"  {r['bin']:<10}{r['n']:>8}{r['mhdb']:>8.3f}{r['df1']:>8.3f}{r['fused']:>8.3f}{r['d_df1_mhdb']:>+9.4f}{r['d_fused_df1']:>+9.4f}{r['d_iter2_fused']:>+8.4f}{r['kl_m_d1']:>8.3f}{r['kl_d1_d2']:>8.3f}{r['agree_m_d1']:>8.3f}{r['htop_rel_m_d1']:>8.3f}{r['htop_rel_d1_d2']:>8.3f}")
-    for title, key in (("by reference own CE (d_df1 column is regression to the mean)", "by_mhdb_ce"),
+        print(f"  {r['bin']:<10}{r['n']:>8}{r['reference']:>8.3f}{r['feedback_pass1']:>8.3f}{r['fused']:>8.3f}{r['d_feedback_pass1_reference']:>+9.4f}{r['d_fused_feedback_pass1']:>+9.4f}{r['d_iter2_fused']:>+8.4f}{r['kl_m_d1']:>8.3f}{r['kl_d1_d2']:>8.3f}{r['agree_m_d1']:>8.3f}{r['htop_rel_m_d1']:>8.3f}{r['htop_rel_d1_d2']:>8.3f}")
+    for title, key in (("by reference own CE (d_feedback_pass1 column is regression to the mean)", "by_reference_ce"),
                        ("by previous-column surprise (reference)", "by_prev_surprise"),
                        ("by input-token frequency", "by_input_token_frequency"), ("by target-token frequency", "by_target_token_frequency"),
-                       ("by reference entropy", "by_mhdb_entropy")):
+                       ("by reference entropy", "by_reference_entropy")):
         print(f"\n== {title} ==")
         for r in report[key]:
-            print(f"  [{r['range'][0]:9.2f},{r['range'][1]:9.2f}) n={r['n']:>7} mhdb={r['mhdb']:.3f} d_df1={r['d_df1_mhdb']:+.4f} ({r['frac_df1_better']:.3f} better) d_fused={r['d_fused_df1']:+.4f} ({r['frac_fused_better']:.3f} better) kl_md1={r['kl_m_d1']:.3f} kl_d12={r['kl_d1_d2']:.3f}")
+            print(f"  [{r['range'][0]:9.2f},{r['range'][1]:9.2f}) n={r['n']:>7} reference={r['reference']:.3f} d_feedback_pass1={r['d_feedback_pass1_reference']:+.4f} ({r['frac_feedback_pass1_better']:.3f} better) d_fused={r['d_fused_feedback_pass1']:+.4f} ({r['frac_fused_better']:.3f} better) kl_md1={r['kl_m_d1']:.3f} kl_d12={r['kl_d1_d2']:.3f}")
     print("\n== ensembles (split-validated) ==")
     for k, v in ens.items():
         print(f"  {k:<8} singles={ {kk: round(vv, 4) for kk, vv in v['single_test'].items()} } best_w={v['best_w_on_calib']} test={v['test_at_best_w']:.4f} gain_over_better_single={v['test_gain_over_better_single']:+.4f}")

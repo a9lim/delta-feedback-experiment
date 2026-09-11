@@ -122,7 +122,7 @@ const LETTERS = ['a', 'r', 'f', 'l'];
 const ROLL = 200;
 
 // ---------------------------------------------------------------- records
-// step: loss/pass1/k (+r under l)/two learning rates/gnorm/throughputs/mem/
+// step: loss/pass1/k (+r under l)/learning rates/gnorm/throughputs/mem/
 // elapsed.  eval: val (+val_fused with f).  route: per-site weights at eval
 // cadence.  contract: the standing self-composition diagnostic (f).  depth:
 // the loop's fixed-r sweep (l).  Non-step series live in run.evals so the
@@ -427,13 +427,20 @@ function seriesOf(view) {
   // layers / cell cell-equivalents on a flat column and 2 + r · core / cell
   // under l, so cell-tokens are the matched-compute axis.
   const setup = view.run.meta.run || {};
-  const per = (num(setup.batch_rows) ?? 0) * (num(setup.seq_len) ?? 0);
-  const layers = num(setup.layers) ?? 12, cell = num(setup.routing_block_size) ?? 4, core = layers - 2 * cell;
+  const batch = num(setup.batch_rows), length = num(setup.seq_len);
+  const per = batch > 0 && length > 0 ? batch * length : null;
+  const layers = num(setup.layers), cell = num(setup.routing_block_size);
+  const geometry = layers > 0 && cell > 0;
+  const core = geometry ? layers - 2 * cell : null;
   const looped = has(view, 'l');
+  const add = (total, amount) => total == null || amount == null ? null : total + amount;
   let cumPred = 0, cumPass = 0, cumCell = 0;
   const cum = steps.map((s) => {
-    const k = s.k ?? 1, cells = looped ? 2 + (s.r ?? 1) * core / cell : layers / cell;
-    cumPred += per; cumPass += k * per; cumCell += k * cells * per;
+    const cells = geometry && (!looped || s.r > 0) ? (looped ? 2 + s.r * core / cell : layers / cell) : null;
+    const pass = per != null && s.k > 0 ? s.k * per : null;
+    cumPred = add(cumPred, per);
+    cumPass = add(cumPass, pass);
+    cumCell = add(cumCell, pass != null && cells != null ? pass * cells : null);
     return [cumPred, cumPass, cumCell];
   });
   const sites = routeSites(view);

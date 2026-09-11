@@ -78,7 +78,7 @@ def main() -> None:
     run = SimpleNamespace(**saved)
     cfg = analysis.config_from_args(saved)
     device = torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not cfg.feedback_active:
+    if not cfg.feedback:
         raise SystemExit("continuation needs a snapshot of a condition with f")
     torch.manual_seed(saved["seed"])
     model = DeltaModel(cfg).to(device)

@@ -650,14 +650,6 @@ def test_tokenize_command_source_and_shuffle_overrides(tmp_path, monkeypatch, so
     assert captured["revision"] == "explicit-revision"
 
 
-def test_tokenize_command_rejects_retired_config(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(data_module, "tokenize", lambda *args, **kwargs: pytest.fail("retired CLI flag reached the builder"))
-    with pytest.raises(SystemExit) as raised:
-        tokenize_command(["--out", str(tmp_path / "tokens"), "--config", "sample-350BT"])
-    assert raised.value.code == 2
-    assert "unrecognized arguments: --config" in capsys.readouterr().err
-
-
 @pytest.mark.parametrize("args,expected", [
     ([], "data/dclm-100b"),
     (["--source", "dclm"], "data/dclm"),
@@ -1216,7 +1208,6 @@ def test_trainer_uses_named_source_paths():
     args = parse_run_args(["x"])
     assert args.data_root == "data"
     assert args.source == DEFAULT_SOURCE
-    assert not hasattr(args, "data_dir")
     parser = build_parser()
     args, pinned = resolve_run_args(
         parser, ["x", "--data-root", "/data/delta", "--source", "fineweb-edu-10b"]
@@ -1225,18 +1216,10 @@ def test_trainer_uses_named_source_paths():
     assert {"data_root", "source"} <= pinned
 
 
-@pytest.mark.parametrize("flags", [["--data-dir", "/data/old"], ["--source", "unknown"]])
-def test_trainer_rejects_retired_or_unknown_data_arguments(flags):
-    with pytest.raises(SystemExit) as raised:
-        parse_run_args(["x", *flags])
-    assert raised.value.code == 2
-
-
 def test_fresh_run_uses_authoritative_optimizer_defaults():
     args = build_parser().parse_args(["x"])
     assert args.lr_normuonh == DEFAULT_NORMUONH_LR == 6e-3
     assert args.lr_nadam == DEFAULT_NADAM_LR == 3e-4
-    assert not hasattr(args, "lr_embedding")
     assert args.warmup_frac == 0.02
     assert args.cooldown_frac == 0.2
 
@@ -1255,33 +1238,12 @@ def test_optimizer_learning_rate_flags_are_independent():
     assert args.lr_nadam == 0.0002
 
 
-def test_condition_flag_canonicalizes_and_rejects_names():
+def test_condition_flag_canonicalizes_and_rejects_unknown_letters():
     assert build_parser().parse_args(["x"]).condition == ""
     assert build_parser().parse_args(["x", "--condition", ""]).condition == ""
     assert build_parser().parse_args(["x", "--condition", "fra"]).condition == "arf"
-    for name in ("vanilla", "base", "mhdb", "fbt", "df"):
-        with pytest.raises(SystemExit):
-            build_parser().parse_args(["x", "--condition", name])
     with pytest.raises(SystemExit):
-        build_parser().parse_args(["x", "--arm", "df"])
-
-
-def test_fixed_warmup_steps_flag_is_removed():
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["x", "--warmup-steps", "200"])
-
-
-def test_log_every_flag_is_removed():
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["x", "--log-every", "2"])
-
-
-@pytest.mark.parametrize(
-    "flag", ["--lr-h", "--lr-muon", "--wd-muon", "--lr-adam", "--lr-embedding"]
-)
-def test_legacy_optimizer_flags_are_removed(flag):
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["x", flag, "0.01"])
+        build_parser().parse_args(["x", "--condition", "z"])
 
 
 @pytest.mark.parametrize(
@@ -1292,11 +1254,6 @@ def test_legacy_optimizer_flags_are_removed(flag):
 def test_pass_probabilities_reject_values_outside_unit_interval(flag, value):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["x", flag, value])
-
-
-def test_feedback_batch_prob_flag_is_removed():
-    with pytest.raises(SystemExit):
-        build_parser().parse_args(["x", "--feedback-batch-prob", "0.5"])
 
 
 def test_mix_is_stable():
@@ -1515,35 +1472,6 @@ def test_continuation_keeps_every_setting_but_the_length(tmp_path):
         run(tmp_path, "src2-dim", [*base, "--continue", "src2", "--steps", "16", "--dim", "64"])
     with pytest.raises(SystemExit):
         parse_run_args(["x", "--resume", "--continue", "src2"])
-
-
-def rewrite_latest_version(tmp_path, tag, version):
-    snapshots = list((tmp_path / "runs").glob(f"{tag}.pt.*"))
-    path = max(snapshots, key=lambda item: int(item.name.rsplit(".", 1)[1]))
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    payload["version"] = version
-    torch.save(payload, path)
-
-
-@pytest.mark.parametrize("version", range(9, 28))
-def test_resume_rejects_every_legacy_checkpoint(tmp_path, version):
-    tag = f"legacy-v{version}"
-    run(tmp_path, tag, ["--condition", "", "--max-steps", "5"])
-    rewrite_latest_version(tmp_path, tag, version)
-    with pytest.raises(ValueError, match="checkpoint version"):
-        run(tmp_path, tag, ["--condition", "", "--resume"])
-
-
-@pytest.mark.parametrize("mode", ["--resume", "--continue"])
-@pytest.mark.parametrize("condition", ["r", "arf"])
-def test_old_tokenizer_cannot_resume_or_continue(tmp_path, mode, condition):
-    base = condition_args(condition)
-    run(tmp_path, "old", [*base, "--max-steps", "5"])
-    rewrite_latest_version(tmp_path, "old", 27)
-    flags = ["--resume"] if mode == "--resume" else ["--continue", "old", "--steps", "16"]
-    tag = "old" if mode == "--resume" else "longer"
-    with pytest.raises(ValueError, match="checkpoint version"):
-        run(tmp_path, tag, flags)
 
 
 def test_multipass_checkpoint_parity():

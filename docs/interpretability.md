@@ -1,10 +1,8 @@
 # Looking inside
 
 The organism is being grown so latent computation can be observed, explained,
-and intervened on. This page lists the analysis tools that exist today, keeps
-the axes of recurrence straight, and sketches the shape of the study the
-organism is being grown for. The current picture from these tools is in
-[findings.md](findings.md).
+and intervened on. This page lists the implemented analysis tools and explains
+their measurement boundaries.
 
 ## Three kinds of recurrence
 
@@ -49,11 +47,6 @@ Every script rebuilds the condition from a snapshot through
 beside its figures under `figures/<kind>-<tag>/`. Commands are in
 [operations.md](operations.md#inspect-a-checkpoint).
 
-What does not exist yet: a persistent trajectory format, general activation
-patching between examples, controlled behavioral tasks, and any learned
-monitor. Each is a natural next tool once there is a channel worth pointing
-it at.
-
 ## Reading a trace
 
 Start with the actual column seed, the completed block deltas, `h_top`, the
@@ -67,11 +60,8 @@ history fixed. When testing autoregressive consequences, let generated tokens
 diverge and treat it as a separate experiment, since later differences then
 include feedback through changed text.
 
-A trace worth keeping records the code and vendor revisions, snapshot and its
-training arguments, the rows or task items, the mode (Standard, Soft, Fused),
-pass count, prefix masks, jitter, the state coordinates (position, layer or
-cell, site and source label, pass, iteration), device and precision, the
-command, and where the raw output went.
+Keep the snapshot, data rows, mode, state coordinates, and precision with an
+analysis result so the measured intervention can be reproduced.
 
 ## Interventions
 
@@ -103,30 +93,4 @@ propagation, recovery, and dependence on history are natural follow-ons.
 
 The `l` letter adds iteration-indexed states; the depth trace is its
 within-column diagnostic, and the payload trace still tests its horizontal
-channel at fixed `r`. The `L` letter would add a shared core cache whose
-two-channel sequence trace advances both the payload and the write bank; see
-[architecture.md](architecture.md#letter-l-a-shared-core-cache-specified-and-unbuilt).
-
-## The study the organism is for
-
-Sketched, so that growing decisions point at it:
-
-- **A behavior that needs the channel.** A small, externally scored task
-  where the answer depends on state carried between columns and not on the
-  visible prefix or PKDA memory alone. Candidate families: retaining a
-  controlled fact across distractors, updating a latent variable after a rule
-  change, tracking a short sequence of operations. Paired items so surface
-  cues do not give the answer away.
-- **A causal account.** State what should carry what, when it should matter,
-  and what a targeted intervention should change, then patch payloads between
-  paired examples, replace block contributions, or disrupt mixer state at a
-  defined boundary, with the controls above.
-- **A monitor.** A narrow independently defined target (a controlled
-  overwrite, a known loss of retained information, a trajectory headed for a
-  specified failure), a declared observation budget, probes fit on
-  development data and frozen, evaluation on disjoint items split by
-  template, comparison against output-only and simple internal-statistic
-  baselines, and error rates, calibration, and lead time reported.
-
-That study is future work. The organism is ready for it when the properties
-in the [README](../README.md#what-ready-looks-like) hold.
+channel at fixed `r`.

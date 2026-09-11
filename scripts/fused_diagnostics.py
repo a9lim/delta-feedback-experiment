@@ -33,9 +33,7 @@ import torch.nn.functional as F
 
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import shift_right
-
-POS_BINS = [(0, 0), (1, 3), (4, 15), (16, 63), (64, 255), (256, 511), (512, 1023)]
+from delta_feedback_experiment.model import BASE_NORMAL_INIT_STD, shift_right
 
 
 @torch.no_grad()
@@ -94,11 +92,11 @@ def main() -> None:
     torch._dynamo.config.recompile_limit = 64
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
-    if not model.cfg.feedback_active:
+    if not model.cfg.feedback:
         raise SystemExit("the fused diagnostics need a snapshot of a condition with f")
     cfg = model.cfg
     T = saved["seq_len"]
-    tag = saved.get("tag", args.snapshot.stem)
+    tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"fused-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data = TokenData.load(args.data_dir, "val", T)
@@ -222,7 +220,7 @@ def main() -> None:
     report["delta_frac_negative"] = float((d[m] < 0).mean())
     report["delta_mean_pos_ge1"] = float(d[m].mean())
     rows = []
-    for lo, hi in POS_BINS:
+    for lo, hi in analysis.position_bins(T):
         mm = (pos >= lo) & (pos <= hi)
         rows.append({"bin": f"{lo}-{hi}", "n": int(mm.sum()), "pass1": float(K["ce1"][mm].mean()), "fused": float(K["ce2"][mm].mean()),
                      "delta": float(d[mm].mean()), "delta_se": float(d[mm].std() / math.sqrt(mm.sum())),
@@ -251,7 +249,7 @@ def main() -> None:
         "coord_std_across_tokens_quantiles": quantiles(np.mean(gate_coord_std, 0)),
         "token_dependent_share_of_prenorm_input_quantiles": quantiles(K["token_frac"]),
     }
-    init_fro = 0.02 * cfg.dim
+    init_fro = BASE_NORMAL_INIT_STD * math.sqrt(cfg.mup_ratio) * cfg.dim
     Wg, Wu = model.fuse_gate.weight.float(), model.fuse_value.weight.float()
     report["weights"] = {
         "fuse_gate_fro": Wg.norm().item(), "fuse_value_fro": Wu.norm().item(), "fuse_gate_init_fro": init_fro,

@@ -34,7 +34,7 @@ def cuda_gate() -> None:
         batch_vocab_order,
         condition_config,
         iterate_fused,
-        linear_cross_entropy,
+        linear_cross_entropy_apply,
         multipass,
         multipass_loss,
     )
@@ -58,7 +58,7 @@ def cuda_gate() -> None:
         route_summary,
     )
 
-    if linear_cross_entropy is None:
+    if linear_cross_entropy_apply is None:
         raise RuntimeError("Jobe gate requires cut-cross-entropy")
     if route_triton is None:
         raise RuntimeError("Jobe gate requires the bespoke Triton router")
@@ -89,10 +89,8 @@ def cuda_gate() -> None:
             ).requires_grad_()
             for _ in range(n_sources - 1)
         )
-        present = torch.rand(n_sources, batch, length, device="cuda") > 0.2
-        present[0] = True
         projected = (query * key).to(torch.bfloat16)
-        routed, weights = bespoke_route(projected, present, null, 1e-6, heads, sources)
+        routed, weights = bespoke_route(projected, null, 1e-6, heads, sources)
         routed.float().square().mean().backward()
         grads = (
             query.grad.clone(),
@@ -111,7 +109,6 @@ def cuda_gate() -> None:
             ref_query,
             ref_key,
             1e-6,
-            present,
             heads,
             ref_null.expand(batch, length, dim),
             *ref_sources,
@@ -164,10 +161,10 @@ def cuda_gate() -> None:
         # built the one above.
         banked_projected = (query * key).to(sources[0].dtype)
         first, _ = bespoke_route(
-            banked_projected, present, null, 1e-6, heads, sources, accumulators
+            banked_projected, null, 1e-6, heads, sources, accumulators
         )
         second, _ = bespoke_route(
-            banked_projected, present, null, 1e-6, heads, sources, accumulators
+            banked_projected, null, 1e-6, heads, sources, accumulators
         )
         (first.float().square().mean() + second.float().square().mean()).backward()
         for index, source in enumerate(sources):

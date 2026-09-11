@@ -72,7 +72,7 @@ def main() -> None:
     out_dir = Path(args.out_dir or f"figures/depth-{tag}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    modes = ["plain"] + (["fused"] if cfg.feedback_active else [])
+    modes = ["plain"] + (["fused"] if cfg.feedback else [])
     sums = {mode: {"loss": [0.0] * cap, "update_norm": [0.0] * cap} for mode in modes}
     counted = 0
     for first in range(0, args.rows, args.micro):
@@ -89,7 +89,7 @@ def main() -> None:
     }
     routes = (
         core_route_mass(model, data.batch(0, min(args.micro, args.rows), device), cap)
-        if cfg.routing_active
+        if cfg.block_routing
         else {}
     )
 

@@ -47,13 +47,13 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     cfg = model.cfg
-    if not cfg.feedback_active or not cfg.routing_active:
+    if not cfg.feedback or not cfg.block_routing:
         raise SystemExit("the payload sweep needs a routed payload: a condition with r and f")
-    if args.head is not None and not 0 <= args.head < cfg.routing_heads:
+    if args.head is not None and not 0 <= args.head < cfg.kv_heads:
         raise SystemExit(
-            f"--head must be in [0, {cfg.routing_heads - 1}], got {args.head}"
+            f"--head must be in [0, {cfg.kv_heads - 1}], got {args.head}"
         )
-    tag = saved.get("tag", args.snapshot.stem)
+    tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"fused-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data_val = TokenData.load(args.data_dir, "val", saved["seq_len"])
@@ -111,12 +111,12 @@ def main() -> None:
             def force_one_head(sources, masks, want, i=i):
                 routed, _ = trained_forward(sources, masks, want)
                 batch, length, dim = routed.shape
-                head_dim = dim // cfg.routing_heads
-                routed = routed.reshape(batch, length, cfg.routing_heads, head_dim)
+                head_dim = dim // cfg.kv_heads
+                routed = routed.reshape(batch, length, cfg.kv_heads, head_dim)
                 routed = routed.clone()
                 chosen = selected_source(sources, i)
                 routed[:, :, args.head] = chosen.reshape(
-                    batch, length, cfg.routing_heads, head_dim
+                    batch, length, cfg.kv_heads, head_dim
                 )[:, :, args.head]
                 return routed.reshape(batch, length, dim), None
 

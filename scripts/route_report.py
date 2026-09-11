@@ -68,7 +68,7 @@ def collect(model, data_val, device, rows: int, micro: int):
     final_source_names: dict[int, tuple[str, ...]] = {}
     route_source_names: dict[tuple[int, str], tuple[str, ...]] = {}
     counted = 0
-    feedback = model.cfg.feedback_active
+    feedback = model.cfg.feedback
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
         n = batch.shape[0]
@@ -143,7 +143,7 @@ def site_matrix(means, route_names, cfg, passes=(0, 1)):
     column_index = {name: index for index, name in enumerate(columns)}
     matrices = {}
     for p in passes:
-        for head in range(cfg.routing_heads):
+        for head in range(cfg.kv_heads):
             matrix = np.full((len(sites), len(columns)), np.nan)
             for row, site in enumerate(sites):
                 if (p, site) not in means:
@@ -168,13 +168,13 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     cfg = model.cfg
-    if not cfg.routing_active:
+    if not cfg.block_routing:
         raise SystemExit("the route report needs a snapshot of a condition with r")
     layers = cfg.layers
-    tag = saved.get("tag", args.snapshot.stem)
+    tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"route-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    passes = (0, 1) if cfg.feedback_active else (0,)
+    passes = (0, 1) if cfg.feedback else (0,)
     pass_titles = {0: "pass 1 (plain)", 1: "pass 2 (fused)"}
     print(f"# {tag} — condition {saved['condition']!r}, {layers} layers, dim {cfg.dim}, device {device}")
 
@@ -186,7 +186,7 @@ def main() -> None:
                 queries.append(router.query.detach().float().cpu())
                 null_rms.append(router.null.detach().float().square().mean().sqrt())
                 labels.append(f"L{i}.{kind}")
-    if getattr(model, "payload_router", None) is not None:
+    if cfg.feedback:
         queries.append(model.payload_router.query.detach().float().cpu())
         null_rms.append(
             model.payload_router.null.detach().float().square().mean().sqrt()
@@ -240,7 +240,7 @@ def main() -> None:
                 "per_head_token_entropy": stats[key][:, 1].tolist(),
                 "head_js": divergences[key],
             }
-            for route_head in range(cfg.routing_heads):
+            for route_head in range(cfg.kv_heads):
                 w = means[key][:, route_head]
                 max_t, h_tok = stats[key][route_head]
                 top = sorted(zip(local, w), key=lambda t: -t[1])[:3]
@@ -265,15 +265,15 @@ def main() -> None:
         vmax=np.nanmax([np.nanmax(matrix) for matrix in matrices.values()]),
     )
     fig, axes = plt.subplots(
-        cfg.routing_heads,
+        cfg.kv_heads,
         len(passes),
-        figsize=(7.5 * len(passes), 3.1 * cfg.routing_heads),
+        figsize=(7.5 * len(passes), 3.1 * cfg.kv_heads),
         sharex=True,
         sharey=True,
         squeeze=False,
         constrained_layout=True,
     )
-    for route_head in range(cfg.routing_heads):
+    for route_head in range(cfg.kv_heads):
         for column, p in enumerate(passes):
             ax = axes[route_head, column]
             image = ax.imshow(
@@ -284,7 +284,7 @@ def main() -> None:
             ax.set_title(f"head {route_head}, {pass_titles[p]}", fontsize=10)
             if column == 0:
                 ax.set_ylabel("reading site")
-            if route_head == cfg.routing_heads - 1:
+            if route_head == cfg.kv_heads - 1:
                 ax.set_xticks(range(len(columns)), columns, fontsize=7, rotation=90)
                 ax.set_xlabel("MHDB source")
     fig.colorbar(image, ax=axes, label="mean routing weight", shrink=0.8)
@@ -305,7 +305,7 @@ def main() -> None:
                 vmax=payload_max,
             )
             ax.grid(False)
-            ax.set_yticks(range(cfg.routing_heads), range(cfg.routing_heads))
+            ax.set_yticks(range(cfg.kv_heads), range(cfg.kv_heads))
             ax.set_ylabel("routing head")
             ax.set_title(pass_titles[p])
         payload_names = route_source_names[0, "payload"]

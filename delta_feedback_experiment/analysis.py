@@ -15,29 +15,14 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .model import DeltaModel, ModelConfig, condition_config, shift_right
-from .train import pick_device, read_checkpoint
-
-GEOMETRY = (
-    "vocab_size",
-    "dim",
-    "layers",
-    "heads",
-    "kv_heads",
-    "head_dim",
-    "intermediate",
-    "pkda_heads",
-    "pkda_head_dim",
-    "pkda_conv_size",
-    "loop_iterations",
-    "loop_max_iterations",
-)
-"""State-defining geometry fields a snapshot carries in its ``args``."""
+from .train import model_fields, pick_device, read_checkpoint
 
 
 def saved_args(payload: dict) -> dict:
@@ -51,8 +36,7 @@ def config_from_args(saved: dict) -> ModelConfig:
     """The configuration a snapshot's saved arguments describe."""
     return condition_config(
         saved["condition"],
-        max_seq_len=saved["seq_len"] + 1,
-        **{field: saved[field] for field in GEOMETRY if field in saved},
+        **model_fields(SimpleNamespace(**saved)),
     )
 
 
@@ -128,3 +112,14 @@ def fused_inputs(
     """
     fused = model.fuse(shift_right(payload), e)
     return torch.where(plain_mask(e.shape[1], prefix, e.device), e, fused)
+
+
+def position_bins(length: int) -> list[tuple[int, int]]:
+    """Inclusive position intervals, widening from the first token to the row end."""
+    bins = []
+    start, stop = 0, 1
+    while start < length:
+        bins.append((start, min(stop, length) - 1))
+        start = stop
+        stop *= 4 if stop < 256 else 2
+    return bins

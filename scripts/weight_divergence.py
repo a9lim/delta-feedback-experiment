@@ -11,7 +11,7 @@ snapshots, including its base initialization constant. The radius check alone
 cannot detect a different NAdam gate/control initialization.
 
 Usage:
-    python scripts/weight_divergence.py runs/A.pt.10745 runs/B.pt.10745
+    python scripts/weight_divergence.py runs/A.pt.STEP runs/B.pt.STEP
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def main() -> None:
         raise SystemExit("the snapshots were initialized from different seeds; nothing is paired")
     sa, sb = pa["state"], pb["state"]
     del pa["optimizer"], pb["optimizer"]
-    tag_a, tag_b = saved_a.get("tag", args.a.stem), saved_b.get("tag", args.b.stem)
+    tag_a, tag_b = saved_a["tag"], saved_b["tag"]
     out_dir = args.out_dir or Path("figures") / f"weights-{tag_a}-vs-{tag_b}"
     out_dir.mkdir(parents=True, exist_ok=True)
 

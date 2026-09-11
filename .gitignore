@@ -1,19 +1,12 @@
 # Data + figures are regenerated artifacts; keep them out of git.
 data/**
 !data/.gitkeep
-!data/summary/
-!data/summary/**
 figures/**
-!figures/README.md
-!figures/architectures/
-!figures/architectures/**
 
 # References: refs.yaml is committed; fetched copies are regenerable.
 references/*.md
 references/*.pdf
 references/*.html
-references/delta-attention-residuals-code/
-references/multi-head-attention-residuals-code/
 
 # Run logs and checkpoints stay local.
 logs/**

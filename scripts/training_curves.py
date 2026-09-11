@@ -75,12 +75,12 @@ def cells_per_pass(run: dict, r: np.ndarray) -> np.ndarray:
     """Cell-equivalents one pass executes at each step: ``layers / cell`` for a
     flat column, ``2 + r * core / cell`` under ``l`` (the two held cells plus
     the core ``r`` times), from the run record's geometry."""
-    layers = int(run["run"].get("layers", 12))
-    cell = int(run["run"].get("routing_block_size", 4))
-    if "l" not in str(run["run"].get("condition", "")):
+    layers = int(run["run"]["layers"])
+    cell = int(run["run"]["routing_block_size"])
+    if "l" not in run["run"]["condition"]:
         return np.full_like(r, layers / cell)
     core = layers - 2 * cell
-    return 2 + np.nan_to_num(r, nan=1.0) * core / cell
+    return 2 + r * core / cell
 
 
 def ema(x: np.ndarray, span: int) -> np.ndarray:
@@ -93,11 +93,13 @@ def ema(x: np.ndarray, span: int) -> np.ndarray:
     return y
 
 
-def step_arrays(steps: dict) -> dict[str, np.ndarray]:
+def step_arrays(steps: dict, *, loop: bool) -> dict[str, np.ndarray]:
     keys = sorted(steps)
     cols = {"step": np.array(keys, dtype=float)}
-    for name in ("loss", "pass1", "k", "r", "gnorm", "pass_tok_s", "cell_tok_s", "tok_s"):
-        cols[name] = np.array([steps[s].get(name, np.nan) for s in keys], dtype=float)
+    for name in ("loss", "pass1", "k", "gnorm", "pass_tok_s", "cell_tok_s", "tok_s"):
+        cols[name] = np.array([steps[s][name] for s in keys], dtype=float)
+    cols["r"] = np.array([steps[s]["r"] for s in keys], dtype=float) if loop else np.ones(len(keys))
+    cols["phase"] = np.array([steps[s]["phase"] for s in keys])
     return cols
 
 
@@ -108,29 +110,27 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--ema", type=int, default=300, help="EMA span in steps for training losses")
     ap.add_argument("--zoom", type=float, default=0.4, help="fraction of the schedule shown in the zoom panel")
-    ap.add_argument("--batch-rows", type=int, default=320)
-    ap.add_argument("--seq-len", type=int, default=1024)
     args = ap.parse_args()
 
     runs = [parse_log(p) for p in args.logs]
-    labels = args.labels or [r["run"].get("tag", p.stem) for r, p in zip(runs, args.logs)]
+    labels = args.labels or [r["run"]["tag"] for r in runs]
     if len(labels) != len(runs):
         raise SystemExit("one label per log")
     out_dir = args.out_dir or Path("figures") / ("curves-" + "-vs-".join(labels))
     out_dir.mkdir(parents=True, exist_ok=True)
-    colors = fs.SERIES[: len(runs)]
+    colors = [fs.SERIES[i % len(fs.SERIES)] for i in range(len(runs))]
     ref = runs[0]
-    total = int(ref["schedule"].get("total_steps", max(ref["steps"])))
-    boundary = ref["schedule"].get("feedback_boundary")
-    cooldown_start = total - int(ref["schedule"].get("cooldown_steps", 0)) + 1
-    tokens_per_step = args.batch_rows * args.seq_len
+    total = int(ref["schedule"]["total_steps"])
+    boundary = ref["schedule"]["feedback_boundary"]
+    cooldown_start = total - int(ref["schedule"]["cooldown_steps"]) + 1
     summary = {"reference": labels[0], "runs": {}}
 
     # -- per-run arrays --------------------------------------------------------
     arrays = []
     for run in runs:
-        a = step_arrays(run["steps"])
-        passes = np.nan_to_num(a["k"], nan=1.0)
+        a = step_arrays(run["steps"], loop="l" in run["run"]["condition"])
+        tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
+        passes = a["k"]
         a["cum_pass_tokens"] = np.cumsum(passes) * tokens_per_step
         a["cum_cell_tokens"] = np.cumsum(passes * cells_per_pass(run, a["r"])) * tokens_per_step
         a["cum_tokens"] = a["step"] * tokens_per_step
@@ -182,7 +182,6 @@ def main() -> None:
             summary["runs"].setdefault(lab, {})["fused_minus_pass1"] = [[float(s), float(v)] for s, v in zip(e["step"], e["val_fused"] - e["val"])]
     fs.zero_line(ax)
     ax.set(xlabel="optimizer step", ylabel="CE difference", title="Paired differences (same held-out rows)")
-    ax.set_ylim(-0.06, 0.12)
     if boundary:
         fs.mark_step(ax, boundary, "feedback", y=0.98)
     fs.mark_step(ax, cooldown_start, "cooldown", y=0.92)
@@ -200,7 +199,6 @@ def main() -> None:
     axes[0].set(xlabel="predicted tokens (matched data)", ylabel="held-out CE", title="Against predicted tokens", xscale="log")
     axes[1].set(xlabel="cell-tokens (matched compute)", ylabel="held-out CE", title="Against cell-tokens", xscale="log")
     for ax in axes:
-        ax.set_ylim(min(np.nanmin(e["val"]) for e in evals) - 0.05, 4.2)
         ax.legend()
     fs.save(fig, out_dir / "matched-compute.png")
 
@@ -210,7 +208,6 @@ def main() -> None:
     for a, lab, col in zip(arrays, labels, colors):
         ax.plot(a["step"], ema(a["pass1"], args.ema), color=col, label=f"{lab}: pass 1")
     ax.set(xlabel="optimizer step", ylabel=f"train CE (EMA {args.ema})", title="Pass-1 training loss")
-    ax.set_ylim(top=4.5)
     ax.legend()
     ax = axes[0, 1]
     ref_steps = arrays[0]["step"]
@@ -219,10 +216,9 @@ def main() -> None:
         d = a["pass1"][ia] - arrays[0]["pass1"][ib]
         ax.plot(common, ema(d, args.ema), color=col, label=f"{lab} − {labels[0]}")
         summary["runs"].setdefault(lab, {})["train_pass1_minus_reference_last1000"] = float(d[-1000:].mean())
+        phases = a["phase"][ia]
         summary["runs"][lab]["train_pass1_minus_reference_by_phase"] = {
-            "warmup+heat_first_half": float(d[common <= total * 0.375].mean()),
-            "heat_second_half": float(d[(common > total * 0.375) & (common < cooldown_start)].mean()),
-            "cooldown": float(d[common >= cooldown_start].mean()),
+            phase: float(d[phases == phase].mean()) for phase in dict.fromkeys(phases)
         }
     fs.zero_line(ax)
     ax.set(xlabel="optimizer step", ylabel=f"paired CE difference (EMA {args.ema})", title="Pass-1 loss difference on identical rows")
@@ -242,7 +238,6 @@ def main() -> None:
     fs.zero_line(ax)
     ax.set(xlabel="optimizer step", ylabel=f"CE difference (EMA {args.ema})", title="Training-time fused gap")
     if any_fb:
-        ax.set_ylim(-0.05, 0.15)
         ax.legend()
     ax = axes[1, 1]
     for a, lab, col in zip(arrays, labels, colors):
@@ -284,11 +279,11 @@ def main() -> None:
             for run, lab, col in payload_runs:
                 recs = [rec for rec in run["routes"] if rec["site"] == "payload"]
                 s = np.array([rec["step"] for rec in recs], dtype=float)
-                axes[0].plot(s, [rec.get("seed", np.nan) for rec in recs], color=col, label=f"{lab}: seed")
-                axes[0].plot(s, [rec.get("null", np.nan) for rec in recs], color=col, ls="--", lw=1.2, label=f"{lab}: null")
-                axes[1].plot(s, [rec.get("max", np.nan) for rec in recs], color=col, label=f"{lab}: mean token-wise max")
-                axes[1].plot(s, [rec.get("head_js", np.nan) for rec in recs], color=col, ls="--", lw=1.2, label=f"{lab}: cross-head JS")
-                axes[2].plot(s, [rec.get("null_rms", np.nan) for rec in recs], color=col, label=lab)
+                axes[0].plot(s, [rec["seed"] for rec in recs], color=col, label=f"{lab}: seed")
+                axes[0].plot(s, [rec["null"] for rec in recs], color=col, ls="--", lw=1.2, label=f"{lab}: null")
+                axes[1].plot(s, [rec["max"] for rec in recs], color=col, label=f"{lab}: mean token-wise max")
+                axes[1].plot(s, [rec["head_js"] for rec in recs], color=col, ls="--", lw=1.2, label=f"{lab}: cross-head JS")
+                axes[2].plot(s, [rec["null_rms"] for rec in recs], color=col, label=lab)
             axes[0].set(xlabel="optimizer step", ylabel="mean routing weight", title="Payload router: seed and null mass", ylim=(0, 1))
             axes[1].set(xlabel="optimizer step", ylabel="statistic", title="Payload router: sharpness and head disagreement", ylim=(0, 1))
             axes[2].set(xlabel="optimizer step", ylabel="RMS of the learned null", title="Payload null scale")
@@ -342,9 +337,10 @@ def main() -> None:
     # -- summary ---------------------------------------------------------------
     for run, a, e, lab in zip(runs, arrays, evals, labels):
         entry = summary["runs"].setdefault(lab, {})
+        tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
         entry.update(
             {
-                "condition": run["run"].get("condition"),
+                "condition": run["run"]["condition"],
                 "final_val": float(e["val"][-1]),
                 "final_val_fused": None if np.isnan(e["val_fused"][-1]) else float(e["val_fused"][-1]),
                 "steps": int(a["step"][-1]),

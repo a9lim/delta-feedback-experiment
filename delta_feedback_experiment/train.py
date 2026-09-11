@@ -568,8 +568,8 @@ class CudaBatchStager:
 @contextlib.contextmanager
 def _capture_without_gc(graph, pool):
     """Keep cyclic CUDA resource destruction outside stream capture."""
-    # PyTorch 2.14 no longer unconditionally collects warm-up cycles before
-    # capture. A later Python collection can free their CUDA resources and
+    # Collect warm-up cycles before capture. A later collection can free
+    # their CUDA resources and
     # invalidate the active stream capture, even inside an unrelated kernel.
     gc.collect()
     was_enabled = gc.isenabled()
@@ -674,7 +674,7 @@ class CudaGraphTrainer:
         for step in range(1, schedule.total + 1):
             n_passes = (
                 draw_passes(self.args, step, schedule.total)
-                if self.model.cfg.feedback_active
+                if self.model.cfg.feedback
                 else 1
             )
             iterations = draw_iterations(self.args, step, self.model.cfg.loop)
@@ -924,7 +924,7 @@ class CudaEvalRunner:
         self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
 
     def _body(self, state: CapturedEval) -> None:
-        n_passes = 2 if self.model.cfg.feedback_active else 1
+        n_passes = 2 if self.model.cfg.feedback else 1
         with self.autocast:
             outs = multipass(
                 self.model,
@@ -949,7 +949,7 @@ class CudaEvalRunner:
             ),
             (
                 torch.ones((1, rows), dtype=torch.long, device=self.device)
-                if self.model.cfg.feedback_active
+                if self.model.cfg.feedback
                 else None
             ),
             torch.zeros((), dtype=torch.float32, device=self.device),
@@ -988,10 +988,10 @@ class CudaEvalRunner:
             state.rows.copy_(data_val.batch(first, rows))
             state.graph.replay()
             total_val.add_(state.val_sum)
-            if self.model.cfg.feedback_active:
+            if self.model.cfg.feedback:
                 total_fused.add_(state.fused_sum)
         result = {"val": (total_val / self.args.eval_rows).item()}
-        if self.model.cfg.feedback_active:
+        if self.model.cfg.feedback:
             result["val_fused"] = (total_fused / self.args.eval_rows).item()
         self.model.train(was_training)
         return result
@@ -1028,7 +1028,7 @@ def evaluate(
         rows = data_val.batch(
             first, min(args.micro_rows, args.eval_rows - first), device
         )
-        n_passes = 2 if model.cfg.feedback_active else 1
+        n_passes = 2 if model.cfg.feedback else 1
         prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
         outs = multipass(
             model, rows, n_passes, prefix_lens=prefix if n_passes > 1 else None
@@ -1047,11 +1047,11 @@ def evaluate(
 @torch.no_grad()
 def route_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[dict]:
     """Per-site routing observables from one validation microbatch."""
-    if not model.cfg.routing_active:
+    if not model.cfg.block_routing:
         return []
     model.eval()
     rows = data_val.batch(0, min(2, args.eval_rows), device)
-    if model.cfg.feedback_active:
+    if model.cfg.feedback:
         prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
         out = multipass(model, rows, 2, prefix_lens=prefix, want_weights=True)[-1]
     else:
@@ -1498,7 +1498,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             phase = schedule.phase(step)[0]
             z_coef = args.zloss if phase == "cooldown" else 0.0
             n_passes = 1
-            if model.cfg.feedback_active:
+            if model.cfg.feedback:
                 n_passes = draw_passes(args, step, total)
             iterations = draw_iterations(args, step, model.cfg.loop)
             checkpointing = automatic_checkpoint(
@@ -1611,7 +1611,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 summary.update(scores)
                 for record in route_summary(model, data_val, args, device):
                     telemetry.log("route", step=address, **record)
-                if model.cfg.feedback_active:
+                if model.cfg.feedback:
                     trace = iterate_fused(
                         model, data_val.batch(0, 2, device), n_iters=8
                     )

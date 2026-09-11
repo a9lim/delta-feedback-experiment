@@ -47,7 +47,7 @@ class DeltaScorer:
     def __init__(self, model, mode: str, passes: int = 1):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}")
-        if mode != "standard" and not model.cfg.feedback_active:
+        if mode != "standard" and not model.cfg.feedback:
             raise ValueError(f"{mode} mode needs a snapshot of a condition with f")
         if passes < 1:
             raise ValueError("passes must be positive")
@@ -95,7 +95,7 @@ def main() -> None:
     if saved["tokenizer_id"] != TOKENIZER_ID:
         raise ValueError("downstream text evaluation requires a NeoX ChatML snapshot")
     tokenizer = load_tokenizer()
-    tag = saved.get("tag", args.snapshot.stem)
+    tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"downstream-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     scorer = DeltaScorer(model, args.mode, args.passes)

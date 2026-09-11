@@ -1,11 +1,7 @@
 """The FLA kernels a PKDA layer calls, as operators Dynamo can keep in a graph.
 
-FLA marks its public entry points ``torch.compiler.disable``, so Dynamo breaks
-the graph at every one of them: a PKDA block compiled into fifteen graphs
-joined by fourteen breaks, and each of them re-entered the block's residual and
-routed sources, which autograd then had to sum eagerly.  Here the three
-kernels a dense PKDA layer uses are ordinary custom operators with exact fake
-implementations, so the whole block compiles as one graph.
+The three dense PKDA kernels are custom operators with exact fake
+implementations, so Dynamo can compile the whole block as one graph.
 
 Each wrapper covers exactly the dense training and prefill configuration: no
 cache state, no final state, no variable-length batching, the gate computed

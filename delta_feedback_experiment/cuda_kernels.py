@@ -140,7 +140,6 @@ if triton is not None:
         s25,
         s26,
         projected,
-        present,
         logits,
         inv_rms,
         routed,
@@ -150,7 +149,6 @@ if triton is not None:
         head_dim: tl.constexpr,
         eps: tl.constexpr,
         n_sources: tl.constexpr,
-        has_present: tl.constexpr,
         block_h: tl.constexpr,
         block_k: tl.constexpr,
     ):
@@ -207,9 +205,6 @@ if triton is not None:
                 tl.sum(tl.sum(value * value, axis=1), axis=0) / dim + eps
             )
             score = tl.sum(value * p, axis=1) * inverse
-            if has_present:
-                exists = tl.load(present + index * bt + token)
-                score = tl.where(exists, score, -float("inf"))
             tl.store(
                 logits + index * bt * num_heads + token * num_heads + h_offsets,
                 score,
@@ -497,12 +492,7 @@ if triton is not None:
 
 
 ROUTE_TOKENS_PER_PROGRAM = 8
-"""Tokens folded into one backward program; sets the query/null partial count.
-
-Eight is where the screen geometry's widest banks are fastest and the partial
-buffer its reduction reads is half of what four leaves; below eight the
-reduction grows without making the kernel quicker, above it the per-program
-serial work starts to cost more than the reduction saves."""
+"""Tokens per backward program; sets the query/null partial count."""
 
 
 def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
@@ -535,7 +525,6 @@ def _check_route_dims(dim: int, num_heads: int) -> int:
 
 def _route_forward_impl(
     projected: Tensor,
-    present: Tensor,
     null: Tensor,
     sources: list[Tensor],
     eps: float,
@@ -554,12 +543,9 @@ def _route_forward_impl(
     inv_rms = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
     weights = torch.empty_like(logits)
     routed = torch.empty_like(sources[0], memory_format=torch.contiguous_format)
-    has_present = present.numel() > 0
-    present_arg = present if has_present else sources[0]
     _route_forward_kernel[(bt,)](
         *padded,
         projected,
-        present_arg,
         logits,
         inv_rms,
         routed,
@@ -569,7 +555,6 @@ def _route_forward_impl(
         head_dim=head_dim,
         eps=eps,
         n_sources=n_sources,
-        has_present=has_present,
         block_h=block_h,
         block_k=block_k,
         num_warps=num_warps,
@@ -756,10 +741,7 @@ def dw_accum(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Tensor:
     ``sink`` is the persistent FP32 ``[rows, cols]`` weight gradient.  The CPU
     kernel is the literal reference; CUDA hands cuBLAS the BF16 operands with
     the FP32 sink as both the ``beta=1`` addend and the output, so a weight
-    gradient is never materialized separately from its accumulator.  Measured
-    on the 4090 against a Triton tensor-core kernel with the same
-    read-modify-write epilogue, cuBLAS was 18% faster over the trunk shapes
-    with equal or lower error, and it captures into CUDA graphs.
+    gradient is never materialized separately from its accumulator.
 
     The op deliberately declares no mutation.  Inside a compiled block the sink
     is a saved tensor of the compiled autograd node, and a declared mutation
@@ -974,7 +956,6 @@ if triton is not None:
     )
     def _route_forward_op(
         projected: Tensor,
-        present: Tensor,
         null: Tensor,
         sources: list[Tensor],
         accumulators: list[Tensor],
@@ -985,19 +966,18 @@ if triton is not None:
         # forward never reads it; it is an input so that the site's backward
         # receives the same buffers the source's bank will hand to autograd.
         del accumulators
-        return _route_forward_impl(projected, present, null, sources, eps, num_heads)
+        return _route_forward_impl(projected, null, sources, eps, num_heads)
 
     @_route_forward_op.register_fake
     def _route_forward_fake(
         projected: Tensor,
-        present: Tensor,
         null: Tensor,
         sources: list[Tensor],
         accumulators: list[Tensor],
         eps: float,
         num_heads: int,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        del present, null, accumulators, eps
+        del null, accumulators, eps
         batch, length, _ = sources[0].shape
         n_sources = len(sources) + 1
         routed = torch.empty_like(sources[0])
@@ -1068,7 +1048,7 @@ if triton is not None:
         )
 
     def _route_setup_context(ctx, inputs, output) -> None:
-        projected, _present, null, sources, accumulators, _eps, num_heads = inputs
+        projected, null, sources, accumulators, _eps, num_heads = inputs
         _routed, weights, inv_rms = output
         # The accumulators are mutated by every reader between this forward and
         # this backward, through an operator that declares no mutation for the
@@ -1099,7 +1079,6 @@ if triton is not None:
         gradients = [None] * len(accumulators) + list(source_grads)
         return (
             grad_projected,
-            None,
             grad_null,
             gradients,
             [None] * len(accumulators),
@@ -1116,7 +1095,6 @@ else:  # pragma: no cover - the Mac never enters the CUDA route.
 
 def bespoke_route(
     projected: Tensor,
-    present: Tensor | None,
     null: Tensor,
     eps: float,
     num_heads: int,
@@ -1135,14 +1113,8 @@ def bespoke_route(
         raise RuntimeError("bespoke_route requires Triton CUDA")
     if len(accumulators) > len(sources):
         raise ValueError("banked accumulators must be a prefix of the sources")
-    present_arg = (
-        present
-        if present is not None
-        else torch.empty(0, device=projected.device, dtype=torch.bool)
-    )
     routed, weights, _inv_rms = _route_forward_op(
         projected,
-        present_arg,
         null.contiguous(),
         list(sources),
         list(accumulators),

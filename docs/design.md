@@ -1,10 +1,10 @@
 # Growing recipe: conditions, data, schedule, evaluation
 
 This page describes how a specimen is grown: the condition letters and how
-conditions pair, the token stream, the optimizer batch, the feedback passes, the learning-rate schedule, and the numbers we look at afterwards.
+conditions pair, the token stream, optimizer batch, feedback passes, schedule,
+and evaluation.
 [Architecture](architecture.md) owns the equations;
-[scaling](scaling.md) owns the three geometries, their accounting, and their
-budgets; [interpretability](interpretability.md) owns the analysis scripts.
+[scaling](scaling.md) owns the geometry presets and their accounting; [interpretability](interpretability.md) owns the analysis scripts.
 
 ## Conditions
 
@@ -158,15 +158,13 @@ threads between them. Assembly uses random-access mmap advice where supported
 and `--readers` concurrent document readers (default 8) into disjoint ranges
 of a roughly 64 MiB output buffer, followed by sequential shard writes.
 These settings change throughput, not document order, token bytes, or
-provenance. Assembly logs progress every 30 seconds.
-See [data-build performance](data-build-performance.md) for the profiling
-procedure and storage requirements.
+document addressing. Assembly logs progress every 30 seconds. Peak storage
+includes selected token parts and the final stream on the output filesystem;
+allow roughly twice the finished store plus sidecars and download scratch.
+`--scratch` relocates downloads only, not token parts.
 
 One row is a non-overlapping `seq_len + 1` window, so 4,097 stored tokens give
-4,096 predictions. Rows may cross document boundaries, and attention crosses
-them too: with shuffled documents the neighbours are unrelated, which is the
-honest packing regime, and an intra-document mask would be an architecture
-question for PKDA's recurrent state rather than a data one. Step `n`
+4,096 predictions. Rows and attention may cross document boundaries. Step `n`
 addresses:
 
 ```text
@@ -189,17 +187,7 @@ rounded up to the next billion. The default target is the screen at 400x,
 ### Optimizer batch
 
 Every optimizer update at every scale sees 524,288 predicted tokens, `2^19`:
-128 rows of 4,096 predictions. The context is the same at every scale, so the
-rungs of the ladder differ only in size, and the batch is uniform, so equal
-steps are equal tokens at every rung. The efficient batch grows with the
-token budget rather than the model, and `2^19` sits inside the flat basin of
-the published fits at the screen's 25x budget and under it at every larger
-rung ([scaling.md](scaling.md)).
-
-| Surface | Realization |
-|---|---|
-| Jobe, any scale | 128 one-row microbatches |
-| Prime, any scale | 8 ranks x 1 row x 16 accumulation microsteps |
+128 rows of 4,096 predictions, accumulated in 128 one-row microbatches.
 
 Every condition uses the NorMuonH/NAdam partition in [architecture.md](architecture.md).
 After all microbatches have accumulated, the single global FP32 gradient
@@ -236,9 +224,9 @@ penalty `mean(logsumexp(logits)^2)` with coefficient `1e-5`.
 Conditions with `l` draw the core iteration count `r` once per step from the
 recurrent-depth log-normal Poisson draw with mean `r_mean = 4` and cap
 `r_max = 8`, `E[r] = 3.88` under the cap, shared by every pass and microbatch
-of the step; the draw is its own keyed sub-stream. A pass at `r` iterations
-executes `2 + r` cells, so a `k`-pass batch costs `k (2 + r)` cell evaluations
-per predicted token. The trainer logs the realized `r` and reports
+of the step; the draw is its own keyed sub-stream. With `C` cells, a pass at
+`r` iterations executes `2 + (C - 2) r` cells. A `k`-pass batch multiplies
+that count by `k` for its cell evaluations per predicted token. The trainer logs the realized `r` and reports
 cell-tokens beside pass-tokens.
 
 ### Schedule
@@ -278,7 +266,7 @@ rounded up to whole steps, and every condition at a scale shares it.
 |---|---:|---|
 | `--condition` | `""` | letters from `arfl` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
-| `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule (25 is the screen recipe, 400 the Prime recipes) |
+| `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
 | `--steps` | derived | schedule length, typed instead of derived |
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | 4,096, 128, 1 at every scale | predictions per row, rows per step, and the microbatch; the scale keeps 524,288 predictions per step, as does a retyped `--seq-len` alone |
@@ -351,9 +339,7 @@ by mode; writing `plain` for the empty condition, `L_plain - L_a` is the
 whole-trunk contrast. Report parameters, predicted tokens, pass-tokens, and
 cell-tokens with every number; a matched-compute view compares at equal
 cumulative cell-tokens, since a loop pass is deeper than a flat one.
-`L_arf - L_arfl` at equal steps is the loop's matched-data contrast. The full two-seed screen over the `a` conditions and the plain
-decoder is the natural complete comparison and has not been run; it is one
-option among several for what to train next, not a prerequisite.
+`L_arf - L_arfl` at equal steps is the loop's matched-data contrast.
 
 ### Downstream tasks
 
@@ -389,11 +375,3 @@ uniform, or forced-source choices. The rest of the toolset is in
 [interpretability.md](interpretability.md). A routing weight is a mixing
 coefficient; learned nulls can carry nonzero values; top-only enrichment
 ablation keeps `h_top` and so keeps most of the payload channel.
-
-## Not in the current recipe
-
-Adaptive pause or halting tokens, token-conditioned payload queries, multiple
-explicit previous-column payloads, per-layer cross-column banks, alternative
-optimizers, long-context continuation, instruction tuning, and any task
-beyond next-token prediction on web text. The current evidence boundary is
-in [findings.md](findings.md).

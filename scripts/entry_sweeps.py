@@ -43,10 +43,10 @@ def main() -> None:
     torch._dynamo.config.recompile_limit = 64
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
-    if not model.cfg.feedback_active:
+    if not model.cfg.feedback:
         raise SystemExit("entry sweeps need a snapshot of a condition with f")
     T = saved["seq_len"]
-    tag = saved.get("tag", args.snapshot.stem)
+    tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"fused-{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     data = TokenData.load(args.data_dir, "val", T)

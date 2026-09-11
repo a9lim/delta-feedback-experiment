@@ -41,11 +41,11 @@ def human(x: float) -> str:
     return f"{x:.2g}"
 
 
-def range_labels(rows: list[dict], fmt=None) -> list[str]:
+def range_labels(rows: list[dict]) -> list[str]:
     return [f"{human(r['range'][0])}–{human(r['range'][1])}" for r in rows]
 
 
-def conditioning_panel(ax, rows, labels, title, xlabel, keys=("d_df1_mhdb", "d_fused_df1"), names=("feedback pass 1 − reference", "fused − feedback pass 1")):
+def conditioning_panel(ax, rows, title, xlabel, keys=("d_feedback_pass1_reference", "d_fused_feedback_pass1"), names=("feedback pass 1 − reference", "fused − feedback pass 1")):
     x = np.arange(len(rows))
     for key, name, col in zip(keys, names, (FB1, FB2)):
         ax.plot(x, [r[key] for r in rows], "o-", color=col, label=name)
@@ -56,40 +56,40 @@ def conditioning_panel(ax, rows, labels, title, xlabel, keys=("d_df1_mhdb", "d_f
 
 
 def compare_figures(report: dict, out_dir: Path) -> None:
-    L = report.get("labels", {"m": "reference pass 1", "d1": "feedback pass 1", "d2": "feedback fused"})
+    L = report["labels"]
     M = report["means"]
     curve = report["position_curve"]
     x = np.array([c["pos_lo"] for c in curve]) + 16
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 3.8), constrained_layout=True)
     ax = axes[0]
-    ax.plot(x, [c["mhdb"] for c in curve], color=REF, label=L["m"])
+    ax.plot(x, [c["reference"] for c in curve], color=REF, label=L["m"])
     ax.set(title="Reference loss by position", xlabel="position in row (32-wide bins)", ylabel="held-out CE", xscale="log")
     ax.legend()
-    for ax, key, col, title in ((axes[1], "d_df1_mhdb", FB1, f"{L['d1']} − {L['m']}"), (axes[2], "d_fused_df1", FB2, f"{L['d2']} − {L['d1']}")):
+    for ax, key, col, title in ((axes[1], "d_feedback_pass1_reference", FB1, f"{L['d1']} − {L['m']}"), (axes[2], "d_fused_feedback_pass1", FB2, f"{L['d2']} − {L['d1']}")):
         y = np.array([c[key] for c in curve])
-        se = np.array([c.get(f"{key}_se", 0.0) for c in curve])
+        se = np.array([c[f"{key}_se"] for c in curve])
         ax.fill_between(x, y - se, y + se, color=col, alpha=0.18, lw=0)
         ax.plot(x, y, "o-", color=col, ms=3)
         fs.zero_line(ax)
         ax.set(title=title, xlabel="position in row (32-wide bins)", ylabel="CE difference (±1 s.e.)", xscale="log")
-        mean = M["delta_df1_minus_mhdb"] if key == "d_df1_mhdb" else M["delta_fused_minus_df1"]
+        mean = M["delta_feedback_pass1_minus_reference"] if key == "d_feedback_pass1_reference" else M["delta_fused_minus_feedback_pass1"]
         ax.axhline(mean, color=col, lw=0.9, ls=":")
         ax.text(x[0], mean, f" mean {mean:+.4f}", color=fs.SECONDARY, fontsize=7, va="bottom")
     fs.save(fig, out_dir / "pair-position.png")
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 7.2), constrained_layout=True)
     names = (f"{L['d1']} − {L['m']}", f"{L['d2']} − {L['d1']}")
-    conditioning_panel(axes[0, 0], report["by_target_token_frequency"], L, "By target-token frequency", "target-token count in the held-out slice (deciles)", names=names)
-    conditioning_panel(axes[0, 1], report["by_input_token_frequency"], L, "By input-token frequency", "input-token count in the held-out slice (deciles)", names=names)
-    conditioning_panel(axes[1, 0], report["by_prev_surprise"], L, "By the reference's surprise at the fused-in token", "reference −log p of the current input token (quantiles)", names=names)
-    conditioning_panel(axes[1, 1], report["by_mhdb_entropy"], L, "By the reference's predictive entropy", "reference entropy (quantiles)", names=names)
+    conditioning_panel(axes[0, 0], report["by_target_token_frequency"], "By target-token frequency", "target-token count in the held-out slice (deciles)", names=names)
+    conditioning_panel(axes[0, 1], report["by_input_token_frequency"], "By input-token frequency", "input-token count in the held-out slice (deciles)", names=names)
+    conditioning_panel(axes[1, 0], report["by_prev_surprise"], "By the reference's surprise at the fused-in token", "reference −log p of the current input token (quantiles)", names=names)
+    conditioning_panel(axes[1, 1], report["by_reference_entropy"], "By the reference's predictive entropy", "reference entropy (quantiles)", names=names)
     fs.save(fig, out_dir / "pair-conditioning.png")
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 3.8), constrained_layout=True)
     ax = axes[0]
-    pairs = [("KL(ref ‖ fb pass 1)", M["kl_mhdb_to_df1"], M["argmax_agree_mhdb_df1"]), ("KL(fb pass 1 ‖ fused)", M["kl_df1_to_fused"], M["argmax_agree_df1_fused"]),
-             ("KL(ref ‖ fused)", M["kl_mhdb_to_fused"], None)]
+    pairs = [("KL(ref ‖ fb pass 1)", M["kl_reference_to_feedback_pass1"], M["argmax_agree_reference_feedback_pass1"]), ("KL(fb pass 1 ‖ fused)", M["kl_feedback_pass1_to_fused"], M["argmax_agree_feedback_pass1_fused"]),
+             ("KL(ref ‖ fused)", M["kl_reference_to_fused"], None)]
     ax.bar(range(3), [p[1] for p in pairs], color=[FB1, FB2, fs.MAGENTA], width=0.6)
     for i, (_, kl, agree) in enumerate(pairs):
         ax.text(i, kl, f"{kl:.3f}" + (f"\nargmax agree {agree:.1%}" if agree is not None else ""), ha="center", va="bottom", fontsize=7, color=fs.SECONDARY)
@@ -104,7 +104,7 @@ def compare_figures(report: dict, out_dir: Path) -> None:
     ax.set(title="Probability mixtures, scored on held-out test rows", xlabel="weight on the second predictor", ylabel="test CE")
     ax.legend()
     ax = axes[2]
-    for key, col, name in (("df1_minus_mhdb", FB1, names[0]), ("fused_minus_df1", FB2, names[1])):
+    for key, col, name in (("feedback_pass1_minus_reference", FB1, names[0]), ("fused_minus_feedback_pass1", FB2, names[1])):
         q = report["delta_quantiles"][key]
         ps = [int(k[1:]) for k in q]
         ax.plot(ps, list(q.values()), "o-", color=col, label=name)
@@ -155,7 +155,7 @@ def compare_figures(report: dict, out_dir: Path) -> None:
 
 
 def weight_figures(report: dict, out_dir: Path) -> None:
-    labels = report.get("labels", {"a": "a", "b": "b"})
+    labels = report["labels"]
     grouped = report["grouped"]
     fig, axes = plt.subplots(2, 2, figsize=(12, 7.2), constrained_layout=True)
     for ax, fam, title in ((axes[0, 0], "attn_matrix", "Token-mixer matrices"), (axes[0, 1], "mlp_matrix", "SwiGLU matrices")):
@@ -190,7 +190,7 @@ def fused_figures(report: dict, out_dir: Path) -> None:
     ax = axes[0]
     x = np.arange(len(rows))
     w = 0.27
-    ax.bar(x - w, [r["delta"] for r in rows], w, color=FB2, label="fused, prefix 1", yerr=[r.get("delta_se", 0) for r in rows], ecolor=fs.MUTED, capsize=2)
+    ax.bar(x - w, [r["delta"] for r in rows], w, color=FB2, label="fused, prefix 1", yerr=[r["delta_se"] for r in rows], ecolor=fs.MUTED, capsize=2)
     ax.bar(x, [r["delta_prefix512"] for r in rows], w, color=fs.YELLOW, label="fused, plain prefix 512")
     ax.bar(x + w, [r["delta_iter2"] for r in rows], w, color=fs.MAGENTA, label="two fused iterations")
     fs.zero_line(ax)
@@ -301,13 +301,13 @@ def followup_figures(report: dict, out_dir: Path) -> None:
     ax = axes[1]
     if "payload_head_ablation" in report:
         abl = report["payload_head_ablation"]
-        base = report.get("impulse_fused_prefix1")
+        base = report["impulse_fused_prefix1"]
         names = list(abl)
-        vals = [abl[k] - base for k in names] if base is not None else list(abl.values())
+        vals = [abl[k] - base for k in names]
         ax.bar(range(len(names)), vals, 0.6, color=fs.VIOLET)
         ax.set_xticks(range(len(names)), [n.replace("_", " ") for n in names], rotation=25, ha="right", fontsize=8)
         fs.zero_line(ax)
-        ax.set(title="Payload-head ablation" + (" (vs the trained fused pass)" if base is not None else ""), ylabel="CE difference" if base is not None else "CE")
+        ax.set(title="Payload-head ablation (vs the trained fused pass)", ylabel="CE difference")
     ax = axes[2]
     gc = report["gradient_conflict"]
     fams = [f for f in gc if "cosine" in gc[f]]
@@ -330,7 +330,7 @@ def swap_figures(report: dict, out_dir: Path) -> None:
     ax.invert_yaxis()
     ax.grid(axis="x")
     ax.grid(False, axis="y")
-    head = report.get("head")
+    head = report["head"]
     ax.set(title=f"Payload enrichment swaps ({report['rows']} rows" + (f", head {head} only)" if head is not None else ")"), xlabel="fused CE, prefix 1")
     fs.save(fig, out_dir / ("payload-swap.png" if head is None else f"payload-swap-head{head}.png"))
 
@@ -341,7 +341,7 @@ CHANCE = {"hellaswag": 0.25, "arc_easy": 0.25, "arc_challenge": 0.25, "piqa": 0.
 
 def downstream_figures(paths: list[Path], labels: list[str] | None, out_dir: Path) -> None:
     runs = [json.loads(p.read_text()) for p in paths]
-    labels = labels or [f"{r['meta'].get('tag', p.stem)} {r['meta'].get('mode', '')}".strip() for r, p in zip(runs, paths)]
+    labels = labels or [f"{r['meta']['tag']} {r['meta']['mode']}" for r in runs]
     tasks = [t for t in runs[0]["tasks"] if all(t in r["tasks"] for r in runs)]
     metric_of = {t: ("acc_norm" if "acc_norm" in runs[0]["tasks"][t]["metrics"] else "acc") for t in tasks}
     fig, ax = plt.subplots(figsize=(1.35 * len(tasks) + 2, 4.2), constrained_layout=True)
@@ -366,7 +366,7 @@ def downstream_modes_figure(paths: list[Path], out_dir: Path) -> None:
 
     payloads = [json.loads(p.read_text()) for p in paths]
     runs = [ds.from_json(d) for d in payloads]
-    names = [f"{d['meta'].get('mode', p.stem)}" + (f" ×{d['meta']['passes']}" if d["meta"].get("passes", 1) > 1 else "") for d, p in zip(payloads, paths)]
+    names = [d["meta"]["mode"] + (f" ×{d['meta']['passes']}" if d["meta"]["passes"] > 1 else "") for d in payloads]
     passes = list(range(len(runs)))
     comparisons = [ds.compare(runs[0], r) for r in runs[1:]]
     tasks = sorted(comparisons[0])

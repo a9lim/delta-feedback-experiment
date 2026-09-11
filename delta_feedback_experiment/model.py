@@ -46,24 +46,15 @@ from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention, rotary_qk
-from .cuda_kernels import ShadowOperand, sink_linear
+from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
 from .tokenizer import VOCAB_SIZE
 
-try:  # Triton is deliberately a CUDA-only optimization dependency.
-    from .cuda_kernels import bespoke_route
-    from .cuda_kernels import triton as route_triton
-except (ImportError, OSError):  # pragma: no cover - portable fallback
-    bespoke_route = None
-    route_triton = None
-
 try:
-    from cut_cross_entropy import linear_cross_entropy
     from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
     from cut_cross_entropy.utils import _handle_eps, compute_z_loss
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
-    linear_cross_entropy = None
     CCEParams = None
     linear_cross_entropy_apply = None
     _handle_eps = None
@@ -212,15 +203,6 @@ class ModelConfig:
         return MUP_BASE_DIM / self.dim
 
     @property
-    def routing_active(self) -> bool:
-        return self.block_routing
-
-    @property
-    def routing_heads(self) -> int:
-        """The authoritative MHDB scaling rule: H equals KV-head count."""
-        return self.kv_heads
-
-    @property
     def routing_blocks(self) -> int:
         """Number of completed block deltas emitted by a full column: one per
         cell, looped or not."""
@@ -253,15 +235,6 @@ class ModelConfig:
                 f"iterations {iterations} outside 1..{self.loop_max_iterations}"
             )
         return iterations
-
-    @property
-    def feedback_active(self) -> bool:
-        return self.feedback
-
-    @property
-    def gated_entry(self) -> bool:
-        """Whether the payload enters through the mandatory GLU fuse."""
-        return self.feedback
 
     def is_pkda_layer(self, layer: int) -> bool:
         return self.hybrid and layer % 4 != 3
@@ -409,10 +382,6 @@ class KVCache:
     def _track(self, layer: int) -> tuple[int, int]:
         return layer, (self.iteration if self.cfg.is_core_layer(layer) else 0)
 
-    def attention_tensors(self, layer: int) -> tuple[Tensor, Tensor]:
-        slot = self.global_slots[self._track(layer)]
-        return self.k[slot], self.v[slot]
-
     def update(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Write k/v [B,T,Hkv,D]; return the full prefix in that layout."""
         slot = self.global_slots[self._track(layer)]
@@ -444,12 +413,6 @@ class KVCache:
 
     def advance(self, length: int) -> None:
         self.pos += length
-
-    def reset(self) -> None:
-        self.pos = 0
-        self.iteration = 0
-        self.pkda_states.clear()
-
 
 # -- trunk modules -------------------------------------------------------------
 
@@ -564,7 +527,6 @@ def _route_algebra(
     query: Tensor,
     key_weight: Tensor,
     eps: float,
-    present: Tensor | None,
     num_heads: int,
 ) -> tuple[Tensor, Tensor]:
     """MHDB algebra over a pre-stacked source bank.
@@ -581,8 +543,6 @@ def _route_algebra(
     dots = (value_heads * query_heads).float().sum(dim=-1)
     inv_rms = torch.rsqrt(values.float().square().mean(dim=-1) + eps)
     logits = dots * inv_rms.unsqueeze(-1)
-    if present is not None:
-        logits = logits.masked_fill(~present.unsqueeze(-1), float("-inf"))
     weights = logits.softmax(dim=0)
     routed = (
         (weights.to(values.dtype).unsqueeze(-1) * value_heads)
@@ -596,7 +556,6 @@ def _route_sources(
     query: Tensor,
     key_weight: Tensor,
     eps: float,
-    present: Tensor | None,
     num_heads: int,
     *sources: Tensor,
 ) -> tuple[Tensor, Tensor]:
@@ -614,8 +573,6 @@ def _route_sources(
             for source in sources
         ]
     )
-    if present is not None:
-        logits = logits.masked_fill(~present.unsqueeze(-1), float("-inf"))
     weights = logits.softmax(dim=0)
     routed = weights[0].to(sources[0].dtype).unsqueeze(-1) * sources[0].reshape(
         batch, length, num_heads, head_dim
@@ -628,30 +585,18 @@ def _route_sources(
     return routed.reshape(batch, length, dim), weights
 
 
-_compiled_route_sources = torch.compile(
-    _route_sources,
-    fullgraph=True,
-    dynamic=True,
-    mode="max-autotune-no-cudagraphs",
-)
-
-
 class _BankedSource(torch.autograd.Function):
     """Give a routing source one gradient accumulator for all of its readers.
 
-    A source of the within-column bank — the column seed, a completed block
-    delta — is read by every later site, so autograd would hold one gradient
-    contribution per reader and sum them in place afterwards: at ``r = 4`` the
-    seed alone reached twenty-four block backwards.  Here the source is handed
-    out through an alias whose readers add their contribution straight into
+    Each source is read by multiple routing sites. The source is handed out
+    through an alias whose readers add their contribution straight into
     ``accumulator`` and return no gradient, and this backward passes the
     finished accumulator on as the source's gradient.
 
     The residual stream rides through as ``carrier`` so the node is on the
     stream's own path: its backward therefore runs, and it runs only once every
     reader of the alias has, which is exactly when the accumulator is complete.
-    A reader that is not banked (the portable and non-Triton routers) still
-    returns an ordinary gradient, which arrives here as ``grad_alias`` and is
+    A reader that is not banked still returns an ordinary gradient, which arrives here as ``grad_alias`` and is
     added; correctness never depends on who banks.
     """
 
@@ -687,14 +632,13 @@ class Router(nn.Module):
 
     A learnable zero-init null vector is always prepended.  Its key is
     rmsnorm(0)=0, so its logit is exactly zero at init and routing mass on it
-    initially adds nothing. The primitive retains an optional source-presence
-    mask for kernel parity, although every screen source is present.
+    initially adds nothing.
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        _check_route_geometry(cfg.dim, cfg.routing_heads)
-        self.num_heads = cfg.routing_heads
+        _check_route_geometry(cfg.dim, cfg.kv_heads)
+        self.num_heads = cfg.kv_heads
         self.query = nn.Parameter(torch.zeros(cfg.dim))
         self.key_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.null = nn.Parameter(torch.zeros(cfg.dim))
@@ -702,7 +646,6 @@ class Router(nn.Module):
     def forward(
         self,
         sources: list[Tensor],
-        masks: list[Tensor | None],
         want_weights: bool,
         accumulators: tuple[Tensor, ...] = (),
     ) -> tuple[Tensor | None, Tensor | None]:
@@ -716,18 +659,7 @@ class Router(nn.Module):
         if not sources:
             return None, None
         null = self.null.to(sources[0].dtype)
-        masks = [None] + masks
-        present = None
-        if any(mask is not None for mask in masks):
-            present = torch.stack(
-                [
-                    mask
-                    if mask is not None
-                    else torch.ones_like(sources[0][..., 0], dtype=torch.bool)
-                    for mask in masks
-                ]
-            )
-        if sources[0].is_cuda and route_triton is not None:
+        if sources[0].is_cuda:
             if accumulators and not (
                 self.query.requires_grad and self.null.requires_grad
             ):
@@ -741,22 +673,11 @@ class Router(nn.Module):
             )
             routed, weights = bespoke_route(
                 projected,
-                present,
                 null,
                 self.key_norm.eps,
                 self.num_heads,
                 tuple(sources),
                 tuple(accumulators),
-            )
-        elif sources[0].is_cuda:
-            routed, weights = _compiled_route_sources(
-                self.query,
-                self.key_norm.weight,
-                self.key_norm.eps,
-                present,
-                self.num_heads,
-                null.expand_as(sources[0]),
-                *sources,
             )
         else:
             routed, weights = _route_algebra(
@@ -764,7 +685,6 @@ class Router(nn.Module):
                 self.query,
                 self.key_norm.weight,
                 self.key_norm.eps,
-                present,
                 self.num_heads,
             )
         return routed, (weights.detach() if want_weights else None)
@@ -804,7 +724,7 @@ class Block(nn.Module):
         )
         self.mlp = SwiGLU(cfg)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
-        if cfg.routing_active:
+        if cfg.block_routing:
             self.attn_router = Router(cfg)
             self.mlp_router = Router(cfg)
         else:
@@ -814,8 +734,7 @@ class Block(nn.Module):
     def _read(self, h, router, sources, accumulators, want_weights):
         if router is None or not sources:
             return h, None
-        masks: list[Tensor | None] = [None] * len(sources)
-        routed, weights = router(list(sources), masks, want_weights, accumulators)
+        routed, weights = router(list(sources), want_weights, accumulators)
         return (h if routed is None else h + routed), weights
 
     def forward(
@@ -1013,14 +932,13 @@ class DeltaModel(nn.Module):
         self.fuse_value_shadow: Tensor | None = None
         self.fuse_gate_shadow: Tensor | None = None
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
-        if cfg.gated_entry:
+        if cfg.feedback:
             self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
             self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        if cfg.feedback_active:
             self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-            if cfg.routing_active:
+            if cfg.block_routing:
                 self.payload_router = Router(cfg)
         self.grad_checkpoint = False
         """Runtime switch: retain cell-final activations, checkpoint other blocks."""
@@ -1037,7 +955,7 @@ class DeltaModel(nn.Module):
         self._init_factor_linears(
             self.attention_gates, factor_seed ^ 0x4152434849544543
         )
-        if cfg.gated_entry:
+        if cfg.feedback:
             self._init_factor_linears(
                 (self.fuse_value, self.fuse_gate),
                 factor_seed ^ 0x524543555252454E,
@@ -1298,7 +1216,7 @@ class DeltaModel(nn.Module):
                 attn.o_sink = sink(attn.o_proj.weight)
                 attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight, gate)
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-        if self.cfg.gated_entry:
+        if self.cfg.feedback:
             self.fuse_value_sink = sink(self.fuse_value.weight)
             self.fuse_gate_sink = sink(self.fuse_gate.weight)
             self.fuse_value_shadow = shadow(
@@ -1525,23 +1443,21 @@ class DeltaModel(nn.Module):
             iterations = cache.iterations
         iterations = cfg.resolve_iterations(iterations)
 
-        # Banking needs the Triton router's in-place accumulation and a live
-        # backward; without either the sources stay raw and every reader
-        # returns its own gradient, as before.
+        # Bank source gradients during CUDA backward; portable execution
+        # accumulates ordinary autograd gradients.
         banking = (
             self.bank_sources
-            and cfg.routing_active
+            and cfg.block_routing
             and x.is_cuda
-            and route_triton is not None
             and torch.is_grad_enabled()
         )
-        payload_reads = cfg.feedback_active and cfg.routing_active and need_payload
+        payload_reads = cfg.feedback and cfg.block_routing and need_payload
 
         h = x
         sources: list[Tensor] | None = None
         source_names: list[str] = []
         accumulators: list[Tensor] = []
-        if cfg.routing_active:
+        if cfg.block_routing:
             if banking:
                 h, seed, accumulator = bank_source(h, x)
                 sources = [seed]
@@ -1677,13 +1593,12 @@ class DeltaModel(nn.Module):
             cache.advance(x.shape[1])
 
         payload = None
-        if cfg.feedback_active and need_payload:
+        if cfg.feedback and need_payload:
             enriched = h
-            if cfg.routing_active:
+            if cfg.block_routing:
                 payload_sources = [sources[seeds - 1], *sources[seeds:]]
                 routed, weights = self.payload_router(
                     payload_sources,
-                    [None] * len(payload_sources),
                     want_weights,
                     tuple(accumulators),
                 )
@@ -1725,7 +1640,7 @@ class DeltaModel(nn.Module):
         previous column (None for Standard decoding and conditions without
         ``f``)."""
         e = self.embed_tokens(tokens)
-        if payload is not None and not self.cfg.feedback_active:
+        if payload is not None and not self.cfg.feedback:
             raise ValueError("a condition without f cannot consume a payload")
         x = self.fuse(payload, e) if payload is not None else e
         return self.forward_column(x, cache=cache, want_weights=want_weights)
@@ -1765,7 +1680,7 @@ def multipass(
     iteration count under ``l``, shared by every pass.
     """
     cfg = model.cfg
-    if n_passes > 1 and not cfg.feedback_active:
+    if n_passes > 1 and not cfg.feedback:
         raise ValueError("multi-pass batches require a condition with f")
     e = model.embed_tokens(tokens[:, :-1])
     out = model.forward_column(
@@ -1816,14 +1731,6 @@ def _head_losses(
     return ce, logits.logsumexp(dim=-1).square().sum()
 
 
-_compiled_head_losses = torch.compile(
-    _head_losses,
-    fullgraph=True,
-    dynamic=False,
-    mode="max-autotune-no-cudagraphs",
-)
-
-
 @torch.no_grad()
 def batch_vocab_order(embeddings: Tensor, classifier: Tensor) -> Tensor:
     """This batch's mean-logit ordering of the vocabulary, an int32 permutation.
@@ -1839,12 +1746,8 @@ def batch_vocab_order(embeddings: Tensor, classifier: Tensor) -> Tensor:
     The order is ascending, as upstream's ``argsort`` is, and that direction
     is load-bearing: the backward accumulates each row's embedding gradient
     across the vocabulary tiles in BF16 through locks, roughly in tile order,
-    so the tiles with the smallest contributions have to arrive first. Every
-    other order that was tried (descending mean logit, held-out frequency, a
-    per-step average) dropped or computed the same tiles yet rounded the
-    tail away against an already large running sum, a coherent error that
-    the step's microbatch averaging did not cancel: the step gradient came
-    out 20 to 25% too large.
+    so the tiles with the smallest contributions arrive first to limit
+    rounding error in the accumulated gradient.
     """
     mean = embeddings.reshape(-1, embeddings.shape[-1]).float().mean(0, keepdim=True)
     logit_avg = torch.addmm(
@@ -1871,7 +1774,7 @@ def _fixed_cce_z(
     Every training target is a real vocabulary id, so CCE's public
     ``ignore_index`` discovery would always produce ``valids=None``. Construct
     that exact pinned-C CCE request directly: its data-dependent ``nonzero`` is
-    illegal inside CUDA graph capture, while its forward and new differentiable
+    illegal inside CUDA graph capture, while its forward and differentiable
     LSE backward are otherwise the authoritative implementation.
 
     With ``vocab_ordering`` both halves tile the classifier through that
@@ -1882,7 +1785,7 @@ def _fixed_cce_z(
 
     ``c_grad_accum`` is a caller-owned persistent BF16 ``[V, D]`` buffer. With
     one the backward lock-adds this call's classifier gradient straight into it
-    instead of zero-filling a fresh 233 MB tensor and returning it, and the
+    instead of allocating and returning a fresh gradient tensor, and the
     classifier receives no autograd gradient at all; the caller flushes the
     buffer into its FP32 sink and clears it on its own cadence.
     """
@@ -1933,15 +1836,13 @@ def sequence_ce(
     *,
     chunk: int = 1024,
 ) -> tuple[Tensor, Tensor]:
-    """(mean CE, mean z²) over [B, T] targets, chunked along the sequence.
+    """Mean CE and z² over [B, T] targets.
 
-    The vocab-sized logits (50304 wide at screen scale) dominate
-    activation memory, so the head runs under activation checkpointing
-    one sequence-chunk at a time — live logits are bounded to a single
-    chunk in both forward and backward.
+    CUDA uses fused cut cross-entropy. CPU/MPS checkpoint sequence chunks
+    to bound the materialized vocabulary logits in forward and backward.
     """
     count = targets.numel()
-    if h_top.is_cuda and linear_cross_entropy is not None:
+    if h_top.is_cuda:
         # CCE fuses tied unembedding and CE, never materializing [B,T,V].
         # Its high-threshold gradient filter is an intentional throughput-
         # first numerical divergence of the authoritative CUDA recipe.
@@ -1969,7 +1870,7 @@ def sequence_ce(
         t_piece = targets[:, start : start + chunk]
         if recompute:
             ce, z = torch.utils.checkpoint.checkpoint(
-                _compiled_head_losses if h_top.is_cuda else _head_losses,
+                _head_losses,
                 h_piece,
                 t_piece,
                 model.final_norm.weight,
@@ -1980,8 +1881,7 @@ def sequence_ce(
                 preserve_rng_state=False,
             )
         else:
-            head = _compiled_head_losses if h_top.is_cuda else _head_losses
-            ce, z = head(
+            ce, z = _head_losses(
                 h_piece,
                 t_piece,
                 model.final_norm.weight,
@@ -2051,7 +1951,7 @@ def iterate_fused(
     core iterations under ``l`` (default: the configured mean).
     """
     cfg = model.cfg
-    if not cfg.feedback_active:
+    if not cfg.feedback:
         raise ValueError("the contraction diagnostic needs a condition with f")
     with _monitor_autocast(tokens):
         e = model.embed_tokens(tokens[:, :-1])
@@ -2097,7 +1997,7 @@ def depth_trace(
     cfg = model.cfg
     if not cfg.loop:
         raise ValueError("the depth trace needs a condition with l")
-    if fused and not cfg.feedback_active:
+    if fused and not cfg.feedback:
         raise ValueError("a fused depth trace needs a condition with f")
     if iterations is None:
         iterations = cfg.loop_max_iterations

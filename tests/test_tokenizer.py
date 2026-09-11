@@ -1,4 +1,4 @@
-"""Text identity, chat structure, and vocabulary cutover boundaries."""
+"""Text identity, chat structure, and stored vocabulary validation."""
 
 import json
 import unicodedata
@@ -8,7 +8,7 @@ import torch
 
 from delta_feedback_experiment import tokenizer as profile
 from delta_feedback_experiment.data import META, TokenData, read_meta, write_synthetic
-from delta_feedback_experiment.train import parse_run_args, read_checkpoint
+from delta_feedback_experiment.train import CONTRACT, parse_run_args, read_checkpoint
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +86,7 @@ def test_text_roundtrip_obeys_neox_nfc_normalization(tokenizer, text):
 @pytest.mark.parametrize(
     "change",
     [
-        {"tokenizer_id": "old-qwen"},
+        {"tokenizer_id": "different-tokenizer"},
         {"tokenizer_revision": "another-revision"},
         {"chatml_end_id": 0},
         {"chat_template": "discard roles"},
@@ -106,9 +106,17 @@ def test_store_readers_reject_incompatible_token_identity(tmp_path, change):
 
 def test_checkpoint_requires_tokenizer_identity(tmp_path):
     path = tmp_path / "test.pt.1"
-    payload = {"version": 28, "state": {}, "args": {"tokenizer_id": "old-qwen"}}
+    payload = {"version": CONTRACT.version, "state": {}, "args": {"tokenizer_id": "different-tokenizer"}}
     torch.save(payload, path)
     with pytest.raises(ValueError, match="tokenizer identity"):
+        read_checkpoint(path)
+
+
+@pytest.mark.parametrize("version", [CONTRACT.version - 1, CONTRACT.version + 1])
+def test_checkpoint_requires_current_version(tmp_path, version):
+    path = tmp_path / "test.pt.1"
+    torch.save({"version": version, "state": {}, "args": {}}, path)
+    with pytest.raises(ValueError, match="checkpoint version"):
         read_checkpoint(path)
 
 
