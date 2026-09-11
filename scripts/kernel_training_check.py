@@ -31,6 +31,7 @@ from delta_feedback_experiment.train import (
     build_schedule,
     clip_gradients,
     parse_run_args,
+    read_checkpoint,
 )
 
 
@@ -123,7 +124,7 @@ def run(options) -> None:
     torch.set_float32_matmul_precision("high")
     torch.manual_seed(1)
     args = parse_run_args(["kernel-stability", "--condition", "arf"])
-    payload = torch.load(options.snapshot, map_location="cpu", weights_only=False)
+    payload = read_checkpoint(options.snapshot)
     saved = analysis.saved_args(payload)
     for field in (*analysis.GEOMETRY, "seq_len", "condition"):
         setattr(args, field, saved[field])

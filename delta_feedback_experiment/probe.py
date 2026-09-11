@@ -649,7 +649,7 @@ def cuda_gate() -> None:
         del decode_model, decode_tokens, full, cache, prefill, pieces, incremental
         return relative
 
-    plain_decode_rel = decode_parity("", 3)
+    plain_decode_rel = decode_parity("", 4)
     hybrid_decode_rel = decode_parity("a", 4)
     # The loop decodes through one core cache track per iteration. BF16 drift
     # between the parallel and single-column paths grows with executed depth.
@@ -657,6 +657,14 @@ def cuda_gate() -> None:
     # accumulated rounding error.
     loop_decode_rel = decode_parity(
         "arfl",
+        12,
+        bf16=False,
+        bound=0.01,
+        loop_iterations=2,
+        loop_max_iterations=2,
+    )
+    rope_loop_decode_rel = decode_parity(
+        "rfl",
         12,
         bf16=False,
         bound=0.01,
@@ -1036,7 +1044,7 @@ def cuda_gate() -> None:
         f"conv_rel={conv_rel:.4f} | "
         f"norm_gate_rel={norm_gate_rel:.4f} | "
         f"decode_rel={plain_decode_rel:.4f}/{hybrid_decode_rel:.4f}"
-        f"/{loop_decode_rel:.4f} | "
+        f"/{loop_decode_rel:.4f}/{rope_loop_decode_rel:.4f} | "
         f"loop_grad_rel={loop_grad_rel:.4f}/floor={grad_floor:.4f} | "
         f"head_flush_rel={flush_rel:.2e}/micro={per_micro_rel:.2e} | "
         f"loop_cap_peak={loop_cap_peak:.2f}GiB | "

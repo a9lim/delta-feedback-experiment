@@ -52,9 +52,14 @@ change it everywhere at once.
 
 - One `DeltaModel` and `CONDITION_LETTERS` define the family. A condition is the
   canonical string `parse_condition` returns (letters in `arfl` order) and
-  `ModelConfig.condition` renders it back; every subset of `arfl` builds. Every dense attention layer is gated NoPE
-  GQA. Under `a` the trunk is `[PKDA, PKDA, PKDA, gated global GQA] x 3`;
-  without `a` it is twelve such layers. The bridge and the
+  `ModelConfig.condition` renders it back; every subset of `arfl` builds.
+  Under `a` each cell is `[PKDA, PKDA, PKDA, NoPE-GGQA]`; without `a` it is
+  `[RoPE-GGQA, RoPE-GGQA, RoPE-GGQA, NoPE-GGQA]`. All GGQA layers retain
+  learned per-head Q/K RMSNorm. RoPE follows that norm, rotates adjacent pairs
+  across the full head width with theta 10,000 in FP32, and casts back to the
+  activation dtype. Positions are absolute within a token row, shared across
+  feedback passes and core iterations; cached keys are already rotated and
+  new queries/keys use the cache position. The screen has three cells. The bridge and the
   flagship in `scaling.md` are the same architecture at four cells and width
   1,152 and at six cells and width 1,536.
 - PKDA runs the literal recurrence on CPU/MPS and the workspace FLA fork's
@@ -143,8 +148,10 @@ change it everywhere at once.
   graph pool reserves about 23.0 GiB. `docs/runtime-qualification.md` holds
   the PyTorch 2.14 / CUDA 13.2 evidence. Keep cyclic Python garbage
   collection outside train/eval graph capture.
-- Snapshots are v26, and only v26 loads, for resume, evaluation, and forks
-  alike; every specimen records its condition as letters.
+- New snapshots are v27. Resume, evaluation, and forks accept v27 for every
+  condition and v26 only for conditions with `a`, whose computation is
+  unchanged; v26 non-`a` snapshots are rejected. Every specimen records its
+  condition as letters.
 - Before touching Jobe, look at `delta status`, the active log, and GPU
   ownership. The queue stores arguments rather than Git state; a worker
   refreshes before the next job and runs the current checkout's probe.

@@ -40,14 +40,14 @@ previous payload p_(t-1) --------------+                  |
 
 The decoder is a bias-free pre-norm stack with tied embedding and readout, a
 final RMSNorm, packed SwiGLU channel mixers, and no dropout. Every RMSNorm,
-including PKDA's gated output norm, uses epsilon `1e-6`. There is no explicit
-position encoding: no sliding window, MLA, RoPE, or additive position
-embedding. Layers come in four-layer **cells**, the unit MHDB addresses and
-the unit the loop ties. Every dense attention layer is gated causal NoPE GQA;
-under `a` each cell is `[PKDA, PKDA, PKDA, gated global GQA]`, so PKDA carries
-token-mixer state, order, and recency and every fourth layer supplies a dense
-causal global read. Without `a` every layer is that dense read, and position
-is whatever the causal mask lets the model infer.
+including PKDA's gated output norm, uses epsilon `1e-6`. Layers come in
+four-layer **cells**, the unit MHDB addresses and the unit the loop ties.
+Under `a` each cell is `[PKDA, PKDA, PKDA, NoPE-GGQA]`, so PKDA carries
+token-mixer state, order, and recency and every fourth layer supplies a gated
+dense causal global read. Without `a` each cell is `[RoPE-GGQA, RoPE-GGQA,
+RoPE-GGQA, NoPE-GGQA]`: the RoPE layers occupy exactly the PKDA sites. The
+pattern holds at every geometry and core iteration. There is no sliding
+window, MLA, or additive position embedding.
 
 On pass 1 and in Standard decoding the seed is the token embedding. The
 readout uses `final_norm(h_top)` times the muP readout multiplier `1536 / D`;
@@ -87,7 +87,7 @@ the recurrent payload, and the loop.
 | Payload | Normalization of top state plus routed enrichment under `r` with `f`, shifted to the next token column |
 | Core entry and core state | `l`: the prelude output the tied core starts from and the residual after its last iteration; their difference is the sum of the core cells' deltas |
 | PKDA matrix, preconditioner, convolution history | Token-mixer memory, continued during decode and reset within each current Jacobi prefill pass |
-| GQA K/V | Visible-prefix cache for the global layers |
+| GQA K/V | Visible-prefix cache for the global layers; RoPE layers store already-rotated keys |
 
 Three recurrences are distinct. Every `a` condition has PKDA recurrence inside
 its token mixers whether or not it has `f`; `f` adds explicit payload
@@ -190,17 +190,34 @@ during decoding.
 
 ### Gated global GQA
 
-Every dense attention layer, the fourth of each cell under `a` and every
-layer without it, is causal NoPE GQA with head width 96 and an output gate.
-For pre-normalized input `x`, a packed bias-free projection produces Q/K/V, Q
-and K receive per-head RMSNorm, and a separate bias-free projection produces
-one gate coordinate per query-head output coordinate:
+Every dense attention layer uses causal GQA with head width 96 and an output
+gate. The fourth layer of each cell is NoPE; without `a`, the other three
+layers use RoPE. For pre-normalized input `x`, a packed bias-free projection
+produces Q/K/V, Q and K receive learned per-head RMSNorm, and a separate
+bias-free projection produces one gate coordinate per query-head output
+coordinate:
 
 ```text
 q, k, v = split(W_qkv x)
+q, k    = rmsnorm_q(q), rmsnorm_k(k)
+q, k    = rope(q, position), rope(k, position)  # RoPE layers only
 z       = concat(GQA(q, k, v))
 o       = W_o(sigmoid(W_g x) * z)
 ```
+
+Partial RoPE here means selecting three layers per cell; each selected layer
+rotates the full head width. For head width `d`, pair `j` is the adjacent
+coordinates `(2j, 2j + 1)`, with angle `position * 10000^(-2j / d)`. Phases,
+sine/cosine, and the rotation are computed in FP32, then Q and K are cast
+back to their activation dtype. The base is fixed at 10,000, with no learned
+parameters or CLI knob. Values are not rotated.
+
+Positions count from zero within each token row. Every feedback pass and
+core iteration reuses those same positions, and the plain/fused split does
+not restart them. Cached execution offsets new queries and keys by
+`cache.pos` and stores the keys after rotation, so a prefix is never rotated
+again when the next token arrives. Every iteration's cache track shares the
+same token position.
 
 The gate acts on the concatenated attention result before the output projection
 and residual-branch scaling. It does not change attention logits or softmax
@@ -736,7 +753,8 @@ A position's **write** at a core layer is everything later positions consume
 there. For PKDA: the pre-convolution Q/K/V projections that form later
 positions' convolution history, the post-convolution `k_t` and `v_t`, and the
 per-head transition controls `alpha_t`, `beta_t`, `alphaP_t`, `betaP_t`. For
-gated GQA: the normalized `k_t` and `v_t`. The write bank of one pass, per
+gated GQA: `k_t` after normalization and, at RoPE sites, rotation, plus `v_t`.
+The write bank of one pass, per
 core layer, holds the BF16 pre-convolution Q/K/V, the BF16 post-convolution K
 and V, the FP32 transition controls, and the BF16 GGQA K and V at every
 position.

@@ -31,13 +31,16 @@ Plain-decoder BF16 and looped-model FP32 comparisons also pass, as do five
 focused CUDA projection/history cases, eleven portable cache/initialization
 cases, and Ruff on both machines. The full suite and full screen graph gate
 were not rerun for this cache fix; the timing evidence below is from September 9.
+These records predate the partial-RoPE path for conditions without `a` and
+do not establish its numerical parity or performance.
 
 The 2026-09-09 execution record's four train/eval graphs peak at 14.46 GiB
 allocated and 22.96 GiB reserved, with
 one/two/three-pass replay at 64.6/129.9/195.9 ms. The loop-versus-flat gradient
 error is 1.64%, matching its 1.64% repeat floor; checkpoint staging leaves
-0.02 GiB of residual device allocation. Snapshots remain v26. Keep GPU work
-serial on Jobe's 24 GiB card.
+0.02 GiB of residual device allocation. Keep GPU work serial on Jobe's
+24 GiB card. New snapshots use v27; loading accepts v27 for every condition
+and v26 only for conditions with `a`, whose computation is unchanged.
 
 ## Maintained execution contract
 
@@ -69,6 +72,13 @@ analysis. CUDA training uses the same equations through the following path:
   The backend scope is inside the compiled region and restores the caller's
   preferences. Cached decode retains compiled FlexAttention, writing BF16 K/V
   and exposing only the valid prefix. No external `flash-attn` package is used.
+- Without `a`, the first three layers of each cell apply full-head,
+  adjacent-pair RoPE after learned per-head Q/K RMSNorm, with theta 10,000,
+  FP32 phases and rotation, and a cast back to the activation dtype. Every
+  fourth layer stays NoPE. Positions are absolute within the token row and
+  reused across feedback passes and core iterations. Cached new queries and
+  keys use `cache.pos`; stored keys are already rotated. Under `a`, the
+  `[PKDA, PKDA, PKDA, NoPE-GGQA]` computation is unchanged.
 - Triton MHDB routing with site-local nulls, raw values, a source softmax per
   group, and full-width RMS coupling in backward. Each compiled block emits
   its distance from the cell entry for the current/completed delta bank.
@@ -141,8 +151,9 @@ The CUDA gate checks the `l` letter three ways:
 
 - **Cached decode through per-iteration core tracks.** At width 128, twelve
   layers, and twelve positions, the full parallel forward and stepped
-  `arfl` decode at two iterations must agree within 1% relative error in
-  FP32. Separate four-layer BF16 checks keep their 4% bound.
+  `arfl` and `rfl` decode at two iterations must agree within 1% relative
+  error in FP32. Separate four-layer BF16 checks of `a` and the partial-RoPE
+  plain decoder keep their 4% bound.
 - **One iteration is the flat column.** At the screen geometry, eager
   two-pass `arfl` at `r = 1` and `arf` agree in loss. The gate compares their
   gradients against a repeated `arf` measurement because the head's BF16

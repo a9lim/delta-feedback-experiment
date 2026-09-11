@@ -51,8 +51,29 @@ from .optim import (
 )
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=26, resumable=frozenset({26}), surface_version=26
+    version=27, resumable=frozenset({26, 27}), surface_version=26
 )
+
+
+def read_checkpoint(path: str | Path) -> dict:
+    """Read current state, including v26 specimens whose ``a`` trunk is unchanged.
+
+    Version 26 non-``a`` weights trained with NoPE everywhere. Their tensor
+    shapes still fit, but interpreting them as RoPE would change the model.
+    All analysis, resume, and continuation entry points share this check.
+    """
+    payload = checkpoints.read(path, CONTRACT, map_location="cpu")
+    CONTRACT.check_resumable(path, payload["version"])
+    if payload["version"] == 26 and "a" not in parse_condition(
+        payload["args"]["condition"]
+    ):
+        raise ValueError(
+            f"{path}: v26 non-a checkpoint uses NoPE in every layer; "
+            "the current non-a trunk uses RoPE in three layers per cell. "
+            "Use its original code revision to load this specimen."
+        )
+    return payload
+
 
 GRAD_CLIP_NORM = 10.0
 """Global FP32 gradient-norm ceiling shared by every run."""
@@ -178,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LETTERS",
         help=(
             "one letter per change from the plain gated GQA decoder, in any order "
-            "(default: none, the plain decoder): "
+            "(default: none, three RoPE-GGQA layers then one NoPE-GGQA per cell): "
             + "; ".join(
                 f"{letter} = {change}"
                 for letter, (_, change) in CONDITION_LETTERS.items()
@@ -1299,8 +1320,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
     payload = None
     if args.resume:
         path = runs.latest_snapshot(args.tag, args.out_dir)
-        payload = checkpoints.read(path, CONTRACT, map_location="cpu")
-        CONTRACT.check_resumable(path, payload["version"])
+        payload = read_checkpoint(path)
         saved = payload["args"]
         missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
         if missing:
@@ -1329,7 +1349,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
         if not found:
             raise FileNotFoundError(f"no snapshot of {source} under {args.out_dir}")
         latest_path = found[-1][1]
-        payload = checkpoints.read(latest_path, CONTRACT, map_location="cpu")
+        payload = read_checkpoint(latest_path)
         saved = payload["args"]
         missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
         if missing:
@@ -1370,8 +1390,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             )
         path = eligible[-1][1]
         if path != latest_path:
-            payload = checkpoints.read(path, CONTRACT, map_location="cpu")
-        CONTRACT.check_resumable(path, payload["version"])
+            payload = read_checkpoint(path)
 
     if args.batch_rows % args.micro_rows:
         raise ValueError("batch-rows must be a multiple of micro-rows")

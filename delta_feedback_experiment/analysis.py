@@ -19,10 +19,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from transformer_experiments import checkpoints
 
 from .model import DeltaModel, ModelConfig, condition_config, shift_right
-from .train import CONTRACT, pick_device
+from .train import pick_device, read_checkpoint
 
 GEOMETRY = (
     "vocab_size",
@@ -67,7 +66,7 @@ def load_checkpoint(
     arguments with the snapshot's cumulative ``step`` added.  The optimizer
     state is dropped; use ``checkpoints.restore`` to continue training.
     """
-    payload = checkpoints.read(path, CONTRACT, map_location="cpu")
+    payload = read_checkpoint(path)
     saved = saved_args(payload)
     model = DeltaModel(config_from_args(saved))
     model.load_state_dict(payload["state"])

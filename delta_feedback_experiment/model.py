@@ -3,8 +3,9 @@
 The architecture contract is ``docs/architecture.md``. Everything here is
 condition-agnostic model semantics: a condition is a string of letters from
 :data:`CONDITION_LETTERS`, each switching on one :class:`ModelConfig` flag
-over the plain twelve-layer gated NoPE GQA decoder (the empty condition).
-``a`` replaces three of every four attention layers with PKDA, ``r`` adds MHDB
+over the plain twelve-layer gated GQA decoder (the empty condition), with
+RoPE in the first three layers of each four-layer cell and NoPE in the last.
+``a`` replaces those RoPE layers with PKDA, ``r`` adds MHDB
 reads, ``f`` adds FBT feedback, and ``l`` turns the cells between the first
 and last into one tied core that runs a drawn number of times per column.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
@@ -44,7 +45,7 @@ import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
-from .attention import causal_attention, prefix_attention
+from .attention import causal_attention, prefix_attention, rotary_qk
 from .cuda_kernels import ShadowOperand, sink_linear
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
@@ -70,7 +71,10 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "a": (
         "hybrid",
-        "Kimi Delta Attention: PKDA in three of every four attention layers",
+        (
+            "Kimi Delta Attention: PKDA replaces the three RoPE-GGQA layers in each "
+            "four-layer cell; the last stays NoPE-GGQA"
+        ),
     ),
     "r": (
         "block_routing",
@@ -93,7 +97,7 @@ def parse_condition(text: str) -> str:
 
     Each letter is one change from the plain decoder; letters may arrive in any
     order and come back in :data:`CONDITION_LETTERS` order. The empty string is
-    the plain twelve-layer gated NoPE GQA decoder.
+    the plain twelve-layer gated GQA decoder with three RoPE layers per cell.
     """
     unknown = sorted(set(text) - set(CONDITION_LETTERS))
     if unknown:
@@ -132,8 +136,8 @@ the plain parametrization.
 class ModelConfig:
     """Trunk geometry plus one flag per condition letter.
 
-    Defaults are the screen geometry and the plain trunk of twelve gated NoPE
-    GQA layers; ``hybrid`` (``a``) makes three of every four of them PKDA.
+    Defaults are the screen geometry and twelve gated GQA layers in
+    [RoPE, RoPE, RoPE, NoPE] cells; ``hybrid`` (``a``) replaces RoPE with PKDA.
     Routing heads are not an independent knob: every routed condition uses one contiguous feature group
     per KV head. The groups do not align to mixer projections.
     """
@@ -260,6 +264,10 @@ class ModelConfig:
 
     def is_pkda_layer(self, layer: int) -> bool:
         return self.hybrid and layer % 4 != 3
+
+    def is_rope_layer(self, layer: int) -> bool:
+        """RoPE occupies exactly the layers PKDA replaces under ``a``."""
+        return not self.hybrid and layer % 4 != 3
 
     @property
     def global_attention_layers(self) -> tuple[int, ...]:
@@ -446,11 +454,14 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Dense causal NoPE GQA with a sigmoid output gate, in every condition."""
+    """Dense causal gated GQA; RoPE on the non-``a`` cell's first three layers."""
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, layer: int):
         super().__init__()
         self.cfg = cfg
+        self.rope = cfg.is_rope_layer(layer)
+        if self.rope and (cfg.head_dim < 2 or cfg.head_dim % 2):
+            raise ValueError("RoPE requires a positive even attention head dimension")
         self.q_size = cfg.heads * cfg.head_dim
         self.kv_size = cfg.kv_heads * cfg.head_dim
         self.qkv_proj = nn.Linear(cfg.dim, self.q_size + 2 * self.kv_size, bias=False)
@@ -487,6 +498,8 @@ class Attention(nn.Module):
         v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
+        if self.rope:
+            q, k = rotary_qk(q, k, 0 if cache is None else cache.pos)
         if cache is not None and length > 1 and cache.pos != 0:
             raise ValueError("multi-column append to a non-empty cache")
         causal = cache is None or length > 1
@@ -786,7 +799,7 @@ class Block(nn.Module):
                 norm_eps=cfg.norm_eps,
             )
             if self.is_pkda
-            else Attention(cfg)
+            else Attention(cfg, layer)
         )
         self.mlp = SwiGLU(cfg)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)

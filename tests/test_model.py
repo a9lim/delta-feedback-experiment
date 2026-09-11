@@ -132,13 +132,20 @@ def test_condition_flags():
     assert not plain.routing_active
     assert not plain.feedback_active
     assert not plain.hybrid
-    # Every dense layer is gated NoPE GQA; a only decides which layers are dense.
+    # The same three positions per cell use RoPE without a and PKDA with a.
     assert plain.global_attention_layers == tuple(range(TINY["layers"]))
+    assert [plain.is_rope_layer(layer) for layer in range(8)] == [
+        True,
+        True,
+        True,
+        False,
+    ] * 2
     hybrid = condition_config("a", **TINY)
     assert hybrid.hybrid
     assert not hybrid.routing_active and not hybrid.feedback_active
     assert hybrid.is_pkda_layer(0) and not hybrid.is_pkda_layer(3)
     assert hybrid.global_attention_layers == (3,)
+    assert not any(hybrid.is_rope_layer(layer) for layer in range(8))
     routed = condition_config("ar", **TINY)
     assert routed.routing_active
     assert not routed.feedback_active
@@ -559,11 +566,11 @@ def test_tied_embedding_sink_accumulates_both_gradient_paths_in_place():
 
 def test_zero_gqa_gate_halves_the_ungated_attention_branch():
     """``o = W_o(sigmoid(W_g x) * GQA(q, k, v))``: a zero gate is a factor 1/2,
-    on the plain trunk's second layer here, and no position tables anywhere."""
+    on the plain trunk's fourth (NoPE) layer here."""
     model = tiny("")
     cfg = model.cfg
-    attention = model.blocks[1].attn
-    gate_weight = model.attention_gates[1].weight
+    attention = model.blocks[3].attn
+    gate_weight = model.attention_gates[3].weight
     x = torch.randn(2, 7, TINY["dim"])
 
     def heads(t, n):
@@ -571,7 +578,7 @@ def test_zero_gqa_gate_halves_the_ungated_attention_branch():
 
     with torch.no_grad():
         gate_weight.zero_()
-        gated = attention(x, gate_weight, None, 1)
+        gated = attention(x, gate_weight, None, 3)
         q, k, v = attention.qkv_proj(x).split(
             (attention.q_size, attention.kv_size, attention.kv_size), dim=-1
         )
@@ -957,7 +964,7 @@ def test_loop_at_one_iteration_is_the_unlooped_condition():
     """At r = 1 the column executes the same layers with the same parameters
     and the same banks: values, routes, losses, and gradients coincide with
     the condition without l, at three cells and with a multi-cell core."""
-    cases = [(condition, 12) for condition in ("al", "afl", "arl", "arfl")]
+    cases = [(condition, 12) for condition in LOOPED]
     cases += [("arl", 16), ("arfl", 20)]
     for condition, layers in cases:
         looped = tiny(condition, layers=layers).train()
@@ -982,7 +989,10 @@ def test_loop_at_one_iteration_is_the_unlooped_condition():
             }
             assert translated.keys() == out_f.route_weights.keys(), condition
             for site, weights in translated.items():
-                assert torch.equal(weights, out_f.route_weights[site]), (condition, site)
+                assert torch.equal(weights, out_f.route_weights[site]), (
+                    condition,
+                    site,
+                )
             translated_names = {
                 site.replace("i0.", "."): names
                 for site, names in out_l.route_source_names.items()

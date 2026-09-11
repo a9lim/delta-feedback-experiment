@@ -27,7 +27,12 @@ from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
 from delta_feedback_experiment.model import DeltaModel, multipass, multipass_loss
 from delta_feedback_experiment.optim import OptimizerPair, build_optimizers
-from delta_feedback_experiment.train import CONTRACT, clip_gradients, micro_draws
+from delta_feedback_experiment.train import (
+    CONTRACT,
+    clip_gradients,
+    micro_draws,
+    read_checkpoint,
+)
 
 FUSION_NAMES = ("fuse_value.weight", "fuse_gate.weight", "gate_norm.weight", "entry_norm.weight",
                 "payload_norm.weight", "payload_router.query", "payload_router.null", "payload_router.key_norm.weight")
@@ -68,7 +73,7 @@ def main() -> None:
 
     torch._dynamo.config.recompile_limit = 64
     torch.set_float32_matmul_precision("high")
-    payload = checkpoints.read(args.snapshot, CONTRACT, map_location="cpu")
+    payload = read_checkpoint(args.snapshot)
     saved = analysis.saved_args(payload)
     run = SimpleNamespace(**saved)
     cfg = analysis.config_from_args(saved)

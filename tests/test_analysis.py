@@ -43,10 +43,11 @@ def snapshot(tmp_path, condition="arf", seed=3):
     return model.eval(), path
 
 
-def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
-    model, path = snapshot(tmp_path)
+@pytest.mark.parametrize("condition", ["", "r", "arf"])
+def test_load_checkpoint_rebuilds_the_saved_model(tmp_path, condition):
+    model, path = snapshot(tmp_path, condition)
     loaded, saved = analysis.load_checkpoint(path, "cpu")
-    assert saved["condition"] == "arf" and saved["step"] == 5
+    assert saved["condition"] == condition and saved["step"] == 5
     assert saved["seq_len"] == 16
     assert not loaded.training
     for (name, a), (_, b) in zip(
@@ -58,6 +59,34 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
         want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
         got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
     assert torch.equal(want, got)
+
+
+@pytest.mark.parametrize("condition", ["", "r", "f", "rf", "a", "ar", "af", "arf"])
+def test_v26_loads_only_unchanged_a_specimens(tmp_path, condition):
+    model, path = snapshot(tmp_path, condition)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["version"] = 26
+    torch.save(payload, path)
+    if "a" not in condition:
+        with pytest.raises(ValueError, match="v26 non-a checkpoint uses NoPE"):
+            analysis.load_checkpoint(path, "cpu")
+    else:
+        loaded, _ = analysis.load_checkpoint(path, "cpu")
+        tokens = torch.randint(0, 97, (2, 7))
+        with torch.no_grad():
+            expected = model.forward_column(model.embed_tokens(tokens)).h_top
+            actual = loaded.forward_column(loaded.embed_tokens(tokens)).h_top
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("version", [25, 28])
+def test_analysis_rejects_unsupported_checkpoint_versions(tmp_path, version):
+    _, path = snapshot(tmp_path)
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    payload["version"] = version
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="unsupported checkpoint version"):
+        analysis.load_checkpoint(path, "cpu")
 
 
 def test_token_ce_matches_sequence_ce(tmp_path):

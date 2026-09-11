@@ -24,12 +24,11 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from transformer_experiments import checkpoints
 
 from delta_feedback_experiment.analysis import config_from_args
 from delta_feedback_experiment.model import DeltaModel
 from delta_feedback_experiment.parameter_groups import is_normuonh_parameter
-from delta_feedback_experiment.train import CONTRACT
+from delta_feedback_experiment.train import read_checkpoint
 
 MATRIX_FAMILIES = ("attn_matrix", "mlp_matrix", "pkda_control", "router", "norms", "attn_gate", "embedding", "final_norm")
 
@@ -108,8 +107,8 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=None)
     args = parser.parse_args()
 
-    pa = checkpoints.read(args.a, CONTRACT, map_location="cpu")
-    pb = checkpoints.read(args.b, CONTRACT, map_location="cpu")
+    pa = read_checkpoint(args.a)
+    pb = read_checkpoint(args.b)
     saved_a, saved_b = pa["args"], pb["args"]
     if saved_a["seed"] != saved_b["seed"]:
         raise SystemExit("the snapshots were initialized from different seeds; nothing is paired")

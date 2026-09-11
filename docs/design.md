@@ -9,20 +9,26 @@ budgets; [interpretability](interpretability.md) owns the analysis scripts.
 ## Conditions
 
 A condition is a string of letters from `arfl`, each one change from the
-plain twelve-layer gated NoPE GQA decoder. `parse_condition` accepts the
+plain twelve-layer gated GQA decoder. `parse_condition` accepts the
 letters in any order and returns them in that order; the empty string is the
 plain decoder, and `ModelConfig.condition` renders a configuration's letters
 back.
 
 | Letter | Change | `ModelConfig` flag |
 |---|---|---|
-| `a` | Kimi Delta Attention: PKDA in three of every four attention layers, `[PKDA, PKDA, PKDA, gated global GQA] x 3` | `hybrid` |
+| `a` | Kimi Delta Attention: replace the three RoPE-GGQA layers per cell with PKDA, giving `[PKDA, PKDA, PKDA, NoPE-GGQA] x 3` | `hybrid` |
 | `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
 | `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
 | `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([architecture.md](architecture.md#letter-l-the-tied-depth-loop)) | `loop` |
 
 Every subset of `arfl` builds; their parameter counts at the screen are in
 [scaling.md](scaling.md#the-screen).
+
+Without `a`, each cell is `[RoPE-GGQA, RoPE-GGQA, RoPE-GGQA, NoPE-GGQA]`.
+This partial use of RoPE selects layers, with full-head Q/K rotation after
+per-head RMSNorm at theta 10,000. The fourth layer stays NoPE in every
+condition. The pattern holds at every scale and core iteration and adds no
+learned parameters or recipe knob.
 
 `arfl` is the full built stack and `arf` the flat column. `a` alone already
 has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
@@ -57,7 +63,7 @@ and gradients.
 The screen, the bridge, and the flagship, with their parameter and cache
 accounting and their budgets, are in [scaling.md](scaling.md). The screen is width 768,
 twelve layers in three cells, and context 4,096; under `a` the trunk is
-`[PKDA, PKDA, PKDA, gated global GQA] x 3`, and under `l` the first cell is
+`[PKDA, PKDA, PKDA, NoPE-GGQA] x 3`, and under `l` the first cell is
 the prelude, the last the coda, and the one between them the tied core, run
 `r` times per column.
 
@@ -254,7 +260,7 @@ rounded up to whole steps, and every condition at a scale shares it.
 
 | Flag | Default | What it changes |
 |---|---:|---|
-| `--condition` | `""` | letters from `arfl` in any order; empty is the plain decoder |
+| `--condition` | `""` | letters from `arfl` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
 | `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule (25 is the screen recipe, 400 the Prime recipes) |
 | `--steps` | derived | schedule length, typed instead of derived |
@@ -268,16 +274,18 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--jitter` | 0.02 | payload jitter half-width |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v26 snapshot |
+| `--resume` | | continues a tag from its latest supported snapshot: v27, or v26 with `a` |
 
 The specimens so far used the default recipe (`ar`) and
 `--feedback-start 0 --three-pass 1` (`arf`); see [findings.md](findings.md).
 
 ### Checkpoints and queue
 
-Snapshots use checkpoint contract v26, and only v26 loads, for resume,
-evaluation, and forks alike. Every snapshot records its condition
-as letters. A snapshot holds the model, both
+New snapshots use checkpoint contract v27. Resume, evaluation, and forks
+accept v27 for every condition and v26 for conditions with `a`, whose
+computation is unchanged. A v26 snapshot without `a` is rejected because its
+all-NoPE trunk does not match the current RoPE/NoPE pattern. Every snapshot
+records its condition as letters. A snapshot holds the model, both
 optimizer states, the fixed NorMuonH radii, the state-defining arguments, the
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,

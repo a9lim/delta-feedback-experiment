@@ -13,6 +13,7 @@ import torch
 import delta_feedback_experiment.model as model_module
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
+from delta_feedback_experiment.train import read_checkpoint
 
 
 def main() -> None:
@@ -24,7 +25,7 @@ def main() -> None:
     options = parser.parse_args()
     options.output.mkdir(parents=True, exist_ok=True)
     torch.set_float32_matmul_precision("high")
-    payload = torch.load(options.snapshot, map_location="cpu", weights_only=False)
+    payload = read_checkpoint(options.snapshot)
     saved = analysis.saved_args(payload)
     model = model_module.DeltaModel(analysis.config_from_args(saved))
     model.load_state_dict(payload["state"])
