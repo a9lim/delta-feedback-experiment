@@ -256,6 +256,13 @@ division by two matches the variance of four independent, equal-variance
 expert outputs to one dense output at equal gates. This is an initialization
 scaling rationale, not a guarantee about learned output variance.
 
+Hard top-three routing is discontinuous at expert-selection boundaries.
+BF16 differences between full-row and cached execution can swap near-tied
+experts and amplify hidden-state differences, even with FP32 router logits.
+The probe checks causal prefixes, full-precision cache agreement, and BF16
+cache arithmetic with expert choices held fixed; unrestricted BF16 decode
+drift is reported separately.
+
 The expert matrices have four times the dense FFN's stored parameters and
 the same active matrix arithmetic per token. The router adds `15D` parameters
 per layer and dispatch overhead. Shared and finely segmented experts follow

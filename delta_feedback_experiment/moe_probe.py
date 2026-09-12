@@ -268,81 +268,17 @@ def _compiled_replay() -> None:
         raise AssertionError("MoE shadow surface omits an expert projection")
 
 
-def _decode_parity() -> dict[str, float]:
-    """Sparse BF16 inference stays token-causal through cached recurrence."""
-    from .model import DeltaModel, KVCache, condition_config
-
-    errors = {}
-    for condition, layers in (("e", 4), ("aerfl", 12)):
-        torch.manual_seed(101)
-        config = condition_config(
-            condition,
-            vocab_size=257,
-            dim=128,
-            layers=layers,
-            heads=4,
-            kv_heads=2,
-            head_dim=32,
-            intermediate=256,
-            pkda_heads=2,
-            pkda_head_dim=128,
-            max_seq_len=32,
-            loop_iterations=2,
-            loop_max_iterations=2,
-        )
-        model = DeltaModel(config).cuda().eval()
-        tokens = torch.randint(0, config.vocab_size, (1, 13), device="cuda")
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            embeddings = model.embed_tokens(tokens)
-            whole = model.forward_column(embeddings, want_weights=True)
-            changed = tokens.clone()
-            changed[:, 7:] = (changed[:, 7:] + 1) % config.vocab_size
-            future = model.forward_column(model.embed_tokens(changed), want_weights=True)
-            errors[f"{condition}.causal"] = _close(
-                f"{condition} causal prefix", future.h_top[:, :7], whole.h_top[:, :7], 1e-6
-            )
-            for site, weights in whole.expert_weights.items():
-                if not torch.equal(weights[:, :7], future.expert_weights[site][:, :7]):
-                    raise AssertionError(f"future tokens altered expert choice at {site}")
-
-            cache = KVCache(config, 1, "cuda", torch.bfloat16)
-            prefill = model.forward_column(embeddings[:, :5], cache=cache)
-            pieces = [prefill.h_top]
-            for column in range(5, tokens.shape[1]):
-                pieces.append(model.step(tokens[:, column : column + 1], None, cache).h_top)
-            errors[f"{condition}.cache"] = _close(
-                f"{condition} cached decode", torch.cat(pieces, dim=1), whole.h_top, 0.08
-            )
-            if config.feedback:
-                cache = KVCache(config, 1, "cuda", torch.bfloat16)
-                prefill = model.forward_column(embeddings[:, :5], cache=cache)
-                payload = prefill.payload[:, -1:]
-                pieces = []
-                reference_rows = embeddings[:, :5]
-                for column in range(5, tokens.shape[1]):
-                    result = model.step(tokens[:, column : column + 1], payload, cache)
-                    pieces.append(result.h_top)
-                    payload = result.payload
-                    previous = model.forward_column(reference_rows).payload[:, -1:]
-                    reference_rows = torch.cat(
-                        [reference_rows, model.fuse(previous, embeddings[:, column : column + 1])],
-                        dim=1,
-                    )
-                reference = model.forward_column(reference_rows).h_top[:, 5:]
-                errors[f"{condition}.feedback"] = _close(
-                    f"{condition} cached feedback", torch.cat(pieces, dim=1), reference, 0.10
-                )
-    return errors
-
-
 @torch.no_grad()
-def _decode_diagnostics() -> dict:
-    """Separate hard-router sensitivity from cache semantics on the failed seed.
+def _decode_parity() -> dict[str, float]:
+    """Qualify cache semantics separately from BF16 hard-routing sensitivity.
 
-    The fixed-route control intervenes only on top-k indices. It still uses
-    the CUDA sparse expert kernels and current-input mixing probabilities.
-    This is a diagnostic, not a different deployed inference path.
+    BF16 mixer rounding can move a near-tied third/fourth expert boundary.
+    Report ordinary BF16 trajectories; hold fixed decisions to the component
+    rounding bound and prove the full standard/feedback cache semantics with
+    the same parameters and tokens in the portable FP32 equations.
     """
+    from contextlib import contextmanager
+
     from torch.utils._python_dispatch import TorchDispatchMode
 
     from .model import DeltaModel, KVCache, condition_config
@@ -363,7 +299,26 @@ def _decode_diagnostics() -> dict:
                 return logits.gather(-1, selected), selected
             return func(*args, **(kwargs or {}))
 
-    def cached(model, tokens, dtype, fixed=None):
+    @contextmanager
+    def fixed_routes(model, weights):
+        fixed = _FixedRoutes([value.topk(3).indices for value in weights.values()])
+        originals = [(block.mlp, block.mlp.forward) for block in model.blocks]
+        # Intervene only on the discrete expert decision, keeping its current
+        # logits, mixture probabilities, and sparse CUDA arithmetic. Compiled
+        # attention must remain outside this diagnostic dispatch mode.
+        for module, original in originals:
+            def routed_forward(*args, forward=original, route_mode=fixed, **kwargs):
+                with route_mode:
+                    return forward(*args, **kwargs)
+
+            module.forward = routed_forward
+        try:
+            yield fixed
+        finally:
+            for module, original in originals:
+                module.forward = original
+
+    def standard(model, tokens, dtype, fixed=None):
         cache = KVCache(model.cfg, 1, tokens.device, dtype)
         if fixed is not None:
             fixed.column = 0
@@ -386,20 +341,40 @@ def _decode_diagnostics() -> dict:
             },
         )
 
-    results = {}
-    token_fixture = None
-    for condition, device, bf16 in (
-        ("aerfl", "cuda", True),
-        ("arfl", "cuda", True),
-        ("aerfl", "cuda", False),
-        ("aerfl", "cpu", False),
-    ):
+    def feedback(model, tokens, dtype):
+        embeddings = model.embed_tokens(tokens)
+        cache = KVCache(model.cfg, 1, tokens.device, dtype)
+        prefill = model.forward_column(embeddings[:, :5], cache=cache, want_weights=True)
+        payload = prefill.payload[:, -1:]
+        pieces = []
+        reference_rows = embeddings[:, :5]
+        for column in range(5, tokens.shape[1]):
+            result = model.step(
+                tokens[:, column : column + 1], payload, cache, want_weights=True
+            )
+            pieces.append(result.h_top)
+            payload = result.payload
+            previous = model.forward_column(reference_rows, want_weights=True).payload[:, -1:]
+            reference_rows = torch.cat(
+                [reference_rows, model.fuse(previous, embeddings[:, column : column + 1])],
+                dim=1,
+            )
+        reference = model.forward_column(reference_rows, want_weights=True).h_top[:, 5:]
+        return torch.cat(pieces, dim=1), reference
+
+    def finite_relative(label, actual, expected):
+        if not torch.isfinite(actual).all() or not torch.isfinite(expected).all():
+            raise AssertionError(f"MoE ordinary BF16 {label} produced nonfinite outputs")
+        return _relative(actual, expected)
+
+    errors = {}
+    for condition, layers in (("e", 4), ("aerfl", 12)):
         torch.manual_seed(101)
         config = condition_config(
             condition,
             vocab_size=257,
             dim=128,
-            layers=12,
+            layers=layers,
             heads=4,
             kv_heads=2,
             head_dim=32,
@@ -410,93 +385,61 @@ def _decode_diagnostics() -> dict:
             loop_iterations=2,
             loop_max_iterations=2,
         )
-        model = DeltaModel(config).to(device).eval()
-        if token_fixture is None:
-            token_fixture = torch.randint(0, 257, (1, 13), device="cuda").cpu()
-        tokens = token_fixture.to(device)
-        recorded = []
-
-        def record(module, inputs, captured=recorded):
-            captured.append(inputs[0].detach())
-
-        handles = [
-            block.mlp.register_forward_pre_hook(record)
-            for block in model.blocks
-            if isinstance(block.mlp, MixtureOfExperts)
-        ]
-        dtype = torch.bfloat16 if bf16 else torch.float32
-        label = f"{condition}.{device}.{'bf16' if bf16 else 'fp32'}"
-        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=bf16):
+        model = DeltaModel(config).cuda().eval()
+        tokens = torch.randint(0, config.vocab_size, (1, 13), device="cuda")
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             whole = model.forward_column(model.embed_tokens(tokens), want_weights=True)
-            full_inputs = tuple(recorded)
-            recorded.clear()
-            incremental, incremental_weights = cached(model, tokens, dtype)
-            result = {"relative": _relative(incremental, whole.h_top)}
-            sites = list(whole.expert_weights)
-            swaps = []
-            for index, site in enumerate(sites):
-                expected = whole.expert_weights[site]
-                actual = incremental_weights[site]
-                changed = expected.ne(0).ne(actual.ne(0)).any(dim=-1)
-                if not changed.any():
-                    continue
-                position = int(torch.where(changed[0])[0][0])
-                cached_inputs = torch.cat(recorded[index::len(sites)], dim=1)
-                full_input = full_inputs[index][0, position]
-                cached_input = cached_inputs[0, position]
-                # The executed order supplies each module across core repeats.
-                execution = list(range(4)) + list(range(4, 8)) * 2 + list(range(8, 12))
-                router = model.blocks[execution[index]].mlp.router
-                with torch.autocast(device_type=device, enabled=False):
-                    full_logits = F.linear(full_input.float(), router.weight.float())
-                    cached_logits = F.linear(cached_input.float(), router.weight.float())
-                full_top = full_logits.topk(4).values
-                cached_top = cached_logits.topk(4).values
-                swaps.append(
-                    {
-                        "site": site,
-                        "swapped_tokens": int(changed.sum()),
-                        "first_position": position,
-                        "full_experts": expected[0, position].nonzero().flatten().tolist(),
-                        "cached_experts": actual[0, position].nonzero().flatten().tolist(),
-                        "full_margin": float(full_top[2] - full_top[3]),
-                        "cached_margin": float(cached_top[2] - cached_top[3]),
-                        "max_logit_delta": float((full_logits - cached_logits).abs().max()),
-                        "input_relative": _relative(cached_input, full_input),
-                    }
+            changed = tokens.clone()
+            changed[:, 7:] = (changed[:, 7:] + 1) % config.vocab_size
+            future = model.forward_column(model.embed_tokens(changed), want_weights=True)
+            errors[f"{condition}.causal"] = _close(
+                f"{condition} causal prefix", future.h_top[:, :7], whole.h_top[:, :7], 1e-6
+            )
+            for site, weights in whole.expert_weights.items():
+                if not torch.equal(weights[:, :7], future.expert_weights[site][:, :7]):
+                    raise AssertionError(f"future tokens altered expert choice at {site}")
+            incremental, incremental_weights = standard(model, tokens, torch.bfloat16)
+            errors[f"{condition}.bf16_raw"] = finite_relative(
+                f"{condition} standard", incremental, whole.h_top
+            )
+            errors[f"{condition}.swapped_sites_tokens"] = sum(
+                int(weights.ne(0).ne(incremental_weights[site].ne(0)).any(dim=-1).sum())
+                for site, weights in whole.expert_weights.items()
+            )
+            with fixed_routes(model, whole.expert_weights) as fixed:
+                pinned, pinned_weights = standard(model, tokens, torch.bfloat16, fixed)
+            for site, weights in whole.expert_weights.items():
+                if not torch.equal(weights.ne(0), pinned_weights[site].ne(0)):
+                    raise AssertionError(f"route-conditioned cache control changed {site}")
+            errors[f"{condition}.bf16_fixed"] = _close(
+                f"{condition} route-conditioned BF16 cache", pinned, whole.h_top, 0.08
+            )
+            if config.feedback:
+                actual, expected = feedback(model, tokens, torch.bfloat16)
+                errors[f"{condition}.feedback_bf16_raw"] = finite_relative(
+                    f"{condition} feedback", actual, expected
                 )
-            result["route_disagreements"] = swaps
-            print(f"MoE decode diagnostic {label}: {result}", flush=True)
-            if sites and bf16:
-                fixed = _FixedRoutes([whole.expert_weights[site].topk(3).indices for site in sites])
-                originals = [
-                    (block.mlp, block.mlp.forward)
-                    for block in model.blocks
-                    if isinstance(block.mlp, MixtureOfExperts)
-                ]
-                # Limit dispatch interception to the MoE itself. Attention
-                # retains its compiled CUDA path and never sees this mode.
-                for module, original in originals:
-                    def routed_forward(*args, forward=original, route_mode=fixed, **kwargs):
-                        with route_mode:
-                            return forward(*args, **kwargs)
 
-                    module.forward = routed_forward
-                try:
-                    pinned, _ = cached(model, tokens, dtype, fixed=fixed)
-                finally:
-                    for module, original in originals:
-                        module.forward = original
-                result["fixed_route_relative"] = _relative(pinned, whole.h_top)
-                print(
-                    f"MoE decode diagnostic {label}: "
-                    f"fixed_route_relative={result['fixed_route_relative']:.6g}",
-                    flush=True,
-                )
-        for handle in handles:
-            handle.remove()
-        results[label] = result
-    return results
+        # CUDA FP32 still exercises the actual sparse kernels and cache tracks.
+        with torch.autocast("cuda", enabled=False):
+            whole = model.forward_column(model.embed_tokens(tokens), want_weights=True)
+            incremental, _ = standard(model, tokens, torch.float32)
+            errors[f"{condition}.cuda_fp32"] = _close(
+                f"{condition} CUDA FP32 cache", incremental, whole.h_top, 0.01
+            )
+        portable = copy.deepcopy(model).cpu().eval()
+        cpu_tokens = tokens.cpu()
+        whole = portable.forward_column(portable.embed_tokens(cpu_tokens), want_weights=True)
+        incremental, _ = standard(portable, cpu_tokens, torch.float32)
+        errors[f"{condition}.cpu_fp32"] = _close(
+            f"{condition} portable FP32 cache", incremental, whole.h_top, 1e-4
+        )
+        if config.feedback:
+            actual, expected = feedback(portable, cpu_tokens, torch.float32)
+            errors[f"{condition}.feedback_cpu_fp32"] = _close(
+                f"{condition} portable FP32 feedback cache", actual, expected, 1e-4
+            )
+    return errors
 
 
 def _screen_capture(
