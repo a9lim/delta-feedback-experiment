@@ -24,7 +24,7 @@ def cuda_probe() -> None:
     an execution smoke, not compiler or production-memory qualification.
     """
     from .model import DeltaModel, KVCache, condition_config
-    from .optim import build_optimizers
+    from .optim import apply_schedule, build_optimizers
     from .train import (
         CudaEvalRunner,
         CudaGraphTrainer,
@@ -112,8 +112,22 @@ def cuda_probe() -> None:
     optimizers = build_optimizers(
         model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam
     )
+    expected_rates = {
+        "normuonh": args.lr_normuonh,
+        "normuonh_expert_in": args.lr_normuonh * cfg.expert_in_lr_scale,
+        "normuonh_expert_out": args.lr_normuonh * cfg.expert_out_lr_scale,
+        "nadam": args.lr_nadam,
+        "nadam_width": args.lr_nadam * cfg.mup_ratio,
+    }
     print("cuda probe | preparing one tiny training graph", flush=True)
-    runner = ProbeTrainer(model, optimizers, args, build_schedule(args))
+    schedule = build_schedule(args)
+    runner = ProbeTrainer(model, optimizers, args, schedule)
+    # State materialization temporarily sets every LR to zero; all five
+    # independently scheduled rates must survive that initialization.
+    assert {
+        group["rate_name"]: group["lr"]
+        for optimizer in optimizers for group in optimizer.param_groups
+    } == expected_rates
     data = Rows()
     spec = next(iter(runner.states))
     expert_parameters = {
@@ -123,6 +137,10 @@ def cuda_probe() -> None:
     assert expert_parameters <= runner.grad_buffers.keys()
     initial = model.embed_tokens.weight.detach().clone()
     for step in (1, 2):
+        rates = apply_schedule(optimizers, schedule, step)
+        assert rates == {
+            name: schedule.rate_at(step, base) for name, base in expected_rates.items()
+        }
         runner.zero_grad()
         state = runner.begin(spec, args.zloss)
         runner.replay_batch(state, data, step, 0)

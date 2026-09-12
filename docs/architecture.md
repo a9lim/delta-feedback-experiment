@@ -779,8 +779,9 @@ it by `sqrt(1536/D)`. Embeddings and PKDA fixed-head-width expansions use
 0.02 directly. This preserves initial control-logit variance across widths.
 `MUP_BASE_DIM` stays at the flagship width 1,536: extension uses a width ratio
 of `1536/2304 = 2/3` for NAdam rates and readout scaling, and its square root
-for the specified initialization scales. Adding extension leaves the other
-presets' initialization and rates unchanged.
+for the specified initialization scales. The reference does not depend on
+the largest configured preset. Expert optimizer rates have their own factors
+below; they do not change initialization or forward computation.
 Depthwise convolutions retain Kaiming-uniform initialization. RMSNorm scales
 start at one; MHDB queries and nulls start at zero.
 
@@ -804,8 +805,23 @@ sink per call; cadence 1 therefore gives per-call precision throughout.
 
 ## NorMuonH and NAdam
 
-Three disjoint groups share the warmup-stable-cooldown schedule with no weight
-decay: NorMuonH, base NAdam, and width-scaled NAdam.
+Five disjoint parameter groups across two optimizers share the
+warmup-stable-cooldown multiplier with no weight decay:
+
+| Group | Parameters | Peak learning rate |
+|---|---|---|
+| `normuonh` | Ordinary NorMuonH matrices outside experts | `lr_normuonh` |
+| `normuonh_expert_in` | Shared and routed expert gate/up matrices | `lr_normuonh * sqrt(1536/D)` |
+| `normuonh_expert_out` | Shared and routed expert down matrices | `lr_normuonh * sqrt(8/(k+1))` |
+| `nadam` | Base NAdam parameters | `lr_nadam` |
+| `nadam_width` | NAdam matrices with residual-width fan-in | `lr_nadam * 1536/D` |
+
+Here `k` is the selected routed expert count, so `k+1` includes the shared
+expert. Both expert groups include every trunk bank and the auxiliary MTP
+bank. Input and output factors are computed separately: the former follows
+residual width and the latter active expert count. They coincide at the
+presets but can differ for custom geometry. The references are the flagship
+width 1,536 and its eight active experts.
 
 ### NorMuonH matrices
 
@@ -818,10 +834,16 @@ M_t = .95 M_(t-1) + .05 G_t
 N_t = .05 G_t + .95 M_t
 U = five_Newton_Schulz_steps(N_t)
 U = row_second_moment_normalize(U, beta=.95, eps=1e-8)
-W_next = R * Normalize_F(W - lr_normuonh * R * Normalize_F(U))
+eta_t = schedule_multiplier(t) * group_peak_lr
+W_next = R * Normalize_F(W - eta_t * R * Normalize_F(U))
 ```
 
-The default relative rate is `6e-3`. CUDA compiles updates by shape bucket.
+The default base relative rate is `6e-3`; the expert groups apply the factors
+above. A Frobenius-relative step alone does not establish equal functional
+updates across widths or expert counts. These factors are an implemented
+scaling candidate; full-model hyperparameter transfer remains unestablished.
+[Scaling](scaling.md#expert-learning-rates) lists the preset rates.
+CUDA compiles updates by shape bucket within each group.
 Packing is bounded to 33,554,432 matrix elements (128 MiB per FP32 tensor),
 except larger individual matrices remain whole. State stays per-parameter.
 

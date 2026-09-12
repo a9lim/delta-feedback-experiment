@@ -2,9 +2,11 @@
 NAdam for parameters whose norm carries semantic information, under one WSD
 learning-rate multiplier.
 
-NorMuonH's relative step is width-invariant. NAdam's is not, so its group
-splits in two: the matrices whose fan-in is the residual width run at the
-base rate times the muP width ratio ``MUP_BASE_DIM / dim``, every other NAdam
+NorMuonH uses its base relative step for ordinary hidden matrices. Expert
+gate/up maps use sqrt(1536 / dim), and expert down maps use sqrt(8 / (k+1)),
+where k is the selected routed count; both shared and MTP experts follow
+these rules. NAdam splits in two: matrices whose fan-in is the residual width
+run at the base rate times the muP width ratio ``MUP_BASE_DIM / dim``, every other NAdam
 parameter at the base rate. ``lr_nadam`` is therefore the rate at the
 flagship width, and the tied readout carries the same ratio as a logit
 multiplier inside the model.
@@ -25,7 +27,11 @@ from collections import defaultdict
 import torch
 from torch import Tensor
 
-from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
+from .parameter_groups import (
+    is_normuonh_parameter,
+    is_width_scaled_parameter,
+    normuonh_rate_name,
+)
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
@@ -284,29 +290,29 @@ class NorMuonH(torch.optim.Optimizer):
         return loss
 
 
-def split_parameters(model: torch.nn.Module) -> tuple[list, list, list]:
-    """Partition trainable parameters into the NorMuonH group and the two
-    NAdam groups: base and width-scaled.
+def split_parameters(model: torch.nn.Module) -> dict[str, list[torch.nn.Parameter]]:
+    """Partition all trainable parameters into five disjoint scheduled groups.
 
-    Ordinary hidden 2D weights get NorMuonH, including PKDA Q/K/V/output
-    projections and the FBT value projection. The NAdam matrices with fan-in
-    ``D``, the global-attention gates, the FBT token gate, and PKDA's packed
-    control projection, form the width-scaled group. The tied
-    embedding/unembedding, PKDA's decay and output-gate expansions, norms,
-    depthwise convolutions, routing parameters, and vectors form the base
-    group.
+    NorMuonH separates ordinary hidden matrices from expert gate/up and down
+    projections. NAdam separates residual-width controls/routers from its
+    base-rate embeddings, fixed-head-width expansions, and vectors.
     """
-    matrices, nadam, width = [], [], []
+    groups = {
+        name: [] for name in (
+            "normuonh", "normuonh_expert_in", "normuonh_expert_out",
+            "nadam", "nadam_width",
+        )
+    }
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
         if is_normuonh_parameter(name, parameter):
-            matrices.append(parameter)
+            groups[normuonh_rate_name(name)].append(parameter)
         elif is_width_scaled_parameter(name, parameter):
-            width.append(parameter)
+            groups["nadam_width"].append(parameter)
         else:
-            nadam.append(parameter)
-    return matrices, nadam, width
+            groups["nadam"].append(parameter)
+    return groups
 
 
 def build_optimizers(
@@ -318,41 +324,43 @@ def build_optimizers(
 ) -> list[torch.optim.Optimizer]:
     """Build the authoritative NorMuonH/NAdam stack with stable WSD rates.
 
-    ``lr_nadam`` is the base NAdam rate, the rate at the muP reference width;
-    the width-scaled group runs at ``lr_nadam * model.cfg.mup_ratio``.
+    Expert input/output factors modify the final NorMuonH relative step,
+    after gradient normalization. Initialization and Frobenius radii retain
+    their fan-in contract. The two expert factors remain independent under
+    geometry overrides, even though they coincide at the four presets.
     """
-    matrices, nadam_parameters, width_parameters = split_parameters(model)
+    parameters = split_parameters(model)
+    rates = {
+        "normuonh": lr_normuonh,
+        "normuonh_expert_in": lr_normuonh * model.cfg.expert_in_lr_scale,
+        "normuonh_expert_out": lr_normuonh * model.cfg.expert_out_lr_scale,
+        "nadam": lr_nadam,
+        "nadam_width": lr_nadam * model.cfg.mup_ratio,
+    }
+
+    def group(name):
+        return {
+            "params": parameters[name],
+            "lr": rates[name],
+            "rate_name": name,
+            "stable_lr": rates[name],
+        }
+
     normuonh = NorMuonH(
-        matrices,
+        [group(name) for name in ("normuonh", "normuonh_expert_in", "normuonh_expert_out")],
         lr=lr_normuonh,
         max_bucket_elements=32 * 1024 * 1024,
     )
-    lr_width = lr_nadam * model.cfg.mup_ratio
+    nadam_parameters = parameters["nadam"]
     use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda
     nadam = torch.optim.NAdam(
-        [
-            {
-                "params": nadam_parameters,
-                "lr": lr_nadam,
-                "rate_name": "nadam",
-                "stable_lr": lr_nadam,
-            },
-            {
-                "params": width_parameters,
-                "lr": lr_width,
-                "rate_name": "nadam_width",
-                "stable_lr": lr_width,
-            },
-        ],
+        [group("nadam"), group("nadam_width")],
         lr=lr_nadam,
         betas=nadam_betas,
         eps=1e-8,
         momentum_decay=NADAM_MOMENTUM_DECAY,
         foreach=use_foreach_nadam,
     )
-    for group in normuonh.param_groups:
-        group["rate_name"] = "normuonh"
-        group["stable_lr"] = lr_normuonh
     return [normuonh, nadam]
 
 

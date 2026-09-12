@@ -29,7 +29,7 @@ Generated runs, logs, figures, token stores, and fetched papers are untracked.
 Preserve the model's causal and numerical contracts: differentiable feedback
 and core iterations, telescoping block deltas, paired initialization and keyed
 randomness, FP32 accumulated gradients, and exact resume of current snapshots.
-Checkpoint v32 and the tokenizer identity define the current stored format.
+Checkpoint v33 and the tokenizer identity define the current stored format.
 Use the existing readers and CLI for checkpoints and run lifecycle actions.
 
 ## Runtime

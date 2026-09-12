@@ -261,7 +261,8 @@ cell-tokens beside pass-tokens.
 
 ### Schedule
 
-All three parameter groups share one warmup-stable-cooldown multiplier.
+All five parameter groups across the two optimizers share one
+warmup-stable-cooldown multiplier.
 Warmup rises linearly over
 `round(warmup_frac * min(steps, steps at 25x))` updates. The default 2%
 warmup is therefore fixed per scale for runs at or above 25x: 192 updates
@@ -295,7 +296,8 @@ reference counts and larger budgets.
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | 4,096, 128, 1 at every scale | predictions per row, rows per step, and the microbatch; the scale keeps 524,288 predictions per step, as does a retyped `--seq-len` alone |
 | `--seed`, `--data-seed` | | initialization pairing and the keyed data/feedback streams |
-| `--lr-normuonh`, `--lr-nadam` | `6e-3`, `3e-4` | the NorMuonH relative step, and the base NAdam rate at the muP reference width 1536; the fan-in-`D` NAdam matrices run at `lr_nadam x 1536 / D` and the tied readout carries the same ratio |
+| `--lr-normuonh` | `6e-3` | base NorMuonH relative step; expert gate/up matrices multiply it by `sqrt(1536/D)` and expert down matrices by `sqrt(8/(k+1))`, where `k` is the selected routed expert count |
+| `--lr-nadam` | `3e-4` | base NAdam rate at reference width 1536; fan-in-`D` NAdam matrices run at `lr_nadam x 1536 / D` and the tied readout carries the same ratio |
 | `--feedback-start` | 0.75 | fraction of the schedule before the feedback boundary; 0 trains fused from step 0 |
 | `--three-pass` | 0.12 | probability of three passes after the boundary; 1 makes every feedback step three-pass |
 | `--loop-iterations`, `--loop-max-iterations` | 4, 8 | `l`: mean and cap of the per-step core iteration draw; the mean is also the fixed evaluation and decode count |
@@ -303,13 +305,15 @@ reference counts and larger budgets.
 | `--mtp-weight` | 0.3 | finite nonnegative weight for auxiliary cross-entropy and its z-loss, constant across the run |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v32 snapshot |
+| `--resume` | | continues a tag from its latest v33 snapshot |
 
 ### Checkpoints and queue
 
-Checkpoint v32 is the only accepted contract for resume, evaluation, and
-forks. Conditions are `f`, `l`, or `fl`; every state dictionary includes the
-payload writer and auxiliary PKDA/expert prediction parameters, and
+Checkpoint v33 is the only accepted contract for resume, evaluation, and
+forks. Its optimizer contract has three NorMuonH groups (`normuonh`,
+`normuonh_expert_in`, `normuonh_expert_out`) and two NAdam groups (`nadam`,
+`nadam_width`). Conditions are `f`, `l`, or `fl`; every state dictionary
+includes the payload writer and auxiliary PKDA/expert prediction parameters, and
 state-defining arguments include `mtp_weight`, `expert_intermediate`,
 `num_routed_experts`, and `experts_per_token`. Snapshots bind to the current
 GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token

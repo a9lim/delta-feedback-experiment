@@ -22,6 +22,16 @@ def is_normuonh_parameter(name: str, parameter: Tensor) -> bool:
     return parameter.ndim == 2 and not nadam_matrix
 
 
+def normuonh_rate_name(name: str) -> str:
+    """Separate expert input/output rates, including shared and MTP experts."""
+    if ".mlp.shared." in name or ".mlp.experts." in name:
+        if name.endswith(".gate_up_proj.weight"):
+            return "normuonh_expert_in"
+        if name.endswith(".down_proj.weight"):
+            return "normuonh_expert_out"
+    return "normuonh"
+
+
 def is_width_scaled_parameter(name: str, parameter: Tensor) -> bool:
     """Whether an NAdam-owned matrix reads the full residual width.
 

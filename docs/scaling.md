@@ -30,8 +30,8 @@ row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
 per step. Each stored row includes one additional target. Width multipliers
 and optimizer ownership are in [architecture.md](architecture.md#nadam-parameters).
 The muP reference stays at the flagship width 1,536. Extension's `1536/D`
-multiplier is `2/3`; adding this preset does not change existing presets'
-initialization, learning rates, or readout scaling.
+multiplier is `2/3` for NAdam width rates and readout scaling. Expert
+NorMuonH rates use the separate factors below.
 
 Each trunk and MTP FFN stores one shared plus `n` routed experts, with `k`
 routed experts selected per token. `expert_intermediate` is the actual
@@ -51,6 +51,32 @@ expert term. It runs once per training pass over `seq_len-1` positions, with
 a second vocabulary-loss call, and shares the embedding/final norm/readout.
 It does not execute in generation. Condition `l` retains the payload writer
 and omits the FBT entry; shared token budgets still use `f`.
+
+## Expert learning rates
+
+Shared and routed experts in the trunk and MTP use separate NorMuonH rates:
+
+```text
+gate/up peak LR = lr_normuonh * sqrt(1536 / D)
+down peak LR    = lr_normuonh * sqrt(8 / (k+1))
+```
+
+`k+1` counts the shared plus selected routed experts. The two factors match
+for every preset, but remain separate when residual width or selected count
+is overridden. With the default `lr_normuonh = 0.006`:
+
+| Scale | Gate/up factor | Down factor | Peak expert LR, both groups |
+|---|---:|---:|---:|
+| Screen | 1.414214 | 1.414214 | 0.00848528 |
+| Bridge | 1.154701 | 1.154701 | 0.00692820 |
+| Flagship | 1.000000 | 1.000000 | 0.00600000 |
+| Extension | 0.816497 | 0.816497 | 0.00489898 |
+
+All five groups share the schedule multiplier. Ordinary NorMuonH retains
+the base rate; NAdam uses its base or `1536/D` rate. The expert factors
+change optimizer updates only: forward normalization and initialization
+retain their own contracts. This is an implemented scaling candidate,
+without demonstrated full-model hyperparameter transfer across scales.
 
 ## Token budgets
 

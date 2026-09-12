@@ -71,10 +71,10 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
     assert torch.equal(want, got)
 
 
-def test_load_checkpoint_rejects_previous_expert_contract(tmp_path):
+def test_load_checkpoint_rejects_previous_optimizer_contract(tmp_path):
     _, path = snapshot(tmp_path)
     payload = torch.load(path, weights_only=False)
-    payload["version"] = 31
+    payload["version"] = 32
     torch.save(payload, path)
     with pytest.raises(ValueError, match="version"):
         analysis.load_checkpoint(path, "cpu")

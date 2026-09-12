@@ -408,9 +408,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 32
-    assert CONTRACT.resumable == frozenset({32})
-    assert CONTRACT.surface_version == 32
+    assert CONTRACT.version == 33
+    assert CONTRACT.resumable == frozenset({33})
+    assert CONTRACT.surface_version == 33
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(10.0)
@@ -484,6 +484,9 @@ def test_width_ladder_preserves_depth_and_ffn_capacity(
     assert cfg.heads == 2 * cfg.kv_heads
     assert cfg.pkda_heads * cfg.pkda_head_dim * 3 == dim * 5
     assert cfg.mup_ratio == 1536 / dim
+    assert cfg.expert_in_lr_scale == pytest.approx((1536 / dim) ** 0.5)
+    assert cfg.expert_out_lr_scale == pytest.approx((8 / (selected + 1)) ** 0.5)
+    assert cfg.expert_in_lr_scale == pytest.approx(cfg.expert_out_lr_scale)
     assert cfg.experts_per_token == selected and cfg.num_routed_experts == routed
     assert (selected + 1) * 832 * 3 == 13 * dim
     assert routed + 1 == 4 * (selected + 1)
@@ -732,7 +735,14 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
 
     identical(complete["state"], restored["state"])
     identical(complete["optimizer"], restored["optimizer"])
-    assert complete["version"] == CONTRACT.version == 32
+    assert complete["version"] == CONTRACT.version == 33
+    groups = complete["optimizer"]["stack"][0]["param_groups"]
+    assert [group["rate_name"] for group in groups] == [
+        "normuonh", "normuonh_expert_in", "normuonh_expert_out"
+    ]
+    assert [group["stable_lr"] for group in groups] == pytest.approx([
+        0.006, 0.006 * (1536 / 16) ** 0.5, 0.006 * (8 / 6) ** 0.5
+    ])
     assert any(
         value.count_nonzero()
         for name, value in restored["state"].items()

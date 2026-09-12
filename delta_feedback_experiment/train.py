@@ -56,7 +56,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=32, resumable=frozenset({32}), surface_version=32
+    version=33, resumable=frozenset({33}), surface_version=33
 )
 
 
@@ -344,7 +344,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-normuonh",
         type=float,
         default=DEFAULT_NORMUONH_LR,
-        help="dimensionless NorMuonH relative step (default: 0.006)",
+        help=(
+            "base NorMuonH relative step; expert gate/up maps multiply by "
+            "sqrt(1536/dim), expert down maps by sqrt(8/(experts-per-token+1)) "
+            "(default: 0.006)"
+        ),
     )
     recipe.add_argument(
         "--lr-nadam",
@@ -1613,6 +1617,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             grad_clip=GRAD_CLIP_NORM,
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
+            expert_in_lr_scale=model.cfg.expert_in_lr_scale,
+            expert_out_lr_scale=model.cfg.expert_out_lr_scale,
             expert_shared=1,
             expert_routed=model.cfg.num_routed_experts,
             expert_top_k=model.cfg.experts_per_token,
@@ -1793,6 +1799,12 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 fields["r"] = iterations
             fields |= {
                 "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
+                "lr_normuonh_expert_in": telemetry.format_metric(
+                    learning_rates["normuonh_expert_in"]
+                ),
+                "lr_normuonh_expert_out": telemetry.format_metric(
+                    learning_rates["normuonh_expert_out"]
+                ),
                 "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
                 "lr_nadam_width": telemetry.format_metric(
                     learning_rates["nadam_width"]

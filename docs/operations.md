@@ -154,7 +154,7 @@ outside `runs/`; custom output paths are not renamed. Both tags must be idle,
 with no queued references and no destination collision. Ordinary I/O failures
 roll back; a multi-file rename is not crash-atomic.
 
-Current snapshots use checkpoint v32 and the pinned tokenizer identity.
+Current snapshots use checkpoint v33 and the pinned tokenizer identity.
 Resume inherits state-defining settings and rejects explicit conflicts;
 runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and
