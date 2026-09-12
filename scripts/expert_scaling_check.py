@@ -3,7 +3,7 @@
 Compare production optimizer groups with an otherwise identical control whose
 expert input/output groups use the base NorMuonH rate. One learned MoE bank is
 trained for at most four steps against the fixed teacher ``sin(x)``; the same
-normalized batch is reused on every step and in both arms. Preset residual and
+normalized batch is reused on every step and in both arms. Screen residual and
 expert widths are divided by eight, while routed/selected counts and the real
 muP reference width stay unchanged. This is a coordinate-dynamics diagnostic,
 not evidence of language-model quality or hyperparameter transfer.
@@ -205,9 +205,6 @@ def run_arm(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument(
-        "--scales", nargs="+", choices=tuple(SCALES), default=list(SCALES)
-    )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1])
     parser.add_argument("--steps", type=int, choices=range(1, 5), default=4)
     parser.add_argument("--threads", type=int, default=1)
@@ -222,13 +219,21 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     started = time.perf_counter()
     device = torch.device(args.device)
+    preset = SCALES["screen"]
+    cfg = ModelConfig(
+        dim=preset["dim"] // WIDTH_DIVISOR,
+        expert_intermediate=preset["expert_intermediate"] // WIDTH_DIVISOR,
+        num_routed_experts=preset["num_routed_experts"],
+        experts_per_token=preset["experts_per_token"],
+    )
     generator = torch.Generator().manual_seed(DATA_SEED)
-    raw = torch.randn(
+    batch = torch.randn(
         BATCH_ROWS,
         SEQUENCE_LENGTH,
-        max(preset["dim"] for preset in SCALES.values()) // WIDTH_DIVISOR,
+        cfg.dim,
         generator=generator,
     )
+    batch /= batch.square().mean(dim=-1, keepdim=True).sqrt()
     report = {
         "purpose": "single-bank coordinate dynamics under paired expert learning rates",
         "limitations": [
@@ -248,7 +253,7 @@ def main() -> None:
             "batch_rows": BATCH_ROWS,
             "sequence_length": SEQUENCE_LENGTH,
             "teacher": "sin(x), coordinatewise on the fixed execution-dtype input",
-            "input": "common Gaussian prefixes, normalized to unit RMS per token",
+            "input": "fixed Gaussian batch, normalized to unit RMS per token",
             "steps": args.steps,
             "schedule": "constant stable rates; no warmup or decay",
             "seeds": args.seeds,
@@ -262,21 +267,9 @@ def main() -> None:
             "expert_balance_coefficient": EXPERT_BALANCE_COEF,
             "expert_bias_rate": EXPERT_BIAS_RATE,
         },
-        "scales": [],
-    }
-    for name in args.scales:
-        preset = SCALES[name]
-        cfg = ModelConfig(
-            dim=preset["dim"] // WIDTH_DIVISOR,
-            expert_intermediate=preset["expert_intermediate"] // WIDTH_DIVISOR,
-            num_routed_experts=preset["num_routed_experts"],
-            experts_per_token=preset["experts_per_token"],
-        )
-        batch = raw[..., : cfg.dim].clone()
-        batch /= batch.square().mean(dim=-1, keepdim=True).sqrt()
-        report["scales"].append(
+        "scales": [
             {
-                "name": name,
+                "name": "screen",
                 "dim": cfg.dim,
                 "expert_intermediate": cfg.expert_intermediate,
                 "num_routed_experts": cfg.num_routed_experts,
@@ -287,7 +280,8 @@ def main() -> None:
                     for arm in ("production_rates", "base_expert_rates")
                 ],
             }
-        )
+        ],
+    }
     report["elapsed_seconds"] = time.perf_counter() - started
     serialized = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.output is None:

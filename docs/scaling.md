@@ -81,8 +81,10 @@ without demonstrated full-model hyperparameter transfer across scales.
 `python scripts/expert_scaling_check.py --device cuda --output /tmp/expert-scaling.json`
 records a bounded coordinate check with learned routing. It compares the
 implemented rates against base expert rates on identical initial weights and
-a fixed synthetic batch, using one bank per run at one-eighth residual and
-expert widths, the preset expert counts, and the real 1,536 reference.
+a fixed synthetic batch, using one screen bank per run at one-eighth residual
+and expert widths (`D=96`, `h=104`), screen expert counts, and the real 1,536
+reference. This diagnostic runs screen only; larger geometries are outside
+Jobe's execution scope.
 The JSON reports output changes, router logits/entropy, and gradient norms
 over four steps and two seeds; it is a diagnostic, not a transfer benchmark.
 Omit `--device cuda` for portable FP32 execution.
