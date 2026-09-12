@@ -283,11 +283,15 @@ def test_cached_decode_matches_full_recomputation(condition):
             new = model.fuse(reference_payload, new)
         reference_rows = torch.cat([reference_rows, new], dim=1)
         reference = model.forward_column(reference_rows)
-        # The two-cell core compounds FP32 full-row versus single-row GEMM
-        # rounding; retain a small absolute floor across CPU BLAS backends.
-        torch.testing.assert_close(
-            out.h_top, reference.h_top[:, -1:], atol=5e-5, rtol=1e-5
-        )
+        # The two-cell core compounds full-row versus single-row projection
+        # rounding. Bound both aggregate drift and spikes against state scale,
+        # including coordinates where the reference happens to cross zero.
+        expected = reference.h_top[:, -1:]
+        error = out.h_top - expected
+        relative_l2 = error.norm() / expected.norm().clamp_min(1e-6)
+        relative_peak = error.abs().max() / expected.square().mean().sqrt().clamp_min(1e-6)
+        assert relative_l2 < 1e-4, relative_l2.item()
+        assert relative_peak < 2e-4, relative_peak.item()
         payload = out.payload[:, -1:] if model.cfg.feedback else None
     assert cache.k.shape[0] == 6  # prelude + two cells * two iterations + coda
     assert len(cache.pkda_states) == 18
