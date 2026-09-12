@@ -14,8 +14,14 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@torch.compiler.set_stance("force_eager")
 def cuda_probe() -> None:
-    """Exercise the complete model with one captured recurrent training mode."""
+    """Exercise CUDA kernels and graph replay without Inductor compilation.
+
+    FLA, CCE, sparse experts, routing, and causal Flash SDPA use real CUDA
+    kernels. Cached attention uses FlexAttention's eager reference. This is
+    an execution smoke, not compiler or production-memory qualification.
+    """
     from .model import DeltaModel, KVCache, condition_config
     from .optim import build_optimizers
     from .train import (

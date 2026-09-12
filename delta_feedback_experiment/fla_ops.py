@@ -510,8 +510,10 @@ def _recurrence_setup_context(ctx, inputs, output) -> None:
 
 
 def _recurrence_backward(ctx, do, _dsaved):
-    inputs = ctx.saved_tensors[:10]
-    saved = list(ctx.saved_tensors[10:])
+    # Checkpoint recomputation permits each saved tensor to be unpacked once.
+    tensors = ctx.saved_tensors
+    inputs = tensors[:10]
+    saved = list(tensors[10:])
     scale, squash_x, squash_eps = ctx.scalars
     gradients = _pkda_recurrence_backward(
         *inputs, saved, do, scale, squash_x, squash_eps, ctx.autocast_dtype

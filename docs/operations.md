@@ -66,7 +66,10 @@ runs one tiny captured `fl` train/eval/decode smoke directly, without pytest.
 The portable suite covers focused model, training, and lifecycle invariants;
 neither path sweeps full geometry or condition matrices. Queue startup runs
 neither tests nor a probe. Run the probe explicitly after changing execution
-code or hardware. Inductor artifacts persist
+code or hardware. The CUDA smoke skips Inductor compilation and uses eager
+cached attention; it checks kernel execution and graph replay, not compiler
+output or production memory fit. First-use kernel JIT can still add startup
+time. Training's Inductor artifacts persist
 at `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
 that cache. Keep cyclic Python garbage collection outside graph capture.
 
