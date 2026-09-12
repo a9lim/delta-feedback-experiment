@@ -151,10 +151,13 @@ def main() -> None:
     args = parser.parse_args()
     torch.set_num_threads(4)
     device = torch.device(args.device)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")  # production trainer policy
     buckets = screen_buckets()
     shapes = sorted({(rows, cols) for rows, cols, _ in buckets})
     result = {
         "device": str(device), "torch": torch.__version__,
+        "matmul_precision": torch.get_float32_matmul_precision(),
         "power_steps": SPECTRAL_POWER_STEPS,
         "scope": "synthetic screen matrix samples and weighted bucket timings",
         "accuracy": [] if args.benchmark_only else accuracy(device, shapes),
