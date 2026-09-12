@@ -294,12 +294,16 @@ def test_cached_expert_forward_matches_full_sequence(condition):
     torch.testing.assert_close(
         torch.cat([out.h_top for out in columns], dim=1),
         full.h_top,
-        atol=2e-6,
+        # Tokenwise and full-row CPU GEMMs differ by a few FP32 ulps;
+        # this recurrent fixture reaches 2.5e-6 on Jobe's CPU backend.
+        atol=4e-6,
         rtol=2e-5,
     )
     for site, weights in full.expert_weights.items():
+        cached_weights = torch.cat([out.expert_weights[site] for out in columns], dim=1)
+        assert torch.equal(cached_weights.ne(0), weights.ne(0))
         torch.testing.assert_close(
-            torch.cat([out.expert_weights[site] for out in columns], dim=1),
+            cached_weights,
             weights,
             atol=2e-6,
             rtol=2e-5,
