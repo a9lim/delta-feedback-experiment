@@ -186,6 +186,7 @@ RUNTIME_FIELDS = (
     "snapshot_every",
     "eval_rows",
     "head_flush_every",
+    "checkpoint_margin_gib",
 )
 """Per-invocation settings: inherited unless retyped."""
 
@@ -428,6 +429,14 @@ def build_parser() -> argparse.ArgumentParser:
         "windows trade the head's gradient precision for the flush's bandwidth; "
         "microbatches wider than the window use per-call FP32 accumulation",
     )
+    runtime.add_argument(
+        "--checkpoint-margin-gib",
+        type=float,
+        default=DEFAULT_CHECKPOINT_MARGIN_GIB,
+        help="device memory kept free of retained activations when the trainer "
+        "plans rows per replay and recomputed blocks for each graph "
+        "(default: 3.5); raise it if capture or the optimizer step runs out of memory",
+    )
     return parser
 
 
@@ -550,37 +559,28 @@ def micro_draws(
     return prefix_out, jitter_out
 
 
-def automatic_checkpoint(
-    model: DeltaModel, n_passes: int, iterations: int, args, device
-) -> bool:
-    """Keep cell-final activations above the screen's raw-activation budget."""
-    if device.type != "cuda":
-        return False
-    cfg = model.cfg
-    # Reserve space for the permanent expert bank, sparse dispatch, and
-    # optimizer workspace. Retain the global-attention block of each cell
-    # when the executed token/layer volume exceeds this screen-scale budget.
-    raw_work = 4096 * 768 * 20
-    work = (
-        args.micro_rows
-        * args.seq_len
-        * cfg.dim
-        * (cfg.executed_layers(iterations) + 1)
-        * n_passes
-    )
-    return work > raw_work
+@dataclass(frozen=True)
+class GraphSpec:
+    """One captured training graph: its pass count and core iteration count."""
+
+    n_passes: int
+    iterations: int = 1
 
 
 @dataclass(frozen=True)
-class GraphSpec:
-    n_passes: int
-    checkpoint: bool
-    iterations: int = 1
+class ReplayPlan:
+    """How one graph executes: rows per replay and blocks recomputed in backward."""
+
+    rows_per_replay: int
+    checkpoint_blocks: int
+    eligible_blocks: int
+    estimated_gib: float
 
 
 @dataclass
 class CapturedMicro:
     spec: GraphSpec
+    plan: ReplayPlan
     rows: torch.Tensor
     prefix: torch.Tensor | None
     jitter: torch.Tensor | None
@@ -593,6 +593,63 @@ class CapturedMicro:
     expert_counts: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
     active: frozenset[torch.nn.Parameter] = frozenset()
+
+
+DEFAULT_CHECKPOINT_MARGIN_GIB = 3.5
+"""Device memory the activation budget leaves free: graph-pool rounding, the
+no-grad evaluation graphs, and the optimizer's packing temporaries. On the
+24 GiB card the retained activations can reach about 20 GiB allocated before
+the optimizer step runs out of memory."""
+
+PER_ROW_PASS_EXTRA_BYTES = 64 << 20
+"""Per-row, per-pass activations outside the blocks: the fused entry, jitter,
+payload chain, and head inputs."""
+
+ROW_MULTIPLES = (4, 2, 1)
+"""Rows-per-replay multiples of ``micro_rows`` a one-pass graph may use."""
+
+
+def block_invocations(cfg, spec: GraphSpec) -> tuple[int, int]:
+    """(all, checkpoint-eligible) block invocations of one logical forward.
+
+    Every pass runs its executed trunk layers plus the auxiliary block. The
+    PKDA blocks and the auxiliary block can recompute in backward; the
+    global-attention blocks stay retained.
+    """
+    executed = cfg.executed_layers(spec.iterations)
+    eligible = cfg.executed_pkda_layers(spec.iterations)
+    return spec.n_passes * (executed + 1), spec.n_passes * (eligible + 1)
+
+
+def plan_replay(
+    cfg, args, spec: GraphSpec, bytes_per_block: float, budget_bytes: float
+) -> ReplayPlan:
+    """Fit one graph into the activation budget.
+
+    A one-pass graph replays the largest row multiple whose raw activations
+    fit; keyed feedback draws address single microbatches, so multi-pass
+    graphs keep ``micro_rows``. When even one microbatch does not fit raw,
+    the first blocks of the logical forward recompute in backward, as many
+    as the shortfall needs.
+    """
+    blocks, eligible = block_invocations(cfg, spec)
+
+    def needed(rows: int) -> float:
+        return (rows / args.micro_rows) * blocks * bytes_per_block + (
+            spec.n_passes * rows * PER_ROW_PASS_EXTRA_BYTES
+        )
+
+    multiples = ROW_MULTIPLES if spec.n_passes == 1 else (1,)
+    for multiple in multiples:
+        rows = multiple * args.micro_rows
+        if args.batch_rows % rows:
+            continue
+        if needed(rows) <= budget_bytes:
+            return ReplayPlan(rows, 0, eligible, needed(rows) / 2**30)
+    rows = args.micro_rows
+    shortfall = needed(rows) - budget_bytes
+    count = min(eligible, math.ceil(shortfall / max(bytes_per_block, 1.0)))
+    return ReplayPlan(rows, count, eligible, needed(rows) / 2**30)
 
 
 class CudaBatchStager:
@@ -644,11 +701,17 @@ class CudaGraphTrainer:
     replay.  Graphs share a private pool and never overlap; each captured body
     ends after backward, so no saved activation survives between replays.
 
-    Every persistent FP32 gradient buffer exists before the first forward.  The
-    tied embedding and the large projections accumulate into their buffers in
-    place from inside backward and hand autograd no gradient, so a buffer that
-    warm-up touched marks its parameter active for that mode exactly as an
-    autograd gradient marks the remaining vectors and small matrices.
+    Every persistent FP32 gradient buffer and the optimizer state exist before
+    the first forward, so the activation budget is measured against the real
+    static footprint: the cheapest reachable graph runs one eager forward,
+    its retained bytes per block invocation calibrate ``plan_replay``, and
+    every graph then gets its rows per replay and its recomputed block count.
+
+    The tied embedding and the large projections accumulate into their
+    buffers in place from inside backward and hand autograd no gradient, so a
+    buffer that warm-up touched marks its parameter active for that mode
+    exactly as an autograd gradient marks the remaining vectors and small
+    matrices.
 
     The head is the one site whose gradient does not reach its FP32 sink on
     every microbatch: every head call lock-adds into one persistent BF16
@@ -662,18 +725,13 @@ class CudaGraphTrainer:
         self.optimizers = optimizers
         self.args = args
         self.device = next(model.parameters()).device
-        self.micros = args.batch_rows // args.micro_rows
         self.autocast = torch.autocast("cuda", dtype=torch.bfloat16)
         self.generator = torch.Generator(device=self.device)
         self.parameters = [p for p in model.parameters() if p.requires_grad]
         self.batch_stager = CudaBatchStager(
             args.batch_rows, args.seq_len + 1, self.device
         )
-        self.states: dict[GraphSpec, CapturedMicro] = {}
         self.model.refresh_shadows()
-        specs = self._reachable_specs(schedule)
-        for spec in specs:
-            self.states[spec] = self._allocate(spec)
         self._buffers = model.allocate_gradient_buffers()
         self.sink_fed = model.bind_gradient_sinks(self._buffers)
 
@@ -688,6 +746,26 @@ class CudaGraphTrainer:
         if model.embed_tokens.grad_sink is not None:
             self.head_accum = torch.zeros_like(model._classifier_shadow)
             model.bind_classifier_accum(self.head_accum)
+
+        # Materialize the optimizer state before anything transient, so the
+        # static footprint the activation budget subtracts is complete.
+        for parameter in self.parameters:
+            parameter.grad = self._buffers[parameter]
+        self._initialize_optimizers()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        self.static_bytes = torch.cuda.memory_allocated()
+        total_bytes = torch.cuda.mem_get_info(self.device)[1]
+        self.budget_bytes = (
+            total_bytes - self.static_bytes - args.checkpoint_margin_gib * 2**30
+        )
+        specs = self._reachable_specs(schedule)
+        base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
+        self.bytes_per_block = self._calibrate(base)
+        self.states: dict[GraphSpec, CapturedMicro] = {}
+        for spec in specs:
+            plan = self._plan(spec, self.bytes_per_block, self.budget_bytes)
+            self.states[spec] = self._allocate(spec, plan)
 
         # The package sets Dynamo's recompile budget once for the process, so
         # every block and router specialization compiles here and in later
@@ -707,7 +785,6 @@ class CudaGraphTrainer:
         for parameter, gradient in self.grad_buffers.items():
             parameter.grad = gradient
 
-        self._initialize_optimizers()
         self.model.refresh_shadows()
         for active in active_by_spec.values():
             for optimizer in self.optimizers:
@@ -733,43 +810,73 @@ class CudaGraphTrainer:
                 else 1
             )
             iterations = draw_iterations(self.args, step, self.model.cfg.loop)
-            specs.add(
-                GraphSpec(
-                    n_passes,
-                    automatic_checkpoint(
-                        self.model, n_passes, iterations, self.args, self.device
-                    ),
-                    iterations,
-                )
-            )
+            specs.add(GraphSpec(n_passes, iterations))
         return sorted(specs, key=lambda spec: (spec.n_passes, spec.iterations))
 
-    def _allocate(self, spec: GraphSpec) -> CapturedMicro:
-        rows = torch.zeros(
-            self.args.micro_rows,
-            self.args.seq_len + 1,
-            dtype=torch.long,
-            device=self.device,
+    def _plan(
+        self, spec: GraphSpec, bytes_per_block: float, budget_bytes: float
+    ) -> ReplayPlan:
+        return plan_replay(self.model.cfg, self.args, spec, bytes_per_block, budget_bytes)
+
+    def _inputs(
+        self, spec: GraphSpec, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        tokens = torch.zeros(
+            rows, self.args.seq_len + 1, dtype=torch.long, device=self.device
         )
         prefix = jitter = None
         if spec.n_passes > 1:
             prefix = torch.ones(
-                spec.n_passes - 1,
-                self.args.micro_rows,
-                dtype=torch.long,
-                device=self.device,
+                spec.n_passes - 1, rows, dtype=torch.long, device=self.device
             )
             jitter = torch.zeros(
                 spec.n_passes - 1,
-                self.args.micro_rows,
+                rows,
                 self.args.seq_len + 1,
                 self.args.dim,
                 dtype=torch.bfloat16,
                 device=self.device,
             )
+        return tokens, prefix, jitter
+
+    def _calibrate(self, spec: GraphSpec) -> float:
+        """Retained activation bytes per block invocation of one raw forward.
+
+        One eager forward of the cheapest graph at ``micro_rows`` rows, with
+        nothing recomputed: what stays allocated once the forward returns is
+        exactly what a raw backward would consume, and the graphs stack it
+        per pass and per block.
+        """
+        tokens, prefix, jitter = self._inputs(spec, self.args.micro_rows)
+        blocks, _ = block_invocations(self.model.cfg, spec)
+        self.model.checkpoint_blocks = 0
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        with self.autocast:
+            outs = multipass(
+                self.model,
+                tokens,
+                spec.n_passes,
+                prefix_lens=prefix,
+                jitter=jitter,
+                iterations=spec.iterations,
+            )
+            result = multipass_loss(
+                self.model, tokens, outs, mtp_weight=self.args.mtp_weight
+            )
+        torch.cuda.synchronize()
+        alive = torch.cuda.memory_allocated() - before
+        del outs, result
+        self.model.zero_grad(set_to_none=True)
+        torch.cuda.synchronize()
+        return alive / blocks
+
+    def _allocate(self, spec: GraphSpec, plan: ReplayPlan) -> CapturedMicro:
+        tokens, prefix, jitter = self._inputs(spec, plan.rows_per_replay)
         return CapturedMicro(
             spec,
-            rows,
+            plan,
+            tokens,
             prefix,
             jitter,
             torch.zeros((), dtype=torch.float32, device=self.device),
@@ -786,10 +893,12 @@ class CudaGraphTrainer:
         )
 
     def _body(self, state: CapturedMicro) -> None:
-        self.model.grad_checkpoint = state.spec.checkpoint
+        self.model.checkpoint_blocks = state.plan.checkpoint_blocks
         self.model.bind_classifier_accum(
             self.head_accum if self._head_calls(state) <= self.head_flush_every else None
         )
+        # Each replay's mean loss enters the step in proportion to its rows.
+        scale = state.plan.rows_per_replay / self.args.batch_rows
         with self.autocast:
             outs = multipass(
                 self.model,
@@ -804,17 +913,15 @@ class CudaGraphTrainer:
                 mtp_weight=self.args.mtp_weight,
             )
             loss, losses = loss_result.total, loss_result.ntp
-        (loss / self.micros).backward()
-        state.loss_sum.add_(loss.detach() / self.micros)
-        state.pass1_sum.add_(losses[0].detach() / self.micros)
-        state.ntp_sum.add_(combine_pass_losses(loss_result.ntp).detach() / self.micros)
-        state.mtp_sum.add_(combine_pass_losses(loss_result.mtp).detach() / self.micros)
+        (loss * scale).backward()
+        state.loss_sum.add_(loss.detach() * scale)
+        state.pass1_sum.add_(losses[0].detach() * scale)
+        state.ntp_sum.add_(combine_pass_losses(loss_result.ntp).detach() * scale)
+        state.mtp_sum.add_(combine_pass_losses(loss_result.mtp).detach() * scale)
         # These are outputs of logical forwards, collected outside the
         # checkpointed blocks. Recomputed backwards cannot count again.
         state.expert_counts.add_(loss_result.expert_counts)
-        state.expert_balance_sum.add_(
-            loss_result.expert_aux_loss.detach() / self.micros
-        )
+        state.expert_balance_sum.add_(loss_result.expert_aux_loss.detach() * scale)
 
     def _drain_head_accum(self) -> None:
         """Add the head's accumulated BF16 gradient into its FP32 sink.
@@ -950,7 +1057,7 @@ class CudaGraphTrainer:
         state.graph.replay()
         calls = self._head_calls(state)
         if self.head_accum is not None and calls <= self.head_flush_every:
-            # The window counts actual NTP and MTP head calls, not replays.
+            # The window counts actual head calls, not replays.
             # Every call rounds the running BF16
             # sum, so the cadence has to hold the number of contributions
             # between flushes fixed across conditions. Draining before the
@@ -964,13 +1071,9 @@ class CudaGraphTrainer:
         self, state: CapturedMicro, data: TokenData, step: int, first_row: int
     ) -> None:
         rows = self.batch_stager.stage(data, first_row)
-        for offset in range(0, self.args.batch_rows, self.args.micro_rows):
-            self.replay(
-                state,
-                rows[offset : offset + self.args.micro_rows],
-                step,
-                first_row + offset,
-            )
+        width = state.plan.rows_per_replay
+        for offset in range(0, self.args.batch_rows, width):
+            self.replay(state, rows[offset : offset + width], step, first_row + offset)
         # A microbatch count that is not a multiple of the flush cadence leaves
         # a remainder; the step's gradient is complete only once it is drained.
         self.flush_head_accum()
@@ -1069,7 +1172,7 @@ class CudaEvalRunner:
         )
         was_training = self.model.training
         self.model.eval()
-        self.model.grad_checkpoint = False
+        self.model.checkpoint_blocks = 0
         for _ in range(2):
             state.reset()
             self._body(state)
@@ -1120,8 +1223,10 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
         "cce": 1,
         "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
         "eval_graphs": len(eval_graph_runner.states),
-        "checkpoint_modes": sum(spec.checkpoint for spec in graph_runner.states),
         "head_flush_every": graph_runner.head_flush_every,
+        "static_gib": round(graph_runner.static_bytes / 2**30, 2),
+        "activation_budget_gib": round(graph_runner.budget_bytes / 2**30, 2),
+        "block_mib": round(graph_runner.bytes_per_block / 2**20, 1),
     }
 
 
@@ -1675,6 +1780,16 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             "execution",
             **execution_fields(model, graph_runner, eval_graph_runner),
         )
+        for spec, state in graph_runner.states.items():
+            telemetry.log(
+                "plan",
+                k=spec.n_passes,
+                r=spec.iterations,
+                rows=state.plan.rows_per_replay,
+                checkpoint_blocks=state.plan.checkpoint_blocks,
+                eligible_blocks=state.plan.eligible_blocks,
+                estimated_gib=round(state.plan.estimated_gib, 2),
+            )
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0
     window_cell_tokens = 0.0
@@ -1692,13 +1807,10 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             if model.cfg.feedback:
                 n_passes = draw_passes(args, step, total)
             iterations = draw_iterations(args, step, model.cfg.loop)
-            checkpointing = automatic_checkpoint(
-                model, n_passes, iterations, args, device
-            )
 
             micros = args.batch_rows // args.micro_rows
             if graph_runner is not None:
-                spec = GraphSpec(n_passes, checkpointing, iterations)
+                spec = GraphSpec(n_passes, iterations)
                 graph_state = graph_runner.begin(spec, z_coef)
                 graph_runner.replay_batch(
                     graph_state, data_train, step, (step - 1) * args.batch_rows
@@ -1711,7 +1823,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 expert_counts = graph_state.expert_counts
                 graph_runner.prepare_optimizer(graph_state)
             else:
-                model.grad_checkpoint = checkpointing
+                model.checkpoint_blocks = 0
                 step_loss = 0.0
                 pass1_loss = 0.0
                 ntp_loss = mtp_loss = 0.0

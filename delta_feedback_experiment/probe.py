@@ -6,6 +6,7 @@ import argparse
 import math
 import time
 import warnings
+from dataclasses import replace
 
 
 def cuda_probe() -> None:
@@ -75,7 +76,13 @@ def cuda_probe() -> None:
 
     class ProbeTrainer(CudaGraphTrainer):
         def _reachable_specs(self, schedule):
-            return [GraphSpec(2, True, 2)]
+            return [GraphSpec(2, 2)]
+
+        def _plan(self, spec, bytes_per_block, budget_bytes):
+            # The tiny model fits raw; recompute a few blocks anyway so the
+            # checkpoint wrappers run under capture.
+            plan = super()._plan(spec, bytes_per_block, budget_bytes)
+            return replace(plan, checkpoint_blocks=3)
 
     class Rows:
         def __init__(self):

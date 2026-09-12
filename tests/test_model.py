@@ -153,7 +153,7 @@ def test_loop_once_pairs_with_flat_values_and_gradients():
 
 def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
     models = [tiny("fl").train(), tiny("fl").train()]
-    models[1].grad_checkpoint = True
+    models[1].checkpoint_blocks = 10**6
     losses, counts = [], []
     for model in models:
         outs = multipass(
@@ -236,3 +236,37 @@ def test_cached_decode_matches_full_recomputation():
         payload = out.payload[:, -1:] if model.cfg.feedback else None
     assert cache.k.shape[0] == 6  # prelude + two cells * two iterations + coda
     assert len(cache.pkda_states) == 18
+
+
+def test_partial_checkpointing_counts_blocks_and_preserves_gradients():
+    """The recomputation budget applies to the first PKDA and auxiliary block
+    invocations of a logical forward, in execution order, and changes nothing
+    numerically."""
+    raw, partial = tiny("fl").train(), tiny("fl").train()
+    partial.checkpoint_blocks = 3
+    results = []
+    for model in (raw, partial):
+        outs = multipass(
+            model, tokens(), 2, prefix_lens=torch.ones(1, 1, dtype=torch.long)
+        )
+        result = multipass_loss(model, tokens(), outs, z_coef=0.017)
+        result.total.backward()
+        results.append(result.total.detach())
+    torch.testing.assert_close(*results, atol=0, rtol=0)
+    assert partial.checkpoint_blocks - partial._checkpoint_left == 3
+    assert raw._checkpoint_left == 0
+    for (name, left), (_, right) in zip(
+        raw.named_parameters(), partial.named_parameters(), strict=True
+    ):
+        assert (left.grad is None) == (right.grad is None), name
+        if left.grad is not None:
+            torch.testing.assert_close(left.grad, right.grad, atol=0, rtol=0, msg=name)
+    # A budget beyond the eligible invocations recomputes every one of them.
+    everything = tiny("fl").train()
+    everything.checkpoint_blocks = 10**6
+    outs = multipass(
+        everything, tokens(), 2, prefix_lens=torch.ones(1, 1, dtype=torch.long)
+    )
+    multipass_loss(everything, tokens(), outs)
+    executed = everything.cfg.executed_pkda_layers(everything.cfg.loop_iterations)
+    assert everything.checkpoint_blocks - everything._checkpoint_left == 2 * (executed + 1)

@@ -258,3 +258,40 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     ]
     assert any(value.count_nonzero() for value in biases)
     assert restored["state"]["mtp.block.mlp.expert_bias"].count_nonzero()
+
+
+def test_replay_plan_fits_rows_then_recomputes_blocks():
+    """One-pass graphs take the largest row multiple that fits raw; multi-pass
+    graphs keep the keyed microbatch width; a shortfall recomputes exactly as
+    many block invocations as it needs, never more than are eligible."""
+    from delta_feedback_experiment.model import condition_config
+    from delta_feedback_experiment.train import (
+        PER_ROW_PASS_EXTRA_BYTES,
+        GraphSpec,
+        block_invocations,
+        plan_replay,
+    )
+
+    args = parse_run_args(["plan", "--condition", "fl", "--steps", "5"])
+    cfg = condition_config("fl", **model_fields(args))
+    assert block_invocations(cfg, GraphSpec(1, 1)) == (17, 13)
+    assert block_invocations(cfg, GraphSpec(2, 1)) == (34, 26)
+    assert block_invocations(cfg, GraphSpec(1, 4)) == (41, 31)
+    block = 300 * 2**20
+    extra = PER_ROW_PASS_EXTRA_BYTES
+
+    def budget(rows, spec):
+        blocks, _ = block_invocations(cfg, spec)
+        return rows * blocks * block + spec.n_passes * rows * extra
+
+    flat = GraphSpec(1, 1)
+    assert plan_replay(cfg, args, flat, block, budget(4, flat)).rows_per_replay == 4
+    assert plan_replay(cfg, args, flat, block, budget(4, flat) - 1).rows_per_replay == 2
+    assert plan_replay(cfg, args, flat, block, budget(1, flat)).rows_per_replay == 1
+    two = GraphSpec(2, 1)
+    generous = plan_replay(cfg, args, two, block, budget(8, two))
+    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (1, 0)
+    short = plan_replay(cfg, args, two, block, budget(1, two) - 5 * block)
+    assert (short.rows_per_replay, short.checkpoint_blocks) == (1, 5)
+    starved = plan_replay(cfg, args, GraphSpec(1, 4), block, 0)
+    assert starved.checkpoint_blocks == starved.eligible_blocks == 31

@@ -302,11 +302,15 @@ Every current prefill pass starts those tracks from zero. Cache position is
 shared across tracks. A pass executes `2+c*r` cells.
 
 All passes and iterations remain differentiable. Readout occurs after the
-coda, and auxiliary prediction runs once per pass. Above the raw activation
-budget, each cell retains its final GQA block and checkpoints its preceding
-three PKDA blocks. Checkpoint wrappers remain outside compiled blocks.
-CUDA captures one training graph per reachable `(pass count,r)` pair and
-no-grad evaluation graphs at the fixed depth.
+coda, and auxiliary prediction runs once per pass. CUDA captures one training
+graph per reachable `(pass count,r)` pair and no-grad evaluation graphs at the
+fixed depth. At start-up the trainer measures the activation bytes one block
+invocation retains, subtracts the static footprint and a margin from device
+memory, and plans each graph: a one-pass graph replays the largest row
+multiple whose raw activations fit, and otherwise the first PKDA and
+auxiliary block invocations of the logical forward, as many as the shortfall
+needs, recompute in backward. Global-attention blocks are always retained.
+Checkpoint wrappers remain outside compiled blocks.
 
 `ColumnOutput` exposes `iterations`, `core_entry`, and `core_state`; route
 keys include iteration, such as `L4i2.attn`. `depth_trace` sweeps `1..r_max`,

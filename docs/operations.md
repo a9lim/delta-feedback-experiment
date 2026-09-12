@@ -143,6 +143,13 @@ CCE reads a BF16 classifier shadow and flushes gradients to the FP32 sink at
 Training compiles blocks and captures fixed-address graphs for reachable
 pass/depth pairs. Inductor caches persist at
 `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
-them. Activation checkpointing wraps blocks outside compilation when needed.
-Keep cyclic Python garbage collection outside train/eval capture.
+them. Before capture the trainer measures the activation bytes one block
+invocation retains and plans each graph against device memory minus the
+static footprint and `--checkpoint-margin-gib` (default 3.5): rows per
+replay for one-pass graphs, otherwise how many leading PKDA and auxiliary
+block invocations recompute in backward. The `execution` record reports the
+static footprint, the budget, and the bytes per block; one `plan` record per
+graph reports its rows and recomputed block count. Raise the margin if
+capture or the optimizer step runs out of memory. Keep cyclic Python garbage
+collection outside train/eval capture.
 CPU/MPS use eager attention, literal PKDA, and chunked tied-head loss.

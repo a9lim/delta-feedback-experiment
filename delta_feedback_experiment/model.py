@@ -235,6 +235,14 @@ class ModelConfig:
             return self.layers
         return 2 * self.routing_block_size + iterations * len(self.core_layers)
 
+    def executed_pkda_layers(self, iterations: int) -> int:
+        """PKDA layer invocations in one column pass; these blocks can
+        recompute in backward, the global-attention blocks stay retained."""
+        core = set(self.core_layers) if self.loop else set()
+        outer = sum(self.is_pkda_layer(layer) for layer in range(self.layers) if layer not in core)
+        inner = sum(self.is_pkda_layer(layer) for layer in core)
+        return outer + (iterations if self.loop else 0) * inner
+
     def resolve_iterations(self, iterations: int | None) -> int:
         """The core iteration count a column runs; ``None`` is the default."""
         if not self.loop:
@@ -837,14 +845,6 @@ def _pkda_block(block, h, block_start, gate_weight, banked, *tensors):
     return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
 
 
-def _retain_block_activations(layer: int, cell_size: int) -> bool:
-    """Retain the final block of each cell when the full column exceeds memory.
-
-    Each cell retains its final global-attention block.
-    """
-    return layer % cell_size == cell_size - 1
-
-
 _compiled_block = torch.compile(
     _attention_block,
     fullgraph=True,
@@ -949,8 +949,12 @@ class DeltaModel(nn.Module):
             self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
             self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.grad_checkpoint = False
-        """Runtime switch: retain cell-final activations, checkpoint other blocks."""
+        self.checkpoint_blocks = 0
+        """Runtime switch: how many PKDA and auxiliary block invocations of
+        each logical forward, in execution order, recompute in backward
+        instead of retaining their activations. ``multipass`` starts the
+        count; the global-attention blocks are always retained."""
+        self._checkpoint_left = 0
         self.bank_sources = True
         """Runtime switch: give each routed source one gradient accumulator.
 
@@ -1048,7 +1052,8 @@ class DeltaModel(nn.Module):
             raise ValueError("MTP needs aligned nonempty payloads and next tokens")
         embedding = self.embed_tokens(next_tokens)
         fn = _compiled_mtp if payload.is_cuda else _mtp_forward
-        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+        if self._checkpoint_left > 0 and self.training and torch.is_grad_enabled():
+            self._checkpoint_left -= 1
             result = torch.utils.checkpoint.checkpoint(
                 fn, self.mtp, payload, embedding, want_weights,
                 use_reentrant=False, preserve_rng_state=False,
@@ -1398,11 +1403,10 @@ class DeltaModel(nn.Module):
             else None
         )
         block_fn = _compiled_pkda_block if block.is_pkda else _compiled_block
-        if checkpointing and not _retain_block_activations(
-            block.layer, self.cfg.routing_block_size
-        ):
+        if checkpointing and block.is_pkda and self._checkpoint_left > 0:
             # Keep checkpointing outside compilation: both stored and
             # recomputed blocks use the same compiled numerical boundaries.
+            self._checkpoint_left -= 1
             h, delta, aux, counts = torch.utils.checkpoint.checkpoint(
                 block_fn if h.is_cuda else _block_for_checkpoint,
                 block,
@@ -1543,9 +1547,9 @@ class DeltaModel(nn.Module):
         expert_losses: list[Tensor] = []
         expert_weights_out: dict[str, Tensor] = {}
         expert_counts_out: dict[int, Tensor] = {}
+        # Blocks may recompute while the logical forward's budget lasts.
         checkpointing = (
-            self.grad_checkpoint
-            and self.training
+            self.training
             and torch.is_grad_enabled()
             and cache is None
             and not want_weights
@@ -1760,6 +1764,9 @@ def multipass(
     cfg = model.cfg
     if n_passes > 1 and not cfg.feedback:
         raise ValueError("multi-pass batches require a condition with f")
+    # One logical forward: its trunk passes here and the auxiliary blocks in
+    # ``multipass_loss`` share this recomputation budget in execution order.
+    model._checkpoint_left = model.checkpoint_blocks
     e = model.embed_tokens(tokens[:, :-1])
     out = model.forward_column(
         e,
