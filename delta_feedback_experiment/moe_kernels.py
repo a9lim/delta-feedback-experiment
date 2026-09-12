@@ -131,11 +131,15 @@ if triton is not None:
         BK: tl.constexpr,
     ):
         expert = tl.program_id(2)
-        if (ACTIVE >> expert) & 1:
-            sink = sinks[0]
-            for index in tl.static_range(1, EXPERTS):
-                if expert == index:
-                    sink = sinks[index]
+        # Keep the flags alongside the pointer tuple: a scalar bit mask would
+        # constrain the bank size to Triton's integer width.
+        sink = sinks[0]
+        active = tl.full((), ACTIVE[0], tl.int1)
+        for index in tl.static_range(1, EXPERTS):
+            if expert == index:
+                sink = sinks[index]
+                active = tl.full((), ACTIVE[index], tl.int1)
+        if active:
             start = tl.load(offsets + expert)
             end = tl.load(offsets + expert + 1)
             rows = tl.program_id(0) * BM + tl.arange(0, BM)
@@ -345,7 +349,7 @@ def _backward(
             selected,
             experts,
             False,
-            sum(int(required) << index for index, required in enumerate(down_required)),
+            tuple(down_required),
             32,
             64,
             32,
@@ -363,7 +367,7 @@ def _backward(
             selected,
             experts,
             True,
-            sum(int(required) << index for index, required in enumerate(gate_required)),
+            tuple(gate_required),
             32,
             64,
             32,
