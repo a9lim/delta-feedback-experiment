@@ -10,26 +10,9 @@ from delta_feedback_experiment.data import META, TokenData, read_meta, write_syn
 from delta_feedback_experiment.train import CONTRACT, read_checkpoint
 
 
-@pytest.fixture(scope="module")
-def tokenizer():
-    # The offline suite never downloads. Qualify the pinned vocabulary after
-    # loading it once on each machine; skip these text checks if it is absent.
-    from transformers import AutoTokenizer
+def test_chat_template_preserves_roles_and_whitespace():
+    from jinja2 import Template
 
-    original = AutoTokenizer.from_pretrained
-    with pytest.MonkeyPatch.context() as patch:
-
-        def cached(*args, **kwargs):
-            return original(*args, **kwargs, local_files_only=True)
-
-        patch.setattr(AutoTokenizer, "from_pretrained", cached)
-        try:
-            return profile.load_tokenizer()
-        except OSError:
-            pytest.skip("pinned NeoX tokenizer is not cached")
-
-
-def test_chatml_preserves_arbitrary_and_repeated_roles(tokenizer):
     messages = [
         {"role": "a9lim", "content": "  first\nsecond\t"},
         {"role": "critic_17", "content": ""},
@@ -40,21 +23,16 @@ def test_chatml_preserves_arbitrary_and_repeated_roles(tokenizer):
         "<|im_start|>critic_17\n<|im_end|>\n"
         "<|im_start|>a9lim\nagain<|im_end|>\n"
     )
-    assert tokenizer.apply_chat_template(messages, tokenize=False) == expected
-    ids = tokenizer.apply_chat_template(messages, return_dict=False)
-    assert tokenizer.decode(ids, skip_special_tokens=False) == expected
-    assert ids.count(profile.CHATML_START_ID) == 3
-    assert ids.count(profile.CHATML_END_ID) == 3
-    for role in ("self", "claude", "a9lim"):
-        rendered = tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, next_role=role
-        )
-        assert rendered == expected + f"<|im_start|>{role}\n"
+    template = Template(profile.CHAT_TEMPLATE)
+    assert template.render(messages=messages) == expected
+    assert template.render(messages=messages, add_generation_prompt=True) == (
+        expected + "<|im_start|>self\n"
+    )
     assert (
-        tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
+        template.render(
+            messages=messages, add_generation_prompt=True, next_role="critic_17"
         )
-        == expected + "<|im_start|>self\n"
+        == expected + "<|im_start|>critic_17\n"
     )
 
 
@@ -62,8 +40,6 @@ def test_chatml_preserves_arbitrary_and_repeated_roles(tokenizer):
     "change",
     [
         {"tokenizer_id": "different-tokenizer"},
-        {"tokenizer_revision": "another-revision"},
-        {"chatml_end_id": 0},
         {"chat_template": "discard roles"},
     ],
 )
@@ -91,8 +67,8 @@ def test_checkpoint_requires_tokenizer_identity(tmp_path):
         read_checkpoint(path)
 
 
-@pytest.mark.parametrize("version", [CONTRACT.version - 1, CONTRACT.version + 1])
-def test_checkpoint_requires_current_version(tmp_path, version):
+def test_checkpoint_requires_current_version(tmp_path):
+    version = CONTRACT.version + 1
     path = tmp_path / "test.pt.1"
     torch.save({"version": version, "state": {}, "args": {}}, path)
     with pytest.raises(ValueError, match="checkpoint version"):

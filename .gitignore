@@ -1,7 +1,6 @@
 # Data + figures are regenerated artifacts; keep them out of git.
-data/**
-!data/.gitkeep
-figures/**
+data/
+figures/
 
 # References: refs.yaml is committed; fetched copies are regenerable.
 references/*.md
@@ -9,8 +8,7 @@ references/*.pdf
 references/*.html
 
 # Run logs and checkpoints stay local.
-logs/**
-!logs/.gitkeep
+logs/
 runs/
 tmp/
 

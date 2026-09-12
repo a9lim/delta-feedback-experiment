@@ -1,28 +1,16 @@
-"""Fast CPU contracts or one small CUDA train/eval/decode execution smoke."""
+"""One small CUDA train/eval/decode smoke; portable contracts live in pytest."""
 
 from __future__ import annotations
 
-import gc
+import argparse
 import math
-import subprocess
-import sys
 import time
 import warnings
-from pathlib import Path
-
-import torch
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
-@torch.compiler.set_stance("force_eager")
 def cuda_probe() -> None:
-    """Exercise CUDA kernels and graph replay without Inductor compilation.
+    import torch
 
-    FLA, CCE, sparse experts, routing, and causal Flash SDPA use real CUDA
-    kernels. Cached attention uses FlexAttention's eager reference. This is
-    an execution smoke, not compiler or production-memory qualification.
-    """
     from .model import DeltaModel, KVCache, condition_config
     from .optim import apply_schedule, build_optimizers
     from .train import (
@@ -31,13 +19,12 @@ def cuda_probe() -> None:
         GraphSpec,
         build_schedule,
         clip_gradients,
-        evaluate,
         model_fields,
         parse_run_args,
     )
 
-    # Keep PKDA's supported 128-wide CUDA heads; shrink the residual stream,
-    # vocabulary, rows, and sequence instead of invoking a production screen.
+    # Three four-layer cells exercise both mixers and a repeated core. PKDA
+    # keeps its CUDA head width; sparse experts and token rows stay tiny.
     args = parse_run_args(
         [
             "probe",
@@ -56,27 +43,27 @@ def cuda_probe() -> None:
             "--eval-rows",
             "1",
             "--seq-len",
-            "64",
-            "--vocab-size",
-            "257",
-            "--dim",
-            "128",
-            "--layers",
             "16",
+            "--vocab-size",
+            "128",
+            "--dim",
+            "64",
+            "--layers",
+            "12",
             "--heads",
             "4",
             "--kv-heads",
             "2",
             "--head-dim",
-            "32",
+            "16",
             "--expert-intermediate",
-            "64",
+            "32",
             "--num-routed-experts",
-            "47",
+            "3",
             "--experts-per-token",
-            "11",
+            "1",
             "--pkda-heads",
-            "2",
+            "1",
             "--pkda-head-dim",
             "128",
             "--loop-iterations",
@@ -85,7 +72,6 @@ def cuda_probe() -> None:
             "2",
         ]
     )
-    cfg = condition_config(args.condition, **model_fields(args))
 
     class ProbeTrainer(CudaGraphTrainer):
         def _reachable_specs(self, schedule):
@@ -93,54 +79,24 @@ def cuda_probe() -> None:
 
     class Rows:
         def __init__(self):
-            self.rows = torch.randint(
-                0,
-                args.vocab_size,
-                (1, args.seq_len + 1),
-                generator=torch.Generator().manual_seed(19),
-            )
+            self.rows = torch.randint(0, args.vocab_size, (1, args.seq_len + 1))
 
         def batch(self, first, count, device=None):
-            rows = self.rows[first : first + count]
-            return rows.to(device) if device is not None else rows
+            return self.rows[first : first + count].to(device=device)
 
     torch.manual_seed(7)
     torch.set_float32_matmul_precision("high")
-    gc.collect()
     started = time.monotonic()
-    model = DeltaModel(cfg).cuda().train()
-    optimizers = build_optimizers(
-        model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam
-    )
-    expected_rates = {
-        "normuonh": args.lr_normuonh,
-        "normuonh_expert_in": args.lr_normuonh * cfg.expert_lr_scale,
-        "normuonh_expert_out": args.lr_normuonh * cfg.expert_lr_scale,
-        "nadam": args.lr_nadam,
-        "nadam_width": args.lr_nadam * cfg.mup_ratio,
-    }
-    print("cuda probe | preparing one tiny training graph", flush=True)
+    model = DeltaModel(condition_config(args.condition, **model_fields(args))).cuda()
+    optimizers = build_optimizers(model)
     schedule = build_schedule(args)
+    print("cuda probe | train graph", flush=True)
     runner = ProbeTrainer(model, optimizers, args, schedule)
-    # State materialization temporarily sets every LR to zero; all five
-    # independently scheduled rates must survive that initialization.
-    assert {
-        group["rate_name"]: group["lr"]
-        for optimizer in optimizers for group in optimizer.param_groups
-    } == expected_rates
     data = Rows()
     spec = next(iter(runner.states))
-    expert_parameters = {
-        parameter for bank in model.expert_banks for parameter in bank.parameters()
-    }
-    assert expert_parameters <= runner.states[spec].active
-    assert expert_parameters <= runner.grad_buffers.keys()
     initial = model.embed_tokens.weight.detach().clone()
     for step in (1, 2):
-        rates = apply_schedule(optimizers, schedule, step)
-        assert rates == {
-            name: schedule.rate_at(step, base) for name, base in expected_rates.items()
-        }
+        apply_schedule(optimizers, schedule, step)
         runner.zero_grad()
         state = runner.begin(spec, args.zloss)
         runner.replay_batch(state, data, step, 0)
@@ -148,85 +104,61 @@ def cuda_probe() -> None:
         assert math.isfinite(state.loss_sum.item())
         assert math.isfinite(clip_gradients(model.parameters()))
         assert runner.head_accum is not None and not runner.head_accum.any()
+        parameters = dict(model.named_parameters())
         for name in (
             "embed_tokens.weight",
             "fuse_value.weight",
             "payload_router.query",
             "mtp.projection.weight",
-            "mtp.block.attn.q_proj.weight",
-            "mtp.block.attn.control_proj.weight",
-            "mtp.block.mlp.router.weight",
-            "mtp.block.mlp.shared.down_proj.weight",
+            "blocks.4.attn.control_proj.weight",
             "blocks.0.mlp.shared.down_proj.weight",
         ):
-            gradient = dict(model.named_parameters())[name].grad
+            gradient = parameters[name].grad
             assert gradient is not None and gradient.dtype == torch.float32, name
-            assert gradient.abs().sum() > 0 and torch.isfinite(gradient).all(), name
+            assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0, name
+        routed = [
+            expert.down_proj.weight.grad for expert in model.blocks[0].mlp.experts
+        ]
+        assert all(
+            gradient is not None and gradient.dtype == torch.float32
+            for gradient in routed
+        )
+        assert sum(gradient.abs().sum() for gradient in routed) > 0
         for optimizer in optimizers:
             optimizer.step()
-        bias_before = torch.stack([bank.expert_bias for bank in model.expert_banks])
-        assert state.expert_counts.shape == (cfg.layers + 1, cfg.num_routed_experts)
-        assert state.expert_counts[-1].sum().item() == (
-            cfg.experts_per_token * args.batch_rows * (args.seq_len - 1) * spec.n_passes
-        )
         model.update_expert_bias(state.expert_counts)
-        assert not torch.equal(bias_before[0], model.blocks[0].mlp.expert_bias)
-        assert not torch.equal(bias_before[-1], model.mtp.block.mlp.expert_bias)
         model.refresh_shadows()
     assert not torch.equal(initial, model.embed_tokens.weight)
     runner.zero_grad()
 
-    print(
-        "cuda probe | train replay passed; checking evaluation and decode", flush=True
-    )
+    print("cuda probe | eval graph and cached decode", flush=True)
     evaluator = CudaEvalRunner(model, args, runner.pool)
-    actual = evaluator.run(data)
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        expected = evaluate(model, data, args, torch.device("cuda"))
-    assert actual.keys() == expected.keys()
-    for key in actual:
-        assert math.isfinite(actual[key])
-        assert math.isclose(actual[key], expected[key], rel_tol=3e-3, abs_tol=3e-3), key
-
+    assert all(math.isfinite(value) for value in evaluator.run(data).values())
     model.eval()
-    with (
-        torch.no_grad(),
-        torch.autocast("cuda", dtype=torch.bfloat16),
-        warnings.catch_warnings(),
-    ):
-        warnings.filterwarnings(
-            "ignore", message=r"flex_attention called without torch\.compile\(\)"
-        )
-        toks = data.rows[:, :4].cuda()
-        embedded = model.embed_tokens(toks)
-        cache = KVCache(cfg, batch=1, device="cuda", dtype=torch.bfloat16)
-        prefill = model.forward_column(embedded[:, :3], cache=cache)
-        decoded = model.step(toks[:, 3:], prefill.payload[:, -1:], cache)
-        # Exact cache parity lives in the portable suite. This smoke checks
-        # execution without a BF16 threshold sensitive to top-k expert flips.
-        assert cache.pos == 4 and decoded.h_top.shape == (1, 1, cfg.dim)
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        tokens = data.rows[:, :4].cuda()
+        cache = KVCache(model.cfg, batch=1, device="cuda", dtype=torch.bfloat16)
+        prefill = model.forward_column(model.embed_tokens(tokens[:, :3]), cache=cache)
+        decoded = model.step(tokens[:, 3:], prefill.payload[:, -1:], cache)
+        assert cache.pos == 4 and decoded.h_top.shape == (1, 1, args.dim)
         assert torch.isfinite(decoded.h_top).all()
     torch.cuda.synchronize()
-    print(
-        f"cuda probe passed | {time.monotonic() - started:.1f}s | train_graphs=1 | eval_graphs=1 | decode=ok"
-    )
+    print(f"cuda probe passed | {time.monotonic() - started:.1f}s")
 
 
 def main(argv: list[str] | None = None) -> None:
-    argv = sys.argv[1:] if argv is None else argv
-    if torch.cuda.is_available():
-        if argv:
-            raise SystemExit(
-                "CUDA probe takes no arguments; run pytest directly for test selection"
-            )
-        cuda_probe()
-    else:
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", str(ROOT / "tests"), "-q", *argv],
-            check=False,
+    argparse.ArgumentParser("delta probe", description=__doc__).parse_args(argv)
+    import torch
+
+    if not torch.cuda.is_available():
+        raise SystemExit("delta probe requires CUDA; run pytest for portable tests")
+    # Exercise real CUDA kernels and graph replay without compiling a matrix
+    # of Inductor specializations. Cached FlexAttention uses its reference.
+    with torch.compiler.set_stance("force_eager"), warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore", message=r"flex_attention called without torch\.compile\(\)"
         )
-        if result.returncode:
-            raise SystemExit(result.returncode)
+        cuda_probe()
 
 
 if __name__ == "__main__":

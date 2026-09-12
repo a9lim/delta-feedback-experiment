@@ -1159,9 +1159,17 @@ def verify(directory: str | Path, *, sample_docs: int = 200_000) -> dict:
             )
         later = starts[1:]
         if later.size:
-            picked = rng.choice(later, min(sample_docs, later.size), replace=False)
-            for start in np.sort(picked):
-                if int(data.read(int(start) - 1, 1)[0]) != meta["eos_id"]:
+            picked = np.sort(
+                rng.choice(later, min(sample_docs, later.size), replace=False)
+            ) - 1
+            for shard, (first, last) in zip(
+                data.maps, pairwise(data.offsets), strict=True
+            ):
+                lower, upper = np.searchsorted(picked, (first, last))
+                positions = picked[lower:upper]
+                invalid = np.flatnonzero(shard[positions - first] != meta["eos_id"])
+                if invalid.size:
+                    start = int(positions[invalid[0]]) + 1
                     raise RuntimeError(
                         f"{split}: no EOS before the document at {start}"
                     )

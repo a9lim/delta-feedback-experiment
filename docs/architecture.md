@@ -16,431 +16,22 @@ cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`. Each trunk FFN uses one shared expert
 and a configurable number of selected routed experts. All presets have four
 cells; the middle two form the tied core under `l`.
 
-The diagram expands **`fl`**, with both feedback and tied depth enabled. Panel
-A follows one column from input to both outputs; B-H expand its modules and
-state. Panel I connects columns, passes, and training objectives. Dimensions
-are symbolic, with the screen preset as a concrete example. Arrows carry
-activations unless labeled as state, weights, or supervision; `(*)` is an
-elementwise product and `(+)` is addition. Linear maps are bias-free except
-PKDA's output-gate expansion.
-
 ```text
-A. fl: COMPLETE COLUMN / PASS
-============================================================================================
-  B = batch rows; T = input positions; D = residual width; V = vocabulary size
-  L = unique trunk layers = 4C; C = unique cells; c = C-2 = core cells
-  r = core iterations; k = Jacobi pass; t = token position; h_ff = per-expert width
-  Screen: D=768, V=50,304, L=16, C=4, c=2, h_ff=832; default eval/decode r=4
-  Residuals, seeds, deltas, payloads: [B,T,D] in a full row; [B,1,D] in decode
-
-  token x_t --> Emb.weight [V,D] --> e_t -------------------------------+
-                                      |                               |
-                                      v                               |
-                           gate_norm --> W_G [D->D]                   |
-                                      |                               |
-                                   sigmoid                            |
-                                      |                               |
-  incoming payload --> W_U [D->D] --> (*) --> entry_norm --> fused_t    |
-       ^                                                      |       |
-       |                                                      v       v
-       |                                            +-------------------------+
-       |                                            | select column seed s_t  |
-       |                                            | plain: e_t              |
-       |                                            | feedback: fused_t       |
-       |                                            +------------+------------+
-       |                                                         |
-       |     Plain = pass 1 / plain prefix / Standard decode.    h=s
-       |     At fused positions e_t controls the gate only.       |
-       |                                                         v
-       |       s ---------------------------> [MHDB source bank: seed]
-       |                                                         |
-       |                          +------------------------------v------------------+
-       |                          | PRELUDE P: one four-layer cell [B]              |
-       |                          | PKDA+FFN -> PKDA+FFN -> PKDA+FFN -> GGQA+FFN    |
-       |                          +------------------------------+------------------+
-       |                                                         |  emit Delta_P
-       |                                                   core_entry
-       |                                                         |
-       |                          +------------------------------v------------------+
-       |                          | TIED CORE: R_0 -> ... -> R_(c-1)                |
-       |                          | Each R_j is a distinct four-layer cell [B].     |
-       |                          |                                                 |
-       |                          |  +--> R_0 --> ... --> R_(c-1) --+               |
-       |                          |  |                              |               |
-       |                          |  +--- h continues; repeat r ----+               |
-       |                          |                                                 |
-       |                          | Same R_j weights on every visit.                |
-       |                          | One accumulated Delta_Rj per cell [C].          |
-       |                          | Separate mixer cache for each iteration [I].    |
-       |                          +------------------------------+------------------+
-       |                                                         |
-       |                                                    core_state
-       |                                                         |
-       |                          +------------------------------v------------------+
-       |                          | CODA: one four-layer cell [B]                   |
-       |                          | PKDA+FFN -> PKDA+FFN -> PKDA+FFN -> GGQA+FFN    |
-       |                          +------------------------------+------------------+
-       |                                                         |  emit Delta_Coda
-       |                                                       h_top
-       |                                                         |
-       |                        +--------------------------------+
-       |                        |
-       |                        v                      seed and emitted cell deltas
-       |                 final_norm                               |
-       |                        |                                 v
-       |                    * 1536/D                   final source bank [D]
-       |                        |                     {seed, Delta_P, all Delta_Rj,
-       |                 @ Emb.weight.T                       Delta_Coda}
-       |                        |                                 |
-       |                 NTP logits [B,T,V]                       v
-       |                        |                         payload MHDB
-       |                 target x_(t+1)                     (own null)
-       |                                                          |
-       |                                      h_top ------------>(+)
-       |                                                          |
-       |                                                     payload_norm
-       |                                                          |
-       +---- next feedback entry [I] <-------- p_t [B,T,D] <-------+
-                                                |
-                                                +--> auxiliary MTP [H]
-
-  Identity: h_top = seed + Delta_P + sum_j Delta_Rj + Delta_Coda
-  Executed trunk: 2+c*r cells, 4*(2+c*r) layers; parameters remain L unique layers.
-  All presets at r=4: P -> (R_0 -> R_1) x 4 -> Coda = 40 executed layers.
-  At r=1, fl matches f in values, routes, losses, and gradients.
-
-
-B. EVERY TRUNK CELL: FOUR LAYERS, EIGHT ROUTED READS
-============================================================================================
-  h_in --> [PKDA layer] --> [PKDA layer] --> [PKDA layer] --> [NoPE-GGQA layer] --> h_out
-            each layer has the complete two-branch residual shell below
-
-                         attention source bank [C,D]
-                                     |
-                                  MHDB_attn
-                                     |
-  h ------------------------------->(+) --> RMSNorm_attn --> mixer [E or F]
-  |                                                                     |
-  |                                                             * b, b=1/sqrt(2L)
-  |                                                                     | a
-  +------------------------------------------------------------------->(+) --> h'
-
-  FFN bank: replace current partial by partial+a; create it as a if absent
-                                     |
-                                  MHDB_ffn
-                                     |
-  h' ------------------------------>(+) --> RMSNorm_ffn --> shared+routed FFN [G]
-  |                                                                     |
-  |                                                                    * b
-  |                                                                     | m
-  +------------------------------------------------------------------->(+) --> h_next
-
-  h' = h+a; h_next = h'+m. The route is consumed only by the temporary pre-norm read.
-  Cell partial grows by a+m after each layer; the cell emits its final partial.
-  b uses UNIQUE L, including in the tied core and MTP; it does not depend on r.
-  Each physical layer has its own mixer, FFN, two norms, and two MHDB sites.
-
-
-C. TIED-CORE DELTA BOOKKEEPING: ONE ADDRESS PER CELL, ACROSS ALL VISITS
-============================================================================================
-  At entry to core cell R_j on iteration i:
-
-     seed  +  Delta_P  +  sum_(q != j) Delta_Rq_so_far  +  Delta_Rj_previous  =  h
-       |         |                     |                       |
-       +---------+---------------------+                       |
-                        |                                     |
-                 effective origin o_j                  live partial d_j
-                        |                                     |
-                        |           +-------------------------v----------------+
-                        |           | R_j: four layers                         |
-                        |           | other-cell deltas stay fixed this visit  |
-                        |           | own partial grows after each branch      |
-                        |           +-------------------------+----------------+
-                        |                                     |
-                        +----------> Delta_Rj_new = h_exit - o_j
-                                                              |
-                               next visit reuses this delta <--+
-
-  First visit: own partial is absent at the first mixer; as-yet-unvisited cells are absent.
-  Later visits: earlier core cells contribute this iteration's deltas; later cells contribute
-  their previous iteration's deltas. Own accumulated delta appears only as the live partial.
-  o_j advances by other cells' additions between visits; weights and source identities persist.
-  For c=1: o_0 = core_entry for every visit, so Delta_R0 = h-core_entry throughout the loop.
-  After the last iteration: commit each final Delta_Rj for the coda and payload writer.
-  No iteration-boundary reset, extra normalization, or extra residual scale is applied to h.
-
-
-D. MHDB: TOKEN-LOCAL DEPTH ROUTING, SEPARATE FROM TOKEN ATTENTION AND EXPERT ROUTING
-============================================================================================
-  one site's learned null --+
-  actual column seed -------+
-  completed/other deltas ---+--> raw values v_i [N,B,T,D] ----------------------------+
-  current partial, if any --+                |                                      |
-                                            v                                      |
-                             full-D RMS statistic + learned scale g                |
-                                            |                                      |
-                                   keys k_i [N,B,T,D]                              |
-                                            |                                      |
-                         split into G=kv_heads contiguous groups                   |
-                                            |                                      |
-  learned query q [D] --> split q_h --> dot(q_h,key_(i,h))                         |
-                                            |                                      |
-                               softmax over source index i                         |
-                                            |                                      |
-                               weights [N,B,T,G]                                   |
-                                            |                                      |
-                                            +--> weighted raw slices <--------------+
-                                                            |
-                                      concatenate groups --> route [B,T,D]
-
-  key_i = g*v_i/sqrt(mean_D(v_i^2)+1e-6); route_h = sum_i weight_i,h * v_i,h
-  No token mixing, head-dimension score factor, or output projection in this router.
-  Groups partition residual features; they do not identify PKDA or GQA projection heads.
-  At most C+2 sources, even at depth r>1: null + seed + one delta/partial per cell.
-  Payload site: exactly C+2 sources, all cells completed; no dependence on next-token input.
-  Each site owns q, g, null; initialization q=0, g=1, null=0 gives uniform source weights.
-  Non-null values sum to h: routed enrichment is initially collinear with the residual.
-
-
-E. PKDA MIXER: CAUSAL CONVOLUTIONS + PRECONDITIONED MATRIX MEMORY
-============================================================================================
-  z = normalized routed read [B,T,D]; P = n_pkda*128 = 5D/3 at the presets
-
-  z --+--> W_Q: D->P --> causal DWConv1d(4) --> SiLU --> head L2 --> /sqrt(128) --> q_t
-      +--> W_K: D->P --> causal DWConv1d(4) --> SiLU --> head L2 ----------------> k_t
-      +--> W_V: D->P --> causal DWConv1d(4) --> SiLU ----------------------------> v_t
-      |
-      +--> packed control projection: D -> 256+3*n_pkda, five disjoint slices
-                |
-                +--> decay hidden [128] --> W_decay: 128->P --> alpha_t [n_pkda,128]
-                +--> update [n_pkda] --> sigmoid ----------------> beta_t [n_pkda]
-                +--> decayP [n_pkda] --> independent decay map --> alphaP_t [n_pkda]
-                +--> updateP [n_pkda] --> sigmoid --------------> betaP_t [n_pkda]
-                +--> gate hidden [128] --> W_gate: 128->P + bias --> sigmoid --> gate_t
-
-  q_t, k_t, v_t and gate_t have shape [B,T,n_pkda,128]. The following is per head/token:
-
-  DIAGONAL MEMORY A                              KEY-BY-VALUE MATRIX MEMORY S
-  -----------------                              ----------------------------
-  A_(t-1), alphaP_t, betaP_t, k_t                 S_(t-1), alpha_t
-                |                                         |
-                v                                         v
-  A_t = alphaP_t*A_(t-1)                        S_tilde = Diag(alpha_t)*S_(t-1)
-        + betaP_t*(k_t*k_t)                               |
-                |                                         +---------------------+
-                +--> retain A_t for next token            |                     |
-                |                                         v                     |
-                v                               k_t --> S_tilde^T k_t           |
-  u = log(A_t+1e-6)-center                                |                     |
-                |                                         v                     |
-                v                             error = v_t - S_tilde^T*k_t       |
-  B_t = exp(-log(1.5)*u/(1+abs(u)))                       |                     |
-                |                                         v                     |
-  k_t -------->(*) --> k_write ------> beta_t*k_write*error^T                   |
-                                                          |                     |
-                                                          v                     |
-                                                         (+) <------------------+
-                                                          |
-                                                          S_t
-                                                          |
-                                                          +--> retain S_t for next token
-                                                          |
-                                                q_t --> S_t^T q_t --> o_t
-                                                                      |
-                                                               per-head RMSNorm
-                                                                      |
-                                                gate_t ------------->(*)
-                                                                      |
-                                                concatenate --> W_O: P->D --> mixer output
-
-  alpha = exp(-exp(A_log)*softplus(decay+b)); beta = sigmoid(update).
-  alphaP/betaP use their own learned controls, rates, and time biases; B_t is in [2/3,3/2].
-  Per layer/iteration: S [B,n_pkda,128,128], A [B,n_pkda,128], three conv histories [B,P,3].
-  S and A start at zero and stay FP32; convolution histories store projected inputs.
-  The recurrence reads the UPDATED S_t; only its key-side write is preconditioned.
-  Output RMSNorm has a learned length-128 scale shared across heads; gate bias starts at zero.
-  Q/K/V convolution, SiLU, and L2 normalization compute in FP32 before activation cast.
-  CUDA: FLA chunk-64 for training/prefill; recurrent operator for decode. No K/V token bank.
-
-
-F. NoPE-GGQA MIXER: CAUSAL GLOBAL TOKEN ATTENTION, EVERY FOURTH LAYER
-============================================================================================
-  z [B,T,D] --> packed Q/K/V + gate projection (independently owned gate weights)
-                        |                                              |
-         +--------------+---------------+           +--> sigmoid gate [B,T,n_q*96]
-         |              |               |                              |
-         Q              K               V                              |
-    [B,n_q,T,96]   [B,n_kv,T,96]   [B,n_kv,T,96]                       |
-         |              |               |                              |
-    head RMSNorm   head RMSNorm         |                              |
-         |              |               |                              |
-         |              +------> per-layer/iteration K/V cache         |
-         |                              |                              |
-         +--> softmax(Q K^T / sqrt(96) + causal mask) --> weighted V   |
-                                                         |             |
-                                                   concatenate heads   |
-                                                         |             |
-                                                        (*) <----------+
-                                                         |
-                                               W_O: n_q*96 -> D
-
-  GQA shares n_kv K/V heads across n_q query heads; presets have n_q=2*n_kv.
-  No positional embedding or rotary transform. The gate scales output features after attention.
-  CUDA full rows: native Flash SDPA (BF16/FP16); cached single-token: FlexAttention valid prefix.
-  K/V storage per track: two [B,T_cache,n_kv,96] BF16 tensors, written before the causal read.
-
-
-G. EVERY FFN: ONE SHARED + TOP-k_e-OF-n ROUTED SwiGLU EXPERTS
-============================================================================================
-  k_e = selected routed count; n = routed bank size; h_ff = per-expert width
-  Screen/bridge/flagship/extension: (k_e,n) = (3,15)/(5,23)/(7,31)/(11,47)
-  h_ff=832 throughout the presets.
-  z [B,T,D] -----------------------+------------------------------------+
-       |                          |                                     |
-       v                          v                                    v
-  shared expert S          W_router: D->n                         E_0 ... E_(n-1)
-  (always active)                 |                          (execute selected rows)
-       |                   sigmoid scores s_j                           |
-       |                      FP32 |                                    |
-       |              +------------+-------------+                      |
-       |              |                          |                      |
-       |      topk_e(s_j + b_j)          gather original s_j             |
-       |              |                          |                      |
-       |         selected J ------------> w_j = s_j/sum_(i in J)s_i     |
-       |              |                          |                      |
-       |              +------ dispatch ----------|--------------------->|
-       |                                         |                      |
-       |                                         +--> weighted sum <----+
-       |                                                     |
-       |                                                   * k_e
-       |                                                     |
-       +--------------------------------------------------->(+) --> /sqrt(k_e+1) --> output
-
-  Each of n+1 independent experts:
-       z --> W_gate: D->h_ff --> SiLU --+
-       |                               (*) --> W_down: h_ff->D --> expert output
-       +---> W_up:   D->h_ff -----------+
-  Gate/up matrices are packed; each expert retains its own parameters and optimizer state.
-  k_e+1 active experts per token; no capacity limit or token dropping.
-  Gradients flow through selected scores and experts; selection indices are discrete.
-
-  Actual selections --> integer counts summed across microbatches/passes/core visits
-                    --> once per optimizer step: b_j += .001*sign(sum_i C_i - n*C_j)
-  Unbiased topk_e(s) + normalized all-expert scores --> sequence balance loss --> [I]
-  One b[n] buffer per PHYSICAL FFN, shared across its tied visits; fixed in evaluation.
-
-
-H. AUXILIARY SECOND-TOKEN PREDICTION: ONE BLOCK, ONCE PER PASS
-============================================================================================
-  p_t from payload writer [A]                      x_(t+1) --> same Emb.weight
-             |                                                   |
-       MTP payload RMSNorm                                MTP embedding RMSNorm
-             |                                                   |
-             +----------------------> concat <-------------------+
-                                        |
-                                   [B,T-1,2D]
-                                        |
-                                  M: 2D->D
-                                        |
-                                        u -------------------------------+
-                                        |                                |
-                                 own attn RMSNorm                        |
-                                        |                                |
-                                 own PKDA mixer [E]                      |
-                                        |                                |
-                              * 1/sqrt(2L) ---------------------------->(+)
-                                                                         |
-                                        +--------------------------------+
-                                        |                                |
-                                  own FFN RMSNorm                        |
-                                        |                                |
-                                 own expert FFN [G]                      |
-                                        |                                |
-                              * 1/sqrt(2L) ---------------------------->(+)
-                                                                         |
-                                   shared final_norm <--------------------+
-                                        |
-                                    * 1536/D
-                                        |
-                                  @ Emb.weight.T
-                                        |
-                              MTP logits [B,T-1,V] --> target x_(t+2)
-
-  Positions: payload[:,:-1] + Emb(tokens[:,1:-1]) predict tokens[:,2:].
-  Independent entry norms, PKDA, FFN, and fresh zero mixer state for every row/pass.
-  No MHDB, trunk-cache input, or tied-depth loop; auxiliary states do not feed the trunk.
-  Both inputs remain differentiable. MTP trains the payload writer even on the final pass.
-  Generation uses NTP only: no auxiliary execution or auxiliary cache allocation.
-
-
-I. THE THREE AXES: TOKEN HISTORY t, FEEDBACK PASS k, AND TIED ITERATION i
-============================================================================================
-  JACOBI TRAINING (each box is the WHOLE column stack [A], evaluated over a causal row):
-
-    stored tokens [B,T+1] --> inputs x_0 ... x_(T-1); ordinary targets x_1 ... x_T
-                |
-                +--> embeddings e ------------------------------------------------+
-                            |                                                     |
-                   pass k=1: seed=e --> [P -> core x r -> Coda] --> h^1, p^1        |
-                                                                         |        |
-                                                    add keyed jitter ----+        |
-                                                                         |        |
-                                                    shift right by one position   |
-                                                                         |        |
-                                                              FBT gate <----------+
-                                                                         |
-                    plain-prefix e / fused-suffix selection <-------------+
-                            |
-                   pass k=2: seed   --> [P -> core x r -> Coda] --> h^2, p^2
-                                                                         |
-                                         repeat feedback construction for k=3..K
-
-    Feedback at (k,t) consumes p^(k-1)_(t-1) + jitter^(k-1)_(t-1), never p^k_(t-1).
-    Per-row/per-feedback-pass prefix length is drawn in 1..T-1; position 0 stays plain.
-    Every pass restarts mixer state, core deltas, and the column source bank.
-    Only the undetached payload crosses passes; all passes/iterations backpropagate.
-    One keyed r draw per optimizer step, shared by all passes and microbatches;
-    independent of feedback draws. Default uncapped mean 4, cap 8; eval/decode fix r=4.
-
-  SEQUENTIAL FEEDBACK DECODE:
-
-    (x_(t-1), p_(t-2)) --> [column t-1] --> p_(t-1) --+
-                                                    |
-                                     x_t --> Emb --> FBT --> [column t] --> p_t
-                                                                 |
-                                                           NTP predicts x_(t+1)
-
-    A prefill pass starts caches empty; final prefill caches continue into generation.
-    A core layer's SAME weights have DIFFERENT token-history tracks:
-
-                  token t-1                     token t                     token t+1
-       i=1:    cache(layer,1) ----------------> cache(layer,1) -----------> cache(layer,1)
-       i=2:    cache(layer,2) ----------------> cache(layer,2) -----------> cache(layer,2)
-        ...                                 ...
-       i=r:    cache(layer,r) ----------------> cache(layer,r) -----------> cache(layer,r)
-
-    Within a column h flows down iterations; token history flows right at the same iteration.
-    Prelude/coda have one track per layer. All tracks share position, advanced once per token.
-    Payload is a separate D-wide channel; it does not replace PKDA or GQA cache state.
-
-  SUPERVISION AND NUMERICS:
-
-    every h^k --> tied NTP head --> mean CE_ntp,k + z_coef*mean(logZ_ntp,k^2) --+
-    every p^k --> MTP [H]       --> mean CE_mtp,k + z_coef*mean(logZ_mtp,k^2) --|--+
-                                                                                |  |
-       combine(ell) = ell_1 if K=1, else ell_1 + mean(ell_2,...,ell_K)          |  |
-                                                                                v  v
-       loss = combine(NTP) + mtp_weight*combine(MTP) + 1e-4*expert_balance
-                             default 0.3
-
-    Each head averages its own positions: T for NTP, T-1 for MTP; all are supervised.
-    Expert balance averages executed trunk layers plus one MTP bank, then averages passes.
-    CUDA activations/payloads are BF16; PKDA S/A, parameters, optimizer state, and accumulated
-    gradients are FP32. The two heads use the tied classifier through a refreshed BF16 shadow.
-    CUDA loss uses cut cross-entropy: the [B,T,V] and [B,T-1,V] logits above are conceptual.
-    Gradients traverse FBT, MHDB values/queries, all tied visits, and both MTP inputs.
-    Before NorMuonH + NAdam updates: global FP32 gradient clipping to norm 10.
+token embedding + incoming payload (f)
+  -> column seed
+  -> prelude cell
+  -> middle cells, repeated r times under l
+  -> coda cell
+  -> top state -> tied readout -> next-token logits
+       + routed block deltas -> payload
+                                  -> next column (f)
+                                  -> auxiliary PKDA/expert block + next-token embedding
+                                     -> tied readout -> second-token logits
 ```
+
+Each cell has four residual layers, each with its own token mixer and expert
+FFN. An MHDB read enriches each branch's input with the seed and cell deltas.
+Linear maps are bias-free except PKDA's output-gate expansion.
 
 Pass 1 and Standard decoding seed the column from the token embedding. The
 readout applies `final_norm(h_top) * 1536 / D` before the tied classifier.
@@ -566,11 +157,8 @@ The presets store four times the active expert matrix parameters. The router
 adds `nD` parameters per bank. The shared expert accounts for `1/(k+1)` of
 active expert width: 25%, 16.7%, 12.5%, and 8.3% across the presets. Fixed expert
 intermediate width does not fix each expert's parameter count as `D` grows.
-Memory and dispatch overhead still matter. The design follows
-[DeepSeekMoE](https://arxiv.org/abs/2401.06066).
-Hard selection can amplify small full-row/cached numerical differences when
-near-tied experts exchange rank; a compact execution smoke does not establish
-unrestricted long-horizon decode agreement.
+Memory and dispatch overhead still matter. Near-tied expert rankings can amplify numerical differences between cached
+and full-row evaluation.
 
 ### Load balancing
 
@@ -583,8 +171,7 @@ b_j += 0.001 * sign(sum_i C_i - n * C_j)
 ```
 
 Evaluation and recomputation leave it fixed. Counts are returned values, so
-activation checkpointing cannot double-count. This follows
-[auxiliary-loss-free balancing](https://arxiv.org/abs/2408.15664).
+activation checkpointing cannot double-count.
 
 A separate sequence regularizer uses unbiased top-`k` preferences:
 
@@ -599,8 +186,7 @@ aux = mean_passes(aux_pass)
 training_loss += 1e-4 * aux
 ```
 
-Selection-only bias, sigmoid scores, and sequence regularization follow
-[DeepSeek-V3](https://arxiv.org/abs/2412.19437). Layer/pass averaging keeps the
+Layer/pass averaging keeps the
 coefficient independent of depth and pass count. The auxiliary bank contributes
 once per pass, with its own `T-1` positions. Its within-sequence gradient
 coupling does not change causal forward activations. Cross-entropy excludes it.
@@ -727,8 +313,7 @@ data; compute comparisons need cell-tokens and auxiliary work or device time.
 
 ## Two-token prediction
 
-One auxiliary prediction depth follows
-[DeepSeek-V3 section 2.2](https://arxiv.org/html/2412.19437v2#S2.SS2):
+One auxiliary prediction depth runs after each column pass:
 
 ```text
 u_t = M concat(RMSNorm_p(p_t), RMSNorm_e(Emb(x_(t+1))))
@@ -859,9 +444,7 @@ normalizing `U`, tangent norms at or below `32 * finfo(dtype).eps` are treated
 as cancellation residue. Zero-rate updates also preserve weights exactly.
 An exact spectral norm would set the trial's RMS-to-RMS norm to the group
 rate. Power iteration can underestimate it, and the sphere retraction changes
-the finite displacement, so this is not a strict final-step bound. This
-spectral/tangent extension is an implemented scaling candidate, not a result
-established by the Hyperball paper; full-model transfer remains unestablished.
+the finite displacement, so this is not a strict final-step bound. Full-model transfer of these rates across scales remains unmeasured.
 [Scaling](scaling.md#expert-learning-rates) lists the preset rates.
 CUDA compiles packing and update arithmetic by shape bucket within each
 group. All results materialize before state and parameter writebacks outside

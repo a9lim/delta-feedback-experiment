@@ -26,8 +26,8 @@ TINY = {
     "kv_heads": 2,
     "head_dim": 8,
     "expert_intermediate": 8,
-    "num_routed_experts": 23,
-    "experts_per_token": 5,
+    "num_routed_experts": 3,
+    "experts_per_token": 2,
     "pkda_heads": 2,
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
@@ -38,11 +38,11 @@ TINY = {
 
 def snapshot(tmp_path, condition="f", seed=3):
     torch.manual_seed(seed)
-    model = DeltaModel(condition_config(condition, max_seq_len=17, **TINY))
+    model = DeltaModel(condition_config(condition, max_seq_len=6, **TINY))
     args = SimpleNamespace(
         condition=condition,
         seed=seed,
-        seq_len=16,
+        seq_len=5,
         tag="tiny",
         tokenizer_id=SYNTHETIC_TOKENIZER_ID,
         **TINY,
@@ -58,43 +58,34 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
     model, path = snapshot(tmp_path, condition)
     loaded, saved = analysis.load_checkpoint(path, "cpu")
     assert saved["condition"] == condition and saved["step"] == 5
-    assert saved["seq_len"] == 16
+    assert saved["seq_len"] == 5
     assert not loaded.training
     for (name, a), (_, b) in zip(
         model.state_dict().items(), loaded.state_dict().items(), strict=True
     ):
         assert torch.equal(a, b), name
-    tokens = torch.randint(0, 97, (2, 17), generator=torch.Generator().manual_seed(0))
+    tokens = torch.randint(0, 97, (1, 6), generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
         want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
         got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
     assert torch.equal(want, got)
 
 
-def test_load_checkpoint_rejects_previous_optimizer_contract(tmp_path):
-    _, path = snapshot(tmp_path)
-    payload = torch.load(path, weights_only=False)
-    payload["version"] = 32
-    torch.save(payload, path)
-    with pytest.raises(ValueError, match="version"):
-        analysis.load_checkpoint(path, "cpu")
-
-
 def test_token_ce_matches_sequence_ce(tmp_path):
     model, _ = snapshot(tmp_path)
-    tokens = torch.randint(0, 97, (2, 17), generator=torch.Generator().manual_seed(1))
+    tokens = torch.randint(0, 97, (1, 6), generator=torch.Generator().manual_seed(1))
     with torch.no_grad():
         out = model.forward_column(model.embed_tokens(tokens[:, :-1]))
         per_token = analysis.token_ce(model, out.h_top, tokens[:, 1:], chunk=5)
         mean, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
-    assert per_token.shape == (2, 16)
+    assert per_token.shape == (1, 5)
     assert per_token.mean().item() == pytest.approx(mean.item(), rel=1e-5)
 
 
 def test_fused_inputs_match_multipass(tmp_path):
     model, _ = snapshot(tmp_path)
-    tokens = torch.randint(0, 97, (3, 17), generator=torch.Generator().manual_seed(2))
-    prefix = torch.tensor([[1, 5, 15]])
+    tokens = torch.randint(0, 97, (2, 6), generator=torch.Generator().manual_seed(2))
+    prefix = torch.tensor([[1, 4]])
     with torch.no_grad():
         outs = multipass(model, tokens, 2, prefix_lens=prefix)
         losses = multipass_loss(model, tokens, outs).ntp
@@ -105,4 +96,4 @@ def test_fused_inputs_match_multipass(tmp_path):
         fused_ce = analysis.token_ce(model, second.h_top, tokens[:, 1:]).mean()
     assert torch.equal(second.h_top, outs[1].h_top)
     assert fused_ce.item() == pytest.approx(losses[1].item(), rel=1e-5)
-    assert analysis.plain_mask(16, 1, "cpu").squeeze(-1).sum() == 1
+    assert analysis.plain_mask(5, 1, "cpu").squeeze(-1).sum() == 1

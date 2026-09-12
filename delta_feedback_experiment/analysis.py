@@ -1,14 +1,4 @@
-"""Checkpoint-analysis helpers shared by the scripts under ``scripts/``.
-
-Analysis must reproduce the trainer's numbers before it interprets a
-checkpoint, so everything here is the trainer's own convention: the snapshot
-loader rebuilds the condition from the saved state-defining arguments, evaluation
-runs under the same BF16 autocast the captured CUDA evaluation uses (FP32 on
-portable devices), per-token cross-entropies read the tied readout through
-``final_norm``, and fused inputs are built exactly as ``multipass`` builds
-them (shift the payload right, fuse through the FBT entry, keep the plain
-prefix).
-"""
+"""Current checkpoint loading and trainer-consistent analysis helpers."""
 
 from __future__ import annotations
 
@@ -84,7 +74,9 @@ def logprob_chunks(
 
 
 @torch.no_grad()
-def token_ce(model: DeltaModel, h_top: Tensor, targets: Tensor, chunk: int = 256) -> Tensor:
+def token_ce(
+    model: DeltaModel, h_top: Tensor, targets: Tensor, chunk: int = 256
+) -> Tensor:
     """Per-token cross-entropy ``[B, T]`` of a top state against its targets."""
     pieces = []
     for start, logprobs in logprob_chunks(model, h_top, chunk):
@@ -112,14 +104,3 @@ def fused_inputs(
     """
     fused = model.fuse(shift_right(payload), e)
     return torch.where(plain_mask(e.shape[1], prefix, e.device), e, fused)
-
-
-def position_bins(length: int) -> list[tuple[int, int]]:
-    """Inclusive position intervals, widening from the first token to the row end."""
-    bins = []
-    start, stop = 0, 1
-    while start < length:
-        bins.append((start, min(stop, length) - 1))
-        start = stop
-        stop *= 4 if stop < 256 else 2
-    return bins

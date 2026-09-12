@@ -8,7 +8,7 @@
 <link rel="stylesheet" href="/vendor/uPlot.min.css">
 <link rel="stylesheet" href="/monitor.css">
 <style>
-  /* Mechanism sections: one per condition letter, shown when a displayed run has the letter. */
+  /* Feedback and core-loop sections follow the displayed conditions. */
   section.mech[hidden] { display: none; }
   section.mech > h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
   section.mech > h3 small { margin-left: 0; }
@@ -31,7 +31,7 @@
 <div id="banner">Fetch failed — the Access session may have expired. Tap to reload.</div>
 <div class="tiles" id="tiles"></div>
 <section class="config">
-  <h3>run configuration <small>selected run · exact structured log values · letter groups follow the condition</small></h3>
+  <h3>run configuration <small>selected run · geometry and training settings</small></h3>
   <div class="config-grid" id="config"></div>
 </section>
 
@@ -51,21 +51,21 @@
   </div>
 </section>
 
-<section class="mech" data-letter="a" hidden>
-  <h3>a · attention <small id="sum-a"></small></h3>
-  <p class="note">Kimi Delta Attention holds three of every four attention layers; the fourth is gated global GQA. Nothing about the mixers is in the per-step telemetry yet, so this letter has configuration only.</p>
+<section class="mech">
+  <h3>attention <small id="sum-attention"></small></h3>
+  <p class="note">PKDA occupies three of every four attention layers; the fourth is gated global GQA.</p>
 </section>
 
-<section class="mech" data-letter="e" hidden>
-  <h3>e · mixture of experts <small id="sum-e"></small></h3>
-  <p class="note">One shared expert and three of fifteen routed experts per token, each at quarter FFN width. Selection biases balance actual assignments across each optimizer step. The tiny sequence penalty uses unbiased choices and is averaged over executed layers and passes. Pass-1 and validation remain cross-entropy.</p>
+<section class="mech">
+  <h3>mixture of experts <small id="sum-experts"></small></h3>
+  <p class="note">Each token uses one shared expert and a selected subset of routed experts. Counts and widths follow the run configuration. Selection biases balance actual assignments across each optimizer step. The tiny sequence penalty uses unbiased choices and is averaged over executed layers and passes. Pass-1 and validation remain cross-entropy.</p>
   <div class="chart"><h2>expert sequence penalty <small>unweighted · coefficient in run configuration</small></h2><div class="plot" id="p-expert-balance"></div></div>
   <div class="chart"><h2>expert load imbalance <small>worst bank · max load / mean load − 1</small></h2><div class="plot" id="p-expert-violation"></div></div>
   <div class="chart"><h2>expert selection bias <small>largest absolute bias after each step</small></h2><div class="plot" id="p-expert-bias"></div></div>
 </section>
 
-<section class="mech" data-letter="r" hidden>
-  <h3>r · residual routing <small id="sum-r"></small></h3>
+<section class="mech">
+  <h3>residual routing <small id="sum-routing"></small></h3>
   <div class="grid two">
     <div class="chart"><h2>source mass by site <small>latest eval · head-averaged · solid null · dashed seed · left to right: prelude, core by iteration, coda, payload router</small></h2><div class="plot" id="p-site-mass"></div></div>
     <div class="chart"><h2>sharpness by site <small>latest eval · solid max weight (uniform is 1/n) · dashed head divergence (normalized Jensen–Shannon, 0 means identical head routes)</small></h2><div class="plot" id="p-site-sharp"></div></div>
@@ -108,9 +108,9 @@
   </div>
 </section>
 
-<section class="mech" data-letter="m" hidden>
-  <h3>m · two-token prediction <small id="sum-m"></small></h3>
-  <p class="note">The auxiliary block predicts the second token from the trunk state and the supplied next token. Training CE is pass-1 plus mean fused CE, before its weight and z-loss. Held-out CE uses the same teacher forcing. Token and cell counters above count trunk work; they exclude the auxiliary block and vocabulary loss.</p>
+<section class="mech">
+  <h3>two-token prediction <small id="sum-mtp"></small></h3>
+  <p class="note">The auxiliary block predicts the second token from the payload and the supplied next token. Training CE is pass-1 plus mean fused CE, before its weight and z-loss. Held-out CE uses the same teacher forcing. Token and cell counters above count trunk work; they exclude the auxiliary block and vocabulary loss.</p>
   <div class="grid two">
     <div class="chart"><h2>auxiliary training CE <small>unweighted · pass-1 plus mean feedback passes</small></h2><div class="plot" id="p-mtp-train"></div></div>
     <div class="chart"><h2>auxiliary held-out CE <small>nats · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-mtp-val"></div></div>
@@ -125,22 +125,17 @@
 <script src="/chassis.js"></script>
 <script>
 'use strict';
-// Delta-feedback view: what this experiment's records mean and which panels
-// they fill.  The page is organized by condition letter: a training section
-// every condition shares, then one section per letter (a, e, r, f, l, m) shown when
-// a displayed run has it.  Every generic mechanism — parsing, lineage,
-// polling, uPlot setup — comes from the chassis.
+// Current Delta telemetry. Parsing, polling, and plotting come from the chassis.
 const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         fmtAge, esc, tile, pace, gpuTile, configGroup, scheduleFields,
         makeChart, setData, bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs,
         state, runFor } = M;
 
-const LETTERS = ['a', 'e', 'r', 'f', 'l', 'm'];
 const ROLL = 200;
 
 // ---------------------------------------------------------------- records
-// step: loss/ntp/pass1/k (+mtp under m, r under l)/learning rates/gnorm/throughputs/mem/
-// elapsed.  eval: val (+val_fused with f, val_mtp/val_mtp_fused with m).  route: per-site weights at eval
+// step: loss/ntp/mtp/pass1/k/r, learning rates, gradients, throughput, memory.
+// eval: val/val_mtp and fused losses with f. route: per-site weights at eval
 // cadence.  contract: the standing self-composition diagnostic (f).  depth:
 // the loop's fixed-r sweep (l).  Non-step series live in run.evals so the
 // chassis's resume-fold rewinds them with everything else.
@@ -186,11 +181,6 @@ function onRecord(run, rec) {
 const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
 const has = (view, letter) => conditionOf(view).includes(letter);
 const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
-// The letters any displayed run has: sections follow them.
-function shownLetters() {
-  const views = shownViews();
-  return new Set(LETTERS.filter((l) => views.some((v) => has(v, l))));
-}
 // The feedback boundary is a schedule event worth a line on every step chart.
 function eventLines(view) {
   if (!view || !has(view, 'f')) return [];
@@ -301,21 +291,19 @@ function renderTiles(view) {
 }
 
 // ---------------------------------------------------------------- config
-// Cards follow the sections: the run and its geometry, one card per active
-// letter's knobs, the optimizer, the batch, the runtime path, the schedule.
-// An inactive letter's knobs are logged but idle, so they are not shown.
+// Permanent geometry plus the active feedback/loop settings.
 const CONFIG_GROUPS = [
   ['run', null, ['condition', 'seed', 'data_seed', 'params', 'device']],
-  ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
-  ['a · attention', 'a', ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
-  ['e · experts', 'e', ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
+  ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'vocab_size', 'seq_len']],
+  ['attention', null, ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
+  ['experts', null, ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
   ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
   ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
-  ['m · prediction', 'm', ['mtp_weight']],
-  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_in_lr_scale', 'expert_out_lr_scale', 'grad_clip', 'zloss']],
+  ['prediction', null, ['mtp_weight']],
+  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_lr_scale', 'grad_clip', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
 ];
-const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', expert_in_lr_scale: 'expert input LR multiplier', expert_out_lr_scale: 'expert output LR multiplier', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap', mtp_weight: 'auxiliary weight' };
+const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', expert_lr_scale: 'expert LR multiplier', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap', mtp_weight: 'auxiliary weight' };
 function renderConfig(view) {
   const run = view.run, setup = run.meta.run, condition = conditionOf(view);
   const cards = [];
@@ -346,14 +334,14 @@ function summaries(view) {
   const out = { train: 'every condition · pass-1 is the common number · loss adds fused CE, weighted MTP, z-loss and expert balance where enabled' };
   if (setup.layers != null) {
     const layers = +setup.layers, pkda = layers - Math.floor(layers / 4);
-    out.a = `PKDA in ${pkda} of ${layers} attention layers · ${setup.pkda_heads} heads × ${setup.pkda_head_dim} · conv ${setup.pkda_conv_size} · configuration only`;
+    out.attention = `PKDA in ${pkda} of ${layers} attention layers · ${setup.pkda_heads} heads × ${setup.pkda_head_dim} · conv ${setup.pkda_conv_size} · configuration only`;
   }
-  if (has(view, 'e')) out.e = `1 shared + 3/15 routed · width ${setup.expert_width ?? '–'} · balance ${fmt(view.steps.at(-1)?.expert_balance, 4)}`;
+  out.experts = `1 shared + ${setup.expert_top_k}/${setup.expert_routed} routed · width ${setup.expert_width} · balance ${fmt(view.steps.at(-1)?.expert_balance, 4)}`;
   const step = latestRouteStep(view);
-  if (has(view, 'r') && step != null) {
+  if (step != null) {
     const sites = orderedSites([view]);
     const pay = (view.evals.get('route|payload') || []).find((e) => e.step === step);
-    out.r = `${sites.length} sites @ ${step.toLocaleString()}`
+    out.routing = `${sites.length} sites @ ${step.toLocaleString()}`
       + (pay ? ` · payload router: seed ${fmt(pay.seed, 3)} · null ${fmt(pay.nul, 3)} · head divergence ${fmt(pay.headjs, 3)}` : '')
       + ' · zero-initialized routers, no knobs';
   }
@@ -370,10 +358,8 @@ function summaries(view) {
   if (has(view, 'l') && setup.loop_iterations != null) l.push(`r drawn per step · mean ${setup.loop_iterations} · cap ${setup.loop_max_iterations}`);
   if (has(view, 'l') && lastD) l.push(`gain at r_mean ${signed(lastD.loss_mean - lastD.loss_one, 3)}`, `at r_max ${signed(lastD.loss_max - lastD.loss_one, 3)}`, `‖Δcore‖ ${fmt(lastD.upd_max, 3)} @ ${lastD.step.toLocaleString()}`);
   out.l = l.join(' · ');
-  if (has(view, 'm')) {
-    out.m = `weight ${fmt(num(setup.mtp_weight), 3)} · train CE ${fmt(view.steps.at(-1)?.mtp, 4)}`;
-    if (lastVal?.val_mtp != null) out.m += ` · held-out ${fmt(lastVal.val_mtp, 4)}${lastVal.val_mtp_fused != null ? ` · fused ${fmt(lastVal.val_mtp_fused, 4)}` : ''} @ ${lastVal.step.toLocaleString()}`;
-  }
+  out.mtp = `weight ${fmt(num(setup.mtp_weight), 3)} · train CE ${fmt(view.steps.at(-1)?.mtp, 4)}`;
+  if (lastVal?.val_mtp != null) out.mtp += ` · held-out ${fmt(lastVal.val_mtp, 4)}${lastVal.val_mtp_fused != null ? ` · fused ${fmt(lastVal.val_mtp_fused, 4)}` : ''} @ ${lastVal.step.toLocaleString()}`;
   return out;
 }
 
@@ -458,11 +444,7 @@ function seriesOf(view) {
   const steps = view.steps, xs = steps.map((s) => s.step);
   const col = (f) => steps.map((s) => s[f] ?? null);
   const loss = col('loss'), pass1 = col('pass1');
-  // Combined NTP CE = pass-1 + mean fused. The total objective also contains
-  // auxiliary losses, so it cannot identify a fused NTP gap for m records.
-  // Older non-m logs retain their original loss-minus-expert approximation.
-  const ntp = steps.map((s) => s.ntp ?? (!has(view, 'm') && s.loss != null
-    ? s.loss - (s.expert_balance ?? 0) * (view.run.meta.run?.expert_balance_coef ?? 0) : null));
+  const ntp = col('ntp');
   const trainGap = steps.map((s, i) => (s.k > 1 && ntp[i] != null && s.pass1 != null ? ntp[i] - 2 * s.pass1 : null));
   // Cumulative tokens from the step records and the geometry: a pass executes
   // layers / cell cell-equivalents on a flat column and 2 + r · core / cell
@@ -526,8 +508,9 @@ function render(view) {
   renderTiles(view);
   renderConfig(view);
   SITES.splice(0, SITES.length, ...orderedSites(shownViews()));
-  const letters = shownLetters();
-  for (const sec of document.querySelectorAll('section.mech[data-letter]')) sec.hidden = !letters.has(sec.dataset.letter);
+  for (const sec of document.querySelectorAll('section.mech[data-letter]')) {
+    sec.hidden = !shownViews().some((v) => has(v, sec.dataset.letter));
+  }
   const sums = summaries(view);
   for (const el of document.querySelectorAll('[id^="sum-"]')) el.textContent = sums[el.id.slice(4)] ?? '';
   const mine = seriesOf(view);
@@ -575,14 +558,14 @@ M.configure({
     const stepSeconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
     return Number.isFinite(stepSeconds) ? Math.ceil(stepSeconds + 1) : 5;
   },
-  metaEvents: ['run', 'schedule', 'execution', 'resume', 'fork'],
+  metaEvents: ['run', 'schedule', 'execution', 'resume', 'continue'],
   title: (run) => `delta · ${run.tag}`,
   meta: (view) => {
     const setup = view.run.meta.run;
     if (!setup) return '';
     const params = num(setup.params);
     return esc([
-      setup.condition ? `condition ${setup.condition}` : 'plain decoder',
+      `condition ${setup.condition}`,
       setup.dim != null ? `d ${setup.dim} × L ${setup.layers}` : null,
       params ? `${(params / 1e6).toFixed(1)}M params` : null,
       setup.seq_len != null ? `batch ${setup.batch_rows}×${setup.seq_len}` : `batch ${setup.batch_rows}`,

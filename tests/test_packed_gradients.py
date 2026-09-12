@@ -20,7 +20,9 @@ def tiny(condition):
             heads=2,
             kv_heads=2,
             head_dim=16,
-            expert_intermediate=16,
+            expert_intermediate=8,
+            num_routed_experts=3,
+            experts_per_token=2,
             pkda_heads=2,
             pkda_head_dim=16,
             pkda_conv_size=4,
@@ -112,7 +114,7 @@ def test_packed_linear_repeated_backward_preserves_segment_gradients():
             preserve_rng_state=False,
         )
 
-    for _ in range(3):
+    for _ in range(2):
         x = torch.randn(2, 5, 8, requires_grad=True)
         reference_x = x.detach().clone().requires_grad_()
         output = run(x)

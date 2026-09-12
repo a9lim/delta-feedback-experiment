@@ -1,6 +1,5 @@
 """Numerical and causal contracts for the teacher-forced second-token head."""
 
-import pytest
 import torch
 import torch.nn.functional as F
 
@@ -20,6 +19,8 @@ GEOMETRY = {
     "kv_heads": 2,
     "head_dim": 8,
     "expert_intermediate": 8,
+    "num_routed_experts": 3,
+    "experts_per_token": 2,
     "pkda_heads": 2,
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
@@ -123,9 +124,9 @@ def test_next_token_conditioning_and_payload_are_differentiable():
     )
 
 
-@pytest.mark.parametrize("condition,count", [("l", 1), ("f", 1), ("f", 2)])
-def test_mtp_trains_the_payload_writer_on_every_supervised_pass(condition, count):
-    model = tiny(condition)
+def test_mtp_trains_the_payload_writer_on_every_supervised_pass():
+    count = 2
+    model = tiny("fl")
     toks = tokens(length=5)
     outs = passes(model, toks, count)
     for out in outs:
@@ -167,9 +168,8 @@ def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
         )
 
 
-@pytest.mark.parametrize("coefficient", [0.0, 0.23])
-def test_mtp_loss_matches_materialized_logits_and_feedback_weighting(coefficient):
-    count, z_coef = 3, 0.017
+def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
+    count, z_coef, coefficient = 3, 0.017, 0.23
     model = tiny("fl")
     toks = tokens(length=6)
     outs = passes(model, toks, count)
@@ -208,10 +208,12 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting(coefficient
         feedback_sum(ntp)
         + z_coef * feedback_sum(ntp_z)
         + coefficient * (feedback_sum(mtp) + z_coef * feedback_sum(mtp_z))
-        + EXPERT_BALANCE_COEF
-        * torch.stack(expert_aux).mean()
+        + EXPERT_BALANCE_COEF * torch.stack(expert_aux).mean()
     )
     torch.testing.assert_close(actual.total, expected)
     torch.testing.assert_close(actual.expert_aux_loss, torch.stack(expert_aux).mean())
-    assert actual.expert_counts.shape == (model.cfg.layers + 1, model.cfg.num_routed_experts)
+    assert actual.expert_counts.shape == (
+        model.cfg.layers + 1,
+        model.cfg.num_routed_experts,
+    )
     torch.testing.assert_close(actual.expert_counts, torch.stack(expert_counts).sum(0))

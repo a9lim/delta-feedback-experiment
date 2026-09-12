@@ -25,7 +25,7 @@ delta — delta-feedback experiment operator
   delta train TAG [FLAGS]  train one condition directly (delta train --help)
   delta tokenize [FLAGS]   build a source token stream prefix (once)
   delta verify DIR         check a token store against its meta and sidecars
-  delta probe              run the compact execution smoke test
+  delta probe              run one CUDA train/eval/decode smoke
   delta queue TAG [FLAGS]  append a training job to the detached spool
   delta queue FILE         append jobs from a file (TAG FLAGS per line)
   delta queue TAG --continue SRC [FLAGS]
@@ -80,16 +80,13 @@ SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="delta")
 STOP_PHASE = "train run"
 
 RUN_ARTIFACTS = (
-    *(f"figures/{kind}-{{tag}}" for kind in ("route", "fused", "downstream", "depth")),
     *(
-        pattern
-        for kind in ("compare", "weights", "curves")
-        for pattern in (
-            f"figures/{kind}-{{tag}}-vs-*",
-            f"figures/{kind}-*-vs-{{tag}}",
-            f"figures/{kind}-*-vs-{{tag}}-vs-*",
-        )
+        f"figures/{kind}-{{tag}}"
+        for kind in ("route", "fused", "downstream", "depth", "curves")
     ),
+    "figures/curves-{tag}-vs-*",
+    "figures/curves-*-vs-{tag}",
+    "figures/curves-*-vs-{tag}-vs-*",
 )
 
 

@@ -1,387 +1,104 @@
-"""Training-dynamics figures from one or more run logs.
+"""Plot main/auxiliary losses, gradient norm, and throughput from current logs.
 
-Parses the trainer's telemetry (`step`, `eval`, `route`, `contract`,
-`schedule`, `run` lines) and draws validation curves, paired differences
-against a reference run, curves against trunk work, exponentially smoothed
-training losses (including the per-step paired pass-1 difference, which is
-exact because paired runs share every row), gradient norms, routing
-trajectories per site, and the repeated-fused-prefill monitor.
-
-Usage:
     python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
 
-The first log is the reference for every difference panel.  Runs that were
-resumed keep the last record for each step.
+Resumed logs keep the final record for each step. Comparing curves does not
+assert that the runs use matching data or schedules.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 
 import figstyle as fs
 import matplotlib.pyplot as plt
 import numpy as np
 
-STEP_RE = re.compile(r"^(\w+)\s*\|")
-
 
 def parse_log(path: Path) -> dict:
-    """Return {'run': {...}, 'schedule': {...}, 'steps': {step: {...}}, 'evals': [...], 'routes': [...], 'contracts': [...]}."""
-    out = {"run": {}, "schedule": {}, "steps": {}, "evals": {}, "routes": [], "contracts": {}, "depths": {}}
+    records = {"step": {}, "eval": {}}
+    run = {}
     for line in path.read_text().splitlines():
-        m = STEP_RE.match(line)
-        if not m:
+        kind, _, tail = line.partition("|")
+        kind = kind.strip()
+        if kind not in ("run", "step", "eval"):
             continue
-        kind = m.group(1)
         fields = {}
-        for piece in line.split("|")[1:]:
-            piece = piece.strip()
-            if "=" in piece:
-                k, v = piece.split("=", 1)
-                fields[k.strip()] = v.strip()
-        if "step" in fields and "/" in fields["step"]:
-            fields["step"] = int(fields["step"].split("/")[0])
-        for k, v in list(fields.items()):
-            if k in ("site", "phase", "tag", "condition", "path", "kind", "device"):
-                continue
-            try:
-                fields[k] = float(v)
-            except (TypeError, ValueError):
-                pass
+        for piece in tail.split("|"):
+            key, sep, value = piece.strip().partition("=")
+            if sep:
+                fields[key.strip()] = value.strip()
         if kind == "run":
-            out["run"] = fields
-        elif kind == "schedule":
-            out["schedule"] = fields
-        elif kind == "step":
-            out["steps"][int(fields["step"])] = fields
-        elif kind == "eval":
-            out["evals"][int(fields["step"])] = fields
-        elif kind == "route":
-            out["routes"].append(fields)
-        elif kind == "contract":
-            out["contracts"][int(fields["step"])] = fields
-        elif kind == "depth":
-            out["depths"][int(fields["step"])] = fields
-    out["evals"] = [out["evals"][s] for s in sorted(out["evals"])]
-    out["contracts"] = [out["contracts"][s] for s in sorted(out["contracts"])]
-    out["depths"] = [out["depths"][s] for s in sorted(out["depths"])]
-    return out
+            run = fields
+        else:
+            step = int(fields["step"].split("/")[0])
+            records[kind][step] = fields
+    if not run or not records["step"]:
+        raise ValueError(f"{path}: expected a current run header and training steps")
+    return {"run": run, **records}
 
 
-def cells_per_pass(run: dict, r: np.ndarray) -> np.ndarray:
-    """Cell-equivalents one pass executes at each step: ``layers / cell`` for a
-    flat column, ``2 + r * core / cell`` under ``l`` (the two held cells plus
-    the core ``r`` times), from the run record's geometry."""
-    layers = int(run["run"]["layers"])
-    cell = int(run["run"]["routing_block_size"])
-    if "l" not in run["run"]["condition"]:
-        return np.full_like(r, layers / cell)
-    core = layers - 2 * cell
-    return 2 + r * core / cell
+def values(records: dict, key: str) -> np.ndarray:
+    return np.array([float(records[step][key]) for step in sorted(records)])
 
 
-def ema(x: np.ndarray, span: int) -> np.ndarray:
+def ema(values: np.ndarray, span: int) -> np.ndarray:
+    result = values.copy()
     alpha = 2.0 / (span + 1)
-    y = np.empty_like(x, dtype=float)
-    acc = x[0]
-    for i, v in enumerate(x):
-        acc = alpha * v + (1 - alpha) * acc
-        y[i] = acc
-    return y
-
-
-def step_arrays(steps: dict, *, loop: bool) -> dict[str, np.ndarray]:
-    keys = sorted(steps)
-    cols = {"step": np.array(keys, dtype=float)}
-    for name in ("loss", "pass1", "k", "gnorm", "pass_tok_s", "cell_tok_s", "tok_s"):
-        cols[name] = np.array([steps[s][name] for s in keys], dtype=float)
-    cols["r"] = np.array([steps[s]["r"] for s in keys], dtype=float) if loop else np.ones(len(keys))
-    cols["phase"] = np.array([steps[s]["phase"] for s in keys])
-    cols["expert_balance"] = np.array([steps[s].get("expert_balance", 0) for s in keys], dtype=float)
-    for name in ("ntp", "mtp"):
-        cols[name] = np.array([steps[s].get(name, np.nan) for s in keys], dtype=float)
-    return cols
+    for index in range(1, len(result)):
+        result[index] = alpha * values[index] + (1 - alpha) * result[index - 1]
+    return result
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("logs", type=Path, nargs="+", help="run logs; the first is the reference")
-    ap.add_argument("--labels", nargs="*", default=None, help="legend labels (default: run tags)")
-    ap.add_argument("--out-dir", type=Path, default=None)
-    ap.add_argument("--ema", type=int, default=300, help="EMA span in steps for training losses")
-    ap.add_argument("--zoom", type=float, default=0.4, help="fraction of the schedule shown in the zoom panel")
-    args = ap.parse_args()
-
-    runs = [parse_log(p) for p in args.logs]
-    labels = args.labels or [r["run"]["tag"] for r in runs]
-    if len(labels) != len(runs):
-        raise SystemExit("one label per log")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("logs", type=Path, nargs="+")
+    parser.add_argument("--out-dir", type=Path)
+    parser.add_argument("--ema", type=int, default=300)
+    args = parser.parse_args()
+    if args.ema < 1:
+        parser.error("--ema must be positive")
+    runs = [parse_log(path) for path in args.logs]
+    labels = [run["run"]["tag"] for run in runs]
     out_dir = args.out_dir or Path("figures") / ("curves-" + "-vs-".join(labels))
     out_dir.mkdir(parents=True, exist_ok=True)
-    colors = [fs.SERIES[i % len(fs.SERIES)] for i in range(len(runs))]
-    ref = runs[0]
-    total = int(ref["schedule"]["total_steps"])
-    boundary = ref["schedule"]["feedback_boundary"]
-    cooldown_start = total - int(ref["schedule"]["cooldown_steps"]) + 1
-    summary = {"reference": labels[0], "runs": {}}
-
-    # -- per-run arrays --------------------------------------------------------
-    arrays = []
-    for run in runs:
-        a = step_arrays(run["steps"], loop="l" in run["run"]["condition"])
-        tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
-        passes = a["k"]
-        a["cum_pass_tokens"] = np.cumsum(passes) * tokens_per_step
-        a["cum_cell_tokens"] = np.cumsum(passes * cells_per_pass(run, a["r"])) * tokens_per_step
-        a["cum_tokens"] = a["step"] * tokens_per_step
-        a["fused_train"] = np.where(a["k"] > 1, a["ntp"] - a["pass1"], np.nan)
-        arrays.append(a)
-    evals = []
-    for run in runs:
-        e = run["evals"]
-        evals.append(
-            {
-                "step": np.array([r["step"] for r in e], dtype=float),
-                "val": np.array([r["val"] for r in e], dtype=float),
-                "val_fused": np.array([r.get("val_fused", np.nan) for r in e], dtype=float),
-                "val_mtp": np.array([r.get("val_mtp", np.nan) for r in e], dtype=float),
-                "val_mtp_fused": np.array([r.get("val_mtp_fused", np.nan) for r in e], dtype=float),
-            }
-        )
-    feedback = [not np.all(np.isnan(e["val_fused"])) for e in evals]
-
-    # -- validation -----------------------------------------------------------
-    fig, axes = plt.subplots(1, 3, figsize=(14, 3.8), constrained_layout=True)
-    ax = axes[0]
-    for e, lab, col, fb in zip(evals, labels, colors, feedback):
-        ax.plot(e["step"], e["val"], color=col, label=f"{lab}: pass 1")
-        if fb:
-            ax.plot(e["step"], e["val_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
-    ax.set(xlabel="optimizer step", ylabel="held-out CE", title="Validation through training")
-    if boundary:
-        fs.mark_step(ax, boundary, "feedback", y=0.98)
-    fs.mark_step(ax, cooldown_start, "cooldown", y=0.92)
-    ax.legend()
-    ax = axes[1]
-    start = total * (1 - args.zoom)
-    for e, lab, col, fb in zip(evals, labels, colors, feedback):
-        m = e["step"] >= start
-        ax.plot(e["step"][m], e["val"][m], "o-", color=col, ms=3, label=f"{lab}: pass 1")
-        if fb:
-            ax.plot(e["step"][m], e["val_fused"][m], "s--", color=col, ms=3, lw=1.2, label=f"{lab}: fused")
-    ax.set(xlabel="optimizer step", ylabel="held-out CE", title=f"Last {int(args.zoom * 100)}% of the schedule")
-    fs.mark_step(ax, cooldown_start, "cooldown")
-    ax.legend()
-    ax = axes[2]
-    for i, (e, lab, col, fb) in enumerate(zip(evals, labels, colors, feedback)):
-        if i > 0:
-            common = np.intersect1d(e["step"], evals[0]["step"])
-            d = np.array([e["val"][np.searchsorted(e["step"], s)] - evals[0]["val"][np.searchsorted(evals[0]["step"], s)] for s in common])
-            ax.plot(common, d, "o-", color=col, ms=3, label=f"{lab} − {labels[0]}, pass 1")
-            summary["runs"].setdefault(lab, {})["val_minus_reference"] = [[float(s), float(v)] for s, v in zip(common, d)]
-        if fb:
-            ax.plot(e["step"], e["val_fused"] - e["val"], "s--", color=col, ms=3, lw=1.2, label=f"{lab}: fused − pass 1")
-            summary["runs"].setdefault(lab, {})["fused_minus_pass1"] = [[float(s), float(v)] for s, v in zip(e["step"], e["val_fused"] - e["val"])]
-    fs.zero_line(ax)
-    ax.set(xlabel="optimizer step", ylabel="CE difference", title="Paired differences (same held-out rows)")
-    if boundary:
-        fs.mark_step(ax, boundary, "feedback", y=0.98)
-    fs.mark_step(ax, cooldown_start, "cooldown", y=0.92)
-    ax.legend(loc="lower left")
-    fs.save(fig, out_dir / "validation.png")
-
-    # -- data and trunk work (MTP block/readout costs excluded) -----------------
-    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
-    for e, a, lab, col, fb in zip(evals, arrays, labels, colors, feedback):
-        idx = np.searchsorted(a["step"], e["step"]).clip(0, len(a["step"]) - 1)
-        axes[0].plot(a["cum_tokens"][idx], e["val"], color=col, label=f"{lab}: pass 1")
-        axes[1].plot(a["cum_cell_tokens"][idx], e["val"], color=col, label=f"{lab}: pass 1")
-        if fb:
-            axes[1].plot(a["cum_cell_tokens"][idx], e["val_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
-    axes[0].set(xlabel="predicted tokens (matched data)", ylabel="held-out CE", title="Against predicted tokens", xscale="log")
-    axes[1].set(xlabel="trunk cell-tokens (excludes MTP)", ylabel="held-out CE", title="Against trunk work", xscale="log")
-    for ax in axes:
-        ax.legend()
-    fs.save(fig, out_dir / "matched-compute.png")
-
-    # -- training losses -------------------------------------------------------
-    fig, axes = plt.subplots(2, 2, figsize=(12, 7), constrained_layout=True)
-    ax = axes[0, 0]
-    for a, lab, col in zip(arrays, labels, colors):
-        ax.plot(a["step"], ema(a["pass1"], args.ema), color=col, label=f"{lab}: pass 1")
-    ax.set(xlabel="optimizer step", ylabel=f"train CE (EMA {args.ema})", title="Pass-1 training loss")
-    ax.legend()
-    ax = axes[0, 1]
-    ref_steps = arrays[0]["step"]
-    for a, lab, col in list(zip(arrays, labels, colors))[1:]:
-        common, ia, ib = np.intersect1d(a["step"], ref_steps, return_indices=True)
-        d = a["pass1"][ia] - arrays[0]["pass1"][ib]
-        ax.plot(common, ema(d, args.ema), color=col, label=f"{lab} − {labels[0]}")
-        summary["runs"].setdefault(lab, {})["train_pass1_minus_reference_last1000"] = float(d[-1000:].mean())
-        phases = a["phase"][ia]
-        summary["runs"][lab]["train_pass1_minus_reference_by_phase"] = {
-            phase: float(d[phases == phase].mean()) for phase in dict.fromkeys(phases)
-        }
-    fs.zero_line(ax)
-    ax.set(xlabel="optimizer step", ylabel=f"paired CE difference (EMA {args.ema})", title="Pass-1 loss difference on identical rows")
-    if boundary:
-        fs.mark_step(ax, boundary, "feedback", y=0.98)
-    fs.mark_step(ax, cooldown_start, "cooldown", y=0.92)
-    ax.legend()
-    ax = axes[1, 0]
-    any_fb = False
-    for a, lab, col, fb in zip(arrays, labels, colors, feedback):
-        if not fb:
-            continue
-        m = ~np.isnan(a["fused_train"])
-        if not m.any():
-            continue
-        any_fb = True
-        ax.plot(a["step"][m], ema((a["fused_train"] - a["pass1"])[m], args.ema), color=col, label=f"{lab}: mean fused pass − pass 1")
-        summary["runs"].setdefault(lab, {})["train_fused_minus_pass1_last1000"] = float((a["fused_train"] - a["pass1"])[m][-1000:].mean())
-    fs.zero_line(ax)
-    ax.set(xlabel="optimizer step", ylabel=f"CE difference (EMA {args.ema})", title="Training-time fused gap")
-    if any_fb:
-        ax.legend()
-    ax = axes[1, 1]
-    for a, lab, col in zip(arrays, labels, colors):
-        ax.plot(a["step"], ema(a["gnorm"], args.ema), color=col, label=lab)
-    ax.set(xlabel="optimizer step", ylabel=f"pre-clip gradient norm (EMA {args.ema})", title="Gradient norm", yscale="log")
-    ax.legend()
-    fs.save(fig, out_dir / "training-loss.png")
-
-    # -- auxiliary second-token prediction ------------------------------------
-    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
-    for run, a, e, lab, col in zip(runs, arrays, evals, labels, colors):
-        observed = np.isfinite(a["mtp"])
-        weight = run["run"].get("mtp_weight", "unknown")
-        if observed.any():
-            axes[0].plot(a["step"][observed], ema(a["mtp"][observed], args.ema), color=col, label=f"{lab}: weight {weight}")
-        axes[1].plot(e["step"], e["val_mtp"], color=col, label=f"{lab}: pass 1")
-        if np.isfinite(e["val_mtp_fused"]).any():
-            axes[1].plot(e["step"], e["val_mtp_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
-    axes[0].set(xlabel="optimizer step", ylabel=f"unweighted CE (EMA {args.ema})", title="Auxiliary train: pass 1 + mean fused")
-    axes[1].set(xlabel="optimizer step", ylabel="held-out CE", title="Auxiliary validation (teacher forcing)")
-    for ax in axes:
-        if ax.lines:
-            ax.legend()
-    fs.save(fig, out_dir / "multi-token-prediction.png")
-
-    # -- routing trajectories -------------------------------------------------
-    routed = [r for r in runs if r["routes"]]
-    if routed:
-        sites = []
-        for r in routed:
-            for rec in r["routes"]:
-                if rec["site"] not in sites:
-                    sites.append(rec["site"])
-        column_sites = [s for s in sites if s != "payload"]
-        fig, axes = plt.subplots(2, len(routed), figsize=(5.2 * len(routed), 7.5), squeeze=False, constrained_layout=True)
-        for j, (run, lab) in enumerate([(r, l) for r, l in zip(runs, labels) if r["routes"]]):
-            steps_r = sorted({rec["step"] for rec in run["routes"]})
-            for i, key in enumerate(("seed", "null")):
-                grid = np.full((len(column_sites), len(steps_r)), np.nan)
-                for rec in run["routes"]:
-                    if rec["site"] in column_sites and key in rec:
-                        grid[column_sites.index(rec["site"]), steps_r.index(rec["step"])] = rec[key]
-                ax = axes[i, j]
-                im = ax.imshow(grid, aspect="auto", cmap=fs.SEQUENTIAL, vmin=0, vmax=1, interpolation="nearest")
-                ax.set_yticks(range(len(column_sites)), column_sites, fontsize=6)
-                xt = np.linspace(0, len(steps_r) - 1, 6).astype(int)
-                ax.set_xticks(xt, [int(steps_r[t]) for t in xt], fontsize=7)
-                ax.set(title=f"{lab}: mean {key} mass per site", xlabel="optimizer step")
-                ax.grid(False)
-        fig.colorbar(im, ax=axes, shrink=0.6, label="mean routing weight (2 held-out rows)")
-        fs.save(fig, out_dir / "routing-sites.png")
-
-        payload_runs = [(r, l, c) for r, l, c in zip(runs, labels, colors) if any(rec["site"] == "payload" for rec in r["routes"])]
-        if payload_runs:
-            fig, axes = plt.subplots(1, 3, figsize=(13, 3.6), constrained_layout=True)
-            for run, lab, col in payload_runs:
-                recs = [rec for rec in run["routes"] if rec["site"] == "payload"]
-                s = np.array([rec["step"] for rec in recs], dtype=float)
-                axes[0].plot(s, [rec["seed"] for rec in recs], color=col, label=f"{lab}: seed")
-                axes[0].plot(s, [rec["null"] for rec in recs], color=col, ls="--", lw=1.2, label=f"{lab}: null")
-                axes[1].plot(s, [rec["max"] for rec in recs], color=col, label=f"{lab}: mean token-wise max")
-                axes[1].plot(s, [rec["head_js"] for rec in recs], color=col, ls="--", lw=1.2, label=f"{lab}: cross-head JS")
-                axes[2].plot(s, [rec["null_rms"] for rec in recs], color=col, label=lab)
-            axes[0].set(xlabel="optimizer step", ylabel="mean routing weight", title="Payload router: seed and null mass", ylim=(0, 1))
-            axes[1].set(xlabel="optimizer step", ylabel="statistic", title="Payload router: sharpness and head disagreement", ylim=(0, 1))
-            axes[2].set(xlabel="optimizer step", ylabel="RMS of the learned null", title="Payload null scale")
-            for ax in axes:
-                ax.legend()
-            fs.save(fig, out_dir / "routing-payload.png")
-
-    # -- contraction monitor --------------------------------------------------
-    contract_runs = [(r, l, c) for r, l, c in zip(runs, labels, colors) if r["contracts"]]
-    if contract_runs:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
-        for run, lab, col in contract_runs:
-            s = np.array([r["step"] for r in run["contracts"]], dtype=float)
-            l0 = np.array([r["loss0"] for r in run["contracts"]])
-            l8 = np.array([r["loss8"] for r in run["contracts"]])
-            u8 = np.array([r["upd8"] for r in run["contracts"]])
-            axes[0].plot(s, l8 - l0, "o-", color=col, ms=3, label=lab)
-            axes[1].plot(s, u8, "o-", color=col, ms=3, label=lab)
-            summary["runs"].setdefault(lab, {})["contract_final"] = {"loss0": float(l0[-1]), "loss8": float(l8[-1]), "upd8": float(u8[-1])}
-        fs.zero_line(axes[0])
-        axes[0].set(xlabel="optimizer step", ylabel="CE(iteration 8) − CE(iteration 1)", title="Repeated fused prefill: loss drift (2 rows)")
-        axes[1].set(xlabel="optimizer step", ylabel="mean ‖h₈ − h₇‖₂", title="Repeated fused prefill: iteration-8 update", yscale="log")
-        for ax in axes:
-            ax.legend()
-        fs.save(fig, out_dir / "contraction.png")
-
-    # -- depth monitor (l) ------------------------------------------------------
-    depth_runs = [(r, l, c) for r, l, c in zip(runs, labels, colors) if r["depths"]]
-    if depth_runs:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 3.6), constrained_layout=True)
-        for run, lab, col in depth_runs:
-            s = np.array([r["step"] for r in run["depths"]], dtype=float)
-            one = np.array([r["loss_one"] for r in run["depths"]])
-            mean = np.array([r["loss_mean"] for r in run["depths"]])
-            mx = np.array([r["loss_max"] for r in run["depths"]])
-            upd = np.array([r["upd_max"] for r in run["depths"]])
-            r_mean, r_max = int(run["depths"][-1]["r_mean"]), int(run["depths"][-1]["r_max"])
-            axes[0].plot(s, mean - one, "o-", color=col, ms=3, label=f"{lab}: r = {r_mean}")
-            axes[0].plot(s, mx - one, "o--", color=col, ms=3, lw=1.2, label=f"{lab}: r = {r_max}")
-            axes[1].plot(s, upd, "o-", color=col, ms=3, label=lab)
-            summary["runs"].setdefault(lab, {})["depth_final"] = {
-                "loss_one": float(one[-1]), "loss_mean": float(mean[-1]), "loss_max": float(mx[-1]), "upd_max": float(upd[-1]),
-            }
-        fs.zero_line(axes[0])
-        axes[0].set(xlabel="optimizer step", ylabel="CE(r) − CE(r = 1)", title="Fixed-r sweep: gain from iterating (2 rows)")
-        axes[1].set(xlabel="optimizer step", ylabel="mean ‖core(r_max) − core(r_max − 1)‖₂", title="Core update at the cap", yscale="log")
-        for ax in axes:
-            ax.legend()
-        fs.save(fig, out_dir / "depth-monitor.png")
-
-    # -- summary ---------------------------------------------------------------
-    for run, a, e, lab in zip(runs, arrays, evals, labels):
-        entry = summary["runs"].setdefault(lab, {})
-        tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
-        entry.update(
-            {
-                "condition": run["run"]["condition"],
-                "final_val": float(e["val"][-1]),
-                "final_val_fused": None if np.isnan(e["val_fused"][-1]) else float(e["val_fused"][-1]),
-                "steps": int(a["step"][-1]),
-                "predicted_tokens": float(a["cum_tokens"][-1]),
-                "pass_tokens": float(a["cum_pass_tokens"][-1]),
-                "pass_token_multiplier": float(a["cum_pass_tokens"][-1] / a["cum_tokens"][-1]),
-                "mean_step_seconds": float(tokens_per_step / np.nanmean(a["tok_s"])),
-            }
-        )
-        entry.update({
-            "mtp_weight": run["run"].get("mtp_weight"),
-            "final_val_mtp": None if np.isnan(e["val_mtp"][-1]) else float(e["val_mtp"][-1]),
-            "final_val_mtp_fused": None if np.isnan(e["val_mtp_fused"][-1]) else float(e["val_mtp_fused"][-1]),
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7), constrained_layout=True)
+    titles = (
+        "Main training CE", "Auxiliary training CE (combined)", "Pre-clip gradient norm",
+        "Main validation CE", "Auxiliary validation CE", "Predicted tokens / second",
+    )
+    summary = []
+    for index, (path, run, label) in enumerate(zip(args.logs, runs, labels, strict=True)):
+        color = fs.SERIES[index % len(fs.SERIES)]
+        steps, evals = run["step"], run["eval"]
+        x = np.array(sorted(steps))
+        axes[0, 0].plot(x, ema(values(steps, "pass1"), args.ema), color=color, label=label)
+        fused = values(steps, "k") > 1
+        if fused.any():
+            ce = values(steps, "ntp") - values(steps, "pass1")
+            axes[0, 0].plot(x[fused], ema(ce[fused], args.ema), "--", color=color, label=f"{label}: feedback")
+        axes[0, 1].plot(x, ema(values(steps, "mtp"), args.ema), color=color, label=label)
+        axes[0, 2].plot(x, ema(values(steps, "gnorm"), args.ema), color=color, label=label)
+        axes[1, 2].plot(x, ema(values(steps, "tok_s"), args.ema), color=color, label=label)
+        e = np.array(sorted(evals))
+        for axis, metric in zip(axes[1, :2], ("val", "val_mtp"), strict=True):
+            axis.plot(e, values(evals, metric), color=color, label=label)
+            if "f" in run["run"]["condition"]:
+                axis.plot(e, values(evals, metric + "_fused"), "--", color=color, label=f"{label}: fused")
+        summary.append({
+            "log": str(path), "tag": label, "condition": run["run"]["condition"],
+            "step": int(x[-1]), "latest_training": steps[int(x[-1])],
+            "latest_validation": evals[int(e[-1])] if len(e) else None,
         })
+    for axis, title in zip(axes.flat, titles, strict=True):
+        axis.set(title=title, xlabel="optimizer step")
+        axis.legend()
+    axes[0, 2].set_yscale("log")
+    fs.save(fig, out_dir / "training-curves.png")
     (out_dir / "training_curves.json").write_text(json.dumps(summary, indent=2) + "\n")
-    print(json.dumps({k: {kk: vv for kk, vv in v.items() if not isinstance(vv, list)} for k, v in summary["runs"].items()}, indent=2))
-    print(f"figures -> {out_dir}/")
+    print(out_dir)
 
 
 if __name__ == "__main__":

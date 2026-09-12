@@ -1,108 +1,41 @@
-# Sources for mechanisms implemented by the current model.
-# Fetch optional local paper copies with python -m transformer_experiments.references.
+# Mechanisms used by the current model.
 references:
   - arxiv: "2401.06066"
     slug: dai2024-deepseekmoe
-    note: >
-      Fine-grained expert segmentation and shared experts; every trunk and auxiliary FFN uses one shared plus three of fifteen routed quarter-width SwiGLUs.
-
+    note: Shared experts and fine-grained routed experts.
   - arxiv: "2408.15664"
     slug: wang2024-auxiliary-loss-free-balancing
-    note: >
-      Expert selection biases updated from whole-step assignment counts, separately from gradient optimization and output mixture weights.
-
+    note: Selection-only expert balancing biases.
   - arxiv: "2412.19437"
     slug: deepseek2025-v3
-    note: >
-      Sigmoid affinity scores, selection-only balancing bias, normalized mixture weights, and a complementary per-sequence balance loss.
-      Section 2.2 supplies sequential multi-token prediction with separately normalized state and next-token embedding, a dedicated transformer block, and shared embedding/output weights. This model uses the routed payload as the state input and one auxiliary PKDA/expert block.
-
+    note: Sigmoid expert routing, sequence balancing, and auxiliary next-token prediction.
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals
-    note: >
-      Grouped softmax over depth sources with contiguous feature heads; combined here with block deltas.
-
+    note: Grouped softmax over depth sources.
   - arxiv: "2605.18855"
     slug: luo2026-delta-attention-residuals
-    note: >
-      Additive residual-delta routing with RMS-normalized keys, raw values, and zero-initialized queries.
-
+    note: Residual-delta routing with normalized keys and raw values.
   - arxiv: "2510.26692"
     slug: kimi2025-kimi-linear
-    note: >
-      KDA recurrence, short convolutions, channel-wise decay, output gates, and the three-to-one recurrent/global cell pattern.
-
+    note: KDA recurrence and recurrent/global attention cells.
   - arxiv: "2604.21100"
     slug: tumma2026-preconditioned-deltanet
-    note: >
-      Apply-to-key diagonal preconditioning with independent decay and gain and a bounded log-space squash.
-
-  - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/layers/precond_kda.py
-    slug: fla2026-preconditioned-kda
-    note: >
-      Reference PKDA controls, initializations, and recurrent-state boundaries. This model uses RMSNorm epsilon 1e-6.
-
-  - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/modules/conv/short_conv.py
-    slug: fla2026-short-convolution
-    note: >
-      Bias-free depthwise causal convolution with three cached positions and standard Conv1d initialization.
-
-  - url: https://github.com/fla-org/flash-linear-attention/blob/35dceaee5408e69a555fec34cb215c93c375dabe/fla/ops/precond_kda/chunk.py
-    slug: fla2026-preconditioned-kda-chunk
-    note: >
-      PKDA chunkwise training recurrence with FP32 boundary states and activation-dtype outputs.
-
-  - url: https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen3_next/modeling_qwen3_next.py
-    slug: qwen2025-qwen3-next-attention
-    note: >
-      Elementwise sigmoid gating of concatenated global-attention heads before the output projection.
-
+    note: Diagonal apply-to-key preconditioning.
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer
-    note: >
-      Asymmetric payload-value/token-gate fusion, Jacobi passes, prefix mixin, jitter, and the feedback training recipe.
-
+    note: Token-gated payload fusion and Jacobi feedback training.
   - arxiv: "2510.05491"
     slug: li2025-normuon
-    note: >
-      Momentum, Newton-Schulz orthogonalization, and row-wise second-moment normalization for matrix updates.
-
-  - url: https://github.com/zichongli5/NorMuon/blob/c6989a8354730695d9f5a9faa6c55eeb24865209/normuon.py#L35-L42
-    slug: li2025-normuon-implementation
-    note: >
-      Nesterov blending before orthogonalization, preserved by NorMuonH.
-
-  - url: https://github.com/pytorch/pytorch/blob/v2.9.1/torch/optim/nadam.py#L380-L531
-    slug: pytorch291-nadam-implementation
-    note: >
-      NAdam first and second moments, scheduled Nesterov momentum, and momentum-product bias correction.
-
+    note: Matrix orthogonalization with row-wise adaptation.
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
-    note: >
-      Fan-in matrix initialization, fixed realized Frobenius radius, and radial projection. The spectral tangent update is this repository's extension, not a Hyperball result.
-
+    note: Fixed realized Frobenius radius; this repo adds spectral tangent steps.
   - arxiv: "2502.05171"
     slug: geiping2025-recurrent-depth
-    note: >
-      Prelude/tied-core/coda structure and log-normal Poisson iteration draw. This model uses full backpropagation and same-depth caches.
-
+    note: Prelude/core/coda and log-normal Poisson depth draw.
   - arxiv: "2203.03466"
     slug: yang2022-tensor-programs-v
-    note: >
-      Width scaling of Adam-family hidden-matrix rates; applied here to NAdam with reference width 1536.
-
+    note: Width-scaled hidden-matrix learning rates and readout.
   - arxiv: "2310.17813"
     slug: yang2023-spectral-condition
-    note: >
-      Spectral scaling condition motivates the sqrt(fan_out/fan_in) normalization of NorMuon tangent updates; finite power estimates and sphere retraction do not provide a strict bound.
-
-  - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/layer.py#L32-L37
-    slug: microsoft-mup-shared-readout
-    note: >
-      Readout multiplier for tied embedding/readout weights, implemented here as 1536 / D.
-
-  - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/init.py#L18-L24
-    slug: microsoft-mup-initialization
-    note: >
-      Inverse-square-root width scaling for hidden-matrix initialization, applied here to NAdam gates and controls.
+    note: Spectral scaling of matrix updates.

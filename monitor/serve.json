@@ -1,4 +1,3 @@
 {
-  "primary": "train",
-  "kinds": ["probe"]
+  "primary": "train"
 }

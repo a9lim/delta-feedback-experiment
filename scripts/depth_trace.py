@@ -13,19 +13,18 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
-import sys
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 import figstyle as fs
+import matplotlib.pyplot as plt
+import torch
 
 from delta_feedback_experiment.analysis import autocast, load_checkpoint
 from delta_feedback_experiment.data import TokenData
 from delta_feedback_experiment.model import depth_trace
 
 
+@torch.no_grad()
 def core_route_mass(model, rows, iterations: int) -> dict[str, dict[int, dict[str, float]]]:
     """Mean route mass per source at every core site, keyed by iteration."""
     device = rows.device

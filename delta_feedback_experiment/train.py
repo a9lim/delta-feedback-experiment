@@ -24,6 +24,7 @@ import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -288,8 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "predicted tokens per active non-embedding parameter of the flat "
             "full stack at this scale; derives --steps, rounded up to whole "
-            "steps, unless --steps is given (default: 25; the Prime recipes "
-            "use 400)"
+            "steps, unless --steps is given (default: 25)"
         ),
     )
 
@@ -1354,8 +1354,14 @@ def reference_active(args) -> int:
     the shared expert and configured selected experts per layer, excluding
     idle experts.
     """
+    return _reference_active(**model_fields(args))
+
+
+@lru_cache(maxsize=128)
+def _reference_active(**fields: int) -> int:
+    """Count once per geometry; parser and schedule calls reuse the result."""
     with torch.device("meta"):
-        model = DeltaModel(condition_config("f", **model_fields(args)))
+        model = DeltaModel(condition_config("f", **fields))
     total = sum(parameter.numel() for parameter in model.parameters())
     inactive = sum(
         parameter.numel()

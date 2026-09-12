@@ -1,8 +1,5 @@
 """Shared figure style for the analysis scripts: palette, rc defaults, helpers.
 
-The categorical order is fixed (never cycled) so a run or a predictor keeps its
-hue across every figure of one analysis.  Marks are thin, grids are hairlines,
-and text stays in ink colors rather than series colors.
 """
 
 from __future__ import annotations
@@ -63,30 +60,6 @@ plt.rcParams.update(
         "savefig.dpi": 170,
     }
 )
-
-
-def zero_line(ax, axis: str = "y") -> None:
-    """A recessive reference line at zero."""
-    if axis == "y":
-        ax.axhline(0, color=BASELINE, lw=0.8, zorder=1)
-    else:
-        ax.axvline(0, color=BASELINE, lw=0.8, zorder=1)
-
-
-def mark_step(ax, step: float, label: str | None = None, y: float = 0.98) -> None:
-    """A vertical schedule marker with a small muted label."""
-    ax.axvline(step, color=MUTED, lw=0.9, ls=":", zorder=1)
-    if label:
-        ax.text(
-            step,
-            y,
-            f" {label}",
-            color=MUTED,
-            fontsize=7,
-            ha="left",
-            va="top",
-            transform=ax.get_xaxis_transform(),
-        )
 
 
 def save(fig, path) -> None:

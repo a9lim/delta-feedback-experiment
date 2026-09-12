@@ -81,26 +81,6 @@ change optimizer updates only: forward normalization and initialization
 retain their own contracts. This is an implemented scaling candidate,
 without demonstrated full-model hyperparameter transfer across scales.
 
-`python scripts/spectral_optimizer_check.py --device cuda --benchmark --output /tmp/spectral.json`
-compares the three-step spectral estimates with exact SVD on synthetic
-screen-shaped directions, including rotating low-rank gradients and unequal
-row histories. It also times bounded optimizer buckets and weights their
-timings by screen matrix counts. Exact SVD is diagnostic only. Results measure
-estimate error and optimizer cost, not full training throughput, model quality,
-or a guaranteed norm bound. Omit `--benchmark` for accuracy alone; omit
-`--device cuda` for CPU execution.
-
-`python scripts/expert_scaling_check.py --device cuda --output /tmp/expert-scaling.json`
-records a bounded coordinate check with learned routing. It compares the
-implemented rates against base expert rates on identical initial weights and
-a fixed synthetic batch, using one screen bank per run at one-eighth residual
-and expert widths (`D=96`, `h=104`), screen expert counts, and the real 1,536
-reference. This diagnostic runs screen only; larger geometries are outside
-Jobe's execution scope.
-The JSON reports output changes, router logits/entropy, and gradient norms
-over four steps and two seeds; it is a diagnostic, not a transfer benchmark.
-Omit `--device cuda` for portable FP32 execution.
-
 ## Token budgets
 
 `--tokens-per-param R` derives steps from the current flat `f` training-active
@@ -128,9 +108,7 @@ the default mixture costs about 1.28 pass-tokens per prediction. See
 [design.md](design.md#schedule).
 
 `--continue TAG` extends a finished run by restoring the last snapshot the
-longer schedule reproduces. A 25x screen run continued to 50x restores step
-7,186 and trains 11,976 more steps to reach 19,162.
-
+longer schedule reproduces.
 Token stores include validation and each row's extra target.
 `delta tokenize --scale S --tokens-per-param R` computes that requirement and
 rounds up to the next billion stored tokens. Screen 100x needs 21B, screen

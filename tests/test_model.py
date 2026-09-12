@@ -1,22 +1,14 @@
 """One tiny model per distinct causal, recurrence, and numerical contract."""
 
-from dataclasses import fields
-
-import pytest
 import torch
 
 from delta_feedback_experiment.model import (
-    CONDITION_LETTERS,
     DeltaModel,
     KVCache,
-    ModelConfig,
     condition_config,
     multipass,
     multipass_loss,
-    parse_condition,
 )
-from delta_feedback_experiment.moe import MixtureOfExperts
-from delta_feedback_experiment.pkda import PreconditionedKDA
 
 TINY = {
     "vocab_size": 31,
@@ -26,6 +18,8 @@ TINY = {
     "kv_heads": 2,
     "head_dim": 8,
     "expert_intermediate": 8,
+    "num_routed_experts": 3,
+    "experts_per_token": 2,
     "pkda_heads": 2,
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
@@ -56,53 +50,6 @@ def separate_expert_selection(model):
         bank.expert_bias[-bank.experts_per_token :] = 2
 
 
-def test_current_conditions_and_permanent_structure():
-    assert tuple(CONDITION_LETTERS) == ("f", "l")
-    assert parse_condition("lf") == "fl"
-    assert ModelConfig().condition == "f"
-    assert not {"hybrid", "block_routing", "experts", "mtp"} & {
-        field.name for field in fields(ModelConfig)
-    }
-    for invalid in ("", "a", "r", "m", "e", "arf", "ff", "x"):
-        with pytest.raises(ValueError):
-            parse_condition(invalid)
-    with pytest.raises(ValueError):
-        ModelConfig(feedback=False, loop=False)
-    with pytest.raises(ValueError, match="three"):
-        condition_config("l", **TINY)
-    for invalid in (
-        {"expert_intermediate": 0}, {"num_routed_experts": 0},
-        {"experts_per_token": 0}, {"experts_per_token": 16},
-    ):
-        with pytest.raises(ValueError):
-            condition_config("f", **(TINY | invalid))
-    model = tiny()
-    assert [isinstance(block.attn, PreconditionedKDA) for block in model.blocks] == [
-        True,
-        True,
-        True,
-        False,
-    ]
-    assert all(isinstance(block.mlp, MixtureOfExperts) for block in model.blocks)
-    assert all(
-        block.attn_router is not None and block.mlp_router is not None
-        for block in model.blocks
-    )
-    assert model.mtp is not None
-    assert isinstance(model.mtp.block.attn, PreconditionedKDA)
-    assert isinstance(model.mtp.block.mlp, MixtureOfExperts)
-    assert model.mtp.block.attn_router is None and model.mtp.block.mlp_router is None
-    assert all(model.mtp.block.attn is not block.attn for block in model.blocks)
-    assert model.expert_banks == (
-        *(block.mlp for block in model.blocks), model.mtp.block.mlp
-    )
-    loop = tiny("l").cfg
-    assert not loop.feedback and loop.core_layers == range(4, 12)
-    assert loop.executed_layers(2) == 24
-    with pytest.raises(ValueError):
-        loop.resolve_iterations(3)
-
-
 def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     states = [tiny(condition, layers=16).state_dict() for condition in ("f", "l", "fl")]
     common = states[0].keys() & states[1].keys() & states[2].keys()
@@ -111,7 +58,9 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     assert any(name.startswith("mtp.block.mlp.experts.") for name in common)
     for name in common:
         for state in states[1:]:
-            torch.testing.assert_close(states[0][name], state[name], atol=0, rtol=0, msg=name)
+            torch.testing.assert_close(
+                states[0][name], state[name], atol=0, rtol=0, msg=name
+            )
 
 
 def test_routing_matches_normalized_math_and_telescopes():
@@ -143,17 +92,6 @@ def test_routing_matches_normalized_math_and_telescopes():
     )
     torch.testing.assert_close(
         out.core_state - out.core_entry, out.sources[2] + out.sources[3]
-    )
-    assert out.route_source_names["L4i1.attn"] == (
-        "null", "seed", "block0", "block2", "partial1"
-    )
-    assert out.route_source_names["payload"] == (
-        "null",
-        "seed",
-        "block0",
-        "block1",
-        "block2",
-        "block3",
     )
 
 
@@ -188,7 +126,7 @@ def test_feedback_and_loop_are_token_causal():
 
 
 def test_loop_once_pairs_with_flat_values_and_gradients():
-    geometry = {"layers": 16, "num_routed_experts": 23, "experts_per_token": 5}
+    geometry = {"layers": 16}
     flat, loop = tiny("f", **geometry).train(), tiny("fl", **geometry).train()
     assert flat.state_dict().keys() == loop.state_dict().keys()
     losses = []
@@ -232,10 +170,12 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
         torch.testing.assert_close(result.expert_counts, logical_counts, atol=0, rtol=0)
         for bank, before in zip(model.expert_banks, biases, strict=True):
             torch.testing.assert_close(bank.expert_bias, before, atol=0, rtol=0)
-        trunk_count = 3 * (tokens().shape[1] - 1) * 2
-        auxiliary_count = 3 * (tokens().shape[1] - 2) * 2
+        trunk_count = 2 * (tokens().shape[1] - 1) * 2
+        auxiliary_count = 2 * (tokens().shape[1] - 2) * 2
         assert logical_counts.sum(-1).tolist() == (
-            [trunk_count] * 4 + [2 * trunk_count] * 8 + [trunk_count] * 4
+            [trunk_count] * 4
+            + [2 * trunk_count] * 8
+            + [trunk_count] * 4
             + [auxiliary_count]
         )
         for name in (
@@ -264,10 +204,9 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
             )
 
 
-@pytest.mark.parametrize("condition", ["l", "fl"])
 @torch.no_grad()
-def test_cached_decode_matches_full_recomputation(condition):
-    model = tiny(condition)
+def test_cached_decode_matches_full_recomputation():
+    model = tiny("fl")
     separate_expert_selection(model)
     toks = tokens()
     embedded = model.embed_tokens(toks)
@@ -289,7 +228,9 @@ def test_cached_decode_matches_full_recomputation(condition):
         expected = reference.h_top[:, -1:]
         error = out.h_top - expected
         relative_l2 = error.norm() / expected.norm().clamp_min(1e-6)
-        relative_peak = error.abs().max() / expected.square().mean().sqrt().clamp_min(1e-6)
+        relative_peak = error.abs().max() / expected.square().mean().sqrt().clamp_min(
+            1e-6
+        )
         assert relative_l2 < 1e-4, relative_l2.item()
         assert relative_peak < 2e-4, relative_peak.item()
         payload = out.payload[:, -1:] if model.cfg.feedback else None

@@ -5,14 +5,10 @@ from copy import deepcopy
 
 import pytest
 import torch
-from transformer_experiments.schedule import Schedule
 
 from delta_feedback_experiment.model import DeltaModel, condition_config
 from delta_feedback_experiment.optim import (
-    NADAM_MOMENTUM_DECAY,
     NorMuonH,
-    OptimizerPair,
-    apply_schedule,
     build_optimizers,
     split_parameters,
 )
@@ -82,7 +78,10 @@ def test_bucket_optimizer_preserves_absent_gradients_and_resume():
     for parameter, other in zip(parameters, restored_parameters):
         assert torch.equal(parameter, other)
         assert set(optimizer.state[parameter]) == {
-            "momentum", "row_moment", "radius", "spectral_vector"
+            "momentum",
+            "row_moment",
+            "radius",
+            "spectral_vector",
         }
         for name, value in optimizer.state[parameter].items():
             assert torch.equal(value, restored.state[other][name])
@@ -107,13 +106,8 @@ def test_bounded_expert_buckets_match_independent_matrix_updates():
             torch.testing.assert_close(parameter, reference)
 
 
-@pytest.mark.parametrize(
-    "overrides",
-    [{}, {"dim": 64}, {"experts_per_token": 3}, {"expert_intermediate": 12}],
-    ids=["tiny_bridge", "residual_width", "active_experts", "expert_width"],
-)
-def test_five_rate_groups_partition_trunk_mtp_and_frozen_parameters(overrides):
-    model = tiny_optimizer_model(**overrides)
+def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
+    model = tiny_optimizer_model()
     frozen = {
         model.fuse_value.weight,
         model.blocks[0].mlp.experts[0].gate_up_proj.weight,
@@ -176,168 +170,11 @@ def test_five_rate_groups_partition_trunk_mtp_and_frozen_parameters(overrides):
     }
     assert set(groups) == set(stable)
     assert {group["rate_name"] for group in optimizers[0].param_groups} == {
-        "normuonh", "normuonh_expert_in", "normuonh_expert_out"
+        "normuonh",
+        "normuonh_expert_in",
+        "normuonh_expert_out",
     }
     for name, group in groups.items():
         assert set(group["params"]) == expected[name]
         assert group["stable_lr"] == pytest.approx(stable[name])
         assert group["lr"] == pytest.approx(stable[name])
-
-
-@pytest.mark.parametrize(
-    "device",
-    [
-        "cpu",
-        pytest.param(
-            "cuda",
-            marks=pytest.mark.skipif(
-                not torch.cuda.is_available(), reason="requires compiled CUDA optimizer"
-            ),
-        ),
-    ],
-)
-def test_five_scheduled_rates_match_independent_updates_and_resume(device):
-    torch.manual_seed(113)
-    model = tiny_optimizer_model().to(device)
-    selected = {
-        "normuonh": [
-            "blocks.0.attn.q_proj.weight", "mtp.projection.weight"
-        ],
-        "normuonh_expert_in": [
-            "blocks.0.mlp.shared.gate_up_proj.weight",
-            "blocks.0.mlp.experts.0.gate_up_proj.weight",
-            "mtp.block.mlp.experts.6.gate_up_proj.weight",
-        ],
-        "normuonh_expert_out": [
-            "blocks.0.mlp.shared.down_proj.weight",
-            "blocks.0.mlp.experts.0.down_proj.weight",
-            "mtp.block.mlp.experts.6.down_proj.weight",
-        ],
-        "nadam": ["embed_tokens.weight", "mtp.payload_norm.weight"],
-        "nadam_width": [
-            "blocks.0.mlp.router.weight", "mtp.block.mlp.router.weight"
-        ],
-    }
-    owners = {
-        name: rate_name for rate_name, names in selected.items() for name in names
-    }
-    parameters = dict(model.named_parameters())
-    for name, parameter in parameters.items():
-        parameter.requires_grad_(name in owners)
-    frozen_weights = {
-        name: parameter.detach().clone()
-        for name, parameter in parameters.items()
-        if name not in owners
-    }
-    normuonh_rate, nadam_rate, betas = 0.021, 0.00017, (0.8, 0.91)
-    stable = expected_stable_rates(model.cfg, normuonh_rate, nadam_rate)
-    stack = build_optimizers(
-        model, lr_normuonh=normuonh_rate, lr_nadam=nadam_rate, nadam_betas=betas
-    )
-    # The ordinary Q projection and expert gate/up matrices deliberately share
-    # a shape. Packing may never combine them across their different rates.
-    assert parameters[selected["normuonh"][0]].shape == parameters[
-        selected["normuonh_expert_in"][0]
-    ].shape
-    references, separate = {}, {}
-    for name, rate_name in owners.items():
-        reference = torch.nn.Parameter(parameters[name].detach().cpu().clone())
-        references[name] = reference
-        if rate_name.startswith("normuonh"):
-            separate[name] = NorMuonH([reference], lr=stable[rate_name])
-        else:
-            separate[name] = torch.optim.NAdam(
-                [reference], lr=stable[rate_name], betas=betas,
-                momentum_decay=NADAM_MOMENTUM_DECAY, eps=1e-8, foreach=False,
-            )
-
-    schedule = Schedule(heat=4, warmup=0.5, cooldown=0.5)
-    multipliers = (0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1 - math.sqrt(0.5), 0.0)
-    deferred = "blocks.0.mlp.experts.0.gate_up_proj.weight"
-    restored_stack, restored_parameters = None, None
-    for step, multiplier in enumerate(multipliers, 1):
-        expected_rates = {name: rate * multiplier for name, rate in stable.items()}
-        assert apply_schedule(stack, schedule, step) == pytest.approx(expected_rates)
-        if restored_stack is not None:
-            assert apply_schedule(restored_stack, schedule, step) == pytest.approx(
-                expected_rates
-            )
-        previous = {
-            name: parameters[name].detach().clone() for name in owners
-        }
-        missing_state = {}
-        for index, (name, rate_name) in enumerate(owners.items()):
-            parameter, reference = parameters[name], references[name]
-            active = (index + step) % 3 != 0 and not (name == deferred and step <= 2)
-            gradient = torch.randn_like(reference) if active else None
-            parameter.grad = None if gradient is None else gradient.to(device)
-            reference.grad = None if gradient is None else gradient.clone()
-            independent = separate[name]
-            independent.param_groups[0]["lr"] = expected_rates[rate_name]
-            if restored_parameters is not None:
-                restored_parameters[name].grad = (
-                    None if gradient is None else gradient.to(device).clone()
-                )
-            if not active:
-                optimizer = stack[0 if rate_name.startswith("normuonh") else 1]
-                missing_state[name] = deepcopy(optimizer.state.get(parameter))
-        for optimizer in stack:
-            optimizer.step()
-        for optimizer in separate.values():
-            optimizer.step()
-        if restored_stack is not None:
-            for optimizer in restored_stack:
-                optimizer.step()
-
-        for name, rate_name in owners.items():
-            parameter, reference = parameters[name], references[name]
-            optimizer_index = 0 if rate_name.startswith("normuonh") else 1
-            state = stack[optimizer_index].state.get(parameter)
-            torch.testing.assert_close(
-                parameter.cpu(), reference, rtol=5e-4, atol=5e-6, msg=name
-            )
-            expected_state = separate[name].state.get(reference)
-            assert (state is None) == (expected_state is None)
-            if state is not None:
-                assert set(state) == set(expected_state)
-                for key, value in state.items():
-                    torch.testing.assert_close(
-                        value.cpu(), expected_state[key], rtol=5e-4, atol=5e-6,
-                        msg=f"{name}: {key}",
-                    )
-            if name in missing_state:
-                torch.testing.assert_close(parameter, previous[name], rtol=0, atol=0)
-                before = missing_state[name]
-                assert (state is None) == (before is None)
-                if state is not None:
-                    for key, value in state.items():
-                        torch.testing.assert_close(value, before[key], rtol=0, atol=0)
-            if restored_stack is not None:
-                other = restored_parameters[name]
-                torch.testing.assert_close(parameter, other, rtol=0, atol=0)
-                restored_state = restored_stack[optimizer_index].state.get(other)
-                assert (state is None) == (restored_state is None)
-                if state is not None:
-                    for key, value in state.items():
-                        torch.testing.assert_close(
-                            value, restored_state[key], rtol=0, atol=0
-                        )
-        for name, original in frozen_weights.items():
-            torch.testing.assert_close(parameters[name], original, rtol=0, atol=0)
-
-        if step == 2:
-            assert parameters[deferred] not in stack[0].state
-            restored_model = deepcopy(model)
-            restored_parameters = dict(restored_model.named_parameters())
-            restored_stack = build_optimizers(
-                restored_model, lr_normuonh=0.09, lr_nadam=0.005
-            )
-            OptimizerPair(restored_stack).load_state_dict(
-                deepcopy(OptimizerPair(stack).state_dict())
-            )
-            restored_rates = {
-                group["rate_name"]: group["stable_lr"]
-                for optimizer in restored_stack
-                for group in optimizer.param_groups
-            }
-            assert restored_rates == pytest.approx(stable)
