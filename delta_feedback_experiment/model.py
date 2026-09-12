@@ -47,7 +47,7 @@ from torch import Tensor, nn
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention, rotary_qk
 from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
-from .moe import MixtureOfExperts
+from .moe import EXPERT_BIAS_RATE, NUM_ROUTED_EXPERTS, MixtureOfExperts
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
 from .tokenizer import VOCAB_SIZE
@@ -128,8 +128,8 @@ flagship is the rate at every narrower geometry, and the flagship itself is
 the plain parametrization.
 """
 
-EXPERT_BALANCE_COEF = 0.01
-"""Load-balance loss coefficient, averaged over executed layers and passes."""
+EXPERT_BALANCE_COEF = 0.0001
+"""Weak sequence-balance coefficient, averaged over executed layers and passes."""
 
 
 @dataclass(frozen=True)
@@ -761,9 +761,10 @@ class Block(nn.Module):
         *sources: Tensor,
         accumulators: tuple[Tensor, ...] = (),
     ) -> tuple[
-        Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None
+        Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None,
+        Tensor | None,
     ]:
-        """Returns (h, cell delta, attn weights, mlp weights). The branch
+        """Return residual, delta, diagnostic weights, expert loss and counts. The branch
         outputs stay inside: nothing reads them, and a compiled block that
         returned them would both write them and take autograd's materialized
         zero gradient back. ``block_start`` is the residual at the cell's
@@ -805,15 +806,17 @@ class Block(nn.Module):
         x, w_mlp = self._read(
             h, self.mlp_router, mlp_sources, accumulators, want_weights
         )
-        aux = expert_weights = None
+        aux = expert_weights = expert_counts = None
         normalized = self.mlp_norm(x)
         if isinstance(self.mlp, MixtureOfExperts):
-            mixed, aux, expert_weights = self.mlp(normalized, want_weights=want_weights)
+            mixed, aux, expert_weights, expert_counts = self.mlp(
+                normalized, want_weights=want_weights
+            )
         else:
             mixed = self.mlp(normalized)
         m = self.branch_scale * mixed
         h = h + m
-        return h, h - start, w_attn, w_mlp, aux, expert_weights
+        return h, h - start, w_attn, w_mlp, aux, expert_weights, expert_counts
 
 
 def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
@@ -824,7 +827,7 @@ def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
     call convention positional.
     """
     sources = tensors[: len(tensors) - banked]
-    h, delta, _, _, aux, _ = block(
+    h, delta, _, _, aux, _, counts = block(
         h,
         block_start,
         None,
@@ -833,7 +836,7 @@ def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
         *sources,
         accumulators=tensors[len(sources) :],
     )
-    return h, delta, aux
+    return h, delta, aux, counts
 
 
 # Each block family compiles through its own code object. Dynamo keys its
@@ -923,6 +926,9 @@ class ColumnOutput:
 
     expert_weights: dict[str, Tensor]
     """Site -> sparse normalized top-3 routing weights [B, T, 15]."""
+
+    expert_counts: Tensor | None
+    """``e``: logical assignment counts [physical layers, 15], summed over core uses."""
 
 
 _ClassifierShadow = ShadowOperand
@@ -1105,6 +1111,18 @@ class DeltaModel(nn.Module):
             if parameter.requires_grad and parameter not in buffers:
                 buffers[parameter] = torch.zeros_like(parameter, dtype=torch.float32)
         return buffers
+
+    @torch.no_grad()
+    def update_expert_bias(
+        self, counts: Tensor, *, rate: float = EXPERT_BIAS_RATE
+    ) -> None:
+        """Update each physical expert bank once after a complete training step."""
+        if not self.cfg.experts or not self.training:
+            return
+        if counts.shape != (len(self.blocks), NUM_ROUTED_EXPERTS):
+            raise ValueError("expert counts must have shape [physical layers, 15]")
+        for block, layer_counts in zip(self.blocks, counts, strict=True):
+            block.mlp.update_bias(layer_counts, rate=rate)
 
     def bind_gradient_sinks(
         self, sinks: dict[nn.Parameter, Tensor] | None
@@ -1369,9 +1387,10 @@ class DeltaModel(nn.Module):
         want_weights: bool,
         checkpointing: bool,
     ) -> tuple[
-        Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None
+        Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None,
+        Tensor | None,
     ]:
-        """One block: residual, delta, MHDB weights, expert loss and weights.
+        """One block: residual, delta, MHDB weights, expert loss, weights and counts.
         Diagnostic weights are None unless requested.
         ``banked`` are the accumulators of the leading sources in ``passed``."""
         gate_weight = (
@@ -1385,7 +1404,7 @@ class DeltaModel(nn.Module):
         ):
             # Keep checkpointing outside compilation: both stored and
             # recomputed blocks use the same compiled numerical boundaries.
-            h, delta, aux = torch.utils.checkpoint.checkpoint(
+            h, delta, aux, counts = torch.utils.checkpoint.checkpoint(
                 block_fn if h.is_cuda else _block_for_checkpoint,
                 block,
                 h,
@@ -1397,12 +1416,12 @@ class DeltaModel(nn.Module):
                 use_reentrant=False,
                 preserve_rng_state=False,
             )
-            return h, delta, None, None, aux, None
+            return h, delta, None, None, aux, None, counts
         if h.is_cuda and cache is None and not want_weights:
-            h, delta, aux = block_fn(
+            h, delta, aux, counts = block_fn(
                 block, h, entry, gate_weight, len(banked), *passed, *banked
             )
-            return h, delta, None, None, aux, None
+            return h, delta, None, None, aux, None, counts
         return block(
             h,
             entry,
@@ -1429,6 +1448,7 @@ class DeltaModel(nn.Module):
         route_source_names: dict[str, tuple[str, ...]],
         expert_losses: list[Tensor],
         expert_weights_out: dict[str, Tensor],
+        expert_counts_out: dict[int, Tensor],
         **runtime,
     ) -> tuple[Tensor, Tensor]:
         """Run ``blocks`` as routing cell ``cell``; return (h, cell delta).
@@ -1448,13 +1468,18 @@ class DeltaModel(nn.Module):
             if sources is not None and not opens:
                 passed.append(partial)
                 passed_names.append(f"partial{cell}")
-            h, partial, w_attn, w_mlp, aux, w_expert = self._run_block(
+            h, partial, w_attn, w_mlp, aux, w_expert, counts = self._run_block(
                 block, h, None if opens else cell_start, passed, banked, **runtime
             )
             if aux is not None:
                 expert_losses.append(aux)
             if w_expert is not None:
                 expert_weights_out[f"L{block.layer}{label}.experts"] = w_expert
+            if counts is not None:
+                previous = expert_counts_out.get(block.layer)
+                expert_counts_out[block.layer] = (
+                    counts if previous is None else previous + counts
+                )
             if w_attn is not None:
                 site = f"L{block.layer}{label}.attn"
                 weights_out[site] = w_attn
@@ -1522,6 +1547,7 @@ class DeltaModel(nn.Module):
         route_source_names: dict[str, tuple[str, ...]] = {}
         expert_losses: list[Tensor] = []
         expert_weights_out: dict[str, Tensor] = {}
+        expert_counts_out: dict[int, Tensor] = {}
         checkpointing = (
             self.grad_checkpoint
             and self.training
@@ -1537,6 +1563,7 @@ class DeltaModel(nn.Module):
             "route_source_names": route_source_names,
             "expert_losses": expert_losses,
             "expert_weights_out": expert_weights_out,
+            "expert_counts_out": expert_counts_out,
         }
 
         def complete(carrier: Tensor, delta: Tensor, cell: int) -> Tensor:
@@ -1683,6 +1710,11 @@ class DeltaModel(nn.Module):
             if expert_losses
             else None,
             expert_weights=expert_weights_out,
+            expert_counts=(
+                torch.stack([
+                    expert_counts_out[layer] for layer in range(len(self.blocks))
+                ]) if expert_counts_out else None
+            ),
         )
 
     # -- sequential decoding ---------------------------------------------------

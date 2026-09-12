@@ -35,16 +35,23 @@ def _close(label: str, actual: Tensor, expected: Tensor, bound: float) -> float:
 
 def _reference(
     module: MixtureOfExperts, x: Tensor
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Literal dropless top-three execution with the CUDA operand precision."""
     flat = x.reshape(-1, module.dim)
     with torch.autocast(device_type=flat.device.type, enabled=False):
         logits = F.linear(flat.float(), module.router.weight.float())
-    top, selected = logits.topk(3, dim=-1)
-    selected_weights = top.softmax(dim=-1)
-    probabilities = logits.softmax(dim=-1)
-    fractions = F.one_hot(selected, 15).sum(dim=1).float().mean(dim=0) / 3
-    auxiliary = 15 * (probabilities.mean(dim=0) * fractions).sum()
+    scores = logits.sigmoid()
+    selected = (scores + module.expert_bias).topk(3, dim=-1).indices
+    selected_scores = scores.gather(1, selected)
+    selected_weights = selected_scores / selected_scores.sum(dim=-1, keepdim=True)
+    probabilities = scores / scores.sum(dim=-1, keepdim=True)
+    selection = F.one_hot(selected, 15).sum(dim=1)
+    length = x.shape[-2]
+    auxiliary_selection = F.one_hot(scores.topk(3, dim=-1).indices, 15).sum(dim=1)
+    fractions = auxiliary_selection.reshape(-1, length, 15).float().mean(dim=1) / 3
+    sequence_probabilities = probabilities.reshape(-1, length, 15).mean(dim=1)
+    auxiliary = 15 * (sequence_probabilities * fractions).sum(dim=-1).mean()
+    counts = selection.sum(dim=0)
 
     # Scatter by assignment slot before the FP32 mixture reduction: summing
     # separately rounded weighted experts would introduce a different forward.
@@ -69,16 +76,19 @@ def _reference(
     )
     output = ((shared + 3 * mixed) / 2).reshape_as(x)
     weights = torch.zeros_like(probabilities).scatter(1, selected, selected_weights)
-    return output, auxiliary, weights.reshape(*x.shape[:-1], 15)
+    return output, auxiliary, weights.reshape(*x.shape[:-1], 15), counts
 
 
 def _kernel_parity(
-    dim: int, intermediate: int, tokens: int, *, skewed: bool = False
+    dim: int, intermediate: int, tokens: int, *, skewed: bool = False,
+    batch: int = 1, biased: bool = False,
 ) -> dict[str, float]:
     """Compare output, router/input/dW, and repeated persistent FP32 sinks."""
     torch.manual_seed(713 + tokens)
     actual = MixtureOfExperts(dim, intermediate).cuda()
-    x = torch.randn(1, tokens, dim, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(batch, tokens, dim, device="cuda", dtype=torch.bfloat16)
+    if biased:
+        actual.expert_bias.copy_(torch.linspace(-0.25, 0.25, 15, device="cuda"))
     if skewed:
         # Every token chooses experts 0, 1, and 2, leaving twelve empty experts.
         # Each selected expert must accommodate the complete row without drops.
@@ -93,20 +103,29 @@ def _kernel_parity(
     actual_x = x.detach().clone().requires_grad_()
     reference_x = x.detach().clone().requires_grad_()
     cotangent = torch.randn_like(x)
-    weight_cotangent = torch.randn(1, tokens, 15, device="cuda")
+    weight_cotangent = torch.randn(batch, tokens, 15, device="cuda")
+    bias_before = actual.expert_bias.clone()
 
     def objective(result):
-        output, auxiliary, weights = result
+        output, auxiliary, weights, _ = result
         return (
-            (output.float() * cotangent.float()).sum() / tokens
-            + 0.01 * auxiliary
-            + 0.01 * (weights * weight_cotangent).sum() / tokens
+            (output.float() * cotangent.float()).sum() / (batch * tokens)
+            + 1e-4 * auxiliary
+            + 0.01 * (weights * weight_cotangent).sum() / (batch * tokens)
         )
 
     actual_result = actual(actual_x, want_weights=True)
     reference_result = _reference(reference, reference_x)
     objective(actual_result).backward()
     objective(reference_result).backward()
+    if actual_result[3].dtype != torch.int64 or actual_result[3].requires_grad:
+        raise AssertionError("MoE usage counts must be detached int64")
+    if not torch.equal(actual_result[3], reference_result[3]):
+        raise AssertionError("MoE selected expert counts drifted from the reference")
+    if actual_result[3].sum().item() != 3 * batch * tokens:
+        raise AssertionError("MoE count total lost or duplicated token assignments")
+    if not torch.equal(actual.expert_bias, bias_before):
+        raise AssertionError("MoE forward/backward mutated the selection bias")
     errors = {
         "output": _close("output", actual_result[0], reference_result[0], 0.015),
         "auxiliary": _close("balance loss", actual_result[1], reference_result[1], 1e-6),
@@ -140,6 +159,8 @@ def _kernel_parity(
         raise AssertionError("MoE must bind both matrices of all sixteen experts")
     for _ in range(2):
         objective(actual(actual_x, want_weights=True)).backward()
+    if not torch.equal(actual.expert_bias, bias_before):
+        raise AssertionError("MoE accumulated backward mutated the selection bias")
     _close(
         "accumulated input gradient", actual_x.grad, 2 * reference_x.grad, 0.035
     )
@@ -181,10 +202,10 @@ def _frozen_kernel_parity(*, partial: bool = False) -> None:
     reference = copy.deepcopy(actual)
     x = torch.randn(1, 19, 48, device="cuda", dtype=torch.bfloat16).requires_grad_()
     ref_x = x.detach().clone().requires_grad_()
-    output, auxiliary, _ = actual(x)
-    ref_output, ref_auxiliary, _ = _reference(reference, ref_x)
-    (output.float().square().mean() + 0.01 * auxiliary).backward()
-    (ref_output.float().square().mean() + 0.01 * ref_auxiliary).backward()
+    output, auxiliary, _, _ = actual(x)
+    ref_output, ref_auxiliary, _, _ = _reference(reference, ref_x)
+    (output.float().square().mean() + 1e-4 * auxiliary).backward()
+    (ref_output.float().square().mean() + 1e-4 * ref_auxiliary).backward()
     _close("frozen bank input gradient", x.grad, ref_x.grad, 0.035)
     for (name, parameter), (_, ref_parameter) in zip(
         actual.named_parameters(), reference.named_parameters(), strict=True
@@ -197,31 +218,99 @@ def _frozen_kernel_parity(*, partial: bool = False) -> None:
             raise AssertionError(f"frozen expert unexpectedly received dW: {name}")
 
 
+def _bias_step_parity() -> None:
+    """Step-only bias updates change selections, retain unbiased gates, and resume."""
+    torch.manual_seed(47)
+    module = MixtureOfExperts(48, 140).cuda().train()
+    with torch.no_grad():
+        module.router.weight.zero_()
+    x = torch.randn(2, 17, 48, device="cuda", dtype=torch.bfloat16)
+    before = module.expert_bias.clone()
+    pointer = module.expert_bias.data_ptr()
+    if before.any() or before.dtype != torch.float32:
+        raise AssertionError("MoE selection bias must start as a zero FP32 buffer")
+    output, auxiliary, weights, counts = module(x, want_weights=True)
+    (output.float().square().mean() + 1e-4 * auxiliary).backward()
+    if not torch.equal(before, module.expert_bias):
+        raise AssertionError("MoE forward or backward updated routing bias")
+    if counts.sum().item() != 3 * 2 * 17:
+        raise AssertionError("MoE batch counts do not include every sequence")
+    direction = (counts.sum() - 15 * counts).sign().float()
+    module.update_bias(counts)
+    if not torch.equal(module.expert_bias, before + 0.001 * direction):
+        raise AssertionError("MoE bias update is not the exact integer load direction")
+    if module.expert_bias.data_ptr() != pointer:
+        raise AssertionError("MoE bias update replaced its persistent buffer")
+    with torch.no_grad():
+        changed, changed_auxiliary, changed_weights, changed_counts = module(x, want_weights=True)
+    if not torch.equal(auxiliary, changed_auxiliary):
+        raise AssertionError("selection bias changed the unbiased sequence auxiliary")
+    if torch.equal(weights.ne(0), changed_weights.ne(0)):
+        raise AssertionError("MoE bias update did not change the tied-score selections")
+    if not torch.allclose(
+        changed_weights[changed_weights.ne(0)],
+        torch.full_like(changed_weights[changed_weights.ne(0)], 1 / 3),
+        atol=0, rtol=0,
+    ):
+        raise AssertionError("selection bias leaked into the normalized expert gates")
+    module.eval()
+    saved_bias = module.expert_bias.clone()
+    module.update_bias(changed_counts)
+    with torch.no_grad():
+        module(x)
+    if not torch.equal(module.expert_bias, saved_bias):
+        raise AssertionError("MoE evaluation mutated routing bias")
+    if "expert_bias" in dict(module.named_parameters()):
+        raise AssertionError("MoE bias entered the trainable parameter surface")
+    snapshot = {name: value.clone() for name, value in module.state_dict().items()}
+    if "expert_bias" not in snapshot:
+        raise AssertionError("MoE snapshot omitted the routing bias")
+    restored = MixtureOfExperts(48, 140).cuda().eval()
+    restored.load_state_dict(snapshot)
+    with torch.no_grad():
+        resumed, _, resumed_weights, resumed_counts = restored(x, want_weights=True)
+    if not torch.equal(changed_weights, resumed_weights) or not torch.equal(
+        changed_counts, resumed_counts
+    ):
+        raise AssertionError("MoE snapshot did not restore exact routing state")
+    _close("restored biased output", resumed, changed, 1e-6)
+
+
 def _compiled_replay() -> None:
-    """Compile the sparse route and replay changing expert assignments."""
+    """Capture counts and gradients, then change the routing bias between steps."""
     from torch._dynamo.utils import counters
 
     from .train import _capture_without_gc
 
     torch.manual_seed(29)
-    module = MixtureOfExperts(48, 140).cuda()
+    module = MixtureOfExperts(48, 140).cuda().train()
+    with torch.no_grad():
+        # Tiny differences keep input-dependent initial choices, while one
+        # default bias update is guaranteed to move the overused boundary.
+        module.router.weight.mul_(1e-4)
     sinks = {parameter: torch.zeros_like(parameter) for parameter in module.parameters()}
     bound, refresh = module.bind_gradient_sinks(sinks)
     for parameter in module.parameters():
         parameter.grad = sinks[parameter]
     x = torch.randn(1, 37, 48, device="cuda", dtype=torch.bfloat16).requires_grad_()
     x.grad = torch.zeros_like(x)
+    usage = torch.zeros(15, device="cuda", dtype=torch.int64)
+    usage_pointer = usage.data_ptr()
+    bias_pointer = module.expert_bias.data_ptr()
+    prepared_bias = module.expert_bias.clone()
     compiled = torch.compile(module, fullgraph=True, mode="max-autotune-no-cudagraphs")
 
     def clear():
         for gradient in sinks.values():
             gradient.zero_()
         x.grad.zero_()
+        usage.zero_()
 
     def body():
-        output, auxiliary, _ = compiled(x)
-        loss = output.float().square().mean() + 0.01 * auxiliary
+        output, auxiliary, _, counts = compiled(x)
+        loss = output.float().square().mean() + 1e-4 * auxiliary
         loss.backward()
+        usage.add_(counts)
         return loss
 
     stream = torch.cuda.Stream()
@@ -236,15 +325,12 @@ def _compiled_replay() -> None:
     graph = torch.cuda.CUDAGraph()
     with _capture_without_gc(graph, torch.cuda.graph_pool_handle()):
         captured_loss = body()
+    if not torch.equal(module.expert_bias, prepared_bias):
+        raise AssertionError("MoE warm-up or capture mutated the routing bias")
     pointer = {parameter: gradient.data_ptr() for parameter, gradient in sinks.items()}
     unique_graphs = counters["stats"]["unique_graphs"]
-    for seed in (41, 43):
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-        with torch.no_grad():
-            x.copy_(torch.randn(x.shape, device="cuda", dtype=x.dtype, generator=generator))
-        clear()
-        graph.replay()
-        torch.cuda.synchronize()
+
+    def check_replay():
         if not math.isfinite(captured_loss.item()):
             raise AssertionError("MoE captured sparse loss is nonfinite")
         if not torch.isfinite(x.grad).all() or not x.grad.any():
@@ -256,14 +342,57 @@ def _compiled_replay() -> None:
                 raise AssertionError("MoE captured expert gradient is nonfinite")
         if not module.router.weight.grad.any():
             raise AssertionError("MoE captured router received no gradient")
-        # Compare the replay to an eager forward at precisely its new inputs;
-        # this catches a graph whose dispatch was frozen during preparation.
+        if usage.data_ptr() != usage_pointer or usage.sum().item() != 3 * x.shape[1]:
+            raise AssertionError("MoE captured logical counts were lost or duplicated")
         with torch.no_grad():
-            output, auxiliary, _ = module(x)
-            expected = output.float().square().mean() + 0.01 * auxiliary
-        _close("changing-dispatch graph loss", captured_loss, expected, 0.015)
+            output, auxiliary, weights, counts = _reference(module, x)
+            expected = output.float().square().mean() + 1e-4 * auxiliary
+        _close("changing-bias graph loss", captured_loss, expected, 0.015)
+        if not torch.equal(usage, counts):
+            raise AssertionError("MoE captured counts disagree with biased sigmoid routing")
+        return weights
+
+    for index, seed in enumerate((41, 43)):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        with torch.no_grad():
+            x.copy_(torch.randn(x.shape, device="cuda", dtype=x.dtype, generator=generator))
+        bias_before = module.expert_bias.clone()
+        clear()
+        graph.replay()
+        torch.cuda.synchronize()
+        old_weights = check_replay()
+        if not torch.equal(module.expert_bias, bias_before):
+            raise AssertionError("MoE replay or backward updated bias inside a step")
+        direction = (usage.sum() - 15 * usage).sign().float()
+        module.update_bias(usage)
+        if not torch.equal(module.expert_bias, bias_before + 0.001 * direction):
+            raise AssertionError("MoE step bias did not follow complete captured counts")
+        if module.expert_bias.data_ptr() != bias_pointer:
+            raise AssertionError("MoE step replaced the captured bias buffer")
+        updated_bias = module.expert_bias.clone()
+        clear()
+        graph.replay()
+        torch.cuda.synchronize()
+        new_weights = check_replay()
+        if not torch.equal(module.expert_bias, updated_bias):
+            raise AssertionError("MoE subsequent replay mutated the updated bias")
+        if index == 0 and torch.equal(old_weights.ne(0), new_weights.ne(0)):
+            raise AssertionError("MoE captured route did not respond to the step bias update")
+
+    snapshot = {name: value.clone() for name, value in module.state_dict().items()}
+    with torch.no_grad():
+        module.expert_bias.add_(0.25)
+    module.load_state_dict(snapshot)
+    if module.expert_bias.data_ptr() != bias_pointer or not torch.equal(
+        module.expert_bias, snapshot["expert_bias"]
+    ):
+        raise AssertionError("MoE state restore did not preserve the captured bias buffer")
+    clear()
+    graph.replay()
+    torch.cuda.synchronize()
+    check_replay()
     if counters["stats"]["unique_graphs"] != unique_graphs:
-        raise AssertionError("MoE graph replay compiled a new graph")
+        raise AssertionError("MoE graph replay or bias update compiled a new graph")
     if len(refresh) != 32:
         raise AssertionError("MoE shadow surface omits an expert projection")
 
@@ -289,14 +418,20 @@ def _decode_parity() -> dict[str, float]:
             self.selections = selections
             self.column = 0
             self.calls = 0
+            self.topk_calls = 0
 
         def __torch_dispatch__(self, func, types, args=(), kwargs=None):
             if func == torch.ops.aten.topk.default and args[0].shape[-1] == 15:
-                logits = args[0]
-                chosen = self.selections[self.calls % len(self.selections)]
-                selected = chosen[0, self.column : self.column + logits.shape[0]]
-                self.calls += 1
-                return logits.gather(-1, selected), selected
+                self.topk_calls += 1
+                if self.topk_calls == 1:
+                    # The first top-k controls biased dispatch. The second
+                    # belongs to the unbiased sequence auxiliary and stays
+                    # on its actual input-dependent branch.
+                    scores = args[0]
+                    chosen = self.selections[self.calls % len(self.selections)]
+                    selected = chosen[0, self.column : self.column + scores.shape[0]]
+                    self.calls += 1
+                    return scores.gather(-1, selected), selected
             return func(*args, **(kwargs or {}))
 
     @contextmanager
@@ -308,8 +443,12 @@ def _decode_parity() -> dict[str, float]:
         # attention must remain outside this diagnostic dispatch mode.
         for module, original in originals:
             def routed_forward(*args, forward=original, route_mode=fixed, **kwargs):
+                route_mode.topk_calls = 0
                 with route_mode:
-                    return forward(*args, **kwargs)
+                    result = forward(*args, **kwargs)
+                if route_mode.topk_calls != 2:
+                    raise AssertionError("MoE route control expected dispatch and auxiliary top-k")
+                return result
 
             module.forward = routed_forward
         try:
@@ -477,6 +616,18 @@ def _screen_capture(
     torch.manual_seed(args.seed)
     model = DeltaModel(cfg).cuda().train()
     optimizers = build_optimizers(model)
+    bias_addresses = [block.mlp.expert_bias.data_ptr() for block in model.blocks]
+
+    def biases():
+        return torch.stack([block.mlp.expert_bias for block in model.blocks])
+
+    def check_bias(expected, label):
+        if not torch.equal(biases(), expected):
+            raise AssertionError(f"MoE screen bias mutated during {label}")
+        if [block.mlp.expert_bias.data_ptr() for block in model.blocks] != bias_addresses:
+            raise AssertionError(f"MoE screen bias storage changed during {label}")
+
+    initial_bias = biases().clone()
 
     class _SelectedModes(CudaGraphTrainer):
         def _reachable_specs(self, schedule):
@@ -494,9 +645,35 @@ def _screen_capture(
     trainer = CudaGraphTrainer if all_modes else _SelectedModes
     runner = trainer(model, optimizers, args, build_schedule(args))
     eval_runner = CudaEvalRunner(model, args, runner.pool)
+    check_bias(initial_bias, "training/evaluation warm-up and capture")
+    count_addresses = {}
+    for spec, state in runner.states.items():
+        counts = state.expert_counts
+        if counts is None or counts.dtype != torch.int64 or counts.shape != (cfg.layers, 15):
+            raise AssertionError("MoE screen lacks physical-bank int64 count buffers")
+        if counts.any():
+            raise AssertionError("MoE warm-up or capture leaked into training counts")
+        count_addresses[spec] = counts.data_ptr()
+
+    def check_counts(state, micros):
+        counts = state.expert_counts
+        if counts.data_ptr() != count_addresses[state.spec]:
+            raise AssertionError("MoE screen replaced a captured count buffer")
+        repetitions = torch.tensor(
+            [state.spec.iterations if cfg.is_core_layer(layer) else 1 for layer in range(cfg.layers)],
+            device="cuda", dtype=torch.int64,
+        )
+        expected = repetitions * (3 * args.seq_len * args.micro_rows * state.spec.n_passes * micros)
+        if not torch.equal(counts.sum(dim=1), expected):
+            raise AssertionError(
+                "MoE screen counts lost or duplicated logical forward assignments "
+                f"for {state.spec}: {counts.sum(dim=1).tolist()} versus {expected.tolist()}"
+            )
     if all_modes and len(runner.states) != 24:
         raise AssertionError("MoE loop qualification did not retain all 24 training modes")
     def replay_eval():
+        unchanged_bias = biases().clone()
+        unchanged_counts = {spec: state.expert_counts.clone() for spec, state in runner.states.items()}
         for state in eval_runner.states.values():
             state.rows.copy_(torch.randint_like(state.rows, high=args.vocab_size))
             state.val_sum.zero_()
@@ -505,6 +682,10 @@ def _screen_capture(
             torch.cuda.synchronize()
             if not math.isfinite(state.val_sum.item()) or not math.isfinite(state.fused_sum.item()):
                 raise AssertionError("MoE resident evaluation graph is nonfinite")
+        check_bias(unchanged_bias, "evaluation replay")
+        for spec, counts in unchanged_counts.items():
+            if not torch.equal(runner.states[spec].expert_counts, counts):
+                raise AssertionError("MoE evaluation replay changed training usage counts")
 
     replay_eval()
     prepared = time.monotonic() - started
@@ -531,9 +712,11 @@ def _screen_capture(
         old_router = model.blocks[0].mlp.router.weight.detach().clone()
         old_shared = model.blocks[0].mlp.shared.down_proj.weight.detach().clone()
         old_routed = model.blocks[0].mlp.experts[0].down_proj.weight.detach().clone()
+        step_bias = biases().clone()
         generator = torch.Generator().manual_seed(59 + spec.n_passes + spec.iterations)
         runner.zero_grad()
         runner.begin(spec, args.zloss)
+        check_counts(state, 0)
         started = time.monotonic()
         # Two distinct rows test accumulation as well as changing dispatch.
         for index in range(2):
@@ -544,6 +727,8 @@ def _screen_capture(
         runner.prepare_optimizer(state)
         torch.cuda.synchronize()
         elapsed = (time.monotonic() - started) / 2
+        check_counts(state, 2)
+        check_bias(step_bias, "forward/backward and checkpoint recomputation")
         gradient_norm = clip_gradients(model.parameters())
         if not math.isfinite(gradient_norm) or gradient_norm <= 0:
             raise AssertionError(f"MoE screen {condition} {spec} invalid gradient norm")
@@ -560,7 +745,13 @@ def _screen_capture(
                 raise AssertionError("MoE screen expert gradient changed persistent storage")
         for optimizer in optimizers:
             optimizer.step()
+        check_bias(step_bias, "parameter optimizer updates")
+        counts = state.expert_counts
+        direction = (counts.sum(dim=1, keepdim=True) - 15 * counts).sign().float()
+        model.update_expert_bias(counts)
+        expected_bias = step_bias + 0.001 * direction
         model.refresh_shadows()
+        check_bias(expected_bias, "one explicit step-boundary bias update")
         if torch.equal(model.blocks[0].mlp.router.weight, old_router):
             raise AssertionError("MoE screen router did not update")
         if torch.equal(model.blocks[0].mlp.shared.down_proj.weight, old_shared):
@@ -575,6 +766,8 @@ def _screen_capture(
         runner.replay(state, rows, 20, 0)
         runner.prepare_optimizer(state)
         torch.cuda.synchronize()
+        check_counts(state, 1)
+        check_bias(expected_bias, "post-update replay")
         if not math.isfinite(state.loss_sum.item()):
             raise AssertionError("MoE screen post-update replay is nonfinite")
         records.append(
@@ -585,11 +778,14 @@ def _screen_capture(
     # first/raw graph after the largest mode, then evaluate with its gradients
     # and the whole training family still resident in the shared pool.
     first = next(spec for spec in runner.states if (spec.n_passes, spec.iterations) in modes)
+    replay_bias = biases().clone()
     state = runner.begin(first)
     runner.zero_grad()
     runner.replay(state, rows, 23, 0)
     runner.prepare_optimizer(state)
     torch.cuda.synchronize()
+    check_counts(state, 1)
+    check_bias(replay_bias, "raw replay after the cap graph")
     if not math.isfinite(state.loss_sum.item()):
         raise AssertionError("MoE raw replay after the cap graph is nonfinite")
     gradient_norm = clip_gradients(model.parameters())
@@ -631,8 +827,10 @@ def cuda_moe_gate() -> None:
         (768, 3328, 67, False),
     ):
         errors.append(max(_kernel_parity(dim, intermediate, tokens, skewed=skewed).values()))
+    errors.append(max(_kernel_parity(48, 140, 19, batch=3, biased=True).values()))
     _frozen_kernel_parity()
     _frozen_kernel_parity(partial=True)
+    _bias_step_parity()
     _compiled_replay()
     decode = _decode_parity()
     release()

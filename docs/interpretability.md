@@ -68,12 +68,21 @@ layer invocation, alongside the separate MHDB `route_weights`. Each expert
 tensor is `[B, T, 15]`: three nonzero routed weights per token, normalized to
 sum to one. The shared expert always runs and is absent from that axis. Align
 core iteration as well as token and pass when comparing expert selections.
-The auxiliary loss describes load balance; expert choice and gate mass alone
-do not establish specialization or causal importance.
-Trainer `expert_balance` telemetry reports the unweighted mean auxiliary
-loss, while the expert summary reports per-site assignment fractions and
-selected-gate entropy on up to two validation rows. Its Standard-mode sample
-does not describe expert use during later feedback passes.
+Each physical bank also carries a persistent `expert_bias` that affects expert
+selection without entering the mixture weights. Hold that bias fixed during
+matched replay. `ColumnOutput.expert_counts` sums actual selections by physical
+bank across repeated invocations; the trainer combines these counts across the
+whole update before adjusting the biases once.
+The auxiliary loss regularizes unbiased expert preferences within sequences;
+actual dispatch can differ because of the selection bias. Expert choice and
+gate mass alone do not establish specialization or causal importance.
+Trainer `expert_balance` telemetry reports the unweighted mean sequence
+auxiliary loss, while the expert summary reports per-site assignment fractions and
+selected-gate entropy and `bias0` through `bias14` on up to two validation
+rows. Its Standard-mode sample does not describe expert use during later
+feedback passes. Step-level `expert_max_violation` uses actual whole-update
+assignment counts: the worst physical bank's `max / mean - 1` load ratio.
+`expert_bias_max` records the maximum absolute post-update bias.
 
 ## Interventions
 

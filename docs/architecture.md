@@ -239,18 +239,20 @@ residual width `D`, with intermediate width `H / 4` for dense width `H`.
 three routed experts. The expert bank is tied wherever its enclosing core
 layer is tied; routing is recomputed from the current state at each iteration.
 
-For normalized FFN input `x`, a bias-free `D -> 15` router computes:
+For normalized FFN input `x`, a bias-free `D -> 15` projection and a separate
+expert-selection bias `b` compute:
 
 ```text
-p = softmax(W_router x)
-J = top3(p)
-w_j = p_j / sum_(i in J) p_i  if j in J, else 0
+s = sigmoid(W_router x)
+J = top3(s + b)
+w_j = s_j / sum_(i in J) s_i  if j in J, else 0
 ffn(x) = (S(x) + 3 * sum_j w_j E_j(x)) / 2
 ```
 
-Softmax is evaluated in FP32 during ordinary training. Selection is token-local,
-has no expert capacity limit, and never drops tokens. The selected gate values
-remain differentiable; the discrete choice has no gradient. The factor of
+Scores are evaluated in FP32 during ordinary training. The bias affects
+selection only; mixture weights use the original sigmoid scores. Selection is
+token-local, has no expert capacity limit, and never drops tokens. The selected
+gate values remain differentiable; the discrete choice has no gradient. The factor of
 three keeps each selected expert's coefficient at one under equal gates;
 division by two matches the variance of four independent, equal-variance
 expert outputs to one dense output at equal gates. This is an initialization
@@ -269,26 +271,48 @@ per layer and dispatch overhead. Shared and finely segmented experts follow
 the architectural ideas in [DeepSeekMoE](https://arxiv.org/abs/2401.06066);
 the specific output normalization and fixed configuration are local choices.
 
-The training load-balance term uses full router probabilities, including
-unselected experts. For `N` microbatch tokens:
+Each physical expert bank has a zero-initialized persistent `expert_bias[15]`
+buffer, outside the optimizer parameter groups. Training sums actual assignment
+counts `C_j` over every microbatch, pass, and invocation of that bank in the
+optimizer update, then changes the bias once after the optimizer step:
 
 ```text
-P_j = mean_tokens(p_j)
-F_j = stop_gradient(count_tokens(j in J) / (3N))
-aux_layer = 15 * sum_j P_j F_j
-aux = mean_passes(mean_executed_layers(aux_layer))
-training_loss += 0.01 * aux
+b_j += 0.001 * sign(sum_i C_i - 15 * C_j)
 ```
 
-This adapts the probability/load product from
-[Switch Transformers](https://arxiv.org/abs/2101.03961) to three selections.
-Each recurrent invocation is one term in the layer mean. The pass mean is
-independent of the feedback cross-entropy weighting; neither more depth nor
-more passes increases the regularizer's coefficient. Cross-entropy reporting
-excludes it. Microbatch statistics couple the regularizer's gradients across
-tokens without changing causal forward activations.
+Underloaded experts receive a larger selection bias; overloaded experts receive
+a smaller one. No assignments or exactly balanced counts leave it unchanged.
+The bias stays fixed during forward, backward, activation recomputation, and
+evaluation. Counts are returned values rather than forward-side mutations, so
+checkpoint recomputation cannot count a token twice. This follows
+[auxiliary-loss-free balancing](https://arxiv.org/abs/2408.15664).
+
+A complementary sequence regularizer normalizes the original sigmoid scores
+over all fifteen experts, including unselected ones. Its load counts use the
+top three unbiased affinities, distinct from the biased dispatch counts `C`
+that drive the bias controller. For each sequence of `T` tokens, compute:
+
+```text
+q_j = s_j / sum_i s_i
+U = top3(s)
+P_j = mean_tokens(q_j)
+F_j = stop_gradient(count_tokens(j in U) / (3T))
+aux_layer = mean_sequences(15 * sum_j P_j F_j)
+aux = mean_passes(mean_executed_layers(aux_layer))
+training_loss += 1e-4 * aux
+```
+
+Sigmoid affinities, selection-only bias, and a small per-sequence regularizer
+follow [DeepSeek-V3](https://arxiv.org/abs/2412.19437). Each recurrent invocation
+is one term in the layer mean. The pass mean is independent of feedback
+cross-entropy weighting; neither more depth nor more passes increases the
+regularizer's coefficient. Cross-entropy reporting excludes it. Sequence
+statistics couple the regularizer's gradients within each sequence without
+changing causal forward activations.
 
 `ColumnOutput.expert_aux_loss` holds the layer mean (`None` without `e`).
+`expert_counts` holds integer counts `[layers, 15]` summed over each physical
+bank's invocations (`None` without `e`); it is not persistent model state.
 With `want_weights=True`, `expert_weights` maps each layer invocation to a
 `[B, T, 15]` tensor containing the sparse normalized `w`: three nonzero values
 per token summing to one. These are separate from MHDB's source weights.

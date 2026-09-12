@@ -54,6 +54,9 @@ one shared plus three routed experts keep active matrix parameters equal to
 the dense FFN. Each layer adds a `D x 15` router: 138,240, 276,480, or 552,960
 parameters over the full model. Active counts refer to one token; a microbatch
 can touch all experts, whose gradients and optimizer state still occupy memory.
+Each physical layer also stores fifteen FP32 selection biases as model buffers,
+excluded from parameter counts. Per-update assignment counts have the same
+small `[layers, 15]` shape and are transient.
 Routing and optimizer overhead mean equal active arithmetic does not imply
 equal training time or measured GPU fit.
 

@@ -32,6 +32,10 @@ token IDs, and a 50,304-row tied embedding/readout.
 The tokenizer formats arbitrary and repeated roles; pretraining uses raw web
 text.
 
+Expert selection uses sigmoid scores with a separate load-balancing bias
+updated after each optimizer step. A small per-sequence regularizer supplements
+that update; reported cross-entropy excludes it.
+
 ## Current state
 
 There are no trained specimens under the current tokenizer and checkpoint

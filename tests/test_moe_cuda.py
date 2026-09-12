@@ -3,7 +3,11 @@
 import pytest
 import torch
 
-from delta_feedback_experiment.moe_probe import _frozen_kernel_parity, _kernel_parity
+from delta_feedback_experiment.moe_probe import (
+    _bias_step_parity,
+    _frozen_kernel_parity,
+    _kernel_parity,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -21,3 +25,11 @@ def test_sparse_expert_cuda_values_gradients_and_persistent_sinks(
 @pytest.mark.parametrize("partial", (False, True))
 def test_frozen_sparse_experts_preserve_input_gradient(partial):
     _frozen_kernel_parity(partial=partial)
+
+
+def test_biased_sigmoid_routing_and_sequence_auxiliary_match_cuda_reference():
+    _kernel_parity(48, 140, 19, batch=3, biased=True)
+
+
+def test_cuda_bias_updates_only_at_steps_and_restores_from_snapshot():
+    _bias_step_parity()

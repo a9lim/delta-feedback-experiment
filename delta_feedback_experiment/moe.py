@@ -17,6 +17,7 @@ from .moe_kernels import sparse_experts
 NUM_ROUTED_EXPERTS = 15
 EXPERTS_PER_TOKEN = 3
 EXPERT_WIDTH_DIVISOR = 4
+EXPERT_BIAS_RATE = 0.001
 
 
 class Expert(nn.Module):
@@ -49,8 +50,10 @@ class MixtureOfExperts(nn.Module):
     The branch is ``(shared + 3 * sum(selected_probability * expert)) / 2``.
     At uniform routing the four independent fan-in-normalized expert outputs
     therefore have the same initial variance as one dense FFN. The returned
-    auxiliary is the unweighted load-balancing loss; the trainer owns its
-    coefficient and averaging across executed layer invocations.
+    auxiliary is the unweighted sequence-balancing loss; the trainer owns its
+    coefficient and averaging across executed layer invocations. Selection
+    uses sigmoid affinity plus bias, while gates use the unbiased affinities.
+    Returned dispatch counts drive a separate update after each training step.
     """
 
     def __init__(self, dim: int, intermediate: int):
@@ -64,12 +67,13 @@ class MixtureOfExperts(nn.Module):
             Expert(dim, self.intermediate) for _ in range(NUM_ROUTED_EXPERTS)
         )
         self.router = nn.Linear(dim, NUM_ROUTED_EXPERTS, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(NUM_ROUTED_EXPERTS))
         self._gate_up_shadow: Tensor | None = None
         self._down_shadow: Tensor | None = None
 
     def forward(
         self, x: Tensor, *, want_weights: bool = False
-    ) -> tuple[Tensor, Tensor, Tensor | None]:
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor]:
         flat = x.reshape(-1, self.dim)
         router_dtype = torch.float64 if flat.dtype == torch.float64 else torch.float32
         # Routing is a discrete decision: keep the logits in FP32 even when
@@ -78,15 +82,37 @@ class MixtureOfExperts(nn.Module):
             logits = F.linear(
                 flat.to(router_dtype), self.router.weight.to(router_dtype)
             )
-        top_logits, selected = logits.topk(EXPERTS_PER_TOKEN, dim=-1)
-        selected_probability = top_logits.softmax(dim=-1)
-        probabilities = logits.softmax(dim=-1)
+        affinities = logits.sigmoid()
+        selected = (affinities + self.expert_bias.to(router_dtype)).topk(
+            EXPERTS_PER_TOKEN, dim=-1
+        ).indices
+        selected_scores = affinities.gather(1, selected)
+        selected_probability = selected_scores / selected_scores.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(torch.finfo(router_dtype).tiny)
+        probabilities = affinities / affinities.sum(dim=-1, keepdim=True).clamp_min(
+            torch.finfo(router_dtype).tiny
+        )
         selection = F.one_hot(selected, NUM_ROUTED_EXPERTS).sum(dim=1)
-        fractions = selection.to(router_dtype).mean(dim=0) / EXPERTS_PER_TOKEN
-        auxiliary = NUM_ROUTED_EXPERTS * (probabilities.mean(dim=0) * fractions).sum()
+        # The weak auxiliary controls individual sequences. The step-level
+        # controller receives detached counts and never runs in this forward.
+        # V3's sequence auxiliary uses affinity-only choices, independently
+        # of the bias-controlled dispatch decisions used by the controller.
+        auxiliary_selection = F.one_hot(
+            affinities.topk(EXPERTS_PER_TOKEN, dim=-1).indices, NUM_ROUTED_EXPERTS
+        ).sum(dim=1)
+        length = x.shape[-2] if x.ndim >= 2 else 1
+        sequence_probabilities = probabilities.reshape(-1, length, NUM_ROUTED_EXPERTS)
+        fractions = (
+            auxiliary_selection.reshape(-1, length, NUM_ROUTED_EXPERTS)
+            .to(router_dtype).mean(dim=1) / EXPERTS_PER_TOKEN
+        )
+        auxiliary = NUM_ROUTED_EXPERTS * (
+            sequence_probabilities.mean(dim=1) * fractions
+        ).sum(dim=-1).mean()
+        counts = selection.sum(dim=0)
 
         if flat.is_cuda:
-            counts = selection.sum(dim=0)
             offsets = F.pad(counts.cumsum(dim=0), (1, 0))
             _, assignments = selected.flatten().sort(stable=True)
             routed = sparse_experts(
@@ -127,7 +153,22 @@ class MixtureOfExperts(nn.Module):
                 .scatter(1, selected, selected_probability)
                 .reshape(*x.shape[:-1], NUM_ROUTED_EXPERTS)
             )
-        return output, auxiliary, weights
+        return output, auxiliary, weights, counts
+
+    @torch.no_grad()
+    def update_bias(self, counts: Tensor, *, rate: float = EXPERT_BIAS_RATE) -> None:
+        """Adjust selection for the next step from completed logical forwards.
+
+        Counts include all microbatches and all uses of this physical bank.
+        Comparing integers avoids rounding the fractional per-expert target.
+        Evaluation keeps the trained selection biases fixed.
+        """
+        if not self.training:
+            return
+        if counts.shape != self.expert_bias.shape or counts.dtype != torch.int64:
+            raise ValueError("expert counts must be an int64 vector of length 15")
+        direction = (counts.sum() - NUM_ROUTED_EXPERTS * counts).sign()
+        self.expert_bias.add_(direction.to(self.expert_bias), alpha=rate)
 
     def bind_gradient_sinks(
         self, sinks: dict[nn.Parameter, Tensor] | None

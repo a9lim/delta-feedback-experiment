@@ -58,8 +58,10 @@
 
 <section class="mech" data-letter="e" hidden>
   <h3>e · mixture of experts <small id="sum-e"></small></h3>
-  <p class="note">One shared expert and three of fifteen routed experts per token, each at quarter FFN width. Balance is averaged over executed layers and passes; uniform aggregate assignment has balance 1. Its weighted contribution is included in the training objective; pass-1 and validation remain cross-entropy.</p>
-  <div class="chart"><h2>expert balance loss <small>unweighted · coefficient in run configuration</small></h2><div class="plot" id="p-expert-balance"></div></div>
+  <p class="note">One shared expert and three of fifteen routed experts per token, each at quarter FFN width. Selection biases balance actual assignments across each optimizer step. The tiny sequence penalty uses unbiased choices and is averaged over executed layers and passes. Pass-1 and validation remain cross-entropy.</p>
+  <div class="chart"><h2>expert sequence penalty <small>unweighted · coefficient in run configuration</small></h2><div class="plot" id="p-expert-balance"></div></div>
+  <div class="chart"><h2>expert load imbalance <small>worst bank · max load / mean load − 1</small></h2><div class="plot" id="p-expert-violation"></div></div>
+  <div class="chart"><h2>expert selection bias <small>largest absolute bias after each step</small></h2><div class="plot" id="p-expert-bias"></div></div>
 </section>
 
 <section class="mech" data-letter="r" hidden>
@@ -138,6 +140,7 @@ function onStep(run, rec) {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
     lr_normuonh: num(rec.lr_normuonh), lr_nadam: num(rec.lr_nadam), lr_nadam_width: num(rec.lr_nadam_width),
     gnorm: num(rec.gnorm), expert_balance: num(rec.expert_balance),
+    expert_max_violation: num(rec.expert_max_violation), expert_bias_max: num(rec.expert_bias_max),
     tok_s: num(rec.tok_s), pass_tok_s: num(rec.pass_tok_s), cell_tok_s: num(rec.cell_tok_s),
     mem: num(rec.mem), elapsed: num(rec.elapsed),
   };
@@ -291,7 +294,7 @@ const CONFIG_GROUPS = [
   ['run', null, ['condition', 'seed', 'data_seed', 'params', 'device']],
   ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
   ['a · attention', 'a', ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
-  ['e · experts', 'e', ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef']],
+  ['e · experts', 'e', ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
   ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
   ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
   ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'grad_clip', 'zloss']],
@@ -400,6 +403,8 @@ function rebuild() {
   step('p-cum', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
 
   step('p-expert-balance', perRun((c, t) => [line(`balance${t}`, c, v3)]));
+  step('p-expert-violation', perRun((c, t) => [line(`imbalance${t}`, c, v3)]));
+  step('p-expert-bias', perRun((c, t) => [line(`bias${t}`, c, v3)]));
 
   // r · residual routing
   site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, SPTS), dashed(`seed${t}`, c, SPTS)]), { yScale: unit });
@@ -471,6 +476,8 @@ function seriesOf(view) {
     lr: [[xs, col('lr_normuonh'), col('lr_nadam_width'), col('lr_nadam')]],
     gnorm: [[xs, col('gnorm')]],
     expertBalance: [[xs, col('expert_balance')]],
+    expertViolation: [[xs, col('expert_max_violation')]],
+    expertBias: [[xs, col('expert_bias_max')]],
     tput: [[xs, col('tok_s'), col('pass_tok_s'), col('cell_tok_s')]],
     cum: [[xs, cum.map((c) => c[0]), cum.map((c) => c[1]), cum.map((c) => c[2])]],
     siteMass: profile('nul', 'seed'),
@@ -509,6 +516,8 @@ function render(view) {
   setData('p-lr', join(merged.lr), lastX);
   setData('p-gnorm', join(merged.gnorm), lastX);
   setData('p-expert-balance', join(merged.expertBalance), lastX);
+  setData('p-expert-violation', join(merged.expertViolation), lastX);
+  setData('p-expert-bias', join(merged.expertBias), lastX);
   setData('p-tput', join(merged.tput), lastX);
   setData('p-cum', join(merged.cum), lastX);
   setData('p-site-mass', join(merged.siteMass));

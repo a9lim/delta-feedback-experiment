@@ -55,19 +55,24 @@ def explicit_expert(expert, x):
 
 def explicit_mixture(moe, x):
     """Dense oracle evaluates all experts before selecting the routed sum."""
-    probabilities = F.linear(x, moe.router.weight).softmax(dim=-1)
-    values, indices = probabilities.topk(3, dim=-1)
-    weights = torch.zeros_like(probabilities).scatter(
+    scores = F.linear(x, moe.router.weight).sigmoid()
+    indices = (scores + moe.expert_bias).topk(3, dim=-1).indices
+    values = scores.gather(-1, indices)
+    weights = torch.zeros_like(scores).scatter(
         -1, indices, values / values.sum(dim=-1, keepdim=True)
     )
     routed = torch.stack([explicit_expert(expert, x) for expert in moe.experts], dim=-2)
     y = (
         explicit_expert(moe.shared, x) + 3 * (weights.unsqueeze(-1) * routed).sum(-2)
     ) / 2
-    counts = torch.zeros_like(probabilities).scatter(-1, indices, 1.0)
-    fraction = counts.flatten(0, -2).mean(0).detach() / 3
-    aux = 15 * (probabilities.flatten(0, -2).mean(0) * fraction).sum()
-    return y, aux, weights
+    selected = torch.zeros_like(scores, dtype=torch.int64).scatter(-1, indices, 1)
+    normalized_scores = scores / scores.sum(dim=-1, keepdim=True)
+    unbiased_selection = torch.zeros_like(scores).scatter(
+        -1, scores.topk(3, dim=-1).indices, 1.0
+    )
+    fraction = unbiased_selection.mean(dim=1).detach() / 3
+    aux = 15 * (normalized_scores.mean(dim=1) * fraction).sum(dim=-1).mean()
+    return y, aux, weights, selected.sum(dim=(0, 1))
 
 
 def test_expert_geometry_and_condition():
@@ -119,7 +124,7 @@ def test_expert_input_and_router_gradcheck():
     router = moe.router.weight.detach().clone().requires_grad_()
 
     def evaluate(inputs, router_weight):
-        output, aux, _ = torch.func.functional_call(
+        output, aux, _, _ = torch.func.functional_call(
             moe, {"router.weight": router_weight}, (inputs,)
         )
         return output, aux
@@ -133,11 +138,13 @@ def test_top_three_normalization_and_selected_expert_gradients():
         moe.router.weight.zero_()
         moe.router.weight[:, 0].copy_(torch.linspace(-1, 1, 15))
     x = torch.ones(2, 4, 4)
-    output, auxiliary, weights = moe(x, want_weights=True)
+    output, auxiliary, weights, counts = moe(x, want_weights=True)
     assert weights.shape == (2, 4, 15)
     assert torch.all((weights != 0).sum(-1) == 3)
     torch.testing.assert_close(weights.sum(-1), torch.ones(2, 4))
     assert torch.count_nonzero(weights[..., :12]) == 0
+    assert counts.dtype == torch.int64
+    assert counts.tolist() == [0] * 12 + [8] * 3
     output.square().sum().backward(retain_graph=True)
     assert moe.shared.down_proj.weight.grad.norm() > 0
     for index, expert in enumerate(moe.experts):
@@ -156,11 +163,99 @@ def test_forward_routing_is_token_local_even_when_load_changes():
     torch.manual_seed(24)
     moe = MixtureOfExperts(8, 16)
     x = torch.randn(2, 5, 8)
-    output, _, weights = moe(x, want_weights=True)
-    short, _, short_weights = moe(x[:1, :2], want_weights=True)
+    output, _, weights, _ = moe(x, want_weights=True)
+    short, _, short_weights, _ = moe(x[:1, :2], want_weights=True)
     torch.testing.assert_close(short, output[:1, :2])
     torch.testing.assert_close(short_weights, weights[:1, :2])
     assert moe(x)[2] is None
+
+
+def test_selection_bias_does_not_enter_mixture_weights():
+    moe = MixtureOfExperts(4, 8)
+    with torch.no_grad():
+        moe.router.weight.zero_()
+        moe.router.weight[:, 0].copy_(torch.linspace(-2, 2, 15))
+    x = torch.ones(1, 3, 4)
+    _, original_aux, original_weights, original_counts = moe(x, want_weights=True)
+    assert torch.count_nonzero(original_weights[..., :12]) == 0
+    with torch.no_grad():
+        moe.expert_bias[:3] = 2
+    output, aux, weights, counts = moe(x, want_weights=True)
+    scores = torch.linspace(-2, 2, 15).sigmoid()[:3]
+    torch.testing.assert_close(weights[0, 0, :3], scores / scores.sum())
+    assert torch.count_nonzero(weights[..., 3:]) == 0
+    assert counts.tolist() == [3] * 3 + [0] * 12
+    assert not torch.equal(counts, original_counts)
+    torch.testing.assert_close(aux, original_aux, rtol=0, atol=0)
+    expected, expected_aux, _, _ = explicit_mixture(moe, x)
+    torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(aux, expected_aux)
+    with torch.no_grad():
+        moe.expert_bias[:3] = 4
+    unchanged = moe(x, want_weights=True)
+    for before, after in zip((output, aux, weights, counts), unchanged, strict=True):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+
+def test_sequence_auxiliary_does_not_pool_independent_sequences():
+    moe = MixtureOfExperts(4, 8)
+    with torch.no_grad():
+        moe.router.weight.zero_()
+        moe.router.weight[:, 0].copy_(torch.linspace(-4, 4, 15))
+    x = torch.ones(2, 4, 4, requires_grad=True)
+    with torch.no_grad():
+        x[1].neg_()
+    _, aux, weights, _ = moe(x, want_weights=True)
+    first = moe(x[:1])[1]
+    second = moe(x[1:])[1]
+    torch.testing.assert_close(aux, (first + second) / 2)
+    scores = F.linear(x, moe.router.weight).sigmoid()
+    normalized = scores / scores.sum(-1, keepdim=True)
+    pooled_load = (weights > 0).float().mean(dim=(0, 1)) / 3
+    pooled = 15 * (normalized.mean(dim=(0, 1)) * pooled_load).sum()
+    assert not torch.isclose(aux, pooled)
+    joint_gradient = torch.autograd.grad(aux, x, retain_graph=True)[0][0]
+    isolated_gradient = torch.autograd.grad(first, x)[0][0]
+    torch.testing.assert_close(joint_gradient, isolated_gradient / 2)
+
+
+def test_bias_update_uses_global_counts_and_has_no_optimizer_gradient():
+    moe = MixtureOfExperts(4, 8)
+    assert "expert_bias" in dict(moe.named_buffers())
+    assert "expert_bias" not in dict(moe.named_parameters())
+    assert not moe.expert_bias.requires_grad
+    counts = torch.tensor([27, 15, 3] + [0] * 12, dtype=torch.int64)
+    direction = torch.tensor([-1, -1, 0] + [1] * 12, dtype=torch.float32)
+    moe.update_bias(counts)
+    torch.testing.assert_close(moe.expert_bias, 0.001 * direction)
+    moe.update_bias(counts * 100, rate=0.002)
+    torch.testing.assert_close(moe.expert_bias, 0.003 * direction)
+    assert moe.expert_bias.grad_fn is None and moe.expert_bias.grad is None
+    before = moe.expert_bias.clone()
+    moe.update_bias(torch.zeros_like(counts))
+    moe.update_bias(torch.ones_like(counts) * 3)
+    torch.testing.assert_close(moe.expert_bias, before, rtol=0, atol=0)
+    moe.eval()
+    moe.update_bias(counts)
+    torch.testing.assert_close(moe.expert_bias, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_fixed_bias_forward_is_pure(training):
+    moe = MixtureOfExperts(4, 8).train(training)
+    with torch.no_grad():
+        moe.expert_bias.copy_(torch.linspace(-0.03, 0.04, 15))
+    before = {name: value.clone() for name, value in moe.state_dict().items()}
+    x = torch.randn(2, 3, 4, requires_grad=True)
+    output, aux, _, counts = moe(x)
+    saved_counts = counts.clone()
+    (output.square().mean() + 1e-4 * aux).backward()
+    moe(x)
+    for name, value in moe.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+    torch.testing.assert_close(counts, saved_counts, rtol=0, atol=0)
+    assert counts.sum() == 3 * 2 * 3
+    assert not counts.requires_grad
 
 
 @pytest.mark.parametrize("condition", ["e", "erf", "erfl"])
@@ -232,6 +327,75 @@ def test_auxiliary_loss_is_mean_over_executed_layers():
     torch.testing.assert_close(out.expert_aux_loss, torch.stack(losses).mean())
     plain = tiny("").forward_column(torch.randn(1, 5, 16), want_weights=True)
     assert plain.expert_aux_loss is None and plain.expert_weights == {}
+    assert plain.expert_counts is None
+
+
+def test_column_counts_aggregate_each_physical_expert_bank():
+    model = tiny("erfl")
+    observed = [[] for _ in model.blocks]
+    hooks = [
+        block.mlp.register_forward_hook(
+            lambda _module, _args, output, index=index: observed[index].append(
+                output[3]
+            )
+        )
+        for index, block in enumerate(model.blocks)
+    ]
+    try:
+        out = model.forward_column(torch.randn(2, 5, 16), iterations=3)
+    finally:
+        for hook in hooks:
+            hook.remove()
+    expected = torch.stack([torch.stack(calls).sum(0) for calls in observed])
+    assert out.expert_counts.shape == (12, 15)
+    assert out.expert_counts.dtype == torch.int64
+    torch.testing.assert_close(out.expert_counts, expected, rtol=0, atol=0)
+    assert out.expert_counts.sum(dim=-1).tolist() == [30] * 4 + [90] * 4 + [30] * 4
+    before = torch.stack([block.mlp.expert_bias.clone() for block in model.blocks])
+    model.update_expert_bias(out.expert_counts)
+    direction = (expected.sum(-1, keepdim=True) - 15 * expected).sign()
+    after = torch.stack([block.mlp.expert_bias for block in model.blocks])
+    torch.testing.assert_close(after, before + 0.001 * direction)
+    model.eval()
+    model.update_expert_bias(out.expert_counts)
+    torch.testing.assert_close(
+        torch.stack([block.mlp.expert_bias for block in model.blocks]),
+        after,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_expert_bias_roundtrip_is_required_current_snapshot_state():
+    model = tiny("erfl")
+    for index, block in enumerate(model.blocks):
+        with torch.no_grad():
+            block.mlp.expert_bias.copy_(torch.linspace(-0.04, 0.03, 15) * (index + 1))
+    state = {name: value.clone() for name, value in model.state_dict().items()}
+    assert not any("expert_counts" in name for name in state)
+    restored = tiny("erfl", seed=19)
+    restored.load_state_dict(state, strict=True)
+    x = torch.randn(1, 4, 16)
+    original_output = model.forward_column(x, want_weights=True)
+    restored_output = restored.forward_column(x, want_weights=True)
+    torch.testing.assert_close(
+        original_output.h_top, restored_output.h_top, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        original_output.expert_counts, restored_output.expert_counts, rtol=0, atol=0
+    )
+    for site, weights in original_output.expert_weights.items():
+        torch.testing.assert_close(
+            weights, restored_output.expert_weights[site], rtol=0, atol=0
+        )
+    missing_bias = {
+        name: value for name, value in state.items() if not name.endswith("expert_bias")
+    }
+    with pytest.raises(RuntimeError, match="expert_bias"):
+        restored.load_state_dict(missing_bias, strict=True)
+    dense = tiny("")
+    assert not any("expert_bias" in name for name in dense.state_dict())
+    tiny("", seed=19).load_state_dict(dense.state_dict(), strict=True)
 
 
 @pytest.mark.parametrize("passes", [1, 2, 3])
@@ -252,11 +416,11 @@ def test_expert_loss_averages_passes_without_polluting_ce(monkeypatch, passes):
     weight = 1 if passes == 1 else 2
     torch.testing.assert_close(
         loss,
-        torch.tensor(weight * (3 + 0.2 * 7)) + 0.01 * torch.stack(auxiliaries).mean(),
+        torch.tensor(weight * (3 + 0.2 * 7)) + 1e-4 * torch.stack(auxiliaries).mean(),
     )
     assert [value.item() for value in per_pass] == [3.0] * passes
     for gradient in torch.autograd.grad(loss, auxiliaries):
-        torch.testing.assert_close(gradient, torch.tensor(0.01 / passes))
+        torch.testing.assert_close(gradient, torch.tensor(1e-4 / passes))
 
 
 @pytest.mark.parametrize("trunk", ["", "a"])
@@ -314,11 +478,17 @@ def test_expert_checkpoint_recomputation_preserves_gradients():
     direct_output = direct.forward_column(x)
     checkpoint_output = checkpointed.forward_column(x)
     for out in (direct_output, checkpoint_output):
-        (out.h_top.square().mean() + 0.01 * out.expert_aux_loss).backward()
+        (out.h_top.square().mean() + 1e-4 * out.expert_aux_loss).backward()
     torch.testing.assert_close(direct_output.h_top, checkpoint_output.h_top)
     torch.testing.assert_close(
         direct_output.expert_aux_loss, checkpoint_output.expert_aux_loss
     )
+    torch.testing.assert_close(
+        direct_output.expert_counts, checkpoint_output.expert_counts, rtol=0, atol=0
+    )
+    assert checkpoint_output.expert_counts.sum() == 3 * 5 * 16
+    for block in checkpointed.blocks:
+        assert torch.count_nonzero(block.mlp.expert_bias) == 0
     for (name, p), (_, q) in zip(
         direct.named_parameters(), checkpointed.named_parameters(), strict=True
     ):

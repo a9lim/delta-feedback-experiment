@@ -142,9 +142,14 @@ runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and
 continuation. See [design.md](design.md#checkpoints-and-queue).
 
-Expert runs log `expert_balance`, the unweighted auxiliary loss averaged over
-the update. The monitor plots it separately from cross-entropy. Evaluation
-also records expert assignment fractions and selected-gate entropy by layer
+Expert runs log `expert_balance`, the unweighted per-sequence auxiliary loss
+averaged over the update. Its coefficient is `1e-4`; the monitor plots it
+separately from cross-entropy. Expert selection biases update once after the
+optimizer step at rate `0.001`, using the whole update's assignment counts,
+and remain fixed during evaluation. `expert_max_violation` is the largest
+`max(load) / mean(load) - 1` across physical banks for that update, and
+`expert_bias_max` is the largest absolute bias after its update. Evaluation
+also records expert assignment fractions, current biases, and selected-gate entropy by layer
 invocation on up to two validation rows; those summaries describe that sample,
 not the full training distribution.
 

@@ -203,16 +203,24 @@ reports the pre-clip norm.
 
 ### Expert balancing
 
-With `e`, each layer adds a differentiable load-balance term computed over the
-microbatch's tokens: `15 * sum(mean(router_probabilities) * assignment_fraction)`.
-The assignment fraction counts each selected expert once and divides by three
-times the token count; it is detached from autograd. The regularizer is averaged
-over executed layer invocations, including repeated core layers, then over
-feedback passes, and added to the training objective with coefficient `0.01`.
-Its weight therefore stays fixed as depth or pass count changes. Reported
-cross-entropy and perplexity exclude this regularizer. Routing of the forward
-activations remains token-local even though the training regularizer couples
-the token statistics of a microbatch.
+With `e`, a sigmoid router selects the top three scores after adding each
+expert's persistent selection bias. The output mixture uses the original
+scores, normalized over the selected experts. Each physical bank accumulates
+assignment counts over the update's microbatches, feedback passes, and repeated
+core invocations. After the optimizer step, overused experts decrease their
+bias by `0.001` and underused experts increase it by `0.001`; equal load leaves
+it unchanged. Forward execution and activation recomputation never update the
+bias, and evaluation holds it fixed.
+
+A complementary load-balance loss is computed separately for each sequence,
+using sigmoid scores normalized over all experts and a detached top-three
+selection fraction computed before adding the bias. Actual biased dispatch
+counts drive the separate bias controller. The loss is averaged over
+sequences, executed layer invocations, then feedback passes, and added with
+coefficient `1e-4`. Its weight therefore stays
+fixed as depth or pass count changes. Reported cross-entropy and perplexity
+exclude it. [Architecture](architecture.md#letter-e-shared-and-routed-experts)
+defines the exact equations and count normalization.
 
 ### Feedback passes
 
@@ -313,6 +321,9 @@ as letters. A snapshot holds the model, both optimizer states, the fixed NorMuon
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,
 evaluation cadence, snapshot cadence, and evaluation-row count may change.
+Expert snapshots include the current per-bank `expert_bias` buffers; strict
+state restoration requires them. Assignment counts are transient and are
+consumed before a step's snapshot is staged.
 
 Each run keeps the latest two snapshots plus protected ones at the cooldown
 boundary, the feedback boundary (the last one-pass state), and the end of the

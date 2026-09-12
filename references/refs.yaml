@@ -6,10 +6,15 @@ references:
     note: >
       Fine-grained expert segmentation and shared experts; condition e uses one shared plus three of fifteen routed quarter-width SwiGLUs.
 
-  - arxiv: "2101.03961"
-    slug: fedus2022-switch-transformers
+  - arxiv: "2408.15664"
+    slug: wang2024-auxiliary-loss-free-balancing
     note: >
-      Router-probability times assignment-load balancing loss, adapted here to top-three selection with a detached assignment fraction.
+      Expert selection biases updated from whole-step assignment counts, separately from gradient optimization and output mixture weights.
+
+  - arxiv: "2412.19437"
+    slug: deepseek2025-v3
+    note: >
+      Sigmoid affinity scores, selection-only balancing bias, normalized mixture weights, and a complementary per-sequence balance loss.
 
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals

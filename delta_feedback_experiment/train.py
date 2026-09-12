@@ -35,6 +35,7 @@ from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
     CONDITION_LETTERS,
     EXPERT_BALANCE_COEF,
+    EXPERT_BIAS_RATE,
     DeltaModel,
     condition_config,
     depth_trace,
@@ -548,6 +549,7 @@ class CapturedMicro:
     loss_sum: torch.Tensor
     pass1_sum: torch.Tensor
     expert_balance_sum: torch.Tensor
+    expert_counts: torch.Tensor | None = None
     graph: torch.cuda.CUDAGraph | None = None
     active: frozenset[torch.nn.Parameter] = frozenset()
 
@@ -732,6 +734,8 @@ class CudaGraphTrainer:
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((len(self.model.blocks), 15), dtype=torch.int64, device=self.device)
+            if self.model.cfg.experts else None,
         )
 
     def _body(self, state: CapturedMicro) -> None:
@@ -752,6 +756,11 @@ class CudaGraphTrainer:
         state.loss_sum.add_(loss.detach() / self.micros)
         state.pass1_sum.add_(losses[0].detach() / self.micros)
         if self.model.cfg.experts:
+            # These are outputs of logical forwards, collected outside the
+            # checkpointed blocks. Recomputed backwards cannot count again.
+            state.expert_counts.add_(
+                torch.stack([out.expert_counts for out in outs]).sum(dim=0)
+            )
             state.expert_balance_sum.add_(
                 torch.stack([out.expert_aux_loss.detach() for out in outs]).mean()
                 / self.micros
@@ -816,6 +825,8 @@ class CudaGraphTrainer:
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
         state.expert_balance_sum.zero_()
+        if state.expert_counts is not None:
+            state.expert_counts.zero_()
         # Capturing on a blocking stream cannot inherit unfinished
         # default-stream writes from optimizer/kernel preparation.
         torch.cuda.synchronize()
@@ -826,6 +837,8 @@ class CudaGraphTrainer:
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
         state.expert_balance_sum.zero_()
+        if state.expert_counts is not None:
+            state.expert_counts.zero_()
 
     def _initialize_optimizers(self) -> None:
         """Materialize persistent state before the graph-private pool grows."""
@@ -864,6 +877,8 @@ class CudaGraphTrainer:
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
         state.expert_balance_sum.zero_()
+        if state.expert_counts is not None:
+            state.expert_counts.zero_()
         return state
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
@@ -1150,6 +1165,11 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
             record.update(
                 {f"expert{i}": round(value, 4) for i, value in enumerate(load.tolist())}
             )
+            layer = int(site.split(".")[0][1:].partition("i")[0])
+            record.update({
+                f"bias{i}": round(value, 6)
+                for i, value in enumerate(model.blocks[layer].mlp.expert_bias.tolist())
+            })
             records.append(record)
         return records
     finally:
@@ -1511,6 +1531,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     "expert_top_k": 3,
                     "expert_width": model.cfg.intermediate // 4,
                     "expert_balance_coef": EXPERT_BALANCE_COEF,
+                    "expert_bias_rate": EXPERT_BIAS_RATE,
                 }
                 if model.cfg.experts
                 else {}
@@ -1591,12 +1612,17 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 step_loss = graph_state.loss_sum.item()
                 pass1_loss = graph_state.pass1_sum.item()
                 expert_balance = graph_state.expert_balance_sum.item()
+                expert_counts = graph_state.expert_counts
                 graph_runner.prepare_optimizer(graph_state)
             else:
                 model.grad_checkpoint = checkpointing
                 step_loss = 0.0
                 pass1_loss = 0.0
                 expert_balance = 0.0
+                expert_counts = (
+                    torch.zeros((len(model.blocks), 15), dtype=torch.int64, device=device)
+                    if model.cfg.experts else None
+                )
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
                     rows = data_train.batch(first_row, args.micro_rows, device)
@@ -1625,6 +1651,9 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     step_loss += loss.item() / micros
                     pass1_loss += losses[0].item() / micros
                     if model.cfg.experts:
+                        expert_counts.add_(
+                            torch.stack([out.expert_counts for out in outs]).sum(dim=0)
+                        )
                         expert_balance += (
                             torch.stack([out.expert_aux_loss.detach() for out in outs])
                             .mean()
@@ -1635,6 +1664,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             grad_norm = clip_gradients(model.parameters())
             for optimizer in optimizers:
                 optimizer.step()
+            if model.cfg.experts:
+                model.update_expert_bias(expert_counts)
             model.refresh_shadows()
             if graph_runner is not None:
                 graph_runner.zero_grad()
@@ -1658,6 +1689,17 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             }
             if model.cfg.experts:
                 fields["expert_balance"] = telemetry.format_metric(expert_balance)
+                # Each physical bank has its own target, including the core
+                # banks that execute repeatedly on looped steps.
+                loads = expert_counts.float()
+                violation = 15 * loads.amax(dim=-1) / loads.sum(dim=-1).clamp_min(1) - 1
+                fields["expert_max_violation"] = telemetry.format_metric(
+                    violation.max().item()
+                )
+                fields["expert_bias_max"] = telemetry.format_metric(
+                    torch.stack([block.mlp.expert_bias for block in model.blocks])
+                    .abs().max().item()
+                )
             if model.cfg.loop:
                 fields["r"] = iterations
             fields |= {
