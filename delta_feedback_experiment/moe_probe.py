@@ -335,13 +335,159 @@ def _decode_parity() -> dict[str, float]:
     return errors
 
 
-def _screen_capture(condition: str, modes: tuple[tuple[int, int], ...]) -> str:
-    """Run full screen training, keeping only the requested graph modes alive."""
+@torch.no_grad()
+def _decode_diagnostics() -> dict:
+    """Separate hard-router sensitivity from cache semantics on the failed seed.
+
+    The fixed-route control intervenes only on top-k indices. It still uses
+    the CUDA sparse expert kernels and current-input mixing probabilities.
+    This is a diagnostic, not a different deployed inference path.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from .model import DeltaModel, KVCache, condition_config
+
+    class _FixedRoutes(TorchDispatchMode):
+        def __init__(self, selections):
+            super().__init__()
+            self.selections = selections
+            self.column = 0
+            self.calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten.topk.default and args[0].shape[-1] == 15:
+                logits = args[0]
+                chosen = self.selections[self.calls % len(self.selections)]
+                selected = chosen[0, self.column : self.column + logits.shape[0]]
+                self.calls += 1
+                return logits.gather(-1, selected), selected
+            return func(*args, **(kwargs or {}))
+
+    def cached(model, tokens, dtype, fixed=None):
+        cache = KVCache(model.cfg, 1, tokens.device, dtype)
+        if fixed is not None:
+            fixed.column = 0
+        outputs = [
+            model.forward_column(
+                model.embed_tokens(tokens[:, :5]), cache=cache, want_weights=True
+            )
+        ]
+        for column in range(5, tokens.shape[1]):
+            if fixed is not None:
+                fixed.column = column
+            outputs.append(
+                model.step(tokens[:, column : column + 1], None, cache, want_weights=True)
+            )
+        return (
+            torch.cat([out.h_top for out in outputs], dim=1),
+            {
+                site: torch.cat([out.expert_weights[site] for out in outputs], dim=1)
+                for site in outputs[0].expert_weights
+            },
+        )
+
+    results = {}
+    token_fixture = None
+    for condition, device, bf16 in (
+        ("aerfl", "cuda", True),
+        ("arfl", "cuda", True),
+        ("aerfl", "cuda", False),
+        ("aerfl", "cpu", False),
+    ):
+        torch.manual_seed(101)
+        config = condition_config(
+            condition,
+            vocab_size=257,
+            dim=128,
+            layers=12,
+            heads=4,
+            kv_heads=2,
+            head_dim=32,
+            intermediate=256,
+            pkda_heads=2,
+            pkda_head_dim=128,
+            max_seq_len=32,
+            loop_iterations=2,
+            loop_max_iterations=2,
+        )
+        model = DeltaModel(config).to(device).eval()
+        if token_fixture is None:
+            token_fixture = torch.randint(0, 257, (1, 13), device="cuda").cpu()
+        tokens = token_fixture.to(device)
+        recorded = []
+
+        def record(module, inputs, captured=recorded):
+            captured.append(inputs[0].detach())
+
+        handles = [
+            block.mlp.register_forward_pre_hook(record)
+            for block in model.blocks
+            if isinstance(block.mlp, MixtureOfExperts)
+        ]
+        dtype = torch.bfloat16 if bf16 else torch.float32
+        with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=bf16):
+            whole = model.forward_column(model.embed_tokens(tokens), want_weights=True)
+            full_inputs = tuple(recorded)
+            recorded.clear()
+            incremental, incremental_weights = cached(model, tokens, dtype)
+            result = {"relative": _relative(incremental, whole.h_top)}
+            sites = list(whole.expert_weights)
+            swaps = []
+            for index, site in enumerate(sites):
+                expected = whole.expert_weights[site]
+                actual = incremental_weights[site]
+                changed = expected.ne(0).ne(actual.ne(0)).any(dim=-1)
+                if not changed.any():
+                    continue
+                position = int(torch.where(changed[0])[0][0])
+                cached_inputs = torch.cat(recorded[index::len(sites)], dim=1)
+                full_input = full_inputs[index][0, position]
+                cached_input = cached_inputs[0, position]
+                # The executed order supplies each module across core repeats.
+                execution = list(range(4)) + list(range(4, 8)) * 2 + list(range(8, 12))
+                router = model.blocks[execution[index]].mlp.router
+                with torch.autocast(device_type=device, enabled=False):
+                    full_logits = F.linear(full_input.float(), router.weight.float())
+                    cached_logits = F.linear(cached_input.float(), router.weight.float())
+                full_top = full_logits.topk(4).values
+                cached_top = cached_logits.topk(4).values
+                swaps.append(
+                    {
+                        "site": site,
+                        "swapped_tokens": int(changed.sum()),
+                        "first_position": position,
+                        "full_experts": expected[0, position].nonzero().flatten().tolist(),
+                        "cached_experts": actual[0, position].nonzero().flatten().tolist(),
+                        "full_margin": float(full_top[2] - full_top[3]),
+                        "cached_margin": float(cached_top[2] - cached_top[3]),
+                        "max_logit_delta": float((full_logits - cached_logits).abs().max()),
+                        "input_relative": _relative(cached_input, full_input),
+                    }
+                )
+            result["route_disagreements"] = swaps
+            if sites and bf16:
+                fixed = _FixedRoutes([whole.expert_weights[site].topk(3).indices for site in sites])
+                with fixed:
+                    pinned, _ = cached(model, tokens, dtype, fixed=fixed)
+                result["fixed_route_relative"] = _relative(pinned, whole.h_top)
+        for handle in handles:
+            handle.remove()
+        label = f"{condition}.{device}.{'bf16' if bf16 else 'fp32'}"
+        results[label] = result
+        print(f"MoE decode diagnostic {label}: {result}", flush=True)
+    return results
+
+
+def _screen_capture(
+    condition: str, modes: tuple[tuple[int, int], ...], *, all_modes: bool = False
+) -> str:
+    """Capture the selected or complete family, then replay representative modes."""
     from torch._dynamo.utils import counters
 
     from .model import DeltaModel, condition_config
     from .optim import build_optimizers
     from .train import (
+        CudaEvalRunner,
         CudaGraphTrainer,
         GraphSpec,
         automatic_checkpoint,
@@ -381,7 +527,19 @@ def _screen_capture(condition: str, modes: tuple[tuple[int, int], ...]) -> str:
 
     torch.cuda.reset_peak_memory_stats()
     started = time.monotonic()
-    runner = _SelectedModes(model, optimizers, args, build_schedule(args))
+    trainer = CudaGraphTrainer if all_modes else _SelectedModes
+    runner = trainer(model, optimizers, args, build_schedule(args))
+    eval_runner = CudaEvalRunner(model, args, runner.pool)
+    if all_modes and len(runner.states) != 24:
+        raise AssertionError("MoE loop qualification did not retain all 24 training modes")
+    for state in eval_runner.states.values():
+        state.rows.copy_(torch.randint_like(state.rows, high=args.vocab_size))
+        state.val_sum.zero_()
+        state.fused_sum.zero_()
+        state.graph.replay()
+        torch.cuda.synchronize()
+        if not math.isfinite(state.val_sum.item()) or not math.isfinite(state.fused_sum.item()):
+            raise AssertionError("MoE resident evaluation graph is nonfinite")
     prepared = time.monotonic() - started
     addresses = {parameter: sink.data_ptr() for parameter, sink in runner.grad_buffers.items()}
     shadows = [
@@ -401,6 +559,8 @@ def _screen_capture(condition: str, modes: tuple[tuple[int, int], ...]) -> str:
     for spec, state in runner.states.items():
         if not experts <= state.active:
             raise AssertionError("CUDA preparation pruned experts absent from warm-up routing")
+        if (spec.n_passes, spec.iterations) not in modes:
+            continue
         old_router = model.blocks[0].mlp.router.weight.detach().clone()
         old_shared = model.blocks[0].mlp.shared.down_proj.weight.detach().clone()
         old_routed = model.blocks[0].mlp.experts[0].down_proj.weight.detach().clone()
@@ -460,6 +620,7 @@ def _screen_capture(condition: str, modes: tuple[tuple[int, int], ...]) -> str:
         f"{condition}: prepare={prepared:.1f}s "
         f"allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
         f"reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB "
+        f"resident_graphs={len(runner.states)}+{len(eval_runner.states)}eval "
         + " ".join(records)
     )
 
@@ -495,13 +656,13 @@ def cuda_moe_gate() -> None:
         + " | ".join(f"{name}={value:.5f}" for name, value in decode.items()),
         flush=True,
     )
-    # Each scope returns before collection, so separate full models and graph
-    # pools never coexist. The loop's worst arithmetic mode is checked without
-    # retaining the complete 24-mode training family at once.
+    # Each scope returns before collection, so separate full models never
+    # coexist. The loop retains its complete 24-mode family plus evaluation;
+    # replay covers raw/checkpoint boundaries and the worst arithmetic mode.
     for condition, modes in (
         ("aerf", ((1, 1), (2, 1), (3, 1))),
-        ("aerfl", ((3, 8),)),
+        ("aerfl", ((1, 1), (1, 3), (1, 4), (2, 4), (3, 8))),
     ):
-        record = _screen_capture(condition, modes)
+        record = _screen_capture(condition, modes, all_modes=condition == "aerfl")
         print(f"moe CUDA screen | {record}", flush=True)
         release()
