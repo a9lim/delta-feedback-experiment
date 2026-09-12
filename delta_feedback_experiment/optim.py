@@ -101,6 +101,41 @@ def _normuonh_batch(
     return momentum, row_moment, projected
 
 
+def _normuonh_bucket_values(
+    parameters: list[Tensor],
+    gradients: list[Tensor],
+    momenta: list[Tensor],
+    row_moments: list[Tensor],
+    radii: list[Tensor],
+    lr: Tensor,
+    momentum_beta: float,
+    beta2: float,
+    eps: float,
+    ns_steps: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compile packing and update arithmetic without mutating their inputs."""
+    return _normuonh_batch(
+        torch.stack(momenta),
+        torch.stack(row_moments),
+        torch.stack(parameters),
+        torch.stack(radii),
+        torch.stack(gradients),
+        lr,
+        momentum_beta,
+        beta2,
+        eps,
+        ns_steps,
+    )
+
+
+_compiled_normuonh_bucket_values = torch.compile(
+    _normuonh_bucket_values,
+    fullgraph=True,
+    dynamic=True,
+    mode="max-autotune-no-cudagraphs",
+)
+
+
 def _normuonh_bucket_step(
     parameters: list[Tensor],
     gradients: list[Tensor],
@@ -113,35 +148,20 @@ def _normuonh_bucket_step(
     eps: float,
     ns_steps: int,
 ) -> None:
-    """Keep packing and state writebacks inside the compiled bucket boundary.
-
-    State remains ordinary per-parameter tensors for checkpoints. Inductor can
-    fuse the stack producers and update epilogues without retaining a second
-    packed copy of the model or optimizer between updates.
-    """
-    new_momenta, new_rows, projected = _normuonh_batch(
-        torch.stack(momenta),
-        torch.stack(row_moments),
-        torch.stack(parameters),
-        torch.stack(radii),
-        torch.stack(gradients),
-        lr,
-        momentum_beta,
-        beta2,
-        eps,
-        ns_steps,
+    # Materialize all results before any writeback. Fusing input momentum
+    # mutation into the arithmetic can reread the updated momentum in a
+    # singleton bucket, changing the Nesterov direction after the first step.
+    values = (
+        _compiled_normuonh_bucket_values
+        if parameters[0].is_cuda else _normuonh_bucket_values
+    )
+    new_momenta, new_rows, projected = values(
+        parameters, gradients, momenta, row_moments, radii, lr,
+        momentum_beta, beta2, eps, ns_steps,
     )
     torch._foreach_copy_(momenta, list(new_momenta.unbind()))
     torch._foreach_copy_(row_moments, list(new_rows.unbind()))
     torch._foreach_copy_(parameters, list(projected.unbind()))
-
-
-_compiled_normuonh_bucket_step = torch.compile(
-    _normuonh_bucket_step,
-    fullgraph=True,
-    dynamic=True,
-    mode="max-autotune-no-cudagraphs",
-)
 
 
 class NorMuonH(torch.optim.Optimizer):
@@ -228,7 +248,7 @@ class NorMuonH(torch.optim.Optimizer):
         ]
         radii = [torch.ones((), device=device, dtype=dtype) for _ in parameters]
         scalar = torch.zeros((), device=device)
-        _compiled_normuonh_bucket_step(
+        _normuonh_bucket_step(
             matrices,
             gradients,
             momenta,
@@ -266,13 +286,8 @@ class NorMuonH(torch.optim.Optimizer):
 
             for (device, _dtype, _shape), bucket in buckets.items():
                 lr = torch.scalar_tensor(group["lr"], device=device)
-                update_fn = (
-                    _compiled_normuonh_bucket_step
-                    if device.type == "cuda"
-                    else _normuonh_bucket_step
-                )
                 for parameters in self._batches(bucket):
-                    update_fn(
+                    _normuonh_bucket_step(
                         parameters,
                         [parameter.grad for parameter in parameters],
                         [self.state[parameter]["momentum"] for parameter in parameters],
@@ -380,6 +395,17 @@ class OptimizerPair:
     def load_state_dict(self, state: dict) -> None:
         for optimizer, saved in zip(self.optimizers, state["stack"], strict=True):
             optimizer.load_state_dict(saved)
+            if isinstance(optimizer, torch.optim.NAdam):
+                # PyTorch's generic load casts mu_product onto each parameter's
+                # device. Non-capturable NAdam creates both scalar counters on
+                # CPU; restore that same placement for exact CUDA resumption.
+                for group in optimizer.param_groups:
+                    if not group["capturable"]:
+                        for parameter in group["params"]:
+                            values = optimizer.state.get(parameter, {})
+                            for key in ("step", "mu_product"):
+                                if key in values:
+                                    values[key] = values[key].cpu()
 
 
 def apply_schedule(

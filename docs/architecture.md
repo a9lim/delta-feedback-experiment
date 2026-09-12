@@ -843,7 +843,9 @@ above. A Frobenius-relative step alone does not establish equal functional
 updates across widths or expert counts. These factors are an implemented
 scaling candidate; full-model hyperparameter transfer remains unestablished.
 [Scaling](scaling.md#expert-learning-rates) lists the preset rates.
-CUDA compiles updates by shape bucket within each group.
+CUDA compiles packing and update arithmetic by shape bucket within each
+group. All results materialize before state and parameter writebacks outside
+the compiled boundary, preserving reads of the previous momentum.
 Packing is bounded to 33,554,432 matrix elements (128 MiB per FP32 tensor),
 except larger individual matrices remain whole. State stays per-parameter.
 
