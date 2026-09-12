@@ -347,8 +347,11 @@ def cuda_mtp_gate() -> None:
         "cuda-mtp-probe", "--condition", "arfm", "--steps", "64",
         "--feedback-start", "0.5", "--three-pass", "0.5", "--micro-rows", "1",
     ]
+    # Tiny parity isolates MTP from unsupported small-head PKDA autotuning;
+    # the full screen arfm gate below qualifies the production hybrid path.
     tiny = parse_run_args([
-        *common, "--batch-rows", "2", "--eval-rows", "2", "--seq-len", "64",
+        *common, "--condition", "rfm",
+        "--batch-rows", "2", "--eval-rows", "2", "--seq-len", "64",
         "--vocab-size", "257", "--dim", "64", "--layers", "4", "--heads", "4",
         "--kv-heads", "2", "--head-dim", "16", "--intermediate", "128",
         "--pkda-heads", "2", "--pkda-head-dim", "32",
