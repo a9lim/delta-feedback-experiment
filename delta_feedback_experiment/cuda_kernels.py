@@ -21,6 +21,12 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 
 MAX_ROUTE_SOURCES = 27
 
+ROUTE_TILE_LANES = 64
+"""Lanes in one head-width sub-tile of the routing kernels."""
+
+MAX_ROUTE_TILES = 4
+"""Sub-tiles the routing kernels unroll; wider heads take wider sub-tiles."""
+
 
 if triton is not None:
 
@@ -111,6 +117,217 @@ if triton is not None:
         return s26
 
     @triton.jit
+    def _route_tile_masks(
+        num_heads: tl.constexpr,
+        head_dim: tl.constexpr,
+        block_h: tl.constexpr,
+        block_k: tl.constexpr,
+    ):
+        """Head offsets plus the offsets and masks of the width sub-tiles.
+
+        The head width is walked in ``block_k``-lane sub-tiles instead of being
+        padded to the next power of two: a 192-wide head is three full 64-lane
+        tiles rather than one 256-lane tile with a quarter of its lanes idle.
+        Only a width that is not a multiple of ``block_k`` masks anything, and
+        only in its last tile.
+        """
+        h_offsets = tl.arange(0, block_h)
+        columns = tl.arange(0, block_k)[None, :]
+        head_mask = h_offsets < num_heads
+        rows = h_offsets[:, None] * head_dim
+        offsets0 = rows + columns
+        offsets1 = offsets0 + block_k
+        offsets2 = offsets1 + block_k
+        offsets3 = offsets2 + block_k
+        mask0 = head_mask[:, None] & (columns < head_dim)
+        mask1 = head_mask[:, None] & (columns + block_k < head_dim)
+        mask2 = head_mask[:, None] & (columns + 2 * block_k < head_dim)
+        mask3 = head_mask[:, None] & (columns + 3 * block_k < head_dim)
+        return (
+            h_offsets,
+            head_mask,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+        )
+
+    @triton.jit
+    def _route_load(
+        pointer,
+        offsets0,
+        offsets1,
+        offsets2,
+        offsets3,
+        mask0,
+        mask1,
+        mask2,
+        mask3,
+        block_h: tl.constexpr,
+        block_k: tl.constexpr,
+        tiles: tl.constexpr,
+    ):
+        """One head-width read as up to four FP32 sub-tiles."""
+        value0 = tl.load(pointer + offsets0, mask=mask0, other=0.0).to(tl.float32)
+        value1 = tl.zeros((block_h, block_k), tl.float32)
+        value2 = value1
+        value3 = value1
+        if tiles > 1:
+            value1 = tl.load(pointer + offsets1, mask=mask1, other=0.0).to(tl.float32)
+        if tiles > 2:
+            value2 = tl.load(pointer + offsets2, mask=mask2, other=0.0).to(tl.float32)
+        if tiles > 3:
+            value3 = tl.load(pointer + offsets3, mask=mask3, other=0.0).to(tl.float32)
+        return value0, value1, value2, value3
+
+    @triton.jit
+    def _route_store(
+        pointer,
+        offsets0,
+        offsets1,
+        offsets2,
+        offsets3,
+        mask0,
+        mask1,
+        mask2,
+        mask3,
+        value0,
+        value1,
+        value2,
+        value3,
+        tiles: tl.constexpr,
+    ):
+        """Write the sub-tiles back in the pointer's own dtype."""
+        dtype = pointer.dtype.element_ty
+        tl.store(pointer + offsets0, value0.to(dtype), mask=mask0)
+        if tiles > 1:
+            tl.store(pointer + offsets1, value1.to(dtype), mask=mask1)
+        if tiles > 2:
+            tl.store(pointer + offsets2, value2.to(dtype), mask=mask2)
+        if tiles > 3:
+            tl.store(pointer + offsets3, value3.to(dtype), mask=mask3)
+
+    @triton.jit
+    def _route_fold(
+        a0,
+        a1,
+        a2,
+        a3,
+        b0,
+        b1,
+        b2,
+        b3,
+        tiles: tl.constexpr,
+    ):
+        """``sum_t a_t * b_t`` elementwise, so the caller reduces once."""
+        folded = a0 * b0
+        if tiles > 1:
+            folded += a1 * b1
+        if tiles > 2:
+            folded += a2 * b2
+        if tiles > 3:
+            folded += a3 * b3
+        return folded
+
+    @triton.jit
+    def _route_scale(a0, a1, a2, a3, scale, tiles: tl.constexpr):
+        """Scale every sub-tile by one per-head factor."""
+        factor = scale[:, None]
+        c0 = a0 * factor
+        c1 = a1
+        c2 = a2
+        c3 = a3
+        if tiles > 1:
+            c1 = a1 * factor
+        if tiles > 2:
+            c2 = a2 * factor
+        if tiles > 3:
+            c3 = a3 * factor
+        return c0, c1, c2, c3
+
+    @triton.jit
+    def _route_add(a0, a1, a2, a3, b0, b1, b2, b3, tiles: tl.constexpr):
+        """Sub-tile-wise addition."""
+        c0 = a0 + b0
+        c1 = a1
+        c2 = a2
+        c3 = a3
+        if tiles > 1:
+            c1 = a1 + b1
+        if tiles > 2:
+            c2 = a2 + b2
+        if tiles > 3:
+            c3 = a3 + b3
+        return c0, c1, c2, c3
+
+    @triton.jit
+    def _route_mix(
+        a0,
+        a1,
+        a2,
+        a3,
+        rescale,
+        v0,
+        v1,
+        v2,
+        v3,
+        term,
+        tiles: tl.constexpr,
+    ):
+        """``a_t * rescale + term * v_t``: the online mixture update."""
+        scale = rescale[:, None]
+        weight = term[:, None]
+        c0 = a0 * scale + weight * v0
+        c1 = a1
+        c2 = a2
+        c3 = a3
+        if tiles > 1:
+            c1 = a1 * scale + weight * v1
+        if tiles > 2:
+            c2 = a2 * scale + weight * v2
+        if tiles > 3:
+            c3 = a3 * scale + weight * v3
+        return c0, c1, c2, c3
+
+    @triton.jit
+    def _route_source_grad(
+        u0,
+        u1,
+        u2,
+        u3,
+        weight,
+        p0,
+        p1,
+        p2,
+        p3,
+        alpha,
+        v0,
+        v1,
+        v2,
+        v3,
+        coefficient,
+        tiles: tl.constexpr,
+    ):
+        """``weight * upstream + alpha * query - coefficient * value``."""
+        mass = weight[:, None]
+        pull = alpha[:, None]
+        c0 = mass * u0 + pull * p0 - coefficient * v0
+        c1 = u1
+        c2 = u2
+        c3 = u3
+        if tiles > 1:
+            c1 = mass * u1 + pull * p1 - coefficient * v1
+        if tiles > 2:
+            c2 = mass * u2 + pull * p2 - coefficient * v2
+        if tiles > 3:
+            c3 = mass * u3 + pull * p3 - coefficient * v3
+        return c0, c1, c2, c3
+
+    @triton.jit
     def _route_forward_kernel(
         s0,
         s1,
@@ -140,7 +357,7 @@ if triton is not None:
         s25,
         s26,
         projected,
-        logits,
+        weights,
         inv_rms,
         routed,
         bt: tl.constexpr,
@@ -151,21 +368,52 @@ if triton is not None:
         n_sources: tl.constexpr,
         block_h: tl.constexpr,
         block_k: tl.constexpr,
+        block_n: tl.constexpr,
+        tiles: tl.constexpr,
     ):
         """Full-width RMS keys, per-group source softmax, and the value mix in
         one pass over the bank: every source tile is read exactly once per
-        token, with the softmax folded in online.  Source 0 is the site's
+        token, with the softmax folded in online.  The per-source scores stay in
+        registers, so the normalized weights leave with the mixture and no
+        second kernel re-reads a logit buffer.  Source 0 is the site's
         width-``dim`` null and is read at a fixed address."""
         token = tl.program_id(0)
-        h_offsets = tl.arange(0, block_h)
-        k_offsets = tl.arange(0, block_k)
-        head_mask = h_offsets < num_heads
-        mask = head_mask[:, None] & (k_offsets[None, :] < head_dim)
-        offsets = h_offsets[:, None] * head_dim + k_offsets[None, :]
-        p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
+        (
+            h_offsets,
+            head_mask,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+        ) = _route_tile_masks(num_heads, head_dim, block_h, block_k)
+        p0, p1, p2, p3 = _route_load(
+            projected,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+            block_h,
+            block_k,
+            tiles,
+        )
+        n_offsets = tl.arange(0, block_n)
+        source_mask = n_offsets < n_sources
+        scores = tl.full((block_h, block_n), -float("inf"), tl.float32)
+        inverses = tl.zeros((block_n,), tl.float32)
         running_max = tl.full((block_h,), -float("inf"), tl.float32)
         running_sum = tl.zeros((block_h,), tl.float32)
-        mixed = tl.zeros((block_h, block_k), tl.float32)
+        a0 = tl.zeros((block_h, block_k), tl.float32)
+        a1 = a0
+        a2 = a0
+        a3 = a0
         for index in tl.static_range(n_sources):
             source = _route_pointer(
                 index,
@@ -198,53 +446,66 @@ if triton is not None:
                 s26,
             )
             base = 0 if index == 0 else token * dim
-            value = tl.load(source + base + offsets, mask=mask, other=0.0).to(
-                tl.float32
+            v0, v1, v2, v3 = _route_load(
+                source + base,
+                offsets0,
+                offsets1,
+                offsets2,
+                offsets3,
+                mask0,
+                mask1,
+                mask2,
+                mask3,
+                block_h,
+                block_k,
+                tiles,
             )
-            inverse = tl.rsqrt(
-                tl.sum(tl.sum(value * value, axis=1), axis=0) / dim + eps
-            )
-            score = tl.sum(value * p, axis=1) * inverse
-            tl.store(
-                logits + index * bt * num_heads + token * num_heads + h_offsets,
-                score,
-                mask=head_mask,
-            )
-            tl.store(inv_rms + index * bt + token, inverse)
+            squares = _route_fold(v0, v1, v2, v3, v0, v1, v2, v3, tiles)
+            inverse = tl.rsqrt(tl.sum(tl.sum(squares, axis=1), axis=0) / dim + eps)
+            products = _route_fold(v0, v1, v2, v3, p0, p1, p2, p3, tiles)
+            score = tl.sum(products, axis=1) * inverse
+            scores = tl.where(n_offsets[None, :] == index, score[:, None], scores)
+            inverses = tl.where(n_offsets == index, inverse, inverses)
             new_max = tl.maximum(running_max, score)
             rescale = tl.where(
                 new_max == -float("inf"), 1.0, tl.exp(running_max - new_max)
             )
             term = tl.where(score == -float("inf"), 0.0, tl.exp(score - new_max))
             running_sum = running_sum * rescale + term
-            mixed = mixed * rescale[:, None] + term[:, None] * value
+            a0, a1, a2, a3 = _route_mix(
+                a0, a1, a2, a3, rescale, v0, v1, v2, v3, term, tiles
+            )
             running_max = new_max
-        mixed = mixed / running_sum[:, None]
-        tl.store(
-            routed + token * dim + offsets,
-            mixed.to(routed.dtype.element_ty),
-            mask=mask,
+        normalizer = 1.0 / running_sum
+        a0, a1, a2, a3 = _route_scale(a0, a1, a2, a3, normalizer, tiles)
+        _route_store(
+            routed + token * dim,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+            a0,
+            a1,
+            a2,
+            a3,
+            tiles,
         )
-
-    @triton.jit
-    def _route_softmax_kernel(
-        logits,
-        weights,
-        bt: tl.constexpr,
-        num_heads: tl.constexpr,
-        n_sources: tl.constexpr,
-        block_n: tl.constexpr,
-    ):
-        token = tl.program_id(0)
-        head = tl.program_id(1)
-        offsets = tl.arange(0, block_n)
-        mask = offsets < n_sources
-        addresses = offsets * bt * num_heads + token * num_heads + head
-        values = tl.load(logits + addresses, mask=mask, other=-float("inf"))
-        values = values - tl.max(values, axis=0)
-        numerators = tl.exp(values)
-        result = numerators / tl.sum(numerators, axis=0)
-        tl.store(weights + addresses, result, mask=mask)
+        # The running max and sum that normalized the mixture normalize the
+        # scores, so the stored weights are exactly the ones the mix used.
+        probabilities = tl.exp(scores - running_max[:, None]) * normalizer[:, None]
+        tl.store(
+            weights
+            + n_offsets[None, :] * bt * num_heads
+            + token * num_heads
+            + h_offsets[:, None],
+            probabilities,
+            mask=head_mask[:, None] & source_mask[None, :],
+        )
+        tl.store(inv_rms + n_offsets * bt + token, inverses, mask=source_mask)
 
     @triton.jit
     def _route_backward_kernel(
@@ -316,12 +577,14 @@ if triton is not None:
         tokens_per_program: tl.constexpr,
         block_h: tl.constexpr,
         block_k: tl.constexpr,
+        tiles: tl.constexpr,
     ):
         """Analytic MHDB backward over ``tokens_per_program`` tokens.
 
         Per-token source gradients are stored directly; the query and null
         gradients, which are sums over every token, stay in FP32 registers and
-        leave as one ``[dim]`` partial per program.
+        leave as one ``[dim]`` partial per program.  As in the forward the head
+        width is walked in unpadded sub-tiles.
 
         The first ``n_banked`` sources are banked: their destination is the
         source's own accumulator, which this program reads and rewrites for the
@@ -330,22 +593,63 @@ if triton is not None:
         instead of one per reader for autograd to sum.
         """
         pid = tl.program_id(0)
-        h_offsets = tl.arange(0, block_h)
-        k_offsets = tl.arange(0, block_k)
-        head_mask = h_offsets < num_heads
-        mask = head_mask[:, None] & (k_offsets[None, :] < head_dim)
-        offsets = h_offsets[:, None] * head_dim + k_offsets[None, :]
-        p = tl.load(projected + offsets, mask=mask, other=0.0).to(tl.float32)
-        grad_p = tl.zeros((block_h, block_k), tl.float32)
-        grad_null = tl.zeros((block_h, block_k), tl.float32)
+        (
+            h_offsets,
+            head_mask,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+        ) = _route_tile_masks(num_heads, head_dim, block_h, block_k)
+        p0, p1, p2, p3 = _route_load(
+            projected,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+            block_h,
+            block_k,
+            tiles,
+        )
+        zero = tl.zeros((block_h, block_k), tl.float32)
+        grad_p0 = zero
+        grad_p1 = zero
+        grad_p2 = zero
+        grad_p3 = zero
+        grad_null0 = zero
+        grad_null1 = zero
+        grad_null2 = zero
+        grad_null3 = zero
         for step in range(tokens_per_program):
             token = pid * tokens_per_program + step
             valid = token < bt
-            token_mask = mask & valid
+            live0 = mask0 & valid
+            live1 = mask1 & valid
+            live2 = mask2 & valid
+            live3 = mask3 & valid
             head_valid = head_mask & valid
-            upstream = tl.load(
-                grad_routed + token * dim + offsets, mask=token_mask, other=0.0
-            ).to(tl.float32)
+            u0, u1, u2, u3 = _route_load(
+                grad_routed + token * dim,
+                offsets0,
+                offsets1,
+                offsets2,
+                offsets3,
+                live0,
+                live1,
+                live2,
+                live3,
+                block_h,
+                block_k,
+                tiles,
+            )
             centered = tl.zeros((block_h,), tl.float32)
             for index in tl.static_range(n_sources):
                 source = _route_pointer(
@@ -379,15 +683,29 @@ if triton is not None:
                     s26,
                 )
                 base = 0 if index == 0 else token * dim
-                value = tl.load(source + base + offsets, mask=token_mask, other=0.0).to(
-                    tl.float32
+                v0, v1, v2, v3 = _route_load(
+                    source + base,
+                    offsets0,
+                    offsets1,
+                    offsets2,
+                    offsets3,
+                    live0,
+                    live1,
+                    live2,
+                    live3,
+                    block_h,
+                    block_k,
+                    tiles,
                 )
                 weight = tl.load(
                     weights + index * bt * num_heads + token * num_heads + h_offsets,
                     mask=head_valid,
                     other=0.0,
                 )
-                centered += weight * tl.sum(upstream * value, axis=1)
+                upstream_dot = tl.sum(
+                    _route_fold(u0, u1, u2, u3, v0, v1, v2, v3, tiles), axis=1
+                )
+                centered += weight * upstream_dot
 
             for index in tl.static_range(n_sources):
                 source = _route_pointer(
@@ -421,8 +739,19 @@ if triton is not None:
                     s26,
                 )
                 base = 0 if index == 0 else token * dim
-                value = tl.load(source + base + offsets, mask=token_mask, other=0.0).to(
-                    tl.float32
+                v0, v1, v2, v3 = _route_load(
+                    source + base,
+                    offsets0,
+                    offsets1,
+                    offsets2,
+                    offsets3,
+                    live0,
+                    live1,
+                    live2,
+                    live3,
+                    block_h,
+                    block_k,
+                    tiles,
                 )
                 weight = tl.load(
                     weights + index * bt * num_heads + token * num_heads + h_offsets,
@@ -430,18 +759,46 @@ if triton is not None:
                     other=0.0,
                 )
                 inverse = tl.load(inv_rms + index * bt + tl.minimum(token, bt - 1))
-                route_beta = weight * (tl.sum(upstream * value, axis=1) - centered)
-                dkp = route_beta[:, None] * p
+                upstream_dot = tl.sum(
+                    _route_fold(u0, u1, u2, u3, v0, v1, v2, v3, tiles), axis=1
+                )
+                query_dot = tl.sum(
+                    _route_fold(p0, p1, p2, p3, v0, v1, v2, v3, tiles), axis=1
+                )
+                route_beta = weight * (upstream_dot - centered)
                 # RMS statistics are shared across the full hidden width, so the
                 # norm-backward correction couples all routing heads.
-                norm_dot = tl.sum(tl.sum(dkp * value, axis=1), axis=0)
-                source_grad = (
-                    weight[:, None] * upstream
-                    + inverse * dkp
-                    - (inverse * inverse * inverse / dim) * norm_dot * value
+                norm_dot = tl.sum(route_beta * query_dot, axis=0)
+                c0, c1, c2, c3 = _route_source_grad(
+                    u0,
+                    u1,
+                    u2,
+                    u3,
+                    weight,
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    inverse * route_beta,
+                    v0,
+                    v1,
+                    v2,
+                    v3,
+                    (inverse * inverse * inverse / dim) * norm_dot,
+                    tiles,
                 )
                 if index == 0:
-                    grad_null += source_grad
+                    grad_null0, grad_null1, grad_null2, grad_null3 = _route_add(
+                        grad_null0,
+                        grad_null1,
+                        grad_null2,
+                        grad_null3,
+                        c0,
+                        c1,
+                        c2,
+                        c3,
+                        tiles,
+                    )
                 else:
                     grad_source = _route_pointer(
                         index - 1,
@@ -474,20 +831,76 @@ if triton is not None:
                         g26,
                     )
                     if index <= n_banked:
-                        source_grad += tl.load(
-                            grad_source + token * dim + offsets,
-                            mask=token_mask,
-                            other=0.0,
-                        ).to(tl.float32)
-                    tl.store(
-                        grad_source + token * dim + offsets,
-                        source_grad.to(grad_source.dtype.element_ty),
-                        mask=token_mask,
+                        b0, b1, b2, b3 = _route_load(
+                            grad_source + token * dim,
+                            offsets0,
+                            offsets1,
+                            offsets2,
+                            offsets3,
+                            live0,
+                            live1,
+                            live2,
+                            live3,
+                            block_h,
+                            block_k,
+                            tiles,
+                        )
+                        c0, c1, c2, c3 = _route_add(
+                            c0, c1, c2, c3, b0, b1, b2, b3, tiles
+                        )
+                    _route_store(
+                        grad_source + token * dim,
+                        offsets0,
+                        offsets1,
+                        offsets2,
+                        offsets3,
+                        live0,
+                        live1,
+                        live2,
+                        live3,
+                        c0,
+                        c1,
+                        c2,
+                        c3,
+                        tiles,
                     )
-                grad_p += route_beta[:, None] * value * inverse
-        tl.store(partials + pid * dim + offsets, grad_p, mask=mask)
-        tl.store(
-            partials + (tl.num_programs(0) + pid) * dim + offsets, grad_null, mask=mask
+                q0, q1, q2, q3 = _route_scale(
+                    v0, v1, v2, v3, route_beta * inverse, tiles
+                )
+                grad_p0, grad_p1, grad_p2, grad_p3 = _route_add(
+                    grad_p0, grad_p1, grad_p2, grad_p3, q0, q1, q2, q3, tiles
+                )
+        _route_store(
+            partials + pid * dim,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+            grad_p0,
+            grad_p1,
+            grad_p2,
+            grad_p3,
+            tiles,
+        )
+        _route_store(
+            partials + (tl.num_programs(0) + pid) * dim,
+            offsets0,
+            offsets1,
+            offsets2,
+            offsets3,
+            mask0,
+            mask1,
+            mask2,
+            mask3,
+            grad_null0,
+            grad_null1,
+            grad_null2,
+            grad_null3,
+            tiles,
         )
 
 
@@ -501,17 +914,29 @@ def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
     return sources + (sources[-1],) * (MAX_ROUTE_SOURCES - len(sources))
 
 
-def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int]:
-    block_h = triton.next_power_of_2(num_heads)
-    block_k = triton.next_power_of_2(head_dim)
-    tile = block_h * block_k
-    if tile > 8192:
+def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int, int]:
+    """``(block_h, block_k, tiles, num_warps)`` for one routing site.
+
+    The head width is covered by ``tiles`` sub-tiles of ``block_k`` lanes
+    instead of one tile padded to the next power of two, so the common widths
+    (192 at every trained scale) carry no idle lanes.  A width wider than
+    ``ROUTE_TILE_LANES * MAX_ROUTE_TILES`` widens the sub-tile rather than
+    adding tiles, which keeps the kernels' unrolled tile count fixed.
+    """
+    block_h = 1 << (num_heads - 1).bit_length()
+    block_k = min(ROUTE_TILE_LANES, 1 << (head_dim - 1).bit_length())
+    tiles = -(-head_dim // block_k)
+    while tiles > MAX_ROUTE_TILES:
+        block_k *= 2
+        tiles = -(-head_dim // block_k)
+    lanes = block_h * block_k * tiles
+    if lanes > 8192:
         raise RuntimeError(
-            f"MHDB routing tile {block_h}x{block_k} is too large "
+            f"MHDB routing tile {block_h}x{block_k}x{tiles} is too large "
             f"(H={num_heads}, D/H={head_dim})"
         )
-    num_warps = 8 if tile >= 4096 else (4 if tile >= 1024 else 2)
-    return block_h, block_k, num_warps
+    num_warps = 8 if lanes >= 4096 else (4 if lanes >= 1024 else 2)
+    return block_h, block_k, tiles, num_warps
 
 
 def _check_route_dims(dim: int, num_heads: int) -> int:
@@ -535,18 +960,17 @@ def _route_forward_impl(
     batch, length, dim = sources[0].shape
     bt = batch * length
     head_dim = _check_route_dims(dim, num_heads)
-    block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
+    block_h, block_k, tiles, num_warps = _route_launch(num_heads, head_dim)
     padded = _padded_sources(bank)
-    logits = torch.empty(
+    inv_rms = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
+    weights = torch.empty(
         (n_sources, bt, num_heads), device=projected.device, dtype=torch.float32
     )
-    inv_rms = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
-    weights = torch.empty_like(logits)
     routed = torch.empty_like(sources[0], memory_format=torch.contiguous_format)
     _route_forward_kernel[(bt,)](
         *padded,
         projected,
-        logits,
+        weights,
         inv_rms,
         routed,
         bt=bt,
@@ -557,16 +981,9 @@ def _route_forward_impl(
         n_sources=n_sources,
         block_h=block_h,
         block_k=block_k,
-        num_warps=num_warps,
-    )
-    _route_softmax_kernel[(bt, num_heads)](
-        logits,
-        weights,
-        bt=bt,
-        num_heads=num_heads,
-        n_sources=n_sources,
         block_n=triton.next_power_of_2(n_sources),
-        num_warps=1,
+        tiles=tiles,
+        num_warps=num_warps,
     )
     return (
         routed,
@@ -592,7 +1009,7 @@ def _route_backward_impl(
     batch, length, dim = sources[0].shape
     bt = batch * length
     head_dim = _check_route_dims(dim, num_heads)
-    block_h, block_k, num_warps = _route_launch(num_heads, head_dim)
+    block_h, block_k, tiles, num_warps = _route_launch(num_heads, head_dim)
     flat_weights = weights.view(n_sources, bt, num_heads)
     padded = _padded_sources(bank)
     # A banked source's destination is its own accumulator, which the kernel
@@ -626,6 +1043,7 @@ def _route_backward_impl(
         tokens_per_program=ROUTE_TOKENS_PER_PROGRAM,
         block_h=block_h,
         block_k=block_k,
+        tiles=tiles,
         num_warps=num_warps,
     )
     summed = partials.sum(dim=1)
