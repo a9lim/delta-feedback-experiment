@@ -130,6 +130,11 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         640044168,
         210357384,
     )
+    from delta_feedback_experiment.cli import stream_target
+    from delta_feedback_experiment.data import (
+        CANONICAL_TARGET_TOKENS,
+        CANONICAL_VAL_TOKENS,
+    )
     from delta_feedback_experiment.model import (
         DeltaModel,
         ModelConfig,
@@ -163,6 +168,7 @@ def test_preset_accounting_counts_shared_and_selected_experts():
     assert reference_active(args) == active
     assert args.steps * BATCH_TOKENS >= 25 * active
     assert (args.steps - 1) * BATCH_TOKENS < 25 * active
+    assert CANONICAL_TARGET_TOKENS == stream_target(scale, 400, CANONICAL_VAL_TOKENS)
 
 
 def test_keyed_schedule_draws_are_reproducible():
