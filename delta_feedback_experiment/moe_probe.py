@@ -425,6 +425,7 @@ def _decode_diagnostics() -> dict:
             if isinstance(block.mlp, MixtureOfExperts)
         ]
         dtype = torch.bfloat16 if bf16 else torch.float32
+        label = f"{condition}.{device}.{'bf16' if bf16 else 'fp32'}"
         with torch.autocast(device_type=device, dtype=torch.bfloat16, enabled=bf16):
             whole = model.forward_column(model.embed_tokens(tokens), want_weights=True)
             full_inputs = tuple(recorded)
@@ -465,16 +466,36 @@ def _decode_diagnostics() -> dict:
                     }
                 )
             result["route_disagreements"] = swaps
+            print(f"MoE decode diagnostic {label}: {result}", flush=True)
             if sites and bf16:
                 fixed = _FixedRoutes([whole.expert_weights[site].topk(3).indices for site in sites])
-                with fixed:
+                originals = [
+                    (block.mlp, block.mlp.forward)
+                    for block in model.blocks
+                    if isinstance(block.mlp, MixtureOfExperts)
+                ]
+                # Limit dispatch interception to the MoE itself. Attention
+                # retains its compiled CUDA path and never sees this mode.
+                for module, original in originals:
+                    def routed_forward(*args, forward=original, route_mode=fixed, **kwargs):
+                        with route_mode:
+                            return forward(*args, **kwargs)
+
+                    module.forward = routed_forward
+                try:
                     pinned, _ = cached(model, tokens, dtype, fixed=fixed)
+                finally:
+                    for module, original in originals:
+                        module.forward = original
                 result["fixed_route_relative"] = _relative(pinned, whole.h_top)
+                print(
+                    f"MoE decode diagnostic {label}: "
+                    f"fixed_route_relative={result['fixed_route_relative']:.6g}",
+                    flush=True,
+                )
         for handle in handles:
             handle.remove()
-        label = f"{condition}.{device}.{'bf16' if bf16 else 'fp32'}"
         results[label] = result
-        print(f"MoE decode diagnostic {label}: {result}", flush=True)
     return results
 
 
@@ -532,14 +553,17 @@ def _screen_capture(
     eval_runner = CudaEvalRunner(model, args, runner.pool)
     if all_modes and len(runner.states) != 24:
         raise AssertionError("MoE loop qualification did not retain all 24 training modes")
-    for state in eval_runner.states.values():
-        state.rows.copy_(torch.randint_like(state.rows, high=args.vocab_size))
-        state.val_sum.zero_()
-        state.fused_sum.zero_()
-        state.graph.replay()
-        torch.cuda.synchronize()
-        if not math.isfinite(state.val_sum.item()) or not math.isfinite(state.fused_sum.item()):
-            raise AssertionError("MoE resident evaluation graph is nonfinite")
+    def replay_eval():
+        for state in eval_runner.states.values():
+            state.rows.copy_(torch.randint_like(state.rows, high=args.vocab_size))
+            state.val_sum.zero_()
+            state.fused_sum.zero_()
+            state.graph.replay()
+            torch.cuda.synchronize()
+            if not math.isfinite(state.val_sum.item()) or not math.isfinite(state.fused_sum.item()):
+                raise AssertionError("MoE resident evaluation graph is nonfinite")
+
+    replay_eval()
     prepared = time.monotonic() - started
     addresses = {parameter: sink.data_ptr() for parameter, sink in runner.grad_buffers.items()}
     shadows = [
@@ -614,12 +638,31 @@ def _screen_capture(
             f"k={spec.n_passes}/r={spec.iterations}/ckpt={int(spec.checkpoint)}:"
             f"{1000 * elapsed:.1f}ms/balance={balance:.3f}"
         )
+    # The live schedule chooses modes out of capture order. Return to the
+    # first/raw graph after the largest mode, then evaluate with its gradients
+    # and the whole training family still resident in the shared pool.
+    first = next(spec for spec in runner.states if (spec.n_passes, spec.iterations) in modes)
+    state = runner.begin(first)
+    runner.zero_grad()
+    runner.replay(state, rows, 23, 0)
+    runner.prepare_optimizer(state)
+    torch.cuda.synchronize()
+    if not math.isfinite(state.loss_sum.item()):
+        raise AssertionError("MoE raw replay after the cap graph is nonfinite")
+    gradient_norm = clip_gradients(model.parameters())
+    if not math.isfinite(gradient_norm) or gradient_norm <= 0:
+        raise AssertionError("MoE raw replay after the cap graph lost gradients")
+    replay_eval()
     if counters["stats"]["unique_graphs"] != compiled:
         raise AssertionError("MoE screen replay escaped CUDA preparation")
+    # CUDA graph executable/driver storage is not all visible to the PyTorch
+    # allocator. This device-wide snapshot also includes the display/context.
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
     return (
         f"{condition}: prepare={prepared:.1f}s "
         f"allocated={torch.cuda.max_memory_allocated() / 2**30:.2f}GiB "
         f"reserved={torch.cuda.max_memory_reserved() / 2**30:.2f}GiB "
+        f"device_resident={(total_bytes - free_bytes) / 2**30:.2f}GiB "
         f"resident_graphs={len(runner.states)}+{len(eval_runner.states)}eval "
         + " ".join(records)
     )
