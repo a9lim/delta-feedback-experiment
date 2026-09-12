@@ -66,9 +66,10 @@ analysis result so the measured intervention can be reproduced.
 
 Request `want_weights=True` to obtain `expert_weights`, keyed by
 layer invocation, alongside the separate MHDB `route_weights`. Each expert
-tensor is `[B, T, 15]`: three nonzero routed weights per token, normalized to
-sum to one. The shared expert always runs and is absent from that axis. Align
-core iteration as well as token and pass when comparing expert selections.
+tensor is `[B, T, n]`, where `n = num_routed_experts`: `experts_per_token`
+nonzero routed weights per token, normalized to sum to one. The shared expert
+always runs and is absent from that axis. Align core iteration as well as
+token and pass when comparing expert selections.
 Each physical bank also carries a persistent `expert_bias` that affects expert
 selection without entering the mixture weights. Hold that bias fixed during
 matched replay. `ColumnOutput.expert_counts` sums actual selections by physical
@@ -81,7 +82,7 @@ gate mass alone do not establish specialization or causal importance.
 Trainer `expert_balance` telemetry reports the unweighted mean sequence
 auxiliary loss over executed trunk and MTP invocations, while the expert summary
 reports per-site assignment fractions, selected-gate entropy, and `bias0`
-through `bias14` on up to two validation rows. The `mtp.experts` site uses the
+through `bias{n-1}` on up to two validation rows. The `mtp.experts` site uses the
 cropped second-token alignment. This plain-pass sample does not describe expert
 use during later feedback passes. Step-level `expert_max_violation` uses actual whole-update
 assignment counts: the worst physical bank's `max / mean - 1` load ratio.

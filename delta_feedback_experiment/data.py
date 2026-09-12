@@ -15,8 +15,8 @@ its row in file order. Optional keyed shuffling (:class:`Shuffle`) sends
 addresses to stream positions; otherwise published file/row order is kept.
 Within one source, ordering mode, tokenizer, build package versions and seed,
 every store is a prefix of the same stream: a build that
-stops at 57B tokens is byte-identical to the first 57B tokens of one that
-stops at 170B. Rows are non-overlapping ``seq_len+1``-token windows addressed
+stops at 81B tokens is byte-identical to the first 81B tokens of one that
+stops at 179B. Rows are non-overlapping ``seq_len+1``-token windows addressed
 by a global row index, so batch ``step`` is the same bytes for every
 condition (the paired data order contract) and a resumed run addresses the
 identical rows.
@@ -68,9 +68,9 @@ WRITE_BUFFER_TOKENS = 1 << 24
 DOC_DTYPE = np.dtype([("start", "<i8"), ("source", "<i8")])
 """One sidecar record: split-local start offset and universe address."""
 
-CANONICAL_TARGET_TOKENS = 57_000_000_000
+CANONICAL_TARGET_TOKENS = 81_000_000_000
 """Stored tokens, held-out slice included, for the screen's 400x schedule;
-the bridge's 400x schedule needs 167B (``docs/scaling.md``)."""
+the bridge's 400x schedule needs 179B (``docs/scaling.md``)."""
 CANONICAL_VAL_TOKENS = 30_000_000
 CANONICAL_SHUFFLE_SEED = 0
 CANONICAL_TOKENS_PER_DOC = 900

@@ -11,7 +11,6 @@ from delta_feedback_experiment.model import (
     multipass,
     multipass_loss,
 )
-from delta_feedback_experiment.moe import EXPERTS_PER_TOKEN, NUM_ROUTED_EXPERTS
 
 GEOMETRY = {
     "vocab_size": 41,
@@ -20,7 +19,7 @@ GEOMETRY = {
     "heads": 2,
     "kv_heads": 2,
     "head_dim": 8,
-    "intermediate": 32,
+    "expert_intermediate": 8,
     "pkda_heads": 2,
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
@@ -32,7 +31,7 @@ GEOMETRY = {
 
 def tiny(condition="f", *, seed=13):
     torch.manual_seed(seed)
-    geometry = GEOMETRY | ({"layers": 12} if "l" in condition else {})
+    geometry = GEOMETRY | ({"layers": 16} if "l" in condition else {})
     return DeltaModel(condition_config(condition, **geometry)).eval()
 
 
@@ -190,7 +189,7 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting(coefficient
         selected_counts = auxiliary.expert_weights.count_nonzero(dim=(0, 1))
         torch.testing.assert_close(auxiliary.expert_counts, selected_counts)
         assert auxiliary.expert_counts.sum() == (
-            toks.shape[0] * (toks.shape[1] - 2) * EXPERTS_PER_TOKEN
+            toks.shape[0] * (toks.shape[1] - 2) * model.cfg.experts_per_token
         )
         expert_counts.append(
             torch.cat((out.expert_counts, selected_counts.unsqueeze(0)))
@@ -210,5 +209,5 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting(coefficient
     )
     torch.testing.assert_close(actual.total, expected)
     torch.testing.assert_close(actual.expert_aux_loss, torch.stack(expert_aux).mean())
-    assert actual.expert_counts.shape == (model.cfg.layers + 1, NUM_ROUTED_EXPERTS)
+    assert actual.expert_counts.shape == (model.cfg.layers + 1, model.cfg.num_routed_experts)
     torch.testing.assert_close(actual.expert_counts, torch.stack(expert_counts).sum(0))

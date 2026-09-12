@@ -1,11 +1,13 @@
-"""One shared and three of fifteen routed quarter-width SwiGLU experts.
+"""One shared and top-k routed SwiGLU experts of explicit intermediate width.
 
-Routing is token-local and dropless. CUDA groups the fixed ``3 * tokens``
+Routing is token-local and dropless. CUDA groups the fixed ``k * tokens``
 assignments by expert for sparse GEMMs; the portable implementation executes
 the same selected rows with ordinary differentiable PyTorch operations.
 """
 
 from __future__ import annotations
+
+import math
 
 import torch
 import torch.nn.functional as F
@@ -14,10 +16,15 @@ from torch import Tensor, nn
 from .cuda_kernels import sink_linear
 from .moe_kernels import sparse_experts
 
-NUM_ROUTED_EXPERTS = 15
-EXPERTS_PER_TOKEN = 3
-EXPERT_WIDTH_DIVISOR = 4
 EXPERT_BIAS_RATE = 0.001
+
+
+def validate_expert_geometry(intermediate: int, routed: int, selected: int) -> None:
+    """Reject empty banks and impossible selections before model construction."""
+    if intermediate < 1:
+        raise ValueError("expert intermediate width must be positive")
+    if not 1 <= selected <= routed:
+        raise ValueError("experts must satisfy 1 <= experts_per_token <= num_routed_experts")
 
 
 class Expert(nn.Module):
@@ -45,10 +52,10 @@ class Expert(nn.Module):
 
 
 class MixtureOfExperts(nn.Module):
-    """Quarter-width shared expert plus a normalized top-three routed mixture.
+    """One shared expert plus a normalized top-k routed mixture.
 
-    The branch is ``(shared + 3 * sum(selected_probability * expert)) / 2``.
-    At uniform routing the four independent fan-in-normalized expert outputs
+    The branch is ``(shared + k * sum(selected_probability * expert)) / sqrt(k + 1)``.
+    At uniform routing the k+1 independent fan-in-normalized expert outputs
     therefore have the same initial variance as one dense FFN. The returned
     auxiliary is the unweighted sequence-balancing loss; the trainer owns its
     coefficient and averaging across executed layer invocations. Selection
@@ -56,18 +63,26 @@ class MixtureOfExperts(nn.Module):
     Returned dispatch counts drive a separate update after each training step.
     """
 
-    def __init__(self, dim: int, intermediate: int):
+    def __init__(
+        self,
+        dim: int,
+        expert_intermediate: int,
+        num_routed_experts: int = 15,
+        experts_per_token: int = 3,
+    ):
         super().__init__()
-        if intermediate < EXPERT_WIDTH_DIVISOR or intermediate % EXPERT_WIDTH_DIVISOR:
-            raise ValueError("MoE requires an FFN width divisible by four")
+        validate_expert_geometry(expert_intermediate, num_routed_experts, experts_per_token)
         self.dim = dim
-        self.intermediate = intermediate // EXPERT_WIDTH_DIVISOR
+        self.intermediate = expert_intermediate
+        self.num_routed_experts = num_routed_experts
+        self.experts_per_token = experts_per_token
+        self.output_scale = 1 / math.sqrt(experts_per_token + 1)
         self.shared = Expert(dim, self.intermediate)
         self.experts = nn.ModuleList(
-            Expert(dim, self.intermediate) for _ in range(NUM_ROUTED_EXPERTS)
+            Expert(dim, self.intermediate) for _ in range(self.num_routed_experts)
         )
-        self.router = nn.Linear(dim, NUM_ROUTED_EXPERTS, bias=False)
-        self.register_buffer("expert_bias", torch.zeros(NUM_ROUTED_EXPERTS))
+        self.router = nn.Linear(dim, self.num_routed_experts, bias=False)
+        self.register_buffer("expert_bias", torch.zeros(self.num_routed_experts))
         self._gate_up_shadow: Tensor | None = None
         self._down_shadow: Tensor | None = None
 
@@ -84,7 +99,7 @@ class MixtureOfExperts(nn.Module):
             )
         affinities = logits.sigmoid()
         selected = (affinities + self.expert_bias.to(router_dtype)).topk(
-            EXPERTS_PER_TOKEN, dim=-1
+            self.experts_per_token, dim=-1
         ).indices
         selected_scores = affinities.gather(1, selected)
         selected_probability = selected_scores / selected_scores.sum(
@@ -93,21 +108,22 @@ class MixtureOfExperts(nn.Module):
         probabilities = affinities / affinities.sum(dim=-1, keepdim=True).clamp_min(
             torch.finfo(router_dtype).tiny
         )
-        selection = F.one_hot(selected, NUM_ROUTED_EXPERTS).sum(dim=1)
+        selection = F.one_hot(selected, self.num_routed_experts).sum(dim=1)
         # The weak auxiliary controls individual sequences. The step-level
         # controller receives detached counts and never runs in this forward.
         # V3's sequence auxiliary uses affinity-only choices, independently
         # of the bias-controlled dispatch decisions used by the controller.
         auxiliary_selection = F.one_hot(
-            affinities.topk(EXPERTS_PER_TOKEN, dim=-1).indices, NUM_ROUTED_EXPERTS
+            affinities.topk(self.experts_per_token, dim=-1).indices, self.num_routed_experts
         ).sum(dim=1)
         length = x.shape[-2] if x.ndim >= 2 else 1
-        sequence_probabilities = probabilities.reshape(-1, length, NUM_ROUTED_EXPERTS)
+        sequence_probabilities = probabilities.reshape(-1, length, self.num_routed_experts)
         fractions = (
-            auxiliary_selection.reshape(-1, length, NUM_ROUTED_EXPERTS)
-            .to(router_dtype).mean(dim=1) / EXPERTS_PER_TOKEN
-        )
-        auxiliary = NUM_ROUTED_EXPERTS * (
+            auxiliary_selection.reshape(-1, length, self.num_routed_experts)
+            .to(router_dtype)
+            .mean(dim=1)
+        ) / self.experts_per_token
+        auxiliary = self.num_routed_experts * (
             sequence_probabilities.mean(dim=1) * fractions
         ).sum(dim=-1).mean()
         counts = selection.sum(dim=0)
@@ -129,7 +145,7 @@ class MixtureOfExperts(nn.Module):
             ordered = torch.empty_like(routed).index_copy(0, assignments, routed)
             mixed = (
                 (
-                    ordered.view(-1, EXPERTS_PER_TOKEN, self.dim).to(router_dtype)
+                    ordered.view(-1, self.experts_per_token, self.dim).to(router_dtype)
                     * selected_probability.unsqueeze(-1)
                 )
                 .sum(dim=1)
@@ -145,13 +161,15 @@ class MixtureOfExperts(nn.Module):
                 ).to(flat.dtype)
                 mixed = mixed.index_add(0, token, weighted)
 
-        output = ((self.shared(flat) + EXPERTS_PER_TOKEN * mixed) / 2).reshape_as(x)
+        output = (
+            (self.shared(flat) + self.experts_per_token * mixed) * self.output_scale
+        ).reshape_as(x)
         weights = None
         if want_weights:
             weights = (
                 torch.zeros_like(probabilities)
                 .scatter(1, selected, selected_probability)
-                .reshape(*x.shape[:-1], NUM_ROUTED_EXPERTS)
+                .reshape(*x.shape[:-1], self.num_routed_experts)
             )
         return output, auxiliary, weights, counts
 
@@ -166,8 +184,8 @@ class MixtureOfExperts(nn.Module):
         if not self.training:
             return
         if counts.shape != self.expert_bias.shape or counts.dtype != torch.int64:
-            raise ValueError("expert counts must be an int64 vector of length 15")
-        direction = (counts.sum() - NUM_ROUTED_EXPERTS * counts).sign()
+            raise ValueError("expert counts must be an int64 vector matching the routed bank")
+        direction = (counts.sum() - self.num_routed_experts * counts).sign()
         self.expert_bias.add_(direction.to(self.expert_bias), alpha=rate)
 
     def bind_gradient_sinks(

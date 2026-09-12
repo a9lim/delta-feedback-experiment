@@ -18,13 +18,14 @@ rejected. The default is `f`.
 | `l` | Repeated application of the tied middle cells | `loop` |
 
 The model always uses `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, MHDB source
-routing, shared plus top-three-of-fifteen quarter-width experts, and an
+routing, one shared plus top-`k`-of-`n` routed experts, and an
 auxiliary PKDA/expert two-token predictor. Every condition produces a
 normalized top state with routed enrichment as its payload. MTP reads this
 payload; `f` also transfers it to the next column. `l` alone uses embedding
-seeds. Experts have no capacity limit or token dropping; intermediate width
-is divisible by four. The auxiliary block has independent PKDA state that
-resets for each row and pass.
+seeds. The presets fix expert intermediate width at 832 and use `(k,n)`
+of `(3,15)`, `(5,23)`, and `(7,31)`. Experts have no capacity limit or token
+dropping. The auxiliary block has independent PKDA state that resets for
+each row and pass.
 
 Shared parameters initialize identically for a given seed. Data order and
 feedback pass, prefix, and jitter draws use keyed streams. The tied-core
@@ -37,8 +38,9 @@ whole cells and adds no parameters.
 
 [Scaling](scaling.md) gives the screen, bridge, and flagship geometry,
 parameter counts, token budgets, and cache accounting. The screen has width
-768, twelve layers in three cells, and context 4,096. Under `l`, its first
-cell is the prelude, the middle is the tied core, and the last is the coda.
+768 and context 4,096. All three scales have sixteen layers in four cells.
+Under `l`, the first cell is the prelude, the middle two form the tied core,
+and the last is the coda.
 [Architecture](architecture.md#precision-and-initialization) defines the
 shared initialization, numerical, and optimizer contracts.
 
@@ -106,8 +108,8 @@ uint32 store, so training rows, validation and resume are local reads.
 The held-out slice contains the stream's first documents up to 30M tokens;
 training follows until it holds the target less that cap, ending on a
 document boundary. A screen at 100 tokens per parameter requires about
-15.218B predicted tokens and a rounded 16B-token store. `--data-root ROOT` places the
-store at `ROOT/NAME` (default `data/dclm-100b`); `--out` overrides that path.
+20.092B predicted tokens and a rounded 21B-token store. `--data-root ROOT`
+places the store at `ROOT/NAME` (default `data/dclm-100b`); `--out` overrides that path.
 On Jobe the root is `/data/delta`, so the subset store is
 `/data/delta/dclm-100b` and a full-source store is `/data/delta/dclm`.
 The trainer uses the same `--data-root` and `--source` pair. Resume and
@@ -158,7 +160,7 @@ same draws.
 `delta tokenize --scale S --tokens-per-param R` sizes a store for a planned
 run: that schedule's rows of `seq_len + 1` tokens plus the slice's cap,
 rounded up to the next billion. The default target is the screen at 400x,
-62B stored tokens; the bridge's 400x rung is 179B.
+81B stored tokens; the bridge's 400x rung is 179B.
 
 ## Training
 
@@ -200,8 +202,8 @@ accounting alongside trunk cell-tokens.
 
 ### Expert balancing
 
-A sigmoid router selects the top three scores after adding each
-expert's persistent selection bias. The output mixture uses the original
+A sigmoid router selects the top `k = experts_per_token` scores after adding
+each expert's persistent selection bias. The output mixture uses the original
 scores, normalized over the selected experts. Each physical bank accumulates
 assignment counts over the update's microbatches, feedback passes, and repeated
 core invocations. The auxiliary bank contributes once per pass over its
@@ -211,7 +213,7 @@ it unchanged. Forward execution and activation recomputation never update the
 bias, and evaluation holds it fixed.
 
 A complementary load-balance loss is computed separately for each sequence,
-using sigmoid scores normalized over all experts and a detached top-three
+using sigmoid scores normalized over all routed experts and a detached top-`k`
 selection fraction computed before adding the bias. Actual biased dispatch
 counts drive the separate bias controller. The loss is averaged over
 sequences within each bank, over all executed trunk invocations plus the one
@@ -262,8 +264,8 @@ cell-tokens beside pass-tokens.
 All three parameter groups share one warmup-stable-cooldown multiplier.
 Warmup rises linearly over
 `round(warmup_frac * min(steps, steps at 25x))` updates. The default 2%
-warmup is therefore fixed per scale for runs at or above 25x: 145 updates
-at screen, 422 at bridge, and 1,094 at flagship. Cooldown occupies
+warmup is therefore fixed per scale for runs at or above 25x: 192 updates
+at screen, 426 at bridge, and 753 at flagship. Cooldown occupies
 `round(cooldown_frac * steps)` updates, default 20%, with multiplier
 `1-sqrt(u)` at local progress `u`, reaching zero at the final step.
 
@@ -274,7 +276,7 @@ otherwise, which targets a 75% / 22% / 3% pass mixture over the run and 1.28
 expected pass-tokens per predicted token. Conditions without `f` use one pass
 throughout.
 
-The default screen schedule is 7,359 steps, or 3,858,235,392 predicted
+The default screen schedule is 9,581 steps, or 5,023,203,328 predicted
 tokens. Its budget is derived from 25 tokens per training-active non-embedding
 parameter of `f`, including MTP, rounded up to whole steps. All conditions
 at a geometry share the same schedule; [scaling.md](scaling.md) gives the
@@ -286,6 +288,8 @@ reference counts and larger budgets.
 |---|---:|---|
 | `--condition` | `f` | `f`, `l`, or `fl`; at least one recurrence must be selected |
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
+| `--expert-intermediate` | 832 | each shared and routed expert's intermediate width, in both trunk and MTP |
+| `--num-routed-experts`, `--experts-per-token` | 15, 3 at screen | routed bank size and selected routed experts per token; bridge uses 23, 5 and flagship 31, 7 |
 | `--tokens-per-param` | 25 | predicted tokens per training-active non-embedding parameter of flat `f`, including MTP; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
 | `--steps` | derived | schedule length, typed instead of derived |
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
@@ -299,14 +303,15 @@ reference counts and larger budgets.
 | `--mtp-weight` | 0.3 | finite nonnegative weight for auxiliary cross-entropy and its z-loss, constant across the run |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v31 snapshot |
+| `--resume` | | continues a tag from its latest v32 snapshot |
 
 ### Checkpoints and queue
 
-Checkpoint v31 is the only accepted contract for resume, evaluation, and
+Checkpoint v32 is the only accepted contract for resume, evaluation, and
 forks. Conditions are `f`, `l`, or `fl`; every state dictionary includes the
 payload writer and auxiliary PKDA/expert prediction parameters, and
-state-defining arguments include `mtp_weight`. Snapshots bind to the current
+state-defining arguments include `mtp_weight`, `expert_intermediate`,
+`num_routed_experts`, and `experts_per_token`. Snapshots bind to the current
 GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token
 store carry the same deterministic
 `tokenizer_id`, derived from the pinned vocabulary, delimiter IDs, and full
@@ -331,7 +336,7 @@ cooldown boundary otherwise. Warmup is fixed per scale, so from that step on
 a continuation of any run at or above 25x is the longer run exactly, and a
 shorter source differs only in the warmup it inherited, which the `continue`
 record reports as `exact`. A screen 25x run continued to 50x restores step
-5,519 and trains 9,199 more steps of a 14,718-step schedule. The queue stores
+7,186 and trains 11,976 more steps of a 19,162-step schedule. The queue stores
 arguments, not Git state; a source change never stops an active child, and the
 worker refreshes before the next job.
 

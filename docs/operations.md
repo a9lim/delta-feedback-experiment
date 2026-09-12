@@ -77,7 +77,7 @@ that cache. Keep cyclic Python garbage collection outside graph capture.
 ## Tokenize
 
 The source and ordering contract is in [design.md](design.md#data).
-The screen at 100 tokens per parameter needs a 16B-token store:
+The screen at 100 tokens per parameter needs a 21B-token store:
 
 ```bash
 delta tokenize --source dclm-100b --data-root /data/delta \
@@ -104,8 +104,11 @@ are in [scaling.md](scaling.md); recipe flags are in
 [design.md](design.md#knobs) and `delta train --help`.
 
 Choose `--condition f` (default), `l`, or `fl`. All runs include PKDA,
-MHDB routing, experts, and auxiliary two-token prediction. Expert width is
-one quarter of `--intermediate`, which must be divisible by four. The finite
+MHDB routing, experts, and auxiliary two-token prediction. The presets use
+sixteen layers and expert intermediate width 832.
+`--expert-intermediate`, `--num-routed-experts`, and `--experts-per-token`
+override expert width, routed bank size, and selected count for both trunk and
+MTP; the selected count must be between one and the routed bank size. The finite
 nonnegative `--mtp-weight` defaults to 0.3 and is restored on resume. MTP uses
 the payload and next-token embedding from existing token-store rows in its
 own PKDA/expert block. Every supervised pass constructs the payload, including
@@ -151,7 +154,7 @@ outside `runs/`; custom output paths are not renamed. Both tags must be idle,
 with no queued references and no destination collision. Ordinary I/O failures
 roll back; a multi-file rename is not crash-atomic.
 
-Current snapshots use checkpoint v31 and the pinned tokenizer identity.
+Current snapshots use checkpoint v32 and the pinned tokenizer identity.
 Resume inherits state-defining settings and rejects explicit conflicts;
 runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and

@@ -10,39 +10,44 @@ Preset availability does not establish GPU fit or throughput.
 | Field | Screen | Bridge | Flagship |
 |---|---:|---:|---:|
 | Residual width `D` | 768 | 1,152 | 1,536 |
-| Layers / four-layer cells | 12 / 3 | 16 / 4 | 24 / 6 |
-| Dense-equivalent FFN width `H` | 3,328 | 4,992 | 6,656 |
-| Trunk and MTP per-expert width | 832 | 1,248 | 1,664 |
+| Layers / four-layer cells | 16 / 4 | 16 / 4 | 16 / 4 |
+| Prelude / core / coda cells | 1 / 2 / 1 | 1 / 2 / 1 | 1 / 2 / 1 |
+| Trunk and MTP per-expert width `h` | 832 | 832 | 832 |
+| Shared + selected / routed experts | 1 + 3 / 15 | 1 + 5 / 23 | 1 + 7 / 31 |
+| Active FFN width `H = (k+1)h` | 3,328 | 4,992 | 6,656 |
+| Stored FFN width `(n+1)h` | 13,312 | 19,968 | 26,624 |
 | GQA query / KV heads, width 96 | 8 / 4 | 12 / 6 | 16 / 8 |
 | MHDB groups | 4 | 6 | 8 |
 | PKDA heads, width 128 | 10 | 15 | 20 |
 | PKDA projection width | 1,280 | 1,920 | 2,560 |
-| `f` / `fl` total parameters | 491,999,952 | 1,384,371,980 | 3,532,504,048 |
-| `f` training-active non-embedding parameters | 154,325,712 | 446,551,820 | 1,154,923,504 |
-| Included auxiliary MTP total parameters | 36,362,664 | 81,398,204 | 144,336,592 |
-| Included auxiliary MTP active parameters | 13,359,528 | 29,641,148 | 52,324,048 |
+| `f` / `fl` total parameters | 630,606,216 | 1,384,528,652 | 2,430,864,784 |
+| `f` training-active non-embedding parameters | 200,919,432 | 446,708,492 | 789,384,592 |
+| Included auxiliary MTP total parameters | 36,362,664 | 81,407,420 | 144,361,168 |
+| Included auxiliary MTP active parameters | 13,359,528 | 29,650,364 | 52,348,624 |
 
 Every scale has a 50,304-row tied embedding/readout, 4,096 predictions per
 row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
 per step. Each stored row includes one additional target. Width multipliers
 and optimizer ownership are in [architecture.md](architecture.md#nadam-parameters).
 
-Each trunk and MTP FFN stores one shared plus fifteen routed quarter-width
-experts. One shared and three selected experts run per token. Active counts
-include those four experts and the router in every bank, plus all mixer and
-payload-writer parameters.
+Each trunk and MTP FFN stores one shared plus `n` routed experts, with `k`
+routed experts selected per token. `expert_intermediate` is the actual
+per-expert width `h`; the active dense-equivalent width `H = (k+1)h` is derived.
+The presets keep `(k+1)/(n+1) = 1/4`, so a quarter of the stored expert
+matrices run per token. Active counts include those experts and the full router
+in every bank, plus all mixer and payload-writer parameters.
 A microbatch can touch all experts; all parameters, gradients, and optimizer
 state occupy memory. Per-bank selection biases are buffers, excluded from
 parameter counts. Training's transient assignment counts have shape
-`[layers+1,15]`, with MTP last; column-only counts remain `[layers,15]`.
+`[layers+1,n]`, with MTP last; column-only counts are `[layers,n]`.
 
-The auxiliary module adds `P_PKDA + 12DH + 2D^2 + 19D` parameters: its PKDA
-mixer, expert matrices, concatenation projection, expert router, and four
-RMSNorm scales. Its active count replaces `12DH` with `3DH`. It runs once per training
-pass over `seq_len-1` positions, with a second vocabulary-loss call, and shares
-the embedding/final norm/readout. It does not execute in generation. Condition
-`l` retains the payload writer and omits the FBT entry; shared token budgets
-still use `f`.
+The auxiliary module adds `P_PKDA + 3D(n+1)h + 2D^2 + (n+4)D` parameters:
+its PKDA mixer, expert matrices, concatenation projection, expert router, and
+four RMSNorm scales. Its active count replaces `(n+1)` with `(k+1)` in the
+expert term. It runs once per training pass over `seq_len-1` positions, with
+a second vocabulary-loss call, and shares the embedding/final norm/readout.
+It does not execute in generation. Condition `l` retains the payload writer
+and omits the FBT entry; shared token budgets still use `f`.
 
 ## Token budgets
 
@@ -60,32 +65,33 @@ ratio is 25; larger ratios are supported arithmetic scenarios.
 
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|
-| Screen | 7,359 | 3,858,235,392 | 117,742 | 61,730,717,696 |
-| Bridge | 21,294 | 11,164,188,672 | 340,693 | 178,621,251,584 |
-| Flagship | 55,072 | 28,873,588,736 | 881,137 | 461,969,555,456 |
+| Screen | 9,581 | 5,023,203,328 | 153,290 | 80,368,107,520 |
+| Bridge | 21,301 | 11,167,858,688 | 340,812 | 178,683,641,856 |
+| Flagship | 37,641 | 19,734,724,608 | 602,253 | 315,754,020,864 |
 
-Warmup is 2% of the shorter of the run and its 25x length: 147, 426, and
-1,101 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
+Warmup is 2% of the shorter of the run and its 25x length: 192, 426, and
+753 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
 the default mixture costs about 1.28 pass-tokens per prediction. See
 [design.md](design.md#schedule).
 
 `--continue TAG` extends a finished run by restoring the last snapshot the
 longer schedule reproduces. A 25x screen run continued to 50x restores step
-5,519 and trains 9,199 more steps to reach 14,718.
+7,186 and trains 11,976 more steps to reach 19,162.
 
 Token stores include validation and each row's extra target.
 `delta tokenize --scale S --tokens-per-param R` computes that requirement and
-rounds up to the next billion stored tokens. Screen 100x needs 16B, screen
-400x needs 62B, bridge 400x needs 179B, and flagship 400x needs 463B.
+rounds up to the next billion stored tokens. Screen 100x needs 21B, screen
+400x needs 81B, bridge 400x needs 179B, and flagship 400x needs 316B.
 Full DCLM supports larger stores. Its stream and held-out slice differ from
 the publisher's DCLM-100B subset, preventing paired per-token comparisons.
 
 ## Loop compute and decode state
 
 With `C` unique cells, the core contains `C-2` cells. At depth `r`, a pass
-executes `2+(C-2)r` cells: `2+r` at screen, `2+2r` at bridge, and `2+4r` at
-flagship. The default capped draw has uncapped mean 4, cap 8, and actual mean
-about 3.88. Report predicted tokens, pass-tokens, and cell-tokens together.
+executes `2+(C-2)r` cells. Every preset has `C=4`, so all scales execute
+`2+2r` cells: four at flat depth, ten at `r=4`, and eighteen at `r=8`. The
+default capped draw has uncapped mean 4, cap 8, and actual mean about 3.88.
+Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its
 vocabulary loss. Measured device time includes routing and execution overhead.
 
@@ -94,9 +100,9 @@ PKDA matrix/diagonal states cost:
 
 | Scale | One cell | Flat / `r=1` | `r=4` | `r=8` |
 |---|---:|---:|---:|---:|
-| Screen | 7.96 MiB | 23.87 MiB | 47.73 MiB | 79.56 MiB |
+| Screen | 7.96 MiB | 31.82 MiB | 79.56 MiB | 143.20 MiB |
 | Bridge | 11.93 MiB | 47.73 MiB | 119.33 MiB | 214.80 MiB |
-| Flagship | 15.91 MiB | 95.47 MiB | 286.40 MiB | 540.98 MiB |
+| Flagship | 15.91 MiB | 63.64 MiB | 159.11 MiB | 286.40 MiB |
 
 Each core iteration keeps its own mixer cache. These per-sequence state
 counts exclude payload, logits, allocator overhead, and serving metadata.

@@ -165,8 +165,8 @@ def tokenize_command(argv: list[str]) -> None:
         "--target",
         type=float,
         default=None,
-        help="stored tokens to write, held-out slice included (default 57e9, "
-        "the screen's 400x schedule; the bridge's needs 167e9)",
+        help="stored tokens to write, held-out slice included (default 81e9, "
+        "the screen's 400x schedule; the bridge's needs 179e9)",
     )
     parser.add_argument(
         "--scale",

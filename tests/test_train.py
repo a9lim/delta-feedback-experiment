@@ -38,7 +38,9 @@ from delta_feedback_experiment.train import (
     draw_iterations,
     draw_passes,
     mix,
+    model_fields,
     parse_run_args,
+    reference_active,
     resolve_run_args,
 )
 
@@ -406,9 +408,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 31
-    assert CONTRACT.resumable == frozenset({31})
-    assert CONTRACT.surface_version == 31
+    assert CONTRACT.version == 32
+    assert CONTRACT.resumable == frozenset({32})
+    assert CONTRACT.surface_version == 32
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(10.0)
@@ -448,12 +450,77 @@ def test_resolved_arguments_pin_what_the_operator_fixed():
     args, pinned = resolve_run_args(parser, ["x", "--resume"])
     assert pinned == frozenset({"resume"}) and args.steps is None
     _, pinned = resolve_run_args(parser, ["x", "--resume", "--scale", "bridge"])
-    assert {"scale", "dim", "layers", "seq_len", "batch_rows", "micro_rows"} <= pinned
+    assert {
+        "scale", "dim", "layers", "seq_len", "batch_rows", "micro_rows",
+        "expert_intermediate", "num_routed_experts", "experts_per_token",
+    } <= pinned
     assert "steps" not in pinned
     _, pinned = resolve_run_args(parser, ["x", "--tokens-per-param", "400"])
     assert {"tokens_per_param", "steps"} <= pinned and "dim" not in pinned
     _, pinned = resolve_run_args(parser, ["x", "--seq-len", "2048"])
     assert {"seq_len", "batch_rows"} <= pinned
+
+
+@pytest.mark.parametrize(
+    "scale,dim,selected,routed,total,active",
+    [
+        ("screen", 768, 3, 15, 630606216, 200919432),
+        ("bridge", 1152, 5, 23, 1384528652, 446708492),
+        ("flagship", 1536, 7, 31, 2430864784, 789384592),
+    ],
+)
+def test_width_ladder_preserves_depth_and_ffn_capacity(
+    scale, dim, selected, routed, total, active
+):
+    from delta_feedback_experiment.model import DeltaModel, condition_config
+
+    args = parse_run_args(["geometry", "--scale", scale])
+    cfg = condition_config("fl", **model_fields(args))
+    assert cfg.layers == 16 and cfg.core_layers == range(4, 12)
+    assert cfg.executed_layers(4) == 40 and cfg.routing_blocks == 4
+    assert cfg.dim == dim and cfg.expert_intermediate == 832
+    assert cfg.experts_per_token == selected and cfg.num_routed_experts == routed
+    assert (selected + 1) * 832 * 3 == 13 * dim
+    assert routed + 1 == 4 * (selected + 1)
+    with torch.device("meta"):
+        model = DeltaModel(cfg)
+    assert sum(p.numel() for p in model.parameters()) == total
+    assert len(model.expert_banks) == 17
+    assert all(
+        bank.intermediate == 832
+        and len(bank.experts) == routed
+        and bank.experts_per_token == selected
+        for bank in model.expert_banks
+    )
+    assert reference_active(args) == active
+    assert args.steps * BATCH_TOKENS >= 25 * active
+    assert (args.steps - 1) * BATCH_TOKENS < 25 * active
+
+
+def test_expert_geometry_overrides_replace_preset_fields():
+    args, pinned = resolve_run_args(
+        build_parser(),
+        [
+            "custom", "--scale", "flagship", "--expert-intermediate", "64",
+            "--num-routed-experts", "9", "--experts-per-token", "2",
+        ],
+    )
+    assert (args.expert_intermediate, args.num_routed_experts, args.experts_per_token) == (
+        64, 9, 2
+    )
+    assert {"expert_intermediate", "num_routed_experts", "experts_per_token"} <= pinned
+    with pytest.raises(SystemExit):
+        parse_run_args(["retired", "--intermediate", "3328"])
+
+
+def test_default_token_store_covers_current_screen_schedule():
+    from delta_feedback_experiment.cli import stream_target
+    from delta_feedback_experiment.data import (
+        CANONICAL_TARGET_TOKENS,
+        CANONICAL_VAL_TOKENS,
+    )
+
+    assert CANONICAL_TARGET_TOKENS == stream_target("screen", 400, CANONICAL_VAL_TOKENS)
 
 
 def test_trainer_uses_named_source_paths():
@@ -520,15 +587,19 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
         "--dim",
         "16",
         "--layers",
-        "12",
+        "16",
         "--heads",
         "2",
         "--kv-heads",
         "2",
         "--head-dim",
         "8",
-        "--intermediate",
-        "32",
+        "--expert-intermediate",
+        "8",
+        "--num-routed-experts",
+        "23",
+        "--experts-per-token",
+        "5",
         "--pkda-heads",
         "2",
         "--pkda-head-dim",
@@ -579,18 +650,18 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
 
     def observe_bias(model, counts, **kwargs):
         assert optimizer_events[-2:] == ["NorMuonH", "NAdam"]
-        per_layer = 3 * 2 * 4 * 2  # top-k * rows * input length * feedback passes
+        per_layer = 5 * 2 * 4 * 2  # top-k * rows * input length * feedback passes
         assert (
             counts.sum(-1).tolist()
-            == [per_layer] * 4 + [2 * per_layer] * 4 + [per_layer] * 4
-            + [3 * 2 * 3 * 2]  # MTP predicts one fewer token on each pass.
+            == [per_layer] * 4 + [2 * per_layer] * 8 + [per_layer] * 4
+            + [5 * 2 * 3 * 2]  # MTP predicts one fewer token on each pass.
         )
         before = torch.stack([bank.expert_bias.clone() for bank in model.expert_banks])
         update_bias(model, counts, **kwargs)
         after = torch.stack([bank.expert_bias for bank in model.expert_banks])
         torch.testing.assert_close(
             after,
-            before + 0.001 * (counts.sum(-1, keepdim=True) - 15 * counts).sign(),
+            before + 0.001 * (counts.sum(-1, keepdim=True) - 23 * counts).sign(),
             rtol=0,
             atol=0,
         )
@@ -604,6 +675,13 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
     Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE).move("half", "renamed")
     with pytest.raises(ValueError, match="conflicts"):
         trainer.train(["renamed", *settings, "--resume", "--mtp-weight", "0.17"])
+    for flag, value in (
+        ("--expert-intermediate", "9"),
+        ("--num-routed-experts", "31"),
+        ("--experts-per-token", "7"),
+    ):
+        with pytest.raises(ValueError, match="conflicts"):
+            trainer.train(["renamed", *settings, "--resume", flag, value])
     resumed = trainer.train(["renamed", *settings, "--resume"])
     for key in ("step", "loss", "val", "val_fused", "val_mtp", "val_mtp_fused"):
         assert resumed[key] == full[key]
@@ -626,7 +704,7 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
 
     identical(complete["state"], restored["state"])
     identical(complete["optimizer"], restored["optimizer"])
-    assert complete["version"] == CONTRACT.version == 31
+    assert complete["version"] == CONTRACT.version == 32
     assert any(
         value.count_nonzero()
         for name, value in restored["state"].items()

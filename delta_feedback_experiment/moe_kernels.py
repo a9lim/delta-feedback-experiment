@@ -1,7 +1,7 @@
 """Dropless, fixed-shape grouped CUDA GEMMs for the routed expert bank.
 
 The launch envelope covers every possible expert load, while device-side
-offsets skip empty tiles. Storage is exactly three assignments per token;
+offsets skip empty tiles. Storage is exactly the selected assignments per token;
 there is no capacity factor, CPU routing decision, or dense all-expert FFN.
 """
 
@@ -27,7 +27,7 @@ if triton is not None:
         assignments,
         offsets,
         output,
-        N: tl.constexpr,
+        SELECTED: tl.constexpr,
         K: tl.constexpr,
         O: tl.constexpr,
         GATHER: tl.constexpr,
@@ -46,7 +46,9 @@ if triton is not None:
             inner = tl.arange(0, BK)
             source_rows = rows
             if GATHER:
-                source_rows = tl.load(assignments + rows, rows < end, other=0) // 3
+                source_rows = (
+                    tl.load(assignments + rows, rows < end, other=0) // SELECTED
+                )
             acc = tl.zeros((BM, BN), tl.float32)
             for block in range(tl.cdiv(K, BK)):
                 k = block * BK + inner
@@ -120,6 +122,8 @@ if triton is not None:
         sinks,
         K: tl.constexpr,
         O: tl.constexpr,
+        SELECTED: tl.constexpr,
+        EXPERTS: tl.constexpr,
         GATHER: tl.constexpr,
         ACTIVE: tl.constexpr,
         BM: tl.constexpr,
@@ -129,7 +133,7 @@ if triton is not None:
         expert = tl.program_id(2)
         if (ACTIVE >> expert) & 1:
             sink = sinks[0]
-            for index in tl.static_range(1, 15):
+            for index in tl.static_range(1, EXPERTS):
                 if expert == index:
                     sink = sinks[index]
             start = tl.load(offsets + expert)
@@ -143,7 +147,7 @@ if triton is not None:
                 source_rows = tokens
                 if GATHER:
                     source_rows = (
-                        tl.load(assignments + tokens, tokens < end, other=0) // 3
+                        tl.load(assignments + tokens, tokens < end, other=0) // SELECTED
                     )
                 a = tl.load(
                     grad + tokens[None, :] * O + rows[:, None],
@@ -179,13 +183,14 @@ if triton is not None:
         output,
         COUNT: tl.constexpr,
         D: tl.constexpr,
+        SELECTED: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         token, column = index // D, index % D
         value = tl.full((BLOCK,), 0, tl.float32)
-        for slot in tl.static_range(3):
-            row = tl.load(inverse + token * 3 + slot, index < COUNT, other=0)
+        for slot in tl.static_range(SELECTED):
+            row = tl.load(inverse + token * SELECTED + slot, index < COUNT, other=0)
             value += tl.load(dx + row * D + column, index < COUNT, other=0).to(
                 tl.float32
             )
@@ -203,14 +208,16 @@ def _mm(
     gather: bool = False,
     transpose: bool = False,
 ) -> Tensor:
-    result = x.new_empty((3 * tokens, output_width))
-    _grouped_mm[(triton.cdiv(tokens, 32), triton.cdiv(output_width, 64), 15)](
+    selected = assignments.numel() // tokens
+    experts = weight.shape[0]
+    result = x.new_empty((assignments.numel(), output_width))
+    _grouped_mm[(triton.cdiv(tokens, 32), triton.cdiv(output_width, 64), experts)](
         x,
         weight,
         assignments,
         offsets,
         result,
-        tokens,
+        selected,
         x.shape[-1],
         output_width,
         gather,
@@ -236,7 +243,7 @@ def _forward(
     tokens, dim = x.shape
     width = down_weight.shape[-1]
     gate_up = _mm(x, gate_weight, assignments, offsets, tokens, 2 * width, gather=True)
-    activated = x.new_empty((3 * tokens, width))
+    activated = x.new_empty((assignments.numel(), width))
     _swiglu[(triton.cdiv(activated.numel(), 256),)](
         gate_up,
         activated,
@@ -256,12 +263,12 @@ def _forward_fake(
     assignments: Tensor,
     offsets: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    tokens, dim = x.shape
+    dim = x.shape[-1]
     width = down_weight.shape[-1]
     return (
-        x.new_empty((3 * tokens, dim)),
-        x.new_empty((3 * tokens, 2 * width)),
-        x.new_empty((3 * tokens, width)),
+        x.new_empty((assignments.numel(), dim)),
+        x.new_empty((assignments.numel(), 2 * width)),
+        x.new_empty((assignments.numel(), width)),
     )
 
 
@@ -288,6 +295,8 @@ def _backward(
     # remain stable across recurrent backward invocations. The returned dX is
     # the graph dependency keeping these FP32 accumulations alive.
     tokens, dim = x.shape
+    selected = assignments.numel() // tokens
+    experts = gate_weight.shape[0]
     width = activated.shape[-1]
     fresh = []
 
@@ -325,7 +334,7 @@ def _backward(
         dgate_up, gate_weight, assignments, offsets, tokens, dim, transpose=True
     )
     if any(down_required):
-        _grouped_dw[(triton.cdiv(dim, 32), triton.cdiv(width, 64), 15)](
+        _grouped_dw[(triton.cdiv(dim, 32), triton.cdiv(width, 64), experts)](
             activated,
             gradient,
             assignments,
@@ -333,6 +342,8 @@ def _backward(
             tuple(down_sinks),
             width,
             dim,
+            selected,
+            experts,
             False,
             sum(int(required) << index for index, required in enumerate(down_required)),
             32,
@@ -341,7 +352,7 @@ def _backward(
             num_warps=4,
         )
     if any(gate_required):
-        _grouped_dw[(triton.cdiv(2 * width, 32), triton.cdiv(dim, 64), 15)](
+        _grouped_dw[(triton.cdiv(2 * width, 32), triton.cdiv(dim, 64), experts)](
             x,
             dgate_up,
             assignments,
@@ -349,6 +360,8 @@ def _backward(
             tuple(gate_sinks),
             dim,
             2 * width,
+            selected,
+            experts,
             True,
             sum(int(required) << index for index, required in enumerate(gate_required)),
             32,
@@ -370,6 +383,7 @@ def _backward(
         dx,
         dx.numel(),
         dim,
+        selected,
         256,
     )
     return dx, fresh
@@ -433,8 +447,9 @@ class _SparseExperts(torch.autograd.Function):
         x, gate_up, activated, gate_operand, down_operand, assignments, offsets = (
             ctx.saved_tensors
         )
-        gate_required = list(ctx.needs_input_grad[7:22])
-        down_required = list(ctx.needs_input_grad[22:37])
+        experts = gate_operand.shape[0]
+        gate_required = list(ctx.needs_input_grad[7 : 7 + experts])
+        down_required = list(ctx.needs_input_grad[7 + experts : 7 + 2 * experts])
         gate_bound = [
             sink is not None and needed
             for sink, needed in zip(ctx.gate_sinks, gate_required, strict=True)

@@ -62,15 +62,19 @@ def cuda_probe() -> None:
             "--dim",
             "128",
             "--layers",
-            "12",
+            "16",
             "--heads",
             "4",
             "--kv-heads",
             "2",
             "--head-dim",
             "32",
-            "--intermediate",
-            "256",
+            "--expert-intermediate",
+            "64",
+            "--num-routed-experts",
+            "31",
+            "--experts-per-token",
+            "7",
             "--pkda-heads",
             "2",
             "--pkda-head-dim",
@@ -143,9 +147,9 @@ def cuda_probe() -> None:
         for optimizer in optimizers:
             optimizer.step()
         bias_before = torch.stack([bank.expert_bias for bank in model.expert_banks])
-        assert state.expert_counts.shape == (cfg.layers + 1, 15)
+        assert state.expert_counts.shape == (cfg.layers + 1, cfg.num_routed_experts)
         assert state.expert_counts[-1].sum().item() == (
-            3 * args.batch_rows * (args.seq_len - 1) * spec.n_passes
+            cfg.experts_per_token * args.batch_rows * (args.seq_len - 1) * spec.n_passes
         )
         model.update_expert_bias(state.expert_counts)
         assert not torch.equal(bias_before[0], model.blocks[0].mlp.expert_bias)

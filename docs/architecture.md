@@ -12,8 +12,9 @@ data and training, and [references](../references/refs.yaml) records sources.
 
 The pre-norm decoder has tied embedding/readout, a final RMSNorm,
 and no dropout. Every RMSNorm uses epsilon `1e-6`. Layers form four-layer
-cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`. Each trunk FFN uses one shared and
-three selected experts. The middle cells form the tied core under `l`.
+cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`. Each trunk FFN uses one shared expert
+and a configurable number of selected routed experts. All presets have four
+cells; the middle two form the tied core under `l`.
 
 The diagram expands **`fl`**, with both feedback and tied depth enabled. Panel
 A follows one column from input to both outputs; B-H expand its modules and
@@ -28,8 +29,8 @@ A. fl: COMPLETE COLUMN / PASS
 ============================================================================================
   B = batch rows; T = input positions; D = residual width; V = vocabulary size
   L = unique trunk layers = 4C; C = unique cells; c = C-2 = core cells
-  r = core iterations; k = Jacobi pass; t = token position; H_ff = dense-equivalent FFN width
-  Screen: D=768, V=50,304, L=12, C=3, c=1, H_ff=3,328; default eval/decode r=4
+  r = core iterations; k = Jacobi pass; t = token position; h_ff = per-expert width
+  Screen: D=768, V=50,304, L=16, C=4, c=2, h_ff=832; default eval/decode r=4
   Residuals, seeds, deltas, payloads: [B,T,D] in a full row; [B,1,D] in decode
 
   token x_t --> Emb.weight [V,D] --> e_t -------------------------------+
@@ -105,7 +106,7 @@ A. fl: COMPLETE COLUMN / PASS
 
   Identity: h_top = seed + Delta_P + sum_j Delta_Rj + Delta_Coda
   Executed trunk: 2+c*r cells, 4*(2+c*r) layers; parameters remain L unique layers.
-  Screen at r=4: P -> R_0 -> R_0 -> R_0 -> R_0 -> Coda = 24 executed layers.
+  All presets at r=4: P -> (R_0 -> R_1) x 4 -> Coda = 40 executed layers.
   At r=1, fl matches f in values, routes, losses, and gradients.
 
 
@@ -289,18 +290,20 @@ F. NoPE-GGQA MIXER: CAUSAL GLOBAL TOKEN ATTENTION, EVERY FOURTH LAYER
   K/V storage per track: two [B,T_cache,n_kv,96] BF16 tensors, written before the causal read.
 
 
-G. EVERY FFN: ONE SHARED + TOP-3-OF-15 ROUTED QUARTER-WIDTH SwiGLU EXPERTS
+G. EVERY FFN: ONE SHARED + TOP-k_e-OF-n ROUTED SwiGLU EXPERTS
 ============================================================================================
+  k_e = selected routed count; n = routed bank size; h_ff = per-expert width
+  Screen/bridge/flagship: (k_e,n) = (3,15)/(5,23)/(7,31); h_ff=832 throughout
   z [B,T,D] -----------------------+------------------------------------+
        |                          |                                     |
        v                          v                                    v
-  shared expert S          W_router: D->15                        E_0 ... E_14
+  shared expert S          W_router: D->n                         E_0 ... E_(n-1)
   (always active)                 |                          (execute selected rows)
        |                   sigmoid scores s_j                           |
        |                      FP32 |                                    |
        |              +------------+-------------+                      |
        |              |                          |                      |
-       |        top3(s_j + b_j)           gather original s_j           |
+       |      topk_e(s_j + b_j)          gather original s_j             |
        |              |                          |                      |
        |         selected J ------------> w_j = s_j/sum_(i in J)s_i     |
        |              |                          |                      |
@@ -308,22 +311,22 @@ G. EVERY FFN: ONE SHARED + TOP-3-OF-15 ROUTED QUARTER-WIDTH SwiGLU EXPERTS
        |                                         |                      |
        |                                         +--> weighted sum <----+
        |                                                     |
-       |                                                    * 3
+       |                                                   * k_e
        |                                                     |
-       +--------------------------------------------------->(+) --> /2 --> FFN output
+       +--------------------------------------------------->(+) --> /sqrt(k_e+1) --> output
 
-  Each of 16 independent experts:
-       z --> W_gate: D->H_ff/4 --> SiLU --+
-       |                                 (*) --> W_down: H_ff/4->D --> expert output
-       +---> W_up:   D->H_ff/4 -----------+
+  Each of n+1 independent experts:
+       z --> W_gate: D->h_ff --> SiLU --+
+       |                               (*) --> W_down: h_ff->D --> expert output
+       +---> W_up:   D->h_ff -----------+
   Gate/up matrices are packed; each expert retains its own parameters and optimizer state.
-  Four active quarter-width experts per token; no capacity limit or token dropping.
+  k_e+1 active experts per token; no capacity limit or token dropping.
   Gradients flow through selected scores and experts; selection indices are discrete.
 
   Actual selections --> integer counts summed across microbatches/passes/core visits
-                    --> once per optimizer step: b_j += .001*sign(sum_i C_i - 15*C_j)
-  Unbiased top3(s) + normalized all-expert scores --> sequence balance loss --> [I]
-  One b[15] buffer per PHYSICAL FFN, shared across its tied visits; fixed in evaluation.
+                    --> once per optimizer step: b_j += .001*sign(sum_i C_i - n*C_j)
+  Unbiased topk_e(s) + normalized all-expert scores --> sequence balance loss --> [I]
+  One b[n] buffer per PHYSICAL FFN, shared across its tied visits; fixed in evaluation.
 
 
 H. AUXILIARY SECOND-TOKEN PREDICTION: ONE BLOCK, ONCE PER PASS
@@ -533,54 +536,63 @@ GQA layer in each trunk cell owns K/V storage.
 
 ## Shared and routed experts
 
-Every trunk and auxiliary FFN holds sixteen independent quarter-width SwiGLUs:
-shared `S` and routed `E_0..E_14`. Each reads/writes residual width `D` and uses
-intermediate width `H/4`; `H` must be divisible by four. For normalized input:
+Every trunk and auxiliary FFN holds one shared SwiGLU `S` and `n` routed
+SwiGLUs `E_0..E_(n-1)`, selecting `k` routed experts per token. Each reads and
+writes residual width `D` and uses actual intermediate width `h`.
+`ModelConfig` names these fields `expert_intermediate`, `num_routed_experts`,
+and `experts_per_token`; their CLI flags are `--expert-intermediate`,
+`--num-routed-experts`, and `--experts-per-token`. Width and bank size must be
+positive and `1 <= k <= n`. Presets fix `h=832` and use `(k,n)` of `(3,15)`,
+`(5,23)`, and `(7,31)`. For normalized input:
 
 ```text
 s = sigmoid(W_router x)
-J = top3(s + b)
+J = topk(s + b)
 w_j = s_j / sum_(i in J) s_i  if j in J, else 0
-ffn(x) = (S(x) + 3 * sum_j w_j E_j(x)) / 2
+ffn(x) = (S(x) + k * sum_j w_j E_j(x)) / sqrt(k+1)
 ```
 
 Router scores are FP32. The persistent bias `b` affects selection only. The
 selected scores remain differentiable; the discrete choice does not. There
-is no capacity limit or token dropping. The factor of three gives unit
-selected coefficients at equal scores; division by two matches the variance
-of four independent equal-variance expert outputs to one dense output at
-initialization. This does not guarantee learned variance.
+is no capacity limit or token dropping. Multiplying by `k` gives unit
+selected coefficients at equal scores; division by `sqrt(k+1)` matches the
+variance of `k+1` independent equal-variance expert outputs to one expert
+output at initialization. This does not guarantee learned variance.
 
-The expert matrices occupy four times the equivalent dense FFN's parameters
-while four active quarter-width experts have its matrix arithmetic per token.
-The router adds `15D` parameters per layer. Memory and dispatch overhead still
-matter. The design follows [DeepSeekMoE](https://arxiv.org/abs/2401.06066).
+The active dense-equivalent width is derived as `H=(k+1)h`: expert matrices
+perform `3DH` multiply-accumulates per token and store `3D(n+1)h` parameters.
+The presets store four times the active expert matrix parameters. The router
+adds `nD` parameters per bank. The shared expert accounts for `1/(k+1)` of
+active expert width: 25%, 16.7%, and 12.5% across the presets. Fixed expert
+intermediate width does not fix each expert's parameter count as `D` grows.
+Memory and dispatch overhead still matter. The design follows
+[DeepSeekMoE](https://arxiv.org/abs/2401.06066).
 Hard selection can amplify small full-row/cached numerical differences when
 near-tied experts exchange rank; a compact execution smoke does not establish
 unrestricted long-horizon decode agreement.
 
 ### Load balancing
 
-Each physical bank's `expert_bias[15]` starts at zero and stays outside the
+Each physical bank's `expert_bias[n]` starts at zero and stays outside the
 optimizer groups. Training sums actual integer assignment counts `C_j` over
 all microbatches, passes, and invocations, then updates once after the step:
 
 ```text
-b_j += 0.001 * sign(sum_i C_i - 15 * C_j)
+b_j += 0.001 * sign(sum_i C_i - n * C_j)
 ```
 
 Evaluation and recomputation leave it fixed. Counts are returned values, so
 activation checkpointing cannot double-count. This follows
 [auxiliary-loss-free balancing](https://arxiv.org/abs/2408.15664).
 
-A separate sequence regularizer uses unbiased top-three preferences:
+A separate sequence regularizer uses unbiased top-`k` preferences:
 
 ```text
 q_j = s_j / sum_i s_i
-U = top3(s)
+U = topk(s)
 P_j = mean_tokens(q_j)
-F_j = stop_gradient(count_tokens(j in U) / (3T))
-aux_layer = mean_sequences(15 * sum_j P_j F_j)
+F_j = stop_gradient(count_tokens(j in U) / (kT))
+aux_layer = mean_sequences(n * sum_j P_j F_j)
 aux_pass = (sum_executed_trunk_layers(aux_layer) + aux_mtp) / (N_trunk + 1)
 aux = mean_passes(aux_pass)
 training_loss += 1e-4 * aux
@@ -593,11 +605,11 @@ once per pass, with its own `T-1` positions. Its within-sequence gradient
 coupling does not change causal forward activations. Cross-entropy excludes it.
 
 `ColumnOutput.expert_aux_loss` holds the trunk layer mean and `expert_counts`
-holds transient `[L,15]` counts summed over physical-bank invocations.
+holds transient `[L,n]` counts summed over physical-bank invocations.
 `LossOutput.expert_aux_loss` includes the auxiliary bank using the averaging
-above; its `[L+1,15]` counts place that bank last. Bias updates include every
+above; its `[L+1,n]` counts place that bank last. Bias updates include every
 bank once per optimizer step. With `want_weights=True`, column `expert_weights`
-maps each trunk invocation to `[B,T,15]` sparse normalized weights, distinct
+maps each trunk invocation to `[B,T,n]` sparse normalized weights, distinct
 from MHDB's source weights. `forward_mtp` can return the auxiliary block's
 weights over its `T-1` positions.
 
@@ -724,9 +736,9 @@ logits_mtp,t = (final_norm(v_t) * 1536 / D) @ Emb.weight.T
 ```
 
 `M` is bias-free `2D -> D`. The two entry norms are independent. The auxiliary
-block has its own PKDA mixer and one shared plus top-three-of-fifteen
-quarter-width SwiGLU experts, at the trunk width and with the same
-`1/sqrt(2L)` branch scale. It shares the final norm and embedding/readout.
+block has its own PKDA mixer and one shared plus top-`k`-of-`n` routed
+SwiGLU experts, using the trunk's residual width, expert intermediate width,
+expert counts, output normalization, and `1/sqrt(2L)` branch scale. It shares the final norm and embedding/readout.
 It has no MHDB read or tied loop. Its independent matrix, diagonal, and
 convolution states start from zero for each row and pass.
 

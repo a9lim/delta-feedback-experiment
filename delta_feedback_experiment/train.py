@@ -56,7 +56,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=31, resumable=frozenset({31}), surface_version=31
+    version=32, resumable=frozenset({32}), surface_version=32
 )
 
 
@@ -83,10 +83,12 @@ BATCH_TOKENS = 524_288
 SCALES: dict[str, dict[str, int]] = {
     "screen": {
         "dim": 768,
-        "layers": 12,
+        "layers": 16,
         "heads": 8,
         "kv_heads": 4,
-        "intermediate": 3328,
+        "expert_intermediate": 832,
+        "num_routed_experts": 15,
+        "experts_per_token": 3,
         "pkda_heads": 10,
         "seq_len": 4096,
         "batch_rows": 128,
@@ -97,7 +99,9 @@ SCALES: dict[str, dict[str, int]] = {
         "layers": 16,
         "heads": 12,
         "kv_heads": 6,
-        "intermediate": 4992,
+        "expert_intermediate": 832,
+        "num_routed_experts": 23,
+        "experts_per_token": 5,
         "pkda_heads": 15,
         "seq_len": 4096,
         "batch_rows": 128,
@@ -105,10 +109,12 @@ SCALES: dict[str, dict[str, int]] = {
     },
     "flagship": {
         "dim": 1536,
-        "layers": 24,
+        "layers": 16,
         "heads": 16,
         "kv_heads": 8,
-        "intermediate": 6656,
+        "expert_intermediate": 832,
+        "num_routed_experts": 31,
+        "experts_per_token": 7,
         "pkda_heads": 20,
         "seq_len": 4096,
         "batch_rows": 128,
@@ -148,7 +154,9 @@ EXACT_FIELDS = (
     "heads",
     "kv_heads",
     "head_dim",
-    "intermediate",
+    "expert_intermediate",
+    "num_routed_experts",
+    "experts_per_token",
     "pkda_heads",
     "pkda_head_dim",
     "pkda_conv_size",
@@ -360,11 +368,18 @@ def build_parser() -> argparse.ArgumentParser:
     trunk.add_argument("--vocab-size", type=int, default=VOCAB_SIZE)
     parser.set_defaults(tokenizer_id=TOKENIZER_ID)
     trunk.add_argument("--dim", type=int, default=768)
-    trunk.add_argument("--layers", type=int, default=12)
+    trunk.add_argument("--layers", type=int, default=16)
     trunk.add_argument("--heads", type=int, default=8)
     trunk.add_argument("--kv-heads", type=int, default=4)
     trunk.add_argument("--head-dim", type=int, default=96)
-    trunk.add_argument("--intermediate", type=int, default=3328)
+    trunk.add_argument(
+        "--expert-intermediate",
+        type=int,
+        default=832,
+        help="intermediate width of each shared or routed expert",
+    )
+    trunk.add_argument("--num-routed-experts", type=int, default=15)
+    trunk.add_argument("--experts-per-token", type=int, default=3)
     trunk.add_argument("--pkda-heads", type=int, default=10)
     trunk.add_argument("--pkda-head-dim", type=int, default=128)
     trunk.add_argument("--pkda-conv-size", type=int, default=4)
@@ -746,7 +761,11 @@ class CudaGraphTrainer:
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((len(self.model.expert_banks), 15), dtype=torch.int64, device=self.device),
+            torch.zeros(
+                (len(self.model.expert_banks), self.model.cfg.num_routed_experts),
+                dtype=torch.int64,
+                device=self.device,
+            ),
         )
 
     def _body(self, state: CapturedMicro) -> None:
@@ -1299,7 +1318,9 @@ def model_fields(args) -> dict:
         "heads": args.heads,
         "kv_heads": args.kv_heads,
         "head_dim": args.head_dim,
-        "intermediate": args.intermediate,
+        "expert_intermediate": args.expert_intermediate,
+        "num_routed_experts": args.num_routed_experts,
+        "experts_per_token": args.experts_per_token,
         "pkda_heads": args.pkda_heads,
         "pkda_head_dim": args.pkda_head_dim,
         "pkda_conv_size": args.pkda_conv_size,
@@ -1313,7 +1334,8 @@ def reference_active(args) -> int:
     """Active non-embedding parameters of flat ``f``, including MTP.
 
     Every condition at a scale shares this denominator and schedule. Count
-    the shared expert and three routed experts per layer, not the idle banks.
+    the shared expert and configured selected experts per layer, excluding
+    idle experts.
     """
     with torch.device("meta"):
         model = DeltaModel(condition_config("f", **model_fields(args)))
@@ -1321,7 +1343,7 @@ def reference_active(args) -> int:
     inactive = sum(
         parameter.numel()
         for bank in model.expert_banks
-        for expert in bank.experts[3:]
+        for expert in bank.experts[bank.experts_per_token :]
         for parameter in expert.parameters()
     )
     return total - model.embed_tokens.weight.numel() - inactive
@@ -1579,9 +1601,9 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
             expert_shared=1,
-            expert_routed=15,
-            expert_top_k=3,
-            expert_width=model.cfg.intermediate // 4,
+            expert_routed=model.cfg.num_routed_experts,
+            expert_top_k=model.cfg.experts_per_token,
+            expert_width=model.cfg.expert_intermediate,
             expert_balance_coef=EXPERT_BALANCE_COEF,
             expert_bias_rate=EXPERT_BIAS_RATE,
             **{name: getattr(args, name) for name in EXACT_FIELDS},
@@ -1671,7 +1693,9 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 ntp_loss = mtp_loss = 0.0
                 expert_balance = 0.0
                 expert_counts = torch.zeros(
-                    (len(model.expert_banks), 15), dtype=torch.int64, device=device
+                    (len(model.expert_banks), model.cfg.num_routed_experts),
+                    dtype=torch.int64,
+                    device=device,
                 )
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
@@ -1739,7 +1763,12 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             # Each physical bank has its own target, including the core
             # banks that execute repeatedly on looped steps.
             loads = expert_counts.float()
-            violation = 15 * loads.amax(dim=-1) / loads.sum(dim=-1).clamp_min(1) - 1
+            violation = (
+                model.cfg.num_routed_experts
+                * loads.amax(dim=-1)
+                / loads.sum(dim=-1).clamp_min(1)
+                - 1
+            )
             fields["expert_max_violation"] = telemetry.format_metric(
                 violation.max().item()
             )

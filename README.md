@@ -11,7 +11,7 @@ The core model always uses:
 
 - four-layer cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`;
 - Multi-Head Delta Block (MHDB) reads over the seed and block deltas;
-- one shared plus top-three-of-fifteen quarter-width SwiGLU experts per layer;
+- one shared plus a scale-dependent selection of routed SwiGLU experts per layer;
 - a routed payload trained by an auxiliary PKDA/expert block for second-token
   prediction.
 
@@ -26,8 +26,11 @@ Two condition letters control its recurrent computation:
 A condition must include at least one letter. Shared parameters initialize
 identically for a given seed, and data and feedback draws use keyed streams.
 
-The screen has width 768 and twelve layers. Four quarter-width experts are
-active per token; all sixteen experts occupy parameter and optimizer memory.
+All three scales have sixteen layers in a one-cell prelude, two-cell core,
+and one-cell coda. Residual widths are 768, 1,152, and 1,536; every expert has
+intermediate width 832. Screen selects three of fifteen routed experts, bridge
+five of twenty-three, and flagship seven of thirty-one, alongside one shared
+expert. All experts occupy parameter and optimizer memory.
 The auxiliary prediction block combines the payload with the next token's
 embedding and trains on existing rows; `--mtp-weight` defaults to 0.3. It
 shares the embedding/readout and uses its own PKDA recurrence and expert bank.

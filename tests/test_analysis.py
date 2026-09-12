@@ -25,7 +25,9 @@ TINY = {
     "heads": 2,
     "kv_heads": 2,
     "head_dim": 8,
-    "intermediate": 32,
+    "expert_intermediate": 8,
+    "num_routed_experts": 23,
+    "experts_per_token": 5,
     "pkda_heads": 2,
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
@@ -67,6 +69,15 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
         want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
         got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
     assert torch.equal(want, got)
+
+
+def test_load_checkpoint_rejects_previous_expert_contract(tmp_path):
+    _, path = snapshot(tmp_path)
+    payload = torch.load(path, weights_only=False)
+    payload["version"] = 31
+    torch.save(payload, path)
+    with pytest.raises(ValueError, match="version"):
+        analysis.load_checkpoint(path, "cpu")
 
 
 def test_token_ce_matches_sequence_ce(tmp_path):

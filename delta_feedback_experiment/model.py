@@ -44,7 +44,7 @@ from torch import Tensor, nn
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
-from .moe import EXPERT_BIAS_RATE, NUM_ROUTED_EXPERTS, MixtureOfExperts
+from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
 from .tokenizer import VOCAB_SIZE
@@ -124,11 +124,13 @@ class ModelConfig:
 
     vocab_size: int = VOCAB_SIZE
     dim: int = 768
-    layers: int = 12
+    layers: int = 16
     heads: int = 8
     kv_heads: int = 4
     head_dim: int = 96
-    intermediate: int = 3328
+    expert_intermediate: int = 832
+    num_routed_experts: int = 15
+    experts_per_token: int = 3
     pkda_heads: int = 10
     pkda_head_dim: int = 128
     pkda_conv_size: int = 4
@@ -155,8 +157,9 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if not (self.feedback or self.loop):
             raise ValueError("condition must enable feedback (f), looping (l), or both")
-        if self.intermediate < 4 or self.intermediate % 4:
-            raise ValueError("MoE requires intermediate width divisible by four")
+        validate_expert_geometry(
+            self.expert_intermediate, self.num_routed_experts, self.experts_per_token
+        )
         if self.layers < 1:
             raise ValueError("model needs at least one layer")
         if self.routing_block_size < 1:
@@ -645,7 +648,9 @@ class Block(nn.Module):
             if self.is_pkda
             else Attention(cfg)
         )
-        self.mlp = MixtureOfExperts(cfg.dim, cfg.intermediate)
+        self.mlp = MixtureOfExperts(
+            cfg.dim, cfg.expert_intermediate, cfg.num_routed_experts, cfg.experts_per_token
+        )
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
         if not auxiliary:
             self.attn_router = Router(cfg)
@@ -883,10 +888,10 @@ class ColumnOutput:
     """Mean load-balance loss over executed layer invocations."""
 
     expert_weights: dict[str, Tensor]
-    """Site -> sparse normalized top-3 routing weights [B, T, 15]."""
+    """Site -> sparse normalized top-k routing weights [B, T, routed experts]."""
 
     expert_counts: Tensor
-    """Logical assignment counts [physical layers, 15], summed over core uses."""
+    """Assignment counts [physical layers, routed experts], summed over core uses."""
 
 
 class DeltaModel(nn.Module):
@@ -1096,8 +1101,10 @@ class DeltaModel(nn.Module):
         """Update each physical expert bank once after a complete training step."""
         if not self.training:
             return
-        if counts.shape != (len(self.expert_banks), NUM_ROUTED_EXPERTS):
-            raise ValueError("expert counts must have shape [trunk layers + MTP, 15]")
+        if counts.shape != (len(self.expert_banks), self.cfg.num_routed_experts):
+            raise ValueError(
+                "expert counts must have shape [trunk layers + MTP, routed experts]"
+            )
         for bank, bank_counts in zip(self.expert_banks, counts, strict=True):
             bank.update_bias(bank_counts, rate=rate)
 
@@ -1955,7 +1962,7 @@ class LossOutput:
     expert_aux_loss: Tensor
     """Mean over passes of the mean over trunk and auxiliary layer invocations."""
     expert_counts: Tensor
-    """Actual assignments summed over passes, [trunk layers + MTP, 15]."""
+    """Assignments summed over passes, [trunk layers + MTP, routed experts]."""
 
 
 def multipass_loss(
