@@ -37,6 +37,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
+import torch._dynamo.config as _dynamo_config
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import Tensor, nn
@@ -48,6 +49,13 @@ from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
 from .tokenizer import VOCAB_SIZE
+
+# Model blocks specialize by layer, route count, mode, and gradient state.
+# Configure their finite compiler budget only when loading the model.
+_dynamo_config.recompile_limit = max(_dynamo_config.recompile_limit, 256)
+_dynamo_config.accumulated_recompile_limit = max(
+    _dynamo_config.accumulated_recompile_limit, 4096
+)
 
 try:
     from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
