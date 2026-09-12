@@ -2,6 +2,7 @@
 
 import torch
 
+from delta_feedback_experiment.cuda_kernels import MAX_ROUTE_TILES, _route_launch
 from delta_feedback_experiment.model import (
     DeltaModel,
     KVCache,
@@ -93,6 +94,21 @@ def test_routing_matches_normalized_math_and_telescopes():
     torch.testing.assert_close(
         out.core_state - out.core_entry, out.sources[2] + out.sources[3]
     )
+
+
+def test_routing_sub_tiles_cover_the_head_width():
+    """The routing kernels walk a head width in sub-tiles instead of padding it
+    to the next power of two, so 192 -- the width at every trained scale -- is
+    three full 64-lane tiles with no idle lanes."""
+    for num_heads in (4, 6, 8, 12):
+        block_h, block_k, tiles, _ = _route_launch(num_heads, 192)
+        assert block_h >= num_heads
+        assert (block_k, tiles) == (64, 3)
+        assert block_k * tiles == 192
+    for num_heads, head_dim in ((4, 16), (2, 32), (2, 96), (2, 384), (2, 1024)):
+        _, block_k, tiles, _ = _route_launch(num_heads, head_dim)
+        assert tiles <= MAX_ROUTE_TILES
+        assert block_k * (tiles - 1) < head_dim <= block_k * tiles
 
 
 def test_feedback_and_loop_are_token_causal():
