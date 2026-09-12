@@ -668,6 +668,18 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
         optimizer_events.append("bias")
 
     monkeypatch.setattr(DeltaModel, "update_expert_bias", observe_bias)
+    summarize_experts = trainer.expert_summary
+
+    def normalized_expert_summary(model, *args, **kwargs):
+        records = summarize_experts(model, *args, **kwargs)
+        assert any(record["site"] == "mtp.experts" for record in records)
+        for record in records:
+            mass = sum(record[f"expert{i}"] for i in range(model.cfg.num_routed_experts))
+            # Summaries round each assignment fraction to four decimal places.
+            assert mass == pytest.approx(1, abs=model.cfg.num_routed_experts * 5e-5)
+        return records
+
+    monkeypatch.setattr(trainer, "expert_summary", normalized_expert_summary)
 
     full = trainer.train(["full", *settings])
     half = trainer.train(["half", *settings, "--max-steps", "1"])

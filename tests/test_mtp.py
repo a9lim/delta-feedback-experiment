@@ -70,6 +70,10 @@ def feedback_sum(values):
 def test_second_token_prediction_cannot_see_its_target():
     """Editing x[t] can first change the auxiliary prediction of x[t+1]."""
     model = tiny()
+    # Keep the selection margin fixed so changing a future token cannot
+    # alter the sparse GEMM batch shape used for earlier tokens.
+    for bank in model.expert_banks:
+        bank.expert_bias[-bank.experts_per_token :] = 2
     original = tokens()
     changed = original.clone()
     edited_position = 4

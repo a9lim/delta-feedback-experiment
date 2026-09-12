@@ -1213,7 +1213,7 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
         weights_by_site = outs[0].expert_weights | {"mtp.experts": mtp.expert_weights}
         for site, weights in weights_by_site.items():
             w = weights.float()
-            load = (w > 0).float().mean(dim=(0, 1)) / 3
+            load = (w > 0).float().mean(dim=(0, 1)) / model.cfg.experts_per_token
             entropy = -(w * w.clamp_min(1e-30).log()).sum(-1).mean()
             record = {
                 "site": site,
