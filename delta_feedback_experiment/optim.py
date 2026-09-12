@@ -21,12 +21,20 @@ power iterations use a checkpointed right vector and an energy-row restart.
 This spectral/tangent extension is a scaling candidate, not a strict bound
 on the final displacement or an established Hyperball result.
 No optimizer group uses weight decay.
+
+On CUDA the Newton-Schulz iterations run in BF16, as reference Muon
+implementations do; the direction returns to FP32 before row adaptation, the
+spectral/tangent step, and the retraction. CPU and MPS keep FP32 throughout.
+Each shape bucket holds its momenta, row moments, radii, and right vectors in
+one packed tensor per state kind, with every parameter's state entries as
+views into them, so a step packs only parameters and gradients.
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor
@@ -39,6 +47,9 @@ from .parameter_groups import (
 
 NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
+
+NS_CUDA_DTYPE = torch.bfloat16
+"""Newton-Schulz working precision on CUDA; every other device keeps FP32."""
 
 DEFAULT_NORMUONH_LR = 6e-3
 """Stable estimated RMS-to-RMS trial-step budget for fresh runs."""
@@ -146,17 +157,24 @@ def _normuonh_batch(
     beta2: float,
     eps: float,
     ns_steps: int,
+    ns_dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Batched NorMuon direction and spectral tangent update on a fixed sphere."""
+    """Batched NorMuon direction and spectral tangent update on a fixed sphere.
+
+    The Newton-Schulz iterations run in ``ns_dtype``; everything from the row
+    second moment onward is back in the parameter dtype.
+    """
     a, b, c = NS_COEFFS
     momentum = torch.lerp(momentum, gradient, 1 - momentum_beta)
     direction = torch.lerp(gradient, momentum, momentum_beta)
     transposed = direction.shape[-2] > direction.shape[-1]
     x = direction.mT if transposed else direction
     x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
+    x = x.to(ns_dtype)
     for _ in range(ns_steps):
         gram = x @ x.mT
         x = a * x + (b * gram + c * gram @ gram) @ x
+    x = x.to(direction.dtype)
     update = x.mT if transposed else x
     row_moment = torch.lerp(
         row_moment, update.square().mean(dim=-1, keepdim=True), 1 - beta2
@@ -171,29 +189,35 @@ def _normuonh_batch(
 def _normuonh_bucket_values(
     parameters: list[Tensor],
     gradients: list[Tensor],
-    momenta: list[Tensor],
-    row_moments: list[Tensor],
-    radii: list[Tensor],
-    spectral_vectors: list[Tensor],
+    momentum: Tensor,
+    row_moment: Tensor,
+    radii: Tensor,
+    spectral_vectors: Tensor,
     lr: Tensor,
     momentum_beta: float,
     beta2: float,
     eps: float,
     ns_steps: int,
+    ns_dtype: torch.dtype,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Compile packing and update arithmetic without mutating their inputs."""
+    """Compile packing and update arithmetic without mutating their inputs.
+
+    State arrives already packed; only the parameters and gradients, which are
+    separate tensors owned by the model and the gradient buffers, are stacked.
+    """
     return _normuonh_batch(
-        torch.stack(momenta),
-        torch.stack(row_moments),
+        momentum,
+        row_moment,
         torch.stack(parameters),
-        torch.stack(radii),
-        torch.stack(spectral_vectors),
+        radii,
+        spectral_vectors,
         torch.stack(gradients),
         lr,
         momentum_beta,
         beta2,
         eps,
         ns_steps,
+        ns_dtype,
     )
 
 
@@ -208,10 +232,10 @@ _compiled_normuonh_bucket_values = torch.compile(
 def _normuonh_bucket_step(
     parameters: list[Tensor],
     gradients: list[Tensor],
-    momenta: list[Tensor],
-    row_moments: list[Tensor],
-    radii: list[Tensor],
-    spectral_vectors: list[Tensor],
+    momentum: Tensor,
+    row_moment: Tensor,
+    radii: Tensor,
+    spectral_vectors: Tensor,
     lr: Tensor,
     momentum_beta: float,
     beta2: float,
@@ -221,18 +245,30 @@ def _normuonh_bucket_step(
     # Materialize all results before any writeback. Fusing input momentum
     # mutation into the arithmetic can reread the updated momentum in a
     # singleton bucket, changing the Nesterov direction after the first step.
-    values = (
-        _compiled_normuonh_bucket_values
-        if parameters[0].is_cuda else _normuonh_bucket_values
-    )
-    new_momenta, new_rows, projected, new_vectors = values(
-        parameters, gradients, momenta, row_moments, radii, spectral_vectors, lr,
+    cuda = parameters[0].is_cuda
+    values = _compiled_normuonh_bucket_values if cuda else _normuonh_bucket_values
+    new_momentum, new_rows, projected, new_vectors = values(
+        parameters, gradients, momentum, row_moment, radii, spectral_vectors, lr,
         momentum_beta, beta2, eps, ns_steps,
+        NS_CUDA_DTYPE if cuda else parameters[0].dtype,
     )
-    torch._foreach_copy_(momenta, list(new_momenta.unbind()))
-    torch._foreach_copy_(row_moments, list(new_rows.unbind()))
+    momentum.copy_(new_momentum)
+    row_moment.copy_(new_rows)
+    spectral_vectors.copy_(new_vectors)
     torch._foreach_copy_(parameters, list(projected.unbind()))
-    torch._foreach_copy_(spectral_vectors, list(new_vectors.unbind()))
+
+
+@dataclass
+class _ShapeBucket:
+    """One compiled bucket: fixed members, packed state, cached row indices."""
+
+    group_index: int
+    params: tuple[torch.nn.Parameter, ...]
+    momentum: Tensor | None = None
+    row_moment: Tensor | None = None
+    radius: Tensor | None = None
+    spectral_vector: Tensor | None = None
+    indices: dict[tuple[int, ...], Tensor] = field(default_factory=dict)
 
 
 class NorMuonH(torch.optim.Optimizer):
@@ -273,6 +309,21 @@ class NorMuonH(torch.optim.Optimizer):
                         f"radius, got {radius_value} for shape {tuple(parameter.shape)}"
                     )
                 self._initial_radii[parameter] = radius
+        self._buckets = self._build_buckets()
+
+    def _build_buckets(self) -> list[_ShapeBucket]:
+        """Fix bucket membership once: device, dtype, shape, packing bound."""
+        buckets = []
+        for index, group in enumerate(self.param_groups):
+            shapes = defaultdict(list)
+            for parameter in group["params"]:
+                shapes[(parameter.device, parameter.dtype, parameter.shape)].append(
+                    parameter
+                )
+            for members in shapes.values():
+                for parameters in self._batches(members):
+                    buckets.append(_ShapeBucket(index, tuple(parameters)))
+        return buckets
 
     def _batches(self, parameters: list[Tensor]):
         """Bound expert packing temporaries without splitting any matrix."""
@@ -282,52 +333,75 @@ class NorMuonH(torch.optim.Optimizer):
         for start in range(0, len(parameters), size):
             yield parameters[start : start + size]
 
+    def _allocate(self, bucket: _ShapeBucket) -> None:
+        """Pack one bucket's state into a tensor per kind, radii included."""
+        if bucket.momentum is not None:
+            return
+        sample = bucket.params[0]
+        count = len(bucket.params)
+        rows, cols = sample.shape
+        kwargs = {"device": sample.device, "dtype": sample.dtype}
+        bucket.momentum = torch.zeros(count, rows, cols, **kwargs)
+        bucket.row_moment = torch.zeros(count, rows, 1, **kwargs)
+        bucket.spectral_vector = torch.zeros(count, cols, **kwargs)
+        bucket.radius = torch.stack(
+            [self._initial_radii[parameter] for parameter in bucket.params]
+        )
+
+    def _views(self, bucket: _ShapeBucket, row: int) -> dict[str, Tensor]:
+        return {
+            "momentum": bucket.momentum[row],
+            "row_moment": bucket.row_moment[row],
+            "radius": bucket.radius[row],
+            "spectral_vector": bucket.spectral_vector[row],
+        }
+
+    def _rows(self, bucket: _ShapeBucket, present: list[int]) -> Tensor:
+        """Cache the gather/scatter index of each recurring active subset."""
+        key = tuple(present)
+        index = bucket.indices.get(key)
+        if index is None:
+            index = torch.tensor(
+                present, device=bucket.params[0].device, dtype=torch.long
+            )
+            bucket.indices[key] = index
+        return index
+
     @torch.no_grad()
     def warmup(self, active: set[torch.nn.Parameter] | None = None) -> None:
         """Compile every CUDA shape bucket without touching optimizer state."""
-        for group in self.param_groups:
-            buckets = defaultdict(list)
-            for parameter in group["params"]:
-                if active is not None and parameter not in active:
-                    continue
-                buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
-                    parameter
-                )
-            for (device, dtype, shape), bucket in buckets.items():
-                if device.type != "cuda":
-                    continue
-                for parameters in self._batches(bucket):
-                    self._warm_bucket(parameters, device, dtype, shape, group)
+        for bucket in self._buckets:
+            sample = bucket.params[0]
+            if not sample.is_cuda:
+                continue
+            count = sum(
+                1
+                for parameter in bucket.params
+                if active is None or parameter in active
+            )
+            if count:
+                self._warm_bucket(bucket, count)
 
-    def _warm_bucket(self, parameters, device, dtype, shape, group) -> None:
+    def _warm_bucket(self, bucket: _ShapeBucket, count: int) -> None:
+        sample = bucket.params[0]
+        group = self.param_groups[bucket.group_index]
+        rows, cols = sample.shape
+        kwargs = {"device": sample.device, "dtype": sample.dtype}
         matrices = [
             torch.nn.Parameter(
-                torch.full(
-                    shape,
-                    1 / math.sqrt(shape[0] * shape[1]),
-                    device=device,
-                    dtype=dtype,
-                ),
+                torch.full(sample.shape, 1 / math.sqrt(rows * cols), **kwargs),
                 requires_grad=parameter.requires_grad,
             )
-            for parameter in parameters
+            for parameter in bucket.params[:count]
         ]
-        gradients = [torch.zeros_like(matrix) for matrix in matrices]
-        momenta = [torch.zeros_like(matrix) for matrix in matrices]
-        rows = [
-            torch.zeros(shape[0], 1, device=device, dtype=dtype) for _ in parameters
-        ]
-        radii = [torch.ones((), device=device, dtype=dtype) for _ in parameters]
-        vectors = [torch.zeros(shape[1], device=device, dtype=dtype) for _ in parameters]
-        scalar = torch.zeros((), device=device)
         _normuonh_bucket_step(
             matrices,
-            gradients,
-            momenta,
-            rows,
-            radii,
-            vectors,
-            scalar,
+            [torch.zeros_like(matrix) for matrix in matrices],
+            torch.zeros(count, rows, cols, **kwargs),
+            torch.zeros(count, rows, 1, **kwargs),
+            torch.ones(count, **kwargs),
+            torch.zeros(count, cols, **kwargs),
+            torch.zeros((), device=sample.device),
             group["momentum"],
             group["beta2"],
             group["eps"],
@@ -337,49 +411,89 @@ class NorMuonH(torch.optim.Optimizer):
     @torch.no_grad()
     def step(self, closure=None):
         loss = None if closure is None else closure()
-        for group in self.param_groups:
-            buckets = defaultdict(list)
-            for parameter in group["params"]:
-                gradient = parameter.grad
-                if gradient is None:
-                    continue
+        rates: dict[tuple[int, torch.device], Tensor] = {}
+        for bucket in self._buckets:
+            present = [
+                row
+                for row, parameter in enumerate(bucket.params)
+                if parameter.grad is not None
+            ]
+            if not present:
+                continue
+            self._allocate(bucket)
+            parameters = [bucket.params[row] for row in present]
+            for row, parameter in zip(present, parameters):
                 state = self.state[parameter]
                 if not state:
-                    state["momentum"] = torch.zeros_like(parameter)
-                    state["row_moment"] = torch.zeros(
-                        parameter.shape[0],
-                        1,
-                        device=parameter.device,
-                        dtype=parameter.dtype,
-                    )
-                    state["radius"] = self._initial_radii[parameter].clone()
-                    state["spectral_vector"] = torch.zeros(
-                        parameter.shape[1], device=parameter.device, dtype=parameter.dtype
-                    )
-                buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
-                    parameter
+                    state.update(self._views(bucket, row))
+            group = self.param_groups[bucket.group_index]
+            rate = (bucket.group_index, bucket.params[0].device)
+            if rate not in rates:
+                rates[rate] = torch.scalar_tensor(group["lr"], device=rate[1])
+            arguments = (
+                rates[rate],
+                group["momentum"],
+                group["beta2"],
+                group["eps"],
+                group["ns_steps"],
+            )
+            gradients = [parameter.grad for parameter in parameters]
+            if len(present) == len(bucket.params):
+                _normuonh_bucket_step(
+                    parameters,
+                    gradients,
+                    bucket.momentum,
+                    bucket.row_moment,
+                    bucket.radius,
+                    bucket.spectral_vector,
+                    *arguments,
                 )
-
-            for (device, _dtype, _shape), bucket in buckets.items():
-                lr = torch.scalar_tensor(group["lr"], device=device)
-                for parameters in self._batches(bucket):
-                    _normuonh_bucket_step(
-                        parameters,
-                        [parameter.grad for parameter in parameters],
-                        [self.state[parameter]["momentum"] for parameter in parameters],
-                        [
-                            self.state[parameter]["row_moment"]
-                            for parameter in parameters
-                        ],
-                        [self.state[parameter]["radius"] for parameter in parameters],
-                        [self.state[parameter]["spectral_vector"] for parameter in parameters],
-                        lr,
-                        group["momentum"],
-                        group["beta2"],
-                        group["eps"],
-                        group["ns_steps"],
-                    )
+                continue
+            # A bucket whose members were not all reached this step gathers the
+            # active rows, so absent parameters keep both weights and state.
+            index = self._rows(bucket, present)
+            momentum = bucket.momentum.index_select(0, index)
+            row_moment = bucket.row_moment.index_select(0, index)
+            spectral_vector = bucket.spectral_vector.index_select(0, index)
+            _normuonh_bucket_step(
+                parameters,
+                gradients,
+                momentum,
+                row_moment,
+                bucket.radius.index_select(0, index),
+                spectral_vector,
+                *arguments,
+            )
+            bucket.momentum.index_copy_(0, index, momentum)
+            bucket.row_moment.index_copy_(0, index, row_moment)
+            bucket.spectral_vector.index_copy_(0, index, spectral_vector)
         return loss
+
+    def load_state_dict(self, state_dict) -> None:
+        """Copy a restored state into the packed buckets, keeping the views.
+
+        The generic load rebuilds ``self.state`` from the saved tensors; each
+        restored value is copied into its bucket row and replaced by the view
+        again, so resume lands in the same storage a fresh run allocates.
+        """
+        super().load_state_dict(state_dict)
+        for bucket in self._buckets:
+            # Reallocate so rows the checkpoint does not mention start from a
+            # fresh run's zeros and initial radius rather than stale values.
+            bucket.momentum = bucket.row_moment = None
+            bucket.radius = bucket.spectral_vector = None
+            restored = [
+                (row, self.state[parameter])
+                for row, parameter in enumerate(bucket.params)
+                if self.state.get(parameter)
+            ]
+            if not restored:
+                continue
+            self._allocate(bucket)
+            for row, state in restored:
+                for name, view in self._views(bucket, row).items():
+                    view.copy_(state[name])
+                    state[name] = view
 
 
 def split_parameters(model: torch.nn.Module) -> dict[str, list[torch.nn.Parameter]]:

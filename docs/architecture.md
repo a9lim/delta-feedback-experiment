@@ -419,7 +419,7 @@ keeps its initial FP32 Frobenius radius `R`, stored in the checkpoint:
 ```text
 M_t = .95 M_(t-1) + .05 G_t
 N_t = .05 G_t + .95 M_t
-U = five_Newton_Schulz_steps(N_t)
+U = five_Newton_Schulz_steps(N_t)          # BF16 on CUDA, FP32 elsewhere
 U = row_second_moment_normalize(U, beta=.95, eps=1e-8)
 U = Normalize_F(U)
 T = U - <W,U>_F / <W,W>_F * W
@@ -446,11 +446,29 @@ An exact spectral norm would set the trial's RMS-to-RMS norm to the group
 rate. Power iteration can underestimate it, and the sphere retraction changes
 the finite displacement, so this is not a strict final-step bound. Full-model transfer of these rates across scales remains unmeasured.
 [Scaling](scaling.md#expert-learning-rates) lists the preset rates.
-CUDA compiles packing and update arithmetic by shape bucket within each
-group. All results materialize before state and parameter writebacks outside
-the compiled boundary, preserving reads of the previous momentum.
-Packing is bounded to 33,554,432 matrix elements (128 MiB per FP32 tensor),
-except larger individual matrices remain whole. State stays per-parameter.
+CUDA compiles the update arithmetic by shape bucket within each group and
+runs the five Newton-Schulz iterations on a BF16 copy of the normalized
+direction, as reference Muon implementations do. The result returns to FP32
+before row adaptation, the spectral/tangent step, and the retraction; CPU and
+MPS stay FP32 throughout. Paired steps on the screen model from one starting
+state keep every one of the 606 matrices within cosine similarity .99985 of
+the FP32 result and on its radius to 1.2e-7 relative. Delta norms land within
+.3% of the FP32 delta in every shape bucket except the expert down matrices,
+which spread from .98 to 1.05 as the power-iteration estimate follows the
+slightly rotated tangent.
+
+Bucket membership is fixed at construction from device, dtype, shape, and a
+packing bound of 33,554,432 matrix elements (128 MiB per FP32 tensor), except
+larger individual matrices remain whole. Each bucket holds its momenta, row
+moments, radii, and right vectors in one packed tensor per state kind, and
+each parameter's state entries are views into them, so a step packs only the
+parameters and gradients, which are separate tensors owned elsewhere.
+The saved schema stays per-parameter, and a restored state is copied into
+the packed storage rather than replacing the views. A step that reaches only
+some members of a bucket gathers the active rows and scatters the results
+back, leaving absent members' weights and state untouched. All results
+materialize before state and parameter writebacks outside the compiled
+boundary, preserving reads of the previous momentum.
 
 ### NAdam parameters
 
