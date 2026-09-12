@@ -293,7 +293,8 @@ F. NoPE-GGQA MIXER: CAUSAL GLOBAL TOKEN ATTENTION, EVERY FOURTH LAYER
 G. EVERY FFN: ONE SHARED + TOP-k_e-OF-n ROUTED SwiGLU EXPERTS
 ============================================================================================
   k_e = selected routed count; n = routed bank size; h_ff = per-expert width
-  Screen/bridge/flagship: (k_e,n) = (3,15)/(5,23)/(7,31); h_ff=832 throughout
+  Screen/bridge/flagship/extension: (k_e,n) = (3,15)/(5,23)/(7,31)/(11,47)
+  h_ff=832 throughout the presets.
   z [B,T,D] -----------------------+------------------------------------+
        |                          |                                     |
        v                          v                                    v
@@ -543,7 +544,7 @@ writes residual width `D` and uses actual intermediate width `h`.
 and `experts_per_token`; their CLI flags are `--expert-intermediate`,
 `--num-routed-experts`, and `--experts-per-token`. Width and bank size must be
 positive and `1 <= k <= n`. Presets fix `h=832` and use `(k,n)` of `(3,15)`,
-`(5,23)`, and `(7,31)`. For normalized input:
+`(5,23)`, `(7,31)`, and `(11,47)`. For normalized input:
 
 ```text
 s = sigmoid(W_router x)
@@ -563,7 +564,7 @@ The active dense-equivalent width is derived as `H=(k+1)h`: expert matrices
 perform `3DH` multiply-accumulates per token and store `3D(n+1)h` parameters.
 The presets store four times the active expert matrix parameters. The router
 adds `nD` parameters per bank. The shared expert accounts for `1/(k+1)` of
-active expert width: 25%, 16.7%, and 12.5% across the presets. Fixed expert
+active expert width: 25%, 16.7%, 12.5%, and 8.3% across the presets. Fixed expert
 intermediate width does not fix each expert's parameter count as `D` grows.
 Memory and dispatch overhead still matter. The design follows
 [DeepSeekMoE](https://arxiv.org/abs/2401.06066).
@@ -776,6 +777,10 @@ NorMuonH matrices initialize from `Normal(0,1/sqrt(fan_in))`. The shared
 expert routers, the FBT gate, and PKDA's packed control projection multiply
 it by `sqrt(1536/D)`. Embeddings and PKDA fixed-head-width expansions use
 0.02 directly. This preserves initial control-logit variance across widths.
+`MUP_BASE_DIM` stays at the flagship width 1,536: extension uses a width ratio
+of `1536/2304 = 2/3` for NAdam rates and readout scaling, and its square root
+for the specified initialization scales. Adding extension leaves the other
+presets' initialization and rates unchanged.
 Depthwise convolutions retain Kaiming-uniform initialization. RMSNorm scales
 start at one; MHDB queries and nulls start at zero.
 

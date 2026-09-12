@@ -127,6 +127,7 @@ def tokenize_command(argv: list[str]) -> None:
         DEFAULT_SOURCE,
         SOURCES,
     )
+    from .train import SCALES
 
     parser = argparse.ArgumentParser(
         "delta tokenize",
@@ -170,7 +171,7 @@ def tokenize_command(argv: list[str]) -> None:
     )
     parser.add_argument(
         "--scale",
-        choices=("screen", "bridge", "flagship"),
+        choices=tuple(SCALES),
         help="derive --target from this scale's schedule at --tokens-per-param: "
         "its rows of seq_len + 1 tokens plus the held-out slice, rounded up to "
         "the next billion",

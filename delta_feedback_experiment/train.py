@@ -120,6 +120,19 @@ SCALES: dict[str, dict[str, int]] = {
         "batch_rows": 128,
         "micro_rows": 1,
     },
+    "extension": {
+        "dim": 2304,
+        "layers": 16,
+        "heads": 24,
+        "kv_heads": 12,
+        "expert_intermediate": 832,
+        "num_routed_experts": 47,
+        "experts_per_token": 11,
+        "pkda_heads": 30,
+        "seq_len": 4096,
+        "batch_rows": 128,
+        "micro_rows": 1,
+    },
 }
 """The geometries of ``docs/scaling.md``: the column, and the row length,
 rows per step, and single-process microbatch every scale shares, 4,096-token

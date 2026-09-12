@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 from delta_feedback_experiment.moe import MixtureOfExperts
 
-GEOMETRIES = [(15, 3), (23, 5), (31, 7)]
+GEOMETRIES = [(15, 3), (23, 5), (31, 7), (47, 11)]
 
 
 def explicit_expert(expert, x):
@@ -199,14 +199,17 @@ def test_cuda_sparse_mixture_matches_dense_values_and_gradients(count, selected_
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA MoE kernels")
-def test_cuda_compiled_mixture_accumulates_mixed_packed_sinks_and_autograd():
+@pytest.mark.parametrize("count,selected_count", [(31, 7), (47, 11)])
+def test_cuda_compiled_mixture_accumulates_mixed_packed_sinks_and_autograd(
+    count, selected_count
+):
     torch.manual_seed(29)
-    count, selected_count, dim, width = 31, 7, 32, 24
+    dim, width = 32, 24
     moe = MixtureOfExperts(dim, width, count, selected_count).cuda()
     with torch.no_grad():
         moe.expert_bias[-selected_count:] = 2
-    moe.experts[24].gate_up_proj.weight.requires_grad_(False)
-    moe.experts[25].down_proj.weight.requires_grad_(False)
+    moe.experts[-selected_count].gate_up_proj.weight.requires_grad_(False)
+    moe.experts[-selected_count + 1].down_proj.weight.requires_grad_(False)
     reference = copy.deepcopy(moe)
     # Per-matrix slices have nonzero storage offsets. Guard experts on both
     # ends catch addressing the backing allocation instead of the slice.
@@ -266,8 +269,8 @@ def test_cuda_compiled_mixture_accumulates_mixed_packed_sinks_and_autograd():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA MoE kernels")
 @pytest.mark.parametrize(
     "dim,count,selected_count",
-    [(768, 15, 3), (1152, 23, 5), (1536, 31, 7)],
-    ids=["screen", "bridge", "flagship"],
+    [(768, 15, 3), (1152, 23, 5), (1536, 31, 7), (2304, 47, 11)],
+    ids=["screen", "bridge", "flagship", "extension"],
 )
 def test_cuda_bf16_preset_bank_matches_dense_fp32_oracle(dim, count, selected_count):
     """Qualify real projection shapes, without allocating a full model.

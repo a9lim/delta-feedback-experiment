@@ -95,7 +95,7 @@ this constant to tune both families; NorMuonH's fan-in scale is independent.
 """
 
 MUP_BASE_DIM = 1536
-"""The muP reference width: the flagship column of ``docs/scaling.md``.
+"""The fixed muP reference width: the flagship column of ``docs/scaling.md``.
 
 NorMuonH's relative step is width-invariant on its own. NAdam's is not: its
 per-coordinate step is the rate whatever the gradient, so a matrix with fan-in
@@ -103,8 +103,8 @@ per-coordinate step is the rate whatever the gradient, so a matrix with fan-in
 matrices therefore run at ``lr_nadam * MUP_BASE_DIM / dim`` and initialize at
 ``BASE_NORMAL_INIT_STD * sqrt(MUP_BASE_DIM / dim)``. The tied readout
 multiplies its logits by the width ratio, so the rate tuned at the
-flagship is the rate at every narrower geometry, and the flagship itself is
-the plain parametrization.
+flagship defines the rates at every other geometry, and the flagship itself
+is the plain parametrization. Extension keeps this reference and uses 2/3.
 """
 
 EXPERT_BALANCE_COEF = 0.0001

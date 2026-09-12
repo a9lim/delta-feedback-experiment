@@ -26,11 +26,12 @@ Two condition letters control its recurrent computation:
 A condition must include at least one letter. Shared parameters initialize
 identically for a given seed, and data and feedback draws use keyed streams.
 
-All three scales have sixteen layers in a one-cell prelude, two-cell core,
-and one-cell coda. Residual widths are 768, 1,152, and 1,536; every expert has
-intermediate width 832. Screen selects three of fifteen routed experts, bridge
-five of twenty-three, and flagship seven of thirty-one, alongside one shared
-expert. All experts occupy parameter and optimizer memory.
+All four scales have sixteen layers in a one-cell prelude, two-cell core,
+and one-cell coda. Residual widths are 768, 1,152, 1,536, and 2,304; every
+expert has intermediate width 832. Screen selects three of fifteen routed
+experts, bridge five of twenty-three, flagship seven of thirty-one, and
+extension eleven of forty-seven, alongside one shared expert. All experts
+occupy parameter and optimizer memory.
 The auxiliary prediction block combines the payload with the next token's
 embedding and trains on existing rows; `--mtp-weight` defaults to 0.3. It
 shares the embedding/readout and uses its own PKDA recurrence and expert bank.

@@ -467,6 +467,7 @@ def test_resolved_arguments_pin_what_the_operator_fixed():
         ("screen", 768, 3, 15, 630606216, 200919432),
         ("bridge", 1152, 5, 23, 1384528652, 446708492),
         ("flagship", 1536, 7, 31, 2430864784, 789384592),
+        ("extension", 2304, 11, 47, 5400778136, 1765397912),
     ],
 )
 def test_width_ladder_preserves_depth_and_ffn_capacity(
@@ -479,6 +480,10 @@ def test_width_ladder_preserves_depth_and_ffn_capacity(
     assert cfg.layers == 16 and cfg.core_layers == range(4, 12)
     assert cfg.executed_layers(4) == 40 and cfg.routing_blocks == 4
     assert cfg.dim == dim and cfg.expert_intermediate == 832
+    assert cfg.heads * cfg.head_dim == dim
+    assert cfg.heads == 2 * cfg.kv_heads
+    assert cfg.pkda_heads * cfg.pkda_head_dim * 3 == dim * 5
+    assert cfg.mup_ratio == 1536 / dim
     assert cfg.experts_per_token == selected and cfg.num_routed_experts == routed
     assert (selected + 1) * 832 * 3 == 13 * dim
     assert routed + 1 == 4 * (selected + 1)
@@ -521,6 +526,17 @@ def test_default_token_store_covers_current_screen_schedule():
     )
 
     assert CANONICAL_TARGET_TOKENS == stream_target("screen", 400, CANONICAL_VAL_TOKENS)
+
+
+def test_extension_tokenize_uses_current_training_budget(monkeypatch):
+    from delta_feedback_experiment.cli import tokenize_command
+
+    calls = []
+    monkeypatch.setattr(data_module, "tokenize", lambda *args, **kwargs: calls.append(kwargs))
+    tokenize_command(["--scale", "extension", "--tokens-per-param", "25"])
+    assert len(calls) == 1
+    assert calls[0]["target_tokens"] == 45_000_000_000
+    assert calls[0]["val_tokens"] == data_module.CANONICAL_VAL_TOKENS
 
 
 def test_trainer_uses_named_source_paths():

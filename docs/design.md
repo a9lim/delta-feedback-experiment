@@ -23,8 +23,8 @@ auxiliary PKDA/expert two-token predictor. Every condition produces a
 normalized top state with routed enrichment as its payload. MTP reads this
 payload; `f` also transfers it to the next column. `l` alone uses embedding
 seeds. The presets fix expert intermediate width at 832 and use `(k,n)`
-of `(3,15)`, `(5,23)`, and `(7,31)`. Experts have no capacity limit or token
-dropping. The auxiliary block has independent PKDA state that resets for
+of `(3,15)`, `(5,23)`, `(7,31)`, and `(11,47)`. Experts have no capacity limit
+or token dropping. The auxiliary block has independent PKDA state that resets for
 each row and pass.
 
 Shared parameters initialize identically for a given seed. Data order and
@@ -36,9 +36,9 @@ whole cells and adds no parameters.
 
 ## Geometry
 
-[Scaling](scaling.md) gives the screen, bridge, and flagship geometry,
+[Scaling](scaling.md) gives the screen, bridge, flagship, and extension geometry,
 parameter counts, token budgets, and cache accounting. The screen has width
-768 and context 4,096. All three scales have sixteen layers in four cells.
+768 and context 4,096. All four scales have sixteen layers in four cells.
 Under `l`, the first cell is the prelude, the middle two form the tied core,
 and the last is the coda.
 [Architecture](architecture.md#precision-and-initialization) defines the
@@ -70,7 +70,7 @@ build package versions so one store never mixes compilation stacks.
 | Source | Dataset and parquet directory | Default ordering |
 |---|---|---|
 | `dclm-100b` (default; screen and Jobe) | `HuggingFaceFW/dclm_100BT-shuffled`, `data/` | Published order |
-| `dclm` (larger stores and flagship) | `mlfoundations/dclm-baseline-1.0-parquet`, `filtered/` | Keyed document shuffle |
+| `dclm` (larger stores, including flagship and extension) | `mlfoundations/dclm-baseline-1.0-parquet`, `filtered/` | Keyed document shuffle |
 | `fineweb-edu` | `HuggingFaceFW/fineweb-edu`, `data/` | Keyed document shuffle |
 | `fineweb-edu-350b` | Same dataset, `sample/350BT/` | Keyed document shuffle |
 | `fineweb-edu-100b` | Same dataset, `sample/100BT/` | Keyed document shuffle |
@@ -265,8 +265,8 @@ All three parameter groups share one warmup-stable-cooldown multiplier.
 Warmup rises linearly over
 `round(warmup_frac * min(steps, steps at 25x))` updates. The default 2%
 warmup is therefore fixed per scale for runs at or above 25x: 192 updates
-at screen, 426 at bridge, and 753 at flagship. Cooldown occupies
-`round(cooldown_frac * steps)` updates, default 20%, with multiplier
+at screen, 426 at bridge, 753 at flagship, and 1,684 at extension. Cooldown
+occupies `round(cooldown_frac * steps)` updates, default 20%, with multiplier
 `1-sqrt(u)` at local progress `u`, reaching zero at the final step.
 
 The feedback boundary is `round(feedback_start * steps)`, independent of the
@@ -287,9 +287,9 @@ reference counts and larger budgets.
 | Flag | Default | What it changes |
 |---|---:|---|
 | `--condition` | `f` | `f`, `l`, or `fl`; at least one recurrence must be selected |
-| `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
+| `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, `flagship`, or `extension`; a trunk or recipe flag typed alongside overrides its field |
 | `--expert-intermediate` | 832 | each shared and routed expert's intermediate width, in both trunk and MTP |
-| `--num-routed-experts`, `--experts-per-token` | 15, 3 at screen | routed bank size and selected routed experts per token; bridge uses 23, 5 and flagship 31, 7 |
+| `--num-routed-experts`, `--experts-per-token` | 15, 3 at screen | routed bank size and selected routed experts per token; bridge uses 23, 5; flagship 31, 7; extension 47, 11 |
 | `--tokens-per-param` | 25 | predicted tokens per training-active non-embedding parameter of flat `f`, including MTP; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
 | `--steps` | derived | schedule length, typed instead of derived |
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
