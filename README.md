@@ -7,48 +7,40 @@ on their computation.
 
 ## Model
 
-One `DeltaModel` implements every subset of six condition letters:
+The core model always uses:
 
-| Letter | Change |
+- four-layer cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`;
+- Multi-Head Delta Block (MHDB) reads over the seed and block deltas;
+- one shared plus top-three-of-fifteen quarter-width SwiGLU experts per layer;
+- an auxiliary dense RoPE-GGQA/SwiGLU block for second-token prediction.
+
+Two condition letters control its recurrent computation:
+
+| Condition | Computation |
 |---|---|
-| `a` | Preconditioned Kimi Delta Attention (PKDA) in three layers of each four-layer cell; the fourth is gated global GQA |
-| `e` | Quarter-width SwiGLU experts: one always shared plus three selected from fifteen routed experts in every layer |
-| `r` | Multi-Head Delta Block (MHDB) routing over the column seed and block deltas before every sublayer |
-| `f` | Full-Bandwidth Transformer (FBT) fusion of the previous column's latent payload with the current token embedding |
+| `f` (default) | FBT latent feedback between token columns |
 | `l` | Repeated application of the tied core between the first and last cells |
-| `m` | One auxiliary transformer block predicts a second token from the top state and the next token's shared embedding |
+| `fl` | Both feedback and tied depth |
 
-`aerflm` is the full stack, `aerfm` its flat column, and the empty condition the
-plain gated GQA decoder. Without `a`, the first three layers of each cell use
-full-head RoPE after Q/K RMSNorm; every fourth layer uses no positional
-encoding. Conditions on the same attention trunk pair their shared parameters
-at initialization and can train on identical rows and keyed feedback draws.
+A condition must include at least one letter. Shared parameters initialize
+identically for a given seed, and data and feedback draws use keyed streams.
 
-The default screen has width 768, twelve layers, and 455,637,288 parameters
-under `aerf` or `aerfl` (179,461,416 without `e`). Four quarter-width experts
-are active per token; their matrix arithmetic matches the dense FFN before
-routing overhead. Token budgets retain the dense `arf` reference. The model
-uses a pinned GPT-NeoX tokenizer with two generic ChatML delimiters, 50,279
-token IDs, and a 50,304-row tied embedding/readout.
-The tokenizer formats arbitrary and repeated roles; pretraining uses raw web
-text.
+The screen has width 768 and twelve layers. Four quarter-width experts are
+active per token; all sixteen experts occupy parameter and optimizer memory.
+The auxiliary prediction block shares the embedding/readout and trains on
+existing rows; `--mtp-weight` defaults to 0.3. Ordinary generation uses the
+main column. [Scaling](docs/scaling.md) gives parameter and token accounting.
 
-Expert selection uses sigmoid scores with a separate load-balancing bias
-updated after each optimizer step. A small per-sequence regularizer supplements
-that update; reported cross-entropy excludes it.
-
-With `m`, DeepSeek-style two-token prediction adds a dense causal RoPE-GGQA
-and SwiGLU block after each pass's top state. It shares the embedding and
-readout, and its loss trains the main model as well as the auxiliary block.
-`--mtp-weight` defaults to 0.3. Ordinary next-token validation remains
-separate from MTP validation; generation uses the main model alone.
+The tokenizer is pinned GPT-NeoX with two generic ChatML delimiters, 50,279
+token IDs, and a 50,304-row tied embedding/readout. It formats arbitrary and
+repeated roles; pretraining uses raw web text.
 
 ## Current state
 
 There are no trained specimens under the current tokenizer and checkpoint
 contract, and no measurements of payload usefulness, token recoverability, or
-learned recurrent dynamics. Jobe is building the 15B-token DCLM-100B store.
-Use `delta status` and the active log for live run and build progress.
+learned recurrent dynamics. Use `delta status` and the active log for live
+run and data-build progress.
 
 The scientific target is a channel that carries behaviorally useful
 information beyond the visible tokens and mixer caches. Payload interventions,
@@ -60,7 +52,7 @@ engineering checks alone do not establish it.
 ```bash
 uv pip install -e .
 delta probe
-delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
+delta train example-f-s1 --condition f --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
 ```
 

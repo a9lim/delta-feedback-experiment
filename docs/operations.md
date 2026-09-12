@@ -48,8 +48,8 @@ accumulated gradients, optimizer state, and PKDA recurrent boundaries:
   backward runs. Packed projection gradients accumulate into FP32 sinks.
 - CCE reads an address-stable BF16 classifier shadow. Its BF16 gradient buffer
   flushes into the FP32 embedding sink at `--head-flush-every` head calls and
-  before the optimizer update. Each pass makes two head calls with `m`, one
-  otherwise; auxiliary calls count toward the flush cadence. A captured
+  before the optimizer update. Each pass makes two head calls; auxiliary calls
+  count toward the flush cadence. A captured
   microbatch that would exceed the limit uses the FP32 sink per call;
   `--head-flush-every 1` gives per-call precision in every mode.
 - Compiled blocks sit inside fixed-address CUDA graphs, one per reachable
@@ -61,15 +61,19 @@ accumulated gradients, optimizer state, and PKDA recurrent boundaries:
   outside the forward/backward graphs. Snapshot staging uses pinned host
   memory and atomic background writes.
 
-`delta probe` runs the invariant suite and, on CUDA, the production-shape gate.
-Run it after changing execution code or hardware. Inductor artifacts persist
+On CPU/MPS, `delta probe` runs the reduced portable test suite. On CUDA it
+runs one tiny captured `fl` train/eval/decode smoke directly, without pytest.
+The portable suite covers focused model, training, and lifecycle invariants;
+neither path sweeps full geometry or condition matrices. Queue startup runs
+neither tests nor a probe. Run the probe explicitly after changing execution
+code or hardware. Inductor artifacts persist
 at `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
 that cache. Keep cyclic Python garbage collection outside graph capture.
 
 ## Tokenize
 
 The source and ordering contract is in [design.md](design.md#data).
-The screen at 100 tokens per parameter needs a 15B-token store:
+The screen at 100 tokens per parameter needs a 16B-token store:
 
 ```bash
 delta tokenize --source dclm-100b --data-root /data/delta \
@@ -95,29 +99,22 @@ parts and source indexes allow interrupted builds to resume.
 are in [scaling.md](scaling.md); recipe flags are in
 [design.md](design.md#knobs) and `delta train --help`.
 
-Add `e` for the one-shared-plus-three-of-fifteen expert configuration, for
-example `--condition aerf` or `--condition aerfl`. Expert width is one quarter
-of `--intermediate`, which must be divisible by four. These runs keep the
-dense `arf` token-budget reference and use more parameter memory; preset
-availability is not a measured GPU fit. Distributed training is not implemented.
-
-Add `m` for two-token prediction, for example `--condition arfm --mtp-weight 0.3`.
-The auxiliary block shares the embedding and output head, consumes the next
-ground-truth token during training, and predicts one token further ahead.
-The finite nonnegative weight is constant across the run and restored on
-resume. Existing token stores supply all targets. This adds training and
-auxiliary-validation work; ordinary generation does not run the module.
+Choose `--condition f` (default), `l`, or `fl`. All runs include PKDA,
+MHDB routing, experts, and auxiliary two-token prediction. Expert width is
+one quarter of `--intermediate`, which must be divisible by four. The finite
+nonnegative `--mtp-weight` defaults to 0.3 and is restored on resume. MTP uses
+existing token-store rows; ordinary generation does not execute it.
 
 ```bash
 delta probe
 # Foreground training or detached queueing.
-delta train example-arf-s1 --condition arf --seed 1 --data-seed 0 \
+delta train example-f-s1 --condition f --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
-delta queue example-arfl-s1 --condition arfl --seed 1 --data-seed 0 \
+delta queue example-fl-s1 --condition fl --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
 # Resume this tag, or extend a completed run under a new tag.
-delta train example-arf-s1 --resume
-delta queue example-arf-s1-50x --continue example-arf-s1 --tokens-per-param 50
+delta train example-f-s1 --resume
+delta queue example-f-s1-50x --continue example-f-s1 --tokens-per-param 50
 
 delta status
 delta watch
@@ -130,8 +127,9 @@ delta clear all
 delta move old-tag new-tag
 ```
 
-The queue stores arguments and refreshes the checkout before each new job,
-then runs its probe. `stop live` stops the active run and keeps pending jobs;
+The queue stores arguments and refreshes the checkout before starting each
+new training job. It does not run tests or a probe as preflight. `stop live`
+stops the active run and keeps pending jobs;
 `stop queue` removes pending jobs and keeps the active run. A stop sends SIGINT
 so the trainer snapshots its completed step; a child still running after
 120 seconds is killed. The current checkpoint resumes through `--resume`.
@@ -146,20 +144,19 @@ outside `runs/`; custom output paths are not renamed. Both tags must be idle,
 with no queued references and no destination collision. Ordinary I/O failures
 roll back; a multi-file rename is not crash-atomic.
 
-Current snapshots use checkpoint v29 and the pinned tokenizer identity.
+Current snapshots use checkpoint v30 and the pinned tokenizer identity.
 Resume inherits state-defining settings and rejects explicit conflicts;
 runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and
 continuation. See [design.md](design.md#checkpoints-and-queue).
 
 Training logs `ntp`, the combined ordinary cross-entropy before z-loss, and
-MTP runs also log `mtp`, the combined auxiliary cross-entropy before its
-weight and z-loss. `loss` reports the full optimized objective. `pass1`,
+`mtp`, the combined auxiliary cross-entropy before its weight and z-loss. `loss` reports the full optimized objective. `pass1`,
 `val`, and `val_fused` keep their ordinary next-token meaning; auxiliary
 validation is `val_mtp` and, with feedback, `val_mtp_fused`. On feedback
 steps, use `ntp - pass1` for mean feedback next-token cross-entropy.
 
-Expert runs log `expert_balance`, the unweighted per-sequence auxiliary loss
+Training logs `expert_balance`, the unweighted per-sequence auxiliary loss
 averaged over the update. Its coefficient is `1e-4`; the monitor plots it
 separately from cross-entropy. Expert selection biases update once after the
 optimizer step at rate `0.001`, using the whole update's assignment counts,
@@ -205,10 +202,10 @@ Every analysis script rebuilds the condition from a snapshot through
 regenerated from current snapshots or logs.
 
 ```bash
-# Routing: per-site/group source mass, entropy, query geometry (any r).
+# Routing: per-site/group source mass, entropy, query geometry (any condition).
 python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 
-# Payload enrichment swaps (r with f): trained router, top-only, uniform, forced source.
+# Payload enrichment swaps (f): trained router, top-only, uniform, forced source.
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b --head 2
 

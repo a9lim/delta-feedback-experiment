@@ -1,13 +1,10 @@
-"""The delta model family: one trunk, one letter per change from the plain decoder.
+"""The Delta model: a routed PKDA/MoE trunk with two recurrence choices.
 
-The architecture contract is ``docs/architecture.md``. Everything here is
-condition-agnostic model semantics: a condition is a string of letters from
-:data:`CONDITION_LETTERS`, each switching on one :class:`ModelConfig` flag
-over the plain twelve-layer gated GQA decoder (the empty condition), with
-RoPE in the first three layers of each four-layer cell and NoPE in the last.
-``a`` replaces those RoPE layers with PKDA, ``r`` adds MHDB
-reads, ``f`` adds FBT feedback, and ``l`` turns the cells between the first
-and last into one tied core that runs a drawn number of times per column.
+The architecture contract is ``docs/architecture.md``. PKDA occupies three
+layers of each four-layer cell, with NoPE gated GQA in the fourth, MHDB reads
+before every sublayer, MoE channel mixers, and sequential two-token prediction.
+``f`` adds FBT feedback; ``l`` ties the middle cells into a core iterated per
+column. At least one recurrence must be selected.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired conditions
 architecturally identical in everything but the flags.
@@ -37,7 +34,7 @@ from __future__ import annotations
 import contextlib
 import math
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
@@ -62,21 +59,6 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     compute_z_loss = None
 
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
-    "a": (
-        "hybrid",
-        (
-            "Kimi Delta Attention: PKDA replaces the three RoPE-GGQA layers in each "
-            "four-layer cell; the last stays NoPE-GGQA"
-        ),
-    ),
-    "e": (
-        "experts",
-        "one shared and top-3 of 15 routed quarter-width SwiGLU experts",
-    ),
-    "r": (
-        "block_routing",
-        "MHDB residual reads of the seed and block deltas before every sublayer",
-    ),
     "f": (
         "feedback",
         "full-bandwidth feedback: the FBT entry and a payload for the next column",
@@ -85,21 +67,14 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
         "loop",
         "Huginn loop: the middle cells become one tied core iterated per column",
     ),
-    "m": (
-        "mtp",
-        "two-token prediction: one sequential auxiliary block with shared readout",
-    ),
 }
 """Letter -> (``ModelConfig`` flag, one-line change), in canonical order."""
 
 
 def parse_condition(text: str) -> str:
-    """Canonicalize a condition string.
-
-    Each letter is one change from the plain decoder; letters may arrive in any
-    order and come back in :data:`CONDITION_LETTERS` order. The empty string is
-    the plain twelve-layer gated GQA decoder with three RoPE layers per cell.
-    """
+    """Accept ``f``, ``l``, or both in either order; reject an empty condition."""
+    if not text:
+        raise ValueError("condition must contain f, l, or both")
     unknown = sorted(set(text) - set(CONDITION_LETTERS))
     if unknown:
         raise ValueError(
@@ -141,12 +116,10 @@ MTP_LOSS_WEIGHT = 0.3
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Trunk geometry plus one flag per condition letter.
+    """Permanent PKDA/MoE/MHDB/MTP geometry plus two recurrence flags.
 
-    Defaults are the screen geometry and twelve gated GQA layers in
-    [RoPE, RoPE, RoPE, NoPE] cells; ``hybrid`` (``a``) replaces RoPE with PKDA.
-    Routing heads are not an independent knob: every routed condition uses one contiguous feature group
-    per KV head. The groups do not align to mixer projections.
+    Routing uses one contiguous feature group per KV head. These groups do
+    not align to mixer projections. The default condition is feedback (f).
     """
 
     vocab_size: int = VOCAB_SIZE
@@ -164,20 +137,8 @@ class ModelConfig:
     routing_block_size: int = 4
     """Exact MHDB cell width in transformer layers."""
 
-    hybrid: bool = False
-    """``a``: [PKDA, PKDA, PKDA, gated global GQA] cells instead of all-GQA."""
-
-    experts: bool = False
-    """``e``: one shared plus three of fifteen quarter-width SwiGLU experts."""
-
-    block_routing: bool = False
-    """``r``: multi-head block-delta routing before every sublayer."""
-
-    feedback: bool = False
+    feedback: bool = True
     """``f``: FBT gated entry plus a payload for the next column."""
-
-    mtp: bool = False
-    """``m``: one sequential auxiliary block predicts the second future token."""
 
     loop: bool = False
     """``l``: the cells between the first and last become one tied core that
@@ -192,8 +153,12 @@ class ModelConfig:
     """``l``: cap of the per-step iteration draw."""
 
     def __post_init__(self) -> None:
-        if self.experts and (self.intermediate < 4 or self.intermediate % 4):
-            raise ValueError("e requires intermediate width divisible by four")
+        if not (self.feedback or self.loop):
+            raise ValueError("condition must enable feedback (f), looping (l), or both")
+        if self.intermediate < 4 or self.intermediate % 4:
+            raise ValueError("MoE requires intermediate width divisible by four")
+        if self.layers < 1:
+            raise ValueError("model needs at least one layer")
         if self.routing_block_size < 1:
             raise ValueError("routing block size must be positive")
         if self.loop_iterations < 1 or self.loop_max_iterations < self.loop_iterations:
@@ -260,17 +225,11 @@ class ModelConfig:
         return iterations
 
     def is_pkda_layer(self, layer: int) -> bool:
-        return self.hybrid and layer % 4 != 3
-
-    def is_rope_layer(self, layer: int) -> bool:
-        """RoPE occupies exactly the layers PKDA replaces under ``a``."""
-        return not self.hybrid and layer % 4 != 3
+        return layer % 4 != 3
 
     @property
     def global_attention_layers(self) -> tuple[int, ...]:
-        """Dense gated GQA layers: every fourth under ``a``, otherwise all."""
-        if not self.hybrid:
-            return tuple(range(self.layers))
+        """Dense NoPE gated GQA layers: the fourth layer of each cell."""
         return tuple(
             layer for layer in range(self.layers) if not self.is_pkda_layer(layer)
         )
@@ -280,7 +239,7 @@ def condition_config(condition: str, **overrides) -> ModelConfig:
     """The configuration a condition string names; overrides adjust geometry."""
     letters = parse_condition(condition)
     flags = {flag: letter in letters for letter, (flag, _) in CONDITION_LETTERS.items()}
-    return replace(ModelConfig(**overrides), **flags)
+    return ModelConfig(**(overrides | flags))
 
 
 class RMSNorm(nn.Module):
@@ -442,12 +401,12 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Dense causal gated GQA; RoPE on the non-``a`` cell's first three layers."""
+    """Dense causal gated GQA; RoPE is used only by the auxiliary predictor."""
 
-    def __init__(self, cfg: ModelConfig, layer: int):
+    def __init__(self, cfg: ModelConfig, *, rope: bool = False):
         super().__init__()
         self.cfg = cfg
-        self.rope = cfg.is_rope_layer(layer)
+        self.rope = rope
         if self.rope and (cfg.head_dim < 2 or cfg.head_dim % 2):
             raise ValueError("RoPE requires a positive even attention head dimension")
         self.q_size = cfg.heads * cfg.head_dim
@@ -576,39 +535,6 @@ def _route_algebra(
     return routed, weights
 
 
-def _route_sources(
-    query: Tensor,
-    key_weight: Tensor,
-    eps: float,
-    num_heads: int,
-    *sources: Tensor,
-) -> tuple[Tensor, Tensor]:
-    """Static MHDB pointer-list router: never copies a value bank."""
-    batch, length, dim = sources[0].shape
-    head_dim = _check_route_geometry(dim, num_heads)
-    projected = (query.float() * key_weight.float()).to(sources[0].dtype)
-    query_heads = projected.reshape(num_heads, head_dim)
-    logits = torch.stack(
-        [
-            (source.reshape(batch, length, num_heads, head_dim) * query_heads)
-            .float()
-            .sum(dim=-1)
-            * torch.rsqrt(source.float().square().mean(dim=-1) + eps).unsqueeze(-1)
-            for source in sources
-        ]
-    )
-    weights = logits.softmax(dim=0)
-    routed = weights[0].to(sources[0].dtype).unsqueeze(-1) * sources[0].reshape(
-        batch, length, num_heads, head_dim
-    )
-    for index in range(1, len(sources)):
-        routed = routed + (
-            weights[index].to(sources[index].dtype).unsqueeze(-1)
-            * sources[index].reshape(batch, length, num_heads, head_dim)
-        )
-    return routed.reshape(batch, length, dim), weights
-
-
 class _BankedSource(torch.autograd.Function):
     """Give a routing source one gradient accumulator for all of its readers.
 
@@ -726,12 +652,12 @@ class Block(nn.Module):
     recomputes the forward.
     """
 
-    def __init__(self, cfg: ModelConfig, layer: int):
+    def __init__(self, cfg: ModelConfig, layer: int, *, auxiliary: bool = False):
         super().__init__()
         self.layer = layer
-        self.is_pkda = cfg.is_pkda_layer(layer)
+        self.is_pkda = not auxiliary and cfg.is_pkda_layer(layer)
         self.global_gate_index = (
-            None if self.is_pkda else cfg.global_attention_layers.index(layer)
+            None if self.is_pkda or auxiliary else cfg.global_attention_layers.index(layer)
         )
         self.attn_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.mlp_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -744,11 +670,11 @@ class Block(nn.Module):
                 norm_eps=cfg.norm_eps,
             )
             if self.is_pkda
-            else Attention(cfg, layer)
+            else Attention(cfg, rope=auxiliary)
         )
-        self.mlp = SwiGLU(cfg)
+        self.mlp = SwiGLU(cfg) if auxiliary else MixtureOfExperts(cfg.dim, cfg.intermediate)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
-        if cfg.block_routing:
+        if not auxiliary:
             self.attn_router = Router(cfg)
             self.mlp_router = Router(cfg)
         else:
@@ -835,7 +761,7 @@ class MultiTokenPrediction(nn.Module):
     Position t consumes the trunk state at t and the embedding of token t+1.
     Causal attention over those pairs cannot see the target at t+2. The
     auxiliary block has the trunk's geometry and residual scaling, with a
-    dense RoPE mixer and dense SwiGLU independently of the trunk's factors.
+    dense RoPE mixer and dense SwiGLU.
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -846,11 +772,7 @@ class MultiTokenPrediction(nn.Module):
         self.projection_sink: Tensor | None = None
         self.projection_shadow: Tensor | None = None
         self.attention_gate = nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
-        self.block = Block(
-            replace(cfg, hybrid=False, experts=False, block_routing=False,
-                    feedback=False, loop=False, mtp=False),
-            0,
-        )
+        self.block = Block(cfg, 0, auxiliary=True)
 
     def forward(self, h: Tensor, next_embedding: Tensor) -> Tensor:
         joined = torch.cat(
@@ -907,8 +829,7 @@ def _pkda_block(block, h, block_start, gate_weight, banked, *tensors):
 def _retain_block_activations(layer: int, cell_size: int) -> bool:
     """Retain the final block of each cell when the full column exceeds memory.
 
-    Selecting by position bounds storage for both hybrid and all-dense trunks;
-    in a hybrid cell the retained block is its global-attention block.
+    Each cell retains its final global-attention block.
     """
     return layer % cell_size == cell_size - 1
 
@@ -917,9 +838,8 @@ _compiled_block = torch.compile(
     _attention_block,
     fullgraph=True,
     dynamic=False,
-    # The graph shapes are fixed by the screen geometry. The probe performs
-    # the expensive search once and later processes reuse its durable cache;
-    # the outer trainer, rather than Inductor, owns CUDA capture.
+    # Each training geometry reuses its durable compilation cache. The outer
+    # trainer owns CUDA capture.
     mode=INDUCTOR_MODE,
 )
 
@@ -955,7 +875,7 @@ class ColumnOutput:
     route_source_names: dict[str, tuple[str, ...]]
     """Site → source-axis labels matching ``route_weights`` exactly."""
 
-    sources: list[Tensor] | None
+    sources: list[Tensor]
     """Final stored bank: the seed followed by completed block deltas.
     The stream reconstructs from that seed plus the block deltas."""
 
@@ -974,27 +894,18 @@ class ColumnOutput:
     core_state: Tensor | None
     """``l``: the residual at core exit after the last iteration [B, T, D]."""
 
-    expert_aux_loss: Tensor | None
-    """``e``: mean load-balance loss over executed layer invocations."""
+    expert_aux_loss: Tensor
+    """Mean load-balance loss over executed layer invocations."""
 
     expert_weights: dict[str, Tensor]
     """Site -> sparse normalized top-3 routing weights [B, T, 15]."""
 
-    expert_counts: Tensor | None
-    """``e``: logical assignment counts [physical layers, 15], summed over core uses."""
-
-
-_ClassifierShadow = ShadowOperand
-"""The tied classifier reads its BF16 shadow through the shared operand.
-
-With a persistent sink the BF16 classifier gradient is added into it in one
-fused pass instead of being widened to a 467 MB FP32 temporary that autograd
-then adds a second time.
-"""
+    expert_counts: Tensor
+    """Logical assignment counts [physical layers, 15], summed over core uses."""
 
 
 class DeltaModel(nn.Module):
-    """The full model; parents are deletions per the config flags."""
+    """The permanent trunk with feedback and/or tied-depth recurrence."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -1025,16 +936,15 @@ class DeltaModel(nn.Module):
             self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
             self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
             self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-            if cfg.block_routing:
-                self.payload_router = Router(cfg)
+            self.payload_router = Router(cfg)
         self.grad_checkpoint = False
         """Runtime switch: retain cell-final activations, checkpoint other blocks."""
         self.bank_sources = True
         """Runtime switch: give each routed source one gradient accumulator.
 
         Off, every site returns its own gradient for every source and autograd
-        sums them, which is what the portable and no-grad paths do anyway and
-        what the gate compares the banked accumulation against."""
+        sums them. This portable path is the reference for checking banked
+        accumulation."""
         torch.random.set_rng_state(common_init_state)
         self.embed_tokens.apply(self._init_weights)
         self.blocks.apply(self._init_weights)
@@ -1047,25 +957,12 @@ class DeltaModel(nn.Module):
                 (self.fuse_value, self.fuse_gate),
                 factor_seed ^ 0x524543555252454E,
             )
-        if cfg.experts:
-            # Complete the ordinary dense initialization first, so adding e
-            # never changes any common attention, norm, embedding or FBT weight.
-            # The replacement expert bank uses a condition-private CPU stream.
-            with torch.random.fork_rng(devices=[]):
-                torch.random.default_generator.manual_seed(
-                    (factor_seed ^ 0x45585045525453) % ((1 << 63) - 1)
-                )
-                for block in self.blocks:
-                    block.mlp = MixtureOfExperts(cfg.dim, cfg.intermediate)
-                    block.mlp.apply(self._init_weights)
-        self.mtp = None
-        if cfg.mtp:
-            with torch.random.fork_rng(devices=[]):
-                torch.random.default_generator.manual_seed(
-                    (factor_seed ^ 0x4D54505F44455054) % ((1 << 63) - 1)
-                )
-                self.mtp = MultiTokenPrediction(cfg)
-                self.mtp.apply(self._init_weights)
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(
+                (factor_seed ^ 0x4D54505F44455054) % ((1 << 63) - 1)
+            )
+            self.mtp = MultiTokenPrediction(cfg)
+            self.mtp.apply(self._init_weights)
         self._scale_initialization()
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -1131,8 +1028,6 @@ class DeltaModel(nn.Module):
 
     def mtp_hidden(self, h_top: Tensor, next_tokens: Tensor) -> Tensor:
         """Predictor states aligned with supplied next tokens, before readout."""
-        if self.mtp is None:
-            raise ValueError("multi-token prediction needs a condition with m")
         if h_top.ndim != 3 or next_tokens.shape != h_top.shape[:2] or not h_top.shape[1]:
             raise ValueError("MTP needs aligned nonempty hidden states and next tokens")
         embedding = self.embed_tokens(next_tokens)
@@ -1152,8 +1047,7 @@ class DeltaModel(nn.Module):
                 else self.attention_gates[block.global_gate_index].weight
             )
             yield block, gate
-        if self.mtp is not None:
-            yield self.mtp.block, self.mtp.attention_gate.weight
+        yield self.mtp.block, self.mtp.attention_gate.weight
 
     # -- persistent gradient sinks -------------------------------------------
 
@@ -1204,7 +1098,7 @@ class DeltaModel(nn.Module):
         self, counts: Tensor, *, rate: float = EXPERT_BIAS_RATE
     ) -> None:
         """Update each physical expert bank once after a complete training step."""
-        if not self.cfg.experts or not self.training:
+        if not self.training:
             return
         if counts.shape != (len(self.blocks), NUM_ROUTED_EXPERTS):
             raise ValueError("expert counts must have shape [physical layers, 15]")
@@ -1371,11 +1265,10 @@ class DeltaModel(nn.Module):
                 self.fuse_value_shadow, self.fuse_value.weight
             )
             self.fuse_gate_shadow = shadow(self.fuse_gate_shadow, self.fuse_gate.weight)
-        if self.mtp is not None:
-            self.mtp.projection_sink = sink(self.mtp.projection.weight)
-            self.mtp.projection_shadow = shadow(
-                self.mtp.projection_shadow, self.mtp.projection.weight
-            )
+        self.mtp.projection_sink = sink(self.mtp.projection.weight)
+        self.mtp.projection_shadow = shadow(
+            self.mtp.projection_shadow, self.mtp.projection.weight
+        )
         self._shadow_refresh = refresh
         return bound
 
@@ -1458,7 +1351,7 @@ class DeltaModel(nn.Module):
         if self._classifier_accum is not None and torch.is_grad_enabled():
             return self._classifier_shadow, self._classifier_accum
         return (
-            _ClassifierShadow.apply(
+            ShadowOperand.apply(
                 master, self._classifier_shadow, self.embed_tokens.grad_sink
             ),
             None,
@@ -1528,7 +1421,7 @@ class DeltaModel(nn.Module):
         blocks: Iterable[Block],
         h: Tensor,
         cell: int,
-        sources: list[Tensor] | None,
+        sources: list[Tensor],
         names: list[str],
         accumulators: list[Tensor],
         *,
@@ -1554,23 +1447,21 @@ class DeltaModel(nn.Module):
         banked = tuple(accumulators)
         for index, block in enumerate(blocks):
             opens = entry is None and index == 0
-            passed = list(sources) if sources is not None else []
+            passed = list(sources)
             passed_names = list(names)
-            if sources is not None and not opens:
+            if not opens:
                 passed.append(partial)
                 passed_names.append(f"partial{cell}")
             h, partial, w_attn, w_mlp, aux, w_expert, counts = self._run_block(
                 block, h, None if opens else cell_start, passed, banked, **runtime
             )
-            if aux is not None:
-                expert_losses.append(aux)
+            expert_losses.append(aux)
             if w_expert is not None:
                 expert_weights_out[f"L{block.layer}{label}.experts"] = w_expert
-            if counts is not None:
-                previous = expert_counts_out.get(block.layer)
-                expert_counts_out[block.layer] = (
-                    counts if previous is None else previous + counts
-                )
+            previous = expert_counts_out.get(block.layer)
+            expert_counts_out[block.layer] = (
+                counts if previous is None else previous + counts
+            )
             if w_attn is not None:
                 site = f"L{block.layer}{label}.attn"
                 weights_out[site] = w_attn
@@ -1614,25 +1505,23 @@ class DeltaModel(nn.Module):
         # accumulates ordinary autograd gradients.
         banking = (
             self.bank_sources
-            and cfg.block_routing
             and x.is_cuda
             and torch.is_grad_enabled()
         )
-        payload_reads = cfg.feedback and cfg.block_routing and need_payload
+        payload_reads = cfg.feedback and need_payload
 
         h = x
-        sources: list[Tensor] | None = None
+        sources: list[Tensor]
         source_names: list[str] = []
         accumulators: list[Tensor] = []
-        if cfg.block_routing:
-            if banking:
-                h, seed, accumulator = bank_source(h, x)
-                sources = [seed]
-                accumulators.append(accumulator)
-            else:
-                sources = [x]
-            source_names.append("seed")
-        seeds = len(sources) if sources is not None else 0
+        if banking:
+            h, seed, accumulator = bank_source(h, x)
+            sources = [seed]
+            accumulators.append(accumulator)
+        else:
+            sources = [x]
+        source_names.append("seed")
+        seeds = 1
 
         weights_out: dict[str, Tensor] = {}
         route_source_names: dict[str, tuple[str, ...]] = {}
@@ -1664,8 +1553,6 @@ class DeltaModel(nn.Module):
             without a payload to write — is stored raw: banking it would give
             the block an all-zero gradient contribution to accumulate.
             """
-            if sources is None:
-                return carrier
             readers = cell < cfg.routing_blocks - 1 or payload_reads
             if banking and readers:
                 carrier, alias, accumulator = bank_source(carrier, delta)
@@ -1718,20 +1605,19 @@ class DeltaModel(nn.Module):
                             origin = origin + (h - exits[index])
                         entry, partial = origin, deltas[index]
                     passed, passed_names = sources, source_names
-                    if sources is not None:
-                        # The other core cells' deltas so far: the cells before
-                        # this one from this iteration, the cells after it from
-                        # the previous one. A cell completed on the last
-                        # iteration is already in the bank.
-                        extra = [
-                            (f"block{1 + other}", deltas[other])
-                            for other in range(len(core))
-                            if other != index
-                            and deltas[other] is not None
-                            and not (iteration == last and other < index)
-                        ]
-                        passed = [*sources, *(tensor for _, tensor in extra)]
-                        passed_names = [*source_names, *(name for name, _ in extra)]
+                    # The other core cells' deltas so far: the cells before
+                    # this one from this iteration, the cells after it from
+                    # the previous one. A cell completed on the last
+                    # iteration is already in the bank.
+                    extra = [
+                        (f"block{1 + other}", deltas[other])
+                        for other in range(len(core))
+                        if other != index
+                        and deltas[other] is not None
+                        and not (iteration == last and other < index)
+                    ]
+                    passed = [*sources, *(tensor for _, tensor in extra)]
+                    passed_names = [*source_names, *(name for name, _ in extra)]
                     h, delta = self._run_cell(
                         blocks,
                         h,
@@ -1768,22 +1654,21 @@ class DeltaModel(nn.Module):
         payload = None
         if cfg.feedback and need_payload:
             enriched = h
-            if cfg.block_routing:
-                payload_sources = [sources[seeds - 1], *sources[seeds:]]
-                routed, weights = self.payload_router(
-                    payload_sources,
-                    want_weights,
-                    tuple(accumulators),
+            payload_sources = [sources[seeds - 1], *sources[seeds:]]
+            routed, weights = self.payload_router(
+                payload_sources,
+                want_weights,
+                tuple(accumulators),
+            )
+            if weights is not None:
+                weights_out["payload"] = weights
+                route_source_names["payload"] = (
+                    "null",
+                    "seed",
+                    *source_names[seeds:],
                 )
-                if weights is not None:
-                    weights_out["payload"] = weights
-                    route_source_names["payload"] = (
-                        "null",
-                        "seed",
-                        *source_names[seeds:],
-                    )
-                if routed is not None:
-                    enriched = h + routed
+            if routed is not None:
+                enriched = h + routed
             payload = self.payload_norm(enriched)
 
         return ColumnOutput(
@@ -1797,15 +1682,11 @@ class DeltaModel(nn.Module):
             iterations=iterations,
             core_entry=core_entry,
             core_state=core_state,
-            expert_aux_loss=torch.stack(expert_losses).mean()
-            if expert_losses
-            else None,
+            expert_aux_loss=torch.stack(expert_losses).mean(),
             expert_weights=expert_weights_out,
-            expert_counts=(
-                torch.stack([
-                    expert_counts_out[layer] for layer in range(len(self.blocks))
-                ]) if expert_counts_out else None
-            ),
+            expert_counts=torch.stack([
+                expert_counts_out[layer] for layer in range(len(self.blocks))
+            ]),
         )
 
     # -- sequential decoding ---------------------------------------------------
@@ -1947,8 +1828,6 @@ def _fixed_cce_z(
     targets: Tensor,
     vocab_ordering: Tensor | None = None,
     *,
-    skip_early: bool = True,
-    tile_flags: Tensor | None = None,
     c_grad_accum: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Current CCE with capture-safe preprocessing and differentiable LSE.
@@ -1961,9 +1840,7 @@ def _fixed_cce_z(
 
     With ``vocab_ordering`` both halves tile the classifier through that
     permutation and the backward skips every tile the gradient filter would
-    drop before recomputing its logits. ``skip_early`` and ``tile_flags`` are
-    the fork's diagnostics: the probe forces the late filter alone and checks
-    that both paths compute the identical tile set.
+    drop before recomputing its logits.
 
     ``c_grad_accum`` is a caller-owned persistent BF16 ``[V, D]`` buffer. With
     one the backward lock-adds this call's classifier gradient straight into it
@@ -1997,8 +1874,8 @@ def _fixed_cce_z(
         vocab_parallel_options=None,
         return_lse=True,
         vocab_ordering=vocab_ordering,
-        skip_early=skip_early,
-        tile_flags=tile_flags,
+        skip_early=True,
+        tile_flags=None,
         c_grad_accum=c_grad_accum,
     )
     ce, lse = linear_cross_entropy_apply(
@@ -2036,10 +1913,8 @@ def sequence_ce(
             if torch.is_grad_enabled()
             else None
         )
-        # Every gradient-bearing head call of a microbatch -- two per pass
-        # with MTP -- uses the bound accumulator or the per-call FP32 sink;
-        # evaluation has no
-        # backward to accumulate and reads the classifier as before.
+        # Both heads use the bound accumulator or the per-call FP32 sink.
+        # Evaluation has no backward to accumulate.
         classifier, accum = model.classifier_for_loss()
         return _fixed_cce_z(
             normalized, classifier, targets, ordering, c_grad_accum=accum
@@ -2114,7 +1989,7 @@ def multipass_loss(
         raise ValueError("loss needs at least one model pass")
     if not math.isfinite(mtp_weight) or mtp_weight < 0:
         raise ValueError("mtp_weight must be finite and nonnegative")
-    if model.cfg.mtp and tokens.shape[1] < 3:
+    if tokens.shape[1] < 3:
         raise ValueError("MTP needs at least three stored tokens")
     targets = tokens[:, 1:]
     losses, z_terms = [], []
@@ -2123,24 +1998,21 @@ def multipass_loss(
         ce, z = sequence_ce(model, out.h_top, targets)
         losses.append(ce)
         z_terms.append(z)
-        if model.cfg.mtp:
-            h_mtp = model.mtp_hidden(out.h_top[:, :-1], tokens[:, 1:-1])
-            ce, z = sequence_ce(model, h_mtp, tokens[:, 2:])
-            mtp_losses.append(ce)
-            mtp_z.append(z)
+        h_mtp = model.mtp_hidden(out.h_top[:, :-1], tokens[:, 1:-1])
+        ce, z = sequence_ce(model, h_mtp, tokens[:, 2:])
+        mtp_losses.append(ce)
+        mtp_z.append(z)
 
     total = combine_pass_losses(losses)
     total = total + z_coef * combine_pass_losses(z_terms)
-    if mtp_losses:
-        total = total + mtp_weight * (
-            combine_pass_losses(mtp_losses) + z_coef * combine_pass_losses(mtp_z)
-        )
-    if model.cfg.experts:
-        total = (
-            total
-            + EXPERT_BALANCE_COEF
-            * torch.stack([out.expert_aux_loss for out in outs]).mean()
-        )
+    total = total + mtp_weight * (
+        combine_pass_losses(mtp_losses) + z_coef * combine_pass_losses(mtp_z)
+    )
+    total = (
+        total
+        + EXPERT_BALANCE_COEF
+        * torch.stack([out.expert_aux_loss for out in outs]).mean()
+    )
     return LossOutput(total, losses, mtp_losses)
 
 

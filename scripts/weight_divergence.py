@@ -30,10 +30,14 @@ from delta_feedback_experiment.model import DeltaModel
 from delta_feedback_experiment.parameter_groups import is_normuonh_parameter
 from delta_feedback_experiment.train import read_checkpoint
 
-MATRIX_FAMILIES = ("attn_matrix", "mlp_matrix", "pkda_control", "router", "norms", "attn_gate", "embedding", "final_norm")
+MATRIX_FAMILIES = ("attn_matrix", "mlp_matrix", "expert_router", "mtp", "pkda_control", "router", "norms", "attn_gate", "embedding", "final_norm")
 
 
 def family(name: str) -> str:
+    if name.startswith("mtp."):
+        return "mtp"
+    if ".mlp.router." in name:
+        return "expert_router"
     if name == "embed_tokens.weight":
         return "embedding"
     if name == "final_norm.weight":
@@ -52,7 +56,7 @@ def family(name: str) -> str:
         return "router"
     if re.search(r"\.attn\.(q|k|v|o|qkv)_proj\.weight$", name):
         return "attn_matrix"
-    if re.search(r"\.mlp\.(gate_up|down)_proj\.weight$", name):
+    if re.search(r"\.mlp\.(?:(?:shared|experts\.\d+)\.)?(gate_up|down)_proj\.weight$", name):
         return "mlp_matrix"
     if re.search(r"\.attn\.(control_proj|decay_up|output_gate_up)\.", name):
         return "pkda_control"

@@ -12,7 +12,7 @@ which one it is indexed by.
 
 | Axis | State and transition | Status |
 |---|---|---|
-| Token-mixer memory | PKDA matrix, diagonal preconditioner, and convolution history advance along tokens; GQA retains prefix K/V | Every condition with `a`, whether or not it has `f` |
+| Token-mixer memory | PKDA matrix, diagonal preconditioner, and convolution history advance along tokens; GQA retains prefix K/V | Every condition |
 | Latent feedback | FBT transfers the previous column's payload through the current token's gate | Every condition with `f`; Jacobi passes train it in parallel |
 | Tied depth | A shared core repeatedly updates one column's residual state; iteration `i` mixes over earlier columns' iteration-`i` writes | Every condition with `l` |
 
@@ -25,7 +25,7 @@ across generated tokens. The two execution modes can behave differently.
 
 | Surface | What it shows | Notes |
 |---|---|---|
-| `DeltaModel.forward_column` / `ColumnOutput` | Top residual state, feedback payload, final source bank, optional per-site/group route weights with source labels; under `e`, expert weights and mean balancing loss | The analysis interface everything below builds on |
+| `DeltaModel.forward_column` / `ColumnOutput` | Top residual state, feedback payload, final source bank, optional per-site/group route weights with source labels; expert weights and mean balancing loss | The analysis interface everything below builds on |
 | `scripts/route_report.py` | Plain and fused route summaries, source and null scales, query geometry | Route mass is a mixing weight, not an importance score |
 | `scripts/payload_swap.py` | Top-only, uniform, and forced-source payload enrichment, optionally one routing group at a time | Top-only keeps the payload's `h_top` term |
 | `scripts/fused_diagnostics.py` | Fused minus pass-1 loss by position, fused-in-token surprise, and token frequency; gate, seed-decodability, and scale statistics; a 30-iteration self-composition trace | Conditioning on a position's own pass-1 loss selects on noise; condition on entropy or frequency instead |
@@ -39,7 +39,7 @@ across generated tokens. The two execution modes can behave differently.
 | `iterate_fused` | Per-iteration held-out loss and mean top-state update norm on fixed tokens | Payload-only repeated prefill |
 | `depth_trace`, `scripts/depth_trace.py` | Loss after each core iteration count, the size of each iteration's update, and the core routers' source mass by iteration | Fixed-`r` sweep; on plain positions one trajectory read out after every iteration |
 | Trainer telemetry / `delta watch` | Training health, validation, routing summaries, recurrent dynamics | Operational |
-| `delta probe` and portable semantics | Numerical, causal, gradient, cache, and execution invariants | Engineering |
+| `delta probe` and portable tests | Tiny CUDA execution smoke; reduced portable suite on CPU/MPS | Engineering |
 
 Every script rebuilds the condition from a snapshot through
 `delta_feedback_experiment.analysis`, evaluates under the trainer's numerics
@@ -63,7 +63,7 @@ include feedback through changed text.
 Keep the snapshot, data rows, mode, state coordinates, and precision with an
 analysis result so the measured intervention can be reproduced.
 
-Under `e`, request `want_weights=True` to obtain `expert_weights`, keyed by
+Request `want_weights=True` to obtain `expert_weights`, keyed by
 layer invocation, alongside the separate MHDB `route_weights`. Each expert
 tensor is `[B, T, 15]`: three nonzero routed weights per token, normalized to
 sum to one. The shared expert always runs and is absent from that axis. Align
@@ -105,7 +105,7 @@ prettiest trajectory.
 
 ## Dynamics
 
-With `m`, auxiliary validation predicts a second token after receiving the
+Auxiliary validation predicts a second token after receiving the
 ground-truth next token's embedding. `val_mtp` and `val_mtp_fused` therefore
 measure a different predictor and target alignment from `val` and
 `val_fused`. Compare the ordinary next-token metrics between paired runs to

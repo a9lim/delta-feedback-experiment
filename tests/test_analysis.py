@@ -20,26 +20,30 @@ from delta_feedback_experiment.train import CONTRACT
 
 TINY = {
     "vocab_size": 97,
-    "dim": 32,
+    "dim": 16,
     "layers": 4,
     "heads": 2,
     "kv_heads": 2,
-    "head_dim": 16,
-    "intermediate": 64,
+    "head_dim": 8,
+    "intermediate": 32,
     "pkda_heads": 2,
-    "pkda_head_dim": 16,
+    "pkda_head_dim": 8,
     "pkda_conv_size": 4,
     "loop_iterations": 4,
     "loop_max_iterations": 8,
 }
 
 
-def snapshot(tmp_path, condition="arf", seed=3):
+def snapshot(tmp_path, condition="f", seed=3):
     torch.manual_seed(seed)
     model = DeltaModel(condition_config(condition, max_seq_len=17, **TINY))
     args = SimpleNamespace(
-        condition=condition, seed=seed, seq_len=16, tag="tiny",
-        tokenizer_id=SYNTHETIC_TOKENIZER_ID, **TINY
+        condition=condition,
+        seed=seed,
+        seq_len=16,
+        tag="tiny",
+        tokenizer_id=SYNTHETIC_TOKENIZER_ID,
+        **TINY,
     )
     pair = OptimizerPair(build_optimizers(model))
     path = tmp_path / "tiny.pt.5"
@@ -47,8 +51,8 @@ def snapshot(tmp_path, condition="arf", seed=3):
     return model.eval(), path
 
 
-@pytest.mark.parametrize("condition", ["", "r", "arf"])
-def test_load_checkpoint_rebuilds_the_saved_model(tmp_path, condition):
+def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
+    condition = "f"
     model, path = snapshot(tmp_path, condition)
     loaded, saved = analysis.load_checkpoint(path, "cpu")
     assert saved["condition"] == condition and saved["step"] == 5

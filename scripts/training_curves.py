@@ -133,11 +133,6 @@ def main() -> None:
     for run in runs:
         a = step_arrays(run["steps"], loop="l" in run["run"]["condition"])
         tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
-        if "m" not in run["run"]["condition"]:
-            # Historical non-MTP records lack separate NTP CE. Retain their
-            # old approximation; any z-loss in those objectives is inseparable.
-            fallback = a["loss"] - a["expert_balance"] * float(run["run"].get("expert_balance_coef", 0))
-            a["ntp"] = np.where(np.isnan(a["ntp"]), fallback, a["ntp"])
         passes = a["k"]
         a["cum_pass_tokens"] = np.cumsum(passes) * tokens_per_step
         a["cum_cell_tokens"] = np.cumsum(passes * cells_per_pass(run, a["r"])) * tokens_per_step
@@ -259,27 +254,21 @@ def main() -> None:
     fs.save(fig, out_dir / "training-loss.png")
 
     # -- auxiliary second-token prediction ------------------------------------
-    mtp_runs = [
-        (run, a, e, lab, col)
-        for run, a, e, lab, col in zip(runs, arrays, evals, labels, colors)
-        if "m" in run["run"]["condition"]
-    ]
-    if mtp_runs:
-        fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
-        for run, a, e, lab, col in mtp_runs:
-            observed = np.isfinite(a["mtp"])
-            weight = run["run"].get("mtp_weight", "unknown")
-            if observed.any():
-                axes[0].plot(a["step"][observed], ema(a["mtp"][observed], args.ema), color=col, label=f"{lab}: weight {weight}")
-            axes[1].plot(e["step"], e["val_mtp"], color=col, label=f"{lab}: pass 1")
-            if np.isfinite(e["val_mtp_fused"]).any():
-                axes[1].plot(e["step"], e["val_mtp_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
-        axes[0].set(xlabel="optimizer step", ylabel=f"unweighted CE (EMA {args.ema})", title="Auxiliary train: pass 1 + mean fused")
-        axes[1].set(xlabel="optimizer step", ylabel="held-out CE", title="Auxiliary validation (teacher forcing)")
-        for ax in axes:
-            if ax.lines:
-                ax.legend()
-        fs.save(fig, out_dir / "multi-token-prediction.png")
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
+    for run, a, e, lab, col in zip(runs, arrays, evals, labels, colors):
+        observed = np.isfinite(a["mtp"])
+        weight = run["run"].get("mtp_weight", "unknown")
+        if observed.any():
+            axes[0].plot(a["step"][observed], ema(a["mtp"][observed], args.ema), color=col, label=f"{lab}: weight {weight}")
+        axes[1].plot(e["step"], e["val_mtp"], color=col, label=f"{lab}: pass 1")
+        if np.isfinite(e["val_mtp_fused"]).any():
+            axes[1].plot(e["step"], e["val_mtp_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
+    axes[0].set(xlabel="optimizer step", ylabel=f"unweighted CE (EMA {args.ema})", title="Auxiliary train: pass 1 + mean fused")
+    axes[1].set(xlabel="optimizer step", ylabel="held-out CE", title="Auxiliary validation (teacher forcing)")
+    for ax in axes:
+        if ax.lines:
+            ax.legend()
+    fs.save(fig, out_dir / "multi-token-prediction.png")
 
     # -- routing trajectories -------------------------------------------------
     routed = [r for r in runs if r["routes"]]
@@ -385,12 +374,11 @@ def main() -> None:
                 "mean_step_seconds": float(tokens_per_step / np.nanmean(a["tok_s"])),
             }
         )
-        if "m" in run["run"]["condition"]:
-            entry.update({
-                "mtp_weight": run["run"].get("mtp_weight"),
-                "final_val_mtp": None if np.isnan(e["val_mtp"][-1]) else float(e["val_mtp"][-1]),
-                "final_val_mtp_fused": None if np.isnan(e["val_mtp_fused"][-1]) else float(e["val_mtp_fused"][-1]),
-            })
+        entry.update({
+            "mtp_weight": run["run"].get("mtp_weight"),
+            "final_val_mtp": None if np.isnan(e["val_mtp"][-1]) else float(e["val_mtp"][-1]),
+            "final_val_mtp_fused": None if np.isnan(e["val_mtp_fused"][-1]) else float(e["val_mtp_fused"][-1]),
+        })
     (out_dir / "training_curves.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({k: {kk: vv for kk, vv in v.items() if not isinstance(vv, list)} for k, v in summary["runs"].items()}, indent=2))
     print(f"figures -> {out_dir}/")

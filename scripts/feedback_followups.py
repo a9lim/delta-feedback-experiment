@@ -38,6 +38,10 @@ FUSION_NAMES = {"fuse_value.weight", "fuse_gate.weight", "gate_norm.weight", "en
 
 
 def family(name: str) -> str:
+    if name.startswith("mtp."):
+        return "mtp"
+    if ".mlp.router." in name:
+        return "expert_router"
     if name in FUSION_NAMES:
         return "fusion"
     if name.startswith("payload_router."):
@@ -89,12 +93,11 @@ def main() -> None:
     starts = (64, 256, 512, 768)
     lags = (0, 1, 2, 4, 8, 16, 32, 64, 128)
     imp = {L: {t0: {lag: 0.0 for lag in lags} for t0 in starts} for L in (1, 8, 64)}
-    routed_payload = cfg.block_routing
     head_abl = {
         f"head{h}_{kind}": 0.0
         for h in range(cfg.kv_heads)
         for kind in ("to_null", "shuffled_rows")
-    } if routed_payload else {}
+    }
     fused_sum = 0.0
     n_imp = 0
     with torch.no_grad(), analysis.autocast(device):
@@ -113,24 +116,22 @@ def main() -> None:
                     d = analysis.token_ce(model, out.h_top, tgt) - ce1
                     for lag in lags:
                         imp[L][t0][lag] += d[:, t0 + L - 1 + lag].sum().item() if t0 + L - 1 + lag < T else float("nan")
-            if routed_payload:
-                payload_sources = [out1.sources[0], *out1.sources[1:]]
-                routed, _ = model.payload_router(payload_sources, False)
-                hd = cfg.dim // cfg.kv_heads
-                null = model.payload_router.null.to(routed.dtype)
-                shuffled = routed.roll(1, dims=0)
-                for h in range(cfg.kv_heads):
-                    for kind, replacement in (("to_null", null), ("shuffled_rows", shuffled)):
-                        r = routed.clone()
-                        r[..., h * hd : (h + 1) * hd] = replacement[..., h * hd : (h + 1) * hd]
-                        p = model.payload_norm(out1.h_top + r)
-                        out = model.forward_column(torch.where(plain1, e, model.fuse(shift_right(p), e)), need_payload=False)
-                        head_abl[f"head{h}_{kind}"] += analysis.token_ce(model, out.h_top, tgt).sum().item()
+            payload_sources = [out1.sources[0], *out1.sources[1:]]
+            routed, _ = model.payload_router(payload_sources, False)
+            hd = cfg.dim // cfg.kv_heads
+            null = model.payload_router.null.to(routed.dtype)
+            shuffled = routed.roll(1, dims=0)
+            for h in range(cfg.kv_heads):
+                for kind, replacement in (("to_null", null), ("shuffled_rows", shuffled)):
+                    r = routed.clone()
+                    r[..., h * hd : (h + 1) * hd] = replacement[..., h * hd : (h + 1) * hd]
+                    p = model.payload_norm(out1.h_top + r)
+                    out = model.forward_column(torch.where(plain1, e, model.fuse(shift_right(p), e)), need_payload=False)
+                    head_abl[f"head{h}_{kind}"] += analysis.token_ce(model, out.h_top, tgt).sum().item()
             n_imp += tokens.shape[0]
     rep["impulse"] = {str(L): {str(t0): {str(lag): v / n_imp for lag, v in d.items()} for t0, d in dd.items()} for L, dd in imp.items()}
     rep["impulse_fused_prefix1"] = fused_sum / (n_imp * T)
-    if routed_payload:
-        rep["payload_head_ablation"] = {k: v / (n_imp * T) for k, v in head_abl.items()}
+    rep["payload_head_ablation"] = {k: v / (n_imp * T) for k, v in head_abl.items()}
     out_path.write_text(json.dumps(rep, indent=2) + "\n")
 
     # -- split-validated calibrated ensemble ------------------------------------------

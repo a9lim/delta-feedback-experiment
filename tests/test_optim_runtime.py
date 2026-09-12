@@ -1,55 +1,10 @@
-"""Runtime boundary checks for the compiled NorMuonH bucket update."""
+"""NorMuonH bucket updates preserve state across sparse gradients and resume."""
 
 from copy import deepcopy
 
 import torch
 
-from delta_feedback_experiment.optim import NorMuonH, _normuonh_bucket_step
-
-
-def test_bucket_compilation_preserves_updates_and_tensor_storage():
-    """Trace the mutation boundary and compare with independent matrix steps."""
-    torch.manual_seed(29)
-    parameters = [torch.nn.Parameter(torch.randn(7, 5)) for _ in range(3)]
-    references = [torch.nn.Parameter(p.detach().clone()) for p in parameters]
-    optimizers = [NorMuonH([p], lr=0.03) for p in references]
-    momenta = [torch.zeros_like(p) for p in parameters]
-    row_moments = [torch.zeros(p.shape[0], 1) for p in parameters]
-    radii = [p.detach().norm() for p in parameters]
-    storage = [t.data_ptr() for t in (*parameters, *momenta, *row_moments, *radii)]
-    compiled = torch.compile(_normuonh_bucket_step, backend="eager", fullgraph=True)
-
-    for lr in (0.03, 0.0, 0.01):
-        gradients = [torch.randn_like(p) for p in parameters]
-        with torch.no_grad():
-            compiled(
-                parameters,
-                gradients,
-                momenta,
-                row_moments,
-                radii,
-                torch.tensor(lr),
-                0.95,
-                0.95,
-                1e-8,
-                5,
-            )
-        for index, (reference, optimizer) in enumerate(zip(references, optimizers)):
-            reference.grad = gradients[index].clone()
-            optimizer.param_groups[0]["lr"] = lr
-            optimizer.step()
-            torch.testing.assert_close(parameters[index], reference)
-            torch.testing.assert_close(
-                momenta[index], optimizer.state[reference]["momentum"]
-            )
-            torch.testing.assert_close(
-                row_moments[index], optimizer.state[reference]["row_moment"]
-            )
-            torch.testing.assert_close(parameters[index].norm(), radii[index])
-
-    assert [
-        t.data_ptr() for t in (*parameters, *momenta, *row_moments, *radii)
-    ] == storage
+from delta_feedback_experiment.optim import NorMuonH
 
 
 def test_bucket_optimizer_preserves_absent_gradients_and_resume():

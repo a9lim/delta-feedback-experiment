@@ -2,7 +2,6 @@
 
 from itertools import pairwise
 
-import pytest
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -30,8 +29,8 @@ def tiny(condition):
     )
 
 
-@pytest.mark.parametrize("condition", ["", "a", "arfl"])
-def test_gradient_slabs_cover_parameters_without_overlap(condition):
+def test_gradient_slabs_cover_parameters_without_overlap():
+    condition = "f"
     model = tiny(condition)
     buffers = model.allocate_gradient_buffers()
     assert set(buffers) == {p for p in model.parameters() if p.requires_grad}
@@ -87,23 +86,7 @@ def test_gradient_slabs_cover_parameters_without_overlap(condition):
     assert all(block.attn.packed_qkv_sink is None for block in model.blocks)
 
 
-def test_independent_or_partial_gradient_buffers_do_not_pack():
-    model = tiny("a")
-    buffers = {p: torch.zeros_like(p) for p in model.parameters()}
-    model.bind_gradient_sinks(buffers)
-    assert all(block.attn.packed_qkv_sink is None for block in model.blocks)
-    buffers = model.allocate_gradient_buffers()
-    del buffers[model.blocks[0].attn.k_proj.weight]
-    model.bind_gradient_sinks(buffers)
-    assert model.blocks[0].attn.packed_qkv_sink is None
-    assert model.blocks[1].attn.packed_qkv_sink is not None
-
-
-@pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("checkpointed", [False, True])
-def test_packed_linear_repeated_backward_preserves_segment_gradients(
-    compiled, checkpointed
-):
+def test_packed_linear_repeated_backward_preserves_segment_gradients():
     torch.manual_seed(89)
     weights = tuple(torch.nn.Parameter(torch.randn(rows, 8)) for rows in (6, 3, 5))
     # Nonzero initial contents and a nonzero storage offset catch overwrite
@@ -118,31 +101,22 @@ def test_packed_linear_repeated_backward_preserves_segment_gradients(
 
     def projection(x):
         output = sink_linear(x, weights, sinks, shadow, packed_sink=packed)
-        return output.sin() * torch.sigmoid(output) if checkpointed else output
-
-    compiled_projection = (
-        torch.compile(projection, backend="aot_eager", fullgraph=True)
-        if compiled
-        else projection
-    )
+        return output.sin() * torch.sigmoid(output)
 
     def run(x):
-        if checkpointed:
-            return torch.utils.checkpoint.checkpoint(
-                compiled_projection,
-                x,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
-        return compiled_projection(x)
+        return torch.utils.checkpoint.checkpoint(
+            projection,
+            x,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
 
     for _ in range(3):
         x = torch.randn(2, 5, 8, requires_grad=True)
         reference_x = x.detach().clone().requires_grad_()
         output = run(x)
         expected = F.linear(reference_x, torch.cat(reference_weights))
-        if checkpointed:
-            expected = expected.sin() * torch.sigmoid(expected)
+        expected = expected.sin() * torch.sigmoid(expected)
         cotangent = torch.randn_like(output)
         output.backward(cotangent)
         expected.backward(cotangent)

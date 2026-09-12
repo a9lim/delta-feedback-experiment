@@ -8,77 +8,37 @@ and evaluation.
 
 ## Conditions
 
-A condition is a string of letters from `aerflm`, each one change from the
-plain twelve-layer gated GQA decoder. `parse_condition` accepts the
-letters in any order and returns them in canonical `aerflm` order; the empty string is the
-plain decoder, and `ModelConfig.condition` renders a configuration's letters
-back.
+Conditions are `f`, `l`, and `fl`. `parse_condition` accepts their letters in
+any order and canonicalizes to `fl` order. Empty input and other letters are
+rejected. The default is `f`.
 
-| Letter | Change | `ModelConfig` flag |
+| Letter | Behavior | `ModelConfig` flag |
 |---|---|---|
-| `a` | Kimi Delta Attention: replace the three RoPE-GGQA layers per cell with PKDA, giving `[PKDA, PKDA, PKDA, NoPE-GGQA] x 3` | `hybrid` |
-| `e` | Replace every dense FFN with one shared plus top-three-of-fifteen routed quarter-width SwiGLU experts | `experts` |
-| `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
-| `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
-| `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([architecture.md](architecture.md#letter-l-the-tied-depth-loop)) | `loop` |
-| `m` | One auxiliary transformer predicts the second token using the top state and the next token's shared embedding ([architecture.md](architecture.md#letter-m-two-token-prediction)) | `mtp` |
+| `f` | FBT token-gated latent payload transfer between columns | `feedback` |
+| `l` | Repeated application of the tied middle cells | `loop` |
 
-Every subset of `aerflm` builds; their parameter counts at the screen are in
-[scaling.md](scaling.md#the-screen).
+The model always uses `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, MHDB source
+routing, shared plus top-three-of-fifteen quarter-width experts, and a dense
+auxiliary two-token predictor. `l` alone uses embedding seeds and emits no
+payload. `f` emits a normalized top state with routed enrichment. Experts
+have no capacity limit or token dropping; intermediate width is divisible by
+four. The auxiliary block has dense RoPE GQA/SwiGLU and no recurrent state.
 
-Without `a`, each cell is `[RoPE-GGQA, RoPE-GGQA, RoPE-GGQA, NoPE-GGQA]`.
-This partial use of RoPE selects layers, with full-head Q/K rotation after
-per-head RMSNorm at theta 10,000. The fourth layer stays NoPE in every
-condition. The pattern holds at every scale and core iteration and adds no
-learned parameters or recipe knob.
-
-`aerflm` is the full built stack and `aerfm` its flat column. `arf` remains the
-dense reference for shared token budgets. `a` alone already
-has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
-emits no payload; `f` without `r` emits `payload_norm(h_top)`; `r` with `f`
-uses the fused seed as a routing source and enriches the payload with routed
-sources. `l` adds no parameters: it holds the first and last cells and runs
-the cells between them as one tied core, so every looped condition has its
-unlooped condition's counts. `e` changes only the channel mixers and their
-training regularizer. Its router reads the current token's normalized residual;
-there is no expert capacity limit or token dropping. Intermediate width must
-be divisible by four.
-`m` adds a separate dense transformer block and training objective after the
-column; the auxiliary block has no experts, routing, or depth loop. It leaves
-ordinary inference's computation and recurrent state unchanged.
-
-Pairing is built in. Two conditions on the same trunk letter initialize every
-parameter they share byte-identically for a given seed
-([architecture.md](architecture.md#precision-and-initialization)); parameters
-do not pair across `a`. Two conditions trained with the same seed and data seed therefore
-see the same rows in the same order with the same keyed feedback draws, and
-can be compared token by token. A looped condition pairs with its unlooped
-one the same way: the iteration draw is its own keyed sub-stream, so `arfl`
-and `arf` share every pass, prefix, and jitter draw.
-Adding `e` preserves all shared non-FFN parameters; its expert and router
-weights use their own deterministic stream and pair across `r`, `f`, and `l`.
-Adding `m` preserves every shared parameter and uses its own initialization
-stream for the auxiliary module.
-
-Initialization uses the single `BASE_NORMAL_INIT_STD = 0.02` constant in
-`delta_feedback_experiment/model.py` for the tied embedding and NAdam dense
-matrices. Gate/control matrices with fan-in `D` multiply that standard
-deviation by `sqrt(1536 / D)`; PKDA's fixed-head-width expansions and the
-embedding use it directly. NorMuonH matrices use `1 / sqrt(fan_in)`
-independently of the base constant.
-
-`l` needs whole cells and at least three of them. At one core iteration
-`arfl` is exactly `arf`: the same layers, parameters, banks, routes, losses,
-and gradients.
+Shared parameters initialize identically for a given seed. Data order and
+feedback pass, prefix, and jitter draws use keyed streams. The tied-core
+depth draw uses an independent stream, so `f` and `fl` can be compared on
+identical rows and feedback draws. At one core iteration, `fl` equals `f`,
+including routes, losses, and gradients. Tied depth requires at least three
+whole cells and adds no parameters.
 
 ## Geometry
 
-The screen, the bridge, and the flagship, with their parameter and cache
-accounting and their budgets, are in [scaling.md](scaling.md). The screen is width 768,
-twelve layers in three cells, and context 4,096; under `a` the trunk is
-`[PKDA, PKDA, PKDA, NoPE-GGQA] x 3`, and under `l` the first cell is
-the prelude, the last the coda, and the one between them the tied core, run
-`r` times per column.
+[Scaling](scaling.md) gives the screen, bridge, and flagship geometry,
+parameter counts, token budgets, and cache accounting. The screen has width
+768, twelve layers in three cells, and context 4,096. Under `l`, its first
+cell is the prelude, the middle is the tied core, and the last is the coda.
+[Architecture](architecture.md#precision-and-initialization) defines the
+shared initialization, numerical, and optimizer contracts.
 
 ## Data
 
@@ -143,8 +103,8 @@ uint32 store, so training rows, validation and resume are local reads.
 
 The held-out slice contains the stream's first documents up to 30M tokens;
 training follows until it holds the target less that cap, ending on a
-document boundary. A screen at 100 tokens per parameter requires 14.083B
-predicted tokens and a rounded 15B-token store. `--data-root ROOT` places the
+document boundary. A screen at 100 tokens per parameter requires about
+15.218B predicted tokens and a rounded 16B-token store. `--data-root ROOT` places the
 store at `ROOT/NAME` (default `data/dclm-100b`); `--out` overrides that path.
 On Jobe the root is `/data/delta`, so the subset store is
 `/data/delta/dclm-100b` and a full-source store is `/data/delta/dclm`.
@@ -184,7 +144,7 @@ addresses:
 first_row(n) = (n - 1) * batch_rows
 ```
 
-With `m`, the same row also supplies `seq_len - 1` auxiliary second-token
+The same row also supplies `seq_len - 1` auxiliary second-token
 targets. Cropping keeps every auxiliary target supervised and preserves the
 stored-row format, row order, and ordinary predicted-token budget.
 
@@ -196,8 +156,7 @@ same draws.
 `delta tokenize --scale S --tokens-per-param R` sizes a store for a planned
 run: that schedule's rows of `seq_len + 1` tokens plus the slice's cap,
 rounded up to the next billion. The default target is the screen at 400x,
-57B stored tokens with about 584M of headroom; the bridge's 400x rung is
-167B from the same stream.
+61B stored tokens; the bridge's 400x rung is 177B.
 
 ## Training
 
@@ -213,10 +172,10 @@ reports the pre-clip norm.
 
 ### Two-token prediction
 
-Add `m` to train one DeepSeek-style auxiliary prediction depth. On every
+Every run trains one DeepSeek-style auxiliary prediction depth. On every
 pass, it combines the trunk's top state at `t` with the shared embedding of
 the ground-truth next token and predicts the token at `t + 2`. Gradients flow
-through both inputs. [Architecture](architecture.md#letter-m-two-token-prediction)
+through both inputs. [Architecture](architecture.md#two-token-prediction)
 defines the causal block and exact target alignment.
 
 The auxiliary cross-entropy averages over `seq_len - 1` positions per row.
@@ -232,12 +191,12 @@ including MTP, z-loss, and expert balancing. On multiple-pass steps,
 
 The extra block and vocabulary loss run once per pass, regardless of the
 trunk's tied-core iteration count. They add training computation without
-changing the schedule's predicted-token count; equal steps between paired
-conditions with and without `m` are matched data, not matched compute.
+changing the schedule's predicted-token count. Include that work in compute
+accounting alongside trunk cell-tokens.
 
 ### Expert balancing
 
-With `e`, a sigmoid router selects the top three scores after adding each
+A sigmoid router selects the top three scores after adding each
 expert's persistent selection bias. The output mixture uses the original
 scores, normalized over the selected experts. Each physical bank accumulates
 assignment counts over the update's microbatches, feedback passes, and repeated
@@ -253,7 +212,7 @@ counts drive the separate bias controller. The loss is averaged over
 sequences, executed layer invocations, then feedback passes, and added with
 coefficient `1e-4`. Its weight therefore stays
 fixed as depth or pass count changes. Reported cross-entropy and perplexity
-exclude it. [Architecture](architecture.md#letter-e-shared-and-routed-experts)
+exclude it. [Architecture](architecture.md#shared-and-routed-experts)
 defines the exact equations and count normalization.
 
 ### Feedback passes
@@ -293,22 +252,13 @@ cell-tokens beside pass-tokens.
 
 ### Schedule
 
-All three parameter groups share one warmup-stable-cooldown multiplier. Warmup
-rises linearly over `round(warmup_frac * min(steps, steps at 25x))` updates:
-the fraction applies to the shorter of the run and the 25x recipe at its
-geometry, so warmup is fixed per scale, 134 steps at the screen, 397 at the
-bridge, 1,051 at the flagship, and a longer run does not spend more of it.
-Warmup guards the optimizer's first steps at the batch and learning rate,
-which do not depend on the horizon; cooldown does, and occupies
-`round(cooldown_frac * steps)` updates with multiplier `1 - sqrt(u)` for
-local progress `u`, reaching zero at the last step. Defaults are 0.02 and
-0.20. The default 6,716-step Jobe schedule:
-
-| Phase | Steps | Passes with `f` |
-|---|---:|---|
-| Warmup | 1–134 | one |
-| Stable heat | 135–5,373 | one through 5,037, then two or three |
-| Cooldown | 5,374–6,716 | two or three |
+All three parameter groups share one warmup-stable-cooldown multiplier.
+Warmup rises linearly over
+`round(warmup_frac * min(steps, steps at 25x))` updates. The default 2%
+warmup is therefore fixed per scale for runs at or above 25x: 145 updates
+at screen, 422 at bridge, and 1,094 at flagship. Cooldown occupies
+`round(cooldown_frac * steps)` updates, default 20%, with multiplier
+`1-sqrt(u)` at local progress `u`, reaching zero at the final step.
 
 The feedback boundary is `round(feedback_start * steps)`, independent of the
 learning-rate phases, and defaults to three quarters of the schedule. After
@@ -317,18 +267,19 @@ otherwise, which targets a 75% / 22% / 3% pass mixture over the run and 1.28
 expected pass-tokens per predicted token. Conditions without `f` use one pass
 throughout.
 
-The run is 3,521,118,208 predicted tokens: 25.0–25.2 per active non-embedding
-parameter with `a`, 29.0–29.3 without. The count is derived: 25 predicted
-tokens per active parameter of the `arf` stack at the screen, 140,827,944,
-rounded up to whole steps, and every condition at a scale shares it.
+The default screen schedule is 7,257 steps, or 3,804,758,016 predicted
+tokens. Its budget is derived from 25 tokens per training-active non-embedding
+parameter of `f`, including MTP, rounded up to whole steps. All conditions
+at a geometry share the same schedule; [scaling.md](scaling.md) gives the
+reference counts and larger budgets.
 
 ### Knobs
 
 | Flag | Default | What it changes |
 |---|---:|---|
-| `--condition` | `""` | letters from `aerflm` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
+| `--condition` | `f` | `f`, `l`, or `fl`; at least one recurrence must be selected |
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
-| `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the dense flat `arf` reference at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
+| `--tokens-per-param` | 25 | predicted tokens per training-active non-embedding parameter of flat `f`, including MTP; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
 | `--steps` | derived | schedule length, typed instead of derived |
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | 4,096, 128, 1 at every scale | predictions per row, rows per step, and the microbatch; the scale keeps 524,288 predictions per step, as does a retyped `--seq-len` alone |
@@ -338,16 +289,16 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--three-pass` | 0.12 | probability of three passes after the boundary; 1 makes every feedback step three-pass |
 | `--loop-iterations`, `--loop-max-iterations` | 4, 8 | `l`: mean and cap of the per-step core iteration draw; the mean is also the fixed evaluation and decode count |
 | `--jitter` | 0.02 | payload jitter half-width |
-| `--mtp-weight` | 0.3 | `m`: finite nonnegative weight for auxiliary cross-entropy and its z-loss, constant across the run |
+| `--mtp-weight` | 0.3 | finite nonnegative weight for auxiliary cross-entropy and its z-loss, constant across the run |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v29 snapshot |
+| `--resume` | | continues a tag from its latest v30 snapshot |
 
 ### Checkpoints and queue
 
-Checkpoint v29 is the only accepted contract for resume, evaluation, and
-forks. The condition records whether `m` is enabled, its state dictionary
-stores the auxiliary parameters, and the state-defining arguments include
+Checkpoint v30 is the only accepted contract for resume, evaluation, and
+forks. Conditions are `f`, `l`, or `fl`; every state dictionary includes the
+auxiliary prediction parameters, and state-defining arguments include
 `mtp_weight`. Snapshots bind to the
 current GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token
 store carry the same deterministic
@@ -357,7 +308,7 @@ as letters. A snapshot holds the model, both optimizer states, the fixed NorMuon
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,
 evaluation cadence, snapshot cadence, and evaluation-row count may change.
-Expert snapshots include the current per-bank `expert_bias` buffers; strict
+Snapshots include the current per-bank `expert_bias` buffers; strict
 state restoration requires them. Assignment counts are transient and are
 consumed before a step's snapshot is staged.
 
@@ -372,9 +323,8 @@ inherited. That step is the feedback boundary when the boundary moves and the
 cooldown boundary otherwise. Warmup is fixed per scale, so from that step on
 a continuation of any run at or above 25x is the longer run exactly, and a
 shorter source differs only in the warmup it inherited, which the `continue`
-record reports as `exact`; at the screen a 25x `arf` run
-continued to 50x restores step 5,037 and trains 8,394 new steps
-of a 13,431-step schedule. The queue stores arguments, not Git state; a
+record reports as `exact`. A screen 25x run continued to 50x restores step
+5,443 and trains 9,070 more steps of a 14,513-step schedule. The queue stores arguments, not Git state; a
 source change never stops an active child, and the worker refreshes before
 the next job.
 
@@ -386,7 +336,7 @@ Every evaluation point reports pass-1 held-out cross-entropy as `val` over
 the slice's first `--eval-rows` rows, 128 by default: 524,288 predictions at
 the screen, every `--eval-every` steps. Conditions with `f` also report `val_fused`, a
 second pass with plain-prefix length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
-Conditions with `m` also report `val_mtp` over the valid second-token targets;
+Every condition reports `val_mtp` over the valid second-token targets;
 with `f`, `val_mtp_fused` reads the second pass's top states. These auxiliary
 metrics exclude their training weight and z-loss. `val` and `val_fused` remain
 ordinary next-token losses over all `seq_len` positions.
@@ -403,23 +353,16 @@ implemented.
 
 ### Comparing conditions
 
-For validation loss `L`, a letter's gain is the paired difference between a
-condition with it and the same condition without it, and two letters interact
-by the difference of their gains. On the `a` trunk, with `G_x = L_a - L_x`:
+`L_f - L_fl` at equal steps is the loop's paired loss reduction at matched
+data. `L_l - L_fl` measures adding feedback to the loop. There is no
+no-recurrence control, so these three conditions do not identify a complete
+two-factor interaction. Keep evaluation mode, initialization seed, source,
+rows, and schedule aligned.
 
-```text
-I = G_arf - G_ar - G_af = L_ar + L_af - L_arf - L_a
-```
-
-Positive `I` is superadditive loss reduction. Computed on paired checkpoints
-by mode; writing `plain` for the empty condition, `L_plain - L_a` is the
-whole-trunk contrast. Report parameters, predicted tokens, pass-tokens, and
-cell-tokens with every number; a matched-compute view compares at equal
-cumulative cell-tokens for the loop, since a loop pass is deeper than a flat
-one. MTP adds a block and a vocabulary-loss call outside those trunk
-cell-tokens, so a comparison involving `m` needs measured device time or
-accounting that includes the auxiliary computation.
-`L_arf - L_arfl` at equal steps is the loop's matched-data contrast.
+Report parameters, predicted tokens, pass-tokens, and cell-tokens with every
+comparison. Equal data does not imply equal compute: repeated cells and
+feedback passes add work, and each pass also executes MTP and its vocabulary
+loss. Measured device time captures those costs and routing overhead.
 
 ### Downstream tasks
 

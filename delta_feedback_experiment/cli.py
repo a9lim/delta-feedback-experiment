@@ -4,7 +4,7 @@ Model-lazy: subcommands import what they need, so ``delta --help`` costs
 nothing and the spool worker drives phases as separate processes.
 Durable orchestration (queue, worker, status/watch/stop/clear) is the
 shared ``transformer_experiments.spool``; this module owns only the
-pipeline: an offline probe, then the training run.
+training pipeline. The compact execution probe is an explicit operator check.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ delta — delta-feedback experiment operator
   delta train TAG [FLAGS]  train one condition directly (delta train --help)
   delta tokenize [FLAGS]   build a source token stream prefix (once)
   delta verify DIR         check a token store against its meta and sidecars
-  delta probe              run the offline invariant suite
+  delta probe              run the compact execution smoke test
   delta queue TAG [FLAGS]  append a training job to the detached spool
   delta queue FILE         append jobs from a file (TAG FLAGS per line)
   delta queue TAG --continue SRC [FLAGS]
@@ -57,12 +57,6 @@ PIPELINE = spool.Pipeline(
     slots=("train",),
     validate=_validate_job,
     phases=(
-        spool.Phase(
-            name="probe",
-            module="delta_feedback_experiment.probe",
-            argv=lambda job: [],
-            log="{tag}.probe.log",
-        ),
         spool.Phase(
             name="train run",
             module="delta_feedback_experiment.train",

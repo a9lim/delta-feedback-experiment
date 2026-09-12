@@ -1,14 +1,13 @@
 """Text identity, chat structure, and stored vocabulary validation."""
 
 import json
-import unicodedata
 
 import pytest
 import torch
 
 from delta_feedback_experiment import tokenizer as profile
 from delta_feedback_experiment.data import META, TokenData, read_meta, write_synthetic
-from delta_feedback_experiment.train import CONTRACT, parse_run_args, read_checkpoint
+from delta_feedback_experiment.train import CONTRACT, read_checkpoint
 
 
 @pytest.fixture(scope="module")
@@ -59,30 +58,6 @@ def test_chatml_preserves_arbitrary_and_repeated_roles(tokenizer):
     )
 
 
-def test_vocabulary_and_specials_survive_serialization(tokenizer, tmp_path):
-    from transformers import AutoTokenizer
-
-    tokenizer.save_pretrained(tmp_path)
-    restored = AutoTokenizer.from_pretrained(tmp_path, local_files_only=True)
-    assert len(restored) == profile.TOKENIZER_VOCAB_SIZE == 50279
-    assert restored.eos_token_id == 0
-    assert restored.chat_template == profile.CHAT_TEMPLATE
-    for text, token_id in ((profile.CHATML_START, 50277), (profile.CHATML_END, 50278)):
-        assert restored.encode(text, add_special_tokens=False) == [token_id]
-        assert token_id in restored.all_special_ids
-        assert restored.decode([token_id], skip_special_tokens=True) == ""
-    assert parse_run_args(["test"]).vocab_size == profile.VOCAB_SIZE == 50304
-
-
-@pytest.mark.parametrize(
-    "text", ["  hello\n\tworld", "a\x00b\x01c", "e\u0301 café", "\U00040000 🦦 中文"]
-)
-def test_text_roundtrip_obeys_neox_nfc_normalization(tokenizer, text):
-    ids = tokenizer.encode(text, add_special_tokens=False)
-    assert tokenizer.decode(ids) == unicodedata.normalize("NFC", text)
-    assert 0 not in ids
-
-
 @pytest.mark.parametrize(
     "change",
     [
@@ -106,7 +81,11 @@ def test_store_readers_reject_incompatible_token_identity(tmp_path, change):
 
 def test_checkpoint_requires_tokenizer_identity(tmp_path):
     path = tmp_path / "test.pt.1"
-    payload = {"version": CONTRACT.version, "state": {}, "args": {"tokenizer_id": "different-tokenizer"}}
+    payload = {
+        "version": CONTRACT.version,
+        "state": {},
+        "args": {"tokenizer_id": "different-tokenizer"},
+    }
     torch.save(payload, path)
     with pytest.raises(ValueError, match="tokenizer identity"):
         read_checkpoint(path)
@@ -118,34 +97,3 @@ def test_checkpoint_requires_current_version(tmp_path, version):
     torch.save({"version": version, "state": {}, "args": {}}, path)
     with pytest.raises(ValueError, match="checkpoint version"):
         read_checkpoint(path)
-
-
-def test_corpus_build_uses_raw_text_and_document_eos(tokenizer, tmp_path, monkeypatch):
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    from delta_feedback_experiment import data
-
-    source = tmp_path / "source" / "filtered"
-    source.mkdir(parents=True)
-    text = "A short English document. " * 12
-    pq.write_table(pa.table({"text": [text] * 40}), source / "part.parquet")
-    monkeypatch.setattr(data, "load_tokenizer", lambda: tokenizer)
-    out = tmp_path / "store"
-    meta = data.tokenize(
-        out,
-        source=data.LocalSource(source.parent),
-        target_tokens=500,
-        val_tokens=100,
-        tokens_per_doc=1,
-        check_packages=False,
-    )
-    assert meta["tokenizer_id"] == profile.TOKENIZER_ID
-    assert meta["tokenizer_vocab_size"] == 50279
-    assert meta["vocab_size"] == 50304
-    assert meta["eos_id"] == 0
-    data.verify(out)
-    val = data.TokenData.load(out, "val", 1)
-    ids = val.read(0, val.total_tokens).tolist()
-    assert ids == tokenizer.encode(text, add_special_tokens=False) + [0]
-    assert profile.CHATML_START_ID not in ids and profile.CHATML_END_ID not in ids

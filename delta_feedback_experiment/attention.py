@@ -47,8 +47,7 @@ def rotary_qk(query, key, offset: int = 0):
 
 
 def _causal_attention(query, key, value):
-    # Flash accepts half precision; the probe also executes a small FP32
-    # reference model, whose dense math path must remain explicit.
+    # Flash accepts half precision; FP32 analysis uses the explicit math path.
     backend = (
         SDPBackend.FLASH_ATTENTION
         if query.dtype in (torch.float16, torch.bfloat16)

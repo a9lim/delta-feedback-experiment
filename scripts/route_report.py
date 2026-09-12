@@ -168,8 +168,6 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     cfg = model.cfg
-    if not cfg.block_routing:
-        raise SystemExit("the route report needs a snapshot of a condition with r")
     layers = cfg.layers
     tag = saved["tag"]
     out_dir = args.out_dir or Path("figures") / f"route-{tag}"

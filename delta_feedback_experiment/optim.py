@@ -325,7 +325,7 @@ def build_optimizers(
     normuonh = NorMuonH(
         matrices,
         lr=lr_normuonh,
-        max_bucket_elements=32 * 1024 * 1024 if model.cfg.experts else None,
+        max_bucket_elements=32 * 1024 * 1024,
     )
     lr_width = lr_nadam * model.cfg.mup_ratio
     use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda

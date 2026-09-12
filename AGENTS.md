@@ -29,7 +29,7 @@ Generated runs, logs, figures, token stores, and fetched papers are untracked.
 Preserve the model's causal and numerical contracts: differentiable feedback
 and core iterations, telescoping block deltas, paired initialization and keyed
 randomness, FP32 accumulated gradients, and exact resume of current snapshots.
-Checkpoint v29 and the tokenizer identity define the current stored format.
+Checkpoint v30 and the tokenizer identity define the current stored format.
 Use the existing readers and CLI for checkpoints and run lifecycle actions.
 
 ## Runtime
@@ -41,9 +41,10 @@ constraints own Jobe's PyTorch/CUDA installation.
 
 Before touching Jobe, inspect `delta status`, the active log, and GPU ownership.
 Keep GPU jobs serial and preserve active data builds. Run focused checks while
-editing and `delta probe` on the final candidate for cross-cutting changes;
-hardware-specific claims need the CUDA path. Keep cyclic Python garbage
-collection outside train/eval graph capture.
+editing and the compact `delta probe` on the final candidate for cross-cutting
+changes; hardware-specific claims need the CUDA path. The queue starts
+training directly. Keep cyclic Python garbage collection outside train/eval
+graph capture.
 
 The queue stores arguments and refreshes the checkout before its next job.
 Source edits do not stop the active child. Distributed training is not

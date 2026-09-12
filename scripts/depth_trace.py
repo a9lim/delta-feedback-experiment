@@ -87,11 +87,7 @@ def main() -> None:
         mode: {key: [value / counted for value in values] for key, values in stats.items()}
         for mode, stats in sums.items()
     }
-    routes = (
-        core_route_mass(model, data.batch(0, min(args.micro, args.rows), device), cap)
-        if cfg.block_routing
-        else {}
-    )
+    routes = core_route_mass(model, data.batch(0, min(args.micro, args.rows), device), cap)
 
     record = {
         "snapshot": str(args.snapshot),

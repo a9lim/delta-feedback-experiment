@@ -230,10 +230,9 @@ def main() -> None:
                 "htop_d1": out_d1.h_top,
                 "e": e_d,
             }
-            if cfg.block_routing:
-                payload_sources = [out_d1.sources[0], *out_d1.sources[1:]]
-                routed, _ = fb.payload_router(payload_sources, False)
-                coll["routed_d1"] = routed
+            payload_sources = [out_d1.sources[0], *out_d1.sources[1:]]
+            routed, _ = fb.payload_router(payload_sources, False)
+            coll["routed_d1"] = routed
             for k, table in srcs.items():
                 for name in common:
                     coll[f"{name}_{k}"] = table[name]

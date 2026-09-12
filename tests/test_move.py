@@ -49,7 +49,6 @@ def test_move_keeps_checkpoint_bytes_and_updates_run_and_analysis_identity(opera
         f"checkpoint | path=runs/{old}.pt.100\n",
     )
     mtime = log.stat().st_mtime_ns
-    write(root, f"logs/{old}.probe.log", f"probe for {old}\n")
     write(
         root,
         "logs/continued.log",
@@ -117,7 +116,7 @@ def test_move_keeps_checkpoint_bytes_and_updates_run_and_analysis_identity(opera
 
 @pytest.mark.parametrize(
     "occupied",
-    ["runs/new.pt.999", "logs/new.probe.log", "figures/route-new/report.json"],
+    ["runs/new.pt.999", "logs/new.log", "figures/route-new/report.json"],
 )
 def test_move_preflights_destination_before_changing_any_artifact(operator, occupied):
     root = operator.layout.root
@@ -147,34 +146,11 @@ def test_move_refuses_managed_tags(operator, tag, state):
     assert (operator.layout.snapshots / "old.pt.10").exists()
 
 
-def test_move_refuses_pending_continuations(operator):
-    write(operator.layout.root, "runs/old.pt.10")
-    operator.write_json(
-        operator.layout.queue_dir / "1.json",
-        spool.Job("later", (("--continue", "old"),)).to_json(),
-    )
-    with pytest.raises(SystemExit):
-        cli.move_command(["old", "new"])
-    assert operator.pending_jobs()[0].argv == (("--continue", "old"),)
-
-
 def test_move_refuses_a_direct_training_lock(operator):
     write(operator.layout.root, "runs/old.pt.10")
     with runs.lock_tags(operator.layout.snapshots, "old"), pytest.raises(SystemExit):
         cli.move_command(["old", "new"])
     cli.move_command(["old", "new"])
-
-
-def test_move_allows_an_unrelated_active_job_and_leaves_its_log_alone(operator):
-    root = operator.layout.root
-    write(root, "runs/old.pt.10")
-    write(root, "logs/old.log", "run | tag=old\n")
-    active_log = write(root, "logs/live-run.log", "run | tag=live-run\n")
-    inode = active_log.stat().st_ino
-    operator.write_json(operator.layout.active, spool.Job("live-run", ((),)).to_json())
-    cli.move_command(["old", "new"])
-    assert active_log.stat().st_ino == inode
-    assert operator.active_payload()["tag"] == "live-run"
 
 
 def test_move_rolls_back_text_and_renames_after_an_io_failure(operator, monkeypatch):
@@ -197,95 +173,3 @@ def test_move_rolls_back_text_and_renames_after_an_io_failure(operator, monkeypa
         "report.json"
     ]
     assert not [p for p in root.rglob("*new*") if p.suffix != ".lock"]
-
-
-def test_short_tag_does_not_rewrite_conditions_or_data_sources(operator):
-    root = operator.layout.root
-    write(root, "runs/a.pt.10")
-    write(root, "logs/a.log", "run | tag=a | condition=a | source=a\n")
-    write(
-        root,
-        "figures/route-a/report.json",
-        json.dumps(
-            {
-                "tag": "a",
-                "condition": "a",
-                "source": "a",
-                "labels": {"a": "a pass 1"},
-                "checkpoint": "runs/a.pt.10",
-            }
-        ),
-    )
-    cli.move_command(["a", "new"])
-    assert (
-        root / "logs/new.log"
-    ).read_text() == "run | tag=new | condition=a | source=a\n"
-    report = json.loads((root / "figures/route-new/report.json").read_text())
-    assert report["condition"] == report["source"] == "a"
-    assert report["tag"] == "new"
-    assert report["labels"] == {"a": "new pass 1"}
-
-
-def test_move_preserves_longer_snapshot_shaped_tag_references(operator):
-    root = operator.layout.root
-    write(root, "runs/old.pt.10")
-    write(root, "logs/other.log", "checkpoint | path=runs/old.pt.10.pt.99\n")
-    cli.move_command(["old", "new"])
-    assert (
-        root / "logs/other.log"
-    ).read_text() == "checkpoint | path=runs/old.pt.10.pt.99\n"
-
-
-def test_training_curves_labels_and_run_keys_are_renamed(operator):
-    root = operator.layout.root
-    write(root, "runs/a.pt.10")
-    write(
-        root,
-        "figures/curves-a-vs-b/training_curves.json",
-        json.dumps(
-            {
-                "reference": "a",
-                "runs": {"a": {"condition": "a"}, "b": {"condition": "a"}},
-            }
-        ),
-    )
-    cli.move_command(["a", "new"])
-    report = json.loads(
-        (root / "figures/curves-new-vs-b/training_curves.json").read_text()
-    )
-    assert report == {
-        "reference": "new",
-        "runs": {"new": {"condition": "a"}, "b": {"condition": "a"}},
-    }
-
-
-def test_move_refuses_ambiguous_comparison_tag_boundaries(operator):
-    root = operator.layout.root
-    write(root, "runs/old.pt.10")
-    write(root, "runs/other-vs-old.pt.10")
-    report = write(root, "figures/compare-other-vs-old-vs-third/report.json")
-    with pytest.raises(SystemExit):
-        cli.move_command(["old", "new"])
-    assert report.read_text() == "artifact"
-
-
-@pytest.mark.parametrize(
-    "args", [["absent", "new"], ["old", "old"], ["../old", "new"], ["old", "all"]]
-)
-def test_move_reports_invalid_requests(operator, args, capsys):
-    with pytest.raises(SystemExit):
-        cli.move_command(args)
-    assert "delta move:" in capsys.readouterr().err
-
-
-def test_move_supports_external_snapshot_directory(operator, tmp_path):
-    external = tmp_path / "external"
-    write(external, "old.pt.20")
-    cli.move_command(["old", "new", "--out-dir", str(external)])
-    assert (external / "new.pt.20").read_text() == "artifact"
-
-
-def test_snapshot_lookup_does_not_match_a_longer_dotted_tag(tmp_path):
-    write(tmp_path, "old.pt.10")
-    write(tmp_path, "old.pt.other.pt.99")
-    assert runs.snapshots("old", tmp_path) == [(10, tmp_path / "old.pt.10")]

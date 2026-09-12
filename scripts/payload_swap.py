@@ -47,8 +47,8 @@ def main() -> None:
     model, saved = analysis.load_checkpoint(args.snapshot, args.device)
     device = next(model.parameters()).device
     cfg = model.cfg
-    if not cfg.feedback or not cfg.block_routing:
-        raise SystemExit("the payload sweep needs a routed payload: a condition with r and f")
+    if not cfg.feedback:
+        raise SystemExit("the payload sweep needs a condition with f")
     if args.head is not None and not 0 <= args.head < cfg.kv_heads:
         raise SystemExit(
             f"--head must be in [0, {cfg.kv_heads - 1}], got {args.head}"

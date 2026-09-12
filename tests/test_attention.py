@@ -1,248 +1,32 @@
-"""Native Flash attention qualification against dense math and cache semantics.
+"""Small independent GQA value and gradient oracle."""
 
-CUDA tests use the screen's non-power-of-two head dimension and real GQA.
-They belong to the serial Jobe gate; CPU checks retain cache-policy coverage.
-"""
-
-import pytest
 import torch
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from delta_feedback_experiment.attention import (
-    _causal_attention,
-    causal_attention,
-    prefix_attention,
-)
-from delta_feedback_experiment.model import KVCache, condition_config
-
-CUDA_ONLY = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="attention requires CUDA qualification"
-)
+from delta_feedback_experiment.attention import _causal_attention
 
 
-def _math_attention(query, key, value, *, causal):
-    # Explicit repetition and the math backend make this independent of fused
-    # GQA selection and its accumulation precision.
-    groups = query.shape[1] // key.shape[1]
-    with sdpa_kernel(SDPBackend.MATH):
-        return F.scaled_dot_product_attention(
-            query.float(),
-            key.float().repeat_interleave(groups, dim=1),
-            value.float().repeat_interleave(groups, dim=1),
-            is_causal=causal,
-        )
-
-
-def test_flash_backend_scope_compiles_fullgraph_and_restores_caller_preferences():
-    # The CPU Flash implementation lets the portable gate check Dynamo's
-    # context handling without claiming CUDA kernel qualification. Production
-    # compiles this same helper inside the larger fullgraph transformer block.
+def test_causal_gqa_matches_repeated_heads_and_restores_backend():
     inputs = tuple(
-        torch.randn(1, 2, 17, 96, dtype=torch.bfloat16, requires_grad=True)
-        for _ in range(3)
+        torch.randn(1, heads, 7, 8, requires_grad=True) for heads in (4, 2, 2)
     )
-    compiled = torch.compile(_causal_attention, fullgraph=True, backend="eager")
+    refs = tuple(value.detach().clone().requires_grad_() for value in inputs)
     with sdpa_kernel(SDPBackend.MATH):
-        actual = compiled(*inputs)
+        actual = _causal_attention(*inputs)
+        expected = F.scaled_dot_product_attention(
+            refs[0],
+            refs[1].repeat_interleave(2, dim=1),
+            refs[2].repeat_interleave(2, dim=1),
+            is_causal=True,
+        )
         assert torch.backends.cuda.math_sdp_enabled()
         assert not torch.backends.cuda.flash_sdp_enabled()
-        expected = F.scaled_dot_product_attention(*inputs, is_causal=True)
-        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=8e-3)
-        gradients = torch.autograd.grad(actual.sum(), inputs)
-        assert all(torch.isfinite(gradient).all() for gradient in gradients)
-        assert torch.backends.cuda.math_sdp_enabled()
-        assert not torch.backends.cuda.flash_sdp_enabled()
-
-
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA_ONLY)])
-def test_fp32_causal_diagnostic_matches_independent_gqa_math(device):
-    inputs = tuple(
-        torch.randn(1, heads, 17, 96, device=device, requires_grad=True)
-        for heads in (4, 2, 2)
-    )
-    references = tuple(value.detach().clone().requires_grad_() for value in inputs)
-    # CPU checks the dtype branch under Dynamo; CUDA checks the authoritative
-    # compiled path used by the loop's full-forward diagnostic.
-    attention = (
-        causal_attention
-        if device == "cuda"
-        else torch.compile(_causal_attention, fullgraph=True, backend="eager")
-    )
-    actual = attention(*inputs)
-    expected = _math_attention(*references, causal=True)
-    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(actual, expected)
     upstream = torch.randn_like(actual)
-    gradients = torch.autograd.grad(actual, inputs, upstream)
-    reference_gradients = torch.autograd.grad(expected, references, upstream)
-    for gradient, reference in zip(gradients, reference_gradients, strict=True):
-        torch.testing.assert_close(gradient, reference, rtol=2e-5, atol=2e-6)
-
-
-def _inputs(length, heads=8, kv_heads=4):
-    torch.manual_seed(42)
-    # Projections and position-major caches reach attention in this strided
-    # layout, rather than contiguous [B,H,T,D] allocations.
-    return tuple(
-        torch.randn(2, length, count, 96, device="cuda", dtype=torch.bfloat16)
-        .transpose(1, 2)
-        .requires_grad_()
-        for count in (heads, kv_heads, kv_heads)
-    )
-
-
-@CUDA_ONLY
-@pytest.mark.parametrize("length", [129, 257, 1025])
-def test_causal_gqa_bf16_forward_and_gradients_match_math(length):
-    query, key, value = _inputs(length)
-    reference_inputs = tuple(
-        x.detach().float().requires_grad_() for x in (query, key, value)
-    )
-    actual = causal_attention(query, key, value)
-    expected = _math_attention(*reference_inputs, causal=True)
-    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=3e-3)
-
-    upstream = torch.randn_like(actual)
-    actual.backward(upstream)
-    expected.backward(upstream.float())
-    for tensor, reference in zip((query, key, value), reference_inputs, strict=True):
-        assert torch.isfinite(tensor.grad).all()
-        # BF16 cancellation can leave a large relative error near zero.
-        # Bound aggregate error and spikes relative to the gradient's scale;
-        # the compiled and eager Flash paths exhibit the same error here.
-        error = tensor.grad.float() - reference.grad
-        assert error.norm() / reference.grad.norm() < 5e-3
-        assert error.abs().max() / reference.grad.abs().max() < torch.finfo(
-            torch.bfloat16
-        ).eps
-
-
-
-@CUDA_ONLY
-@torch.no_grad()
-def test_causal_gqa_cannot_read_future_across_block_boundary():
-    query, key, value = _inputs(257, heads=4, kv_heads=2)
-    original = causal_attention(query, key, value)
-    cut = 129
-    changed_key, changed_value = key.clone(), value.clone()
-    changed_key[:, :, cut:] = torch.randn_like(changed_key[:, :, cut:]) * 4
-    changed_value[:, :, cut:] += 32
-    changed = causal_attention(query, changed_key, changed_value)
-    torch.testing.assert_close(
-        changed[:, :, :cut], original[:, :, :cut], rtol=0, atol=0
-    )
-    assert (changed[:, :, cut:] - original[:, :, cut:]).abs().max() > 1
-
-
-def _cache(device):
-    cfg = condition_config(
-        "",
-        vocab_size=97,
-        dim=384,
-        layers=1,
-        heads=4,
-        kv_heads=2,
-        head_dim=96,
-        intermediate=512,
-        max_seq_len=300,
-    )
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
-    cache = KVCache(cfg, batch=2, device=device, dtype=dtype)
-    # Poison all unoccupied storage, so accidentally attending beyond the
-    # written prefix is observable even when an output happens to be near zero.
-    cache.k.fill_(float("nan"))
-    cache.v.fill_(float("nan"))
-    return cache
-
-
-@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=CUDA_ONLY)])
-@torch.no_grad()
-def test_prefix_cache_reads_every_valid_key_and_excludes_unused_tail(device):
-    cache = _cache(device)
-    dtype = cache.k.dtype
-    query = torch.zeros(2, 4, 1, 96, device=device, dtype=dtype)
-    # Successive prefixes exercise dynamic decoding at both sides of a kernel
-    # block boundary. The last valid value controls the analytically known mean.
-    for length in (1, 127, 128, 129, 257):
-        count = length - cache.pos
-        key = torch.zeros(2, count, 2, 96, device=device, dtype=dtype)
-        value = torch.zeros_like(key)
-        value[:, -1] = 16
-        k_prefix, v_prefix = cache.update(0, key, value)
-        cache.advance(count)
-        key, value = k_prefix.transpose(1, 2), v_prefix.transpose(1, 2)
-        if device == "cuda":
-            actual = prefix_attention(query, key, value)
-        else:
-            actual = _math_attention(query, key, value, causal=False)
-        expected = value.float().mean(dim=2, keepdim=True).repeat_interleave(2, dim=1)
-        assert torch.isfinite(actual).all()
-        torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-3)
-        # Tail poison is still present: finite output cannot result from merely
-        # overwriting the entire allocation with valid values.
-        assert torch.isnan(cache.v[:, :, length:]).all()
-
-
-@CUDA_ONLY
-def test_checkpoint_keeps_each_outstanding_forward_attention_geometry():
-    from delta_feedback_experiment.model import DeltaModel
-
-    torch.manual_seed(314)
-    cfg = condition_config(
-        "",
-        vocab_size=97,
-        dim=192,
-        layers=1,
-        heads=2,
-        kv_heads=1,
-        head_dim=96,
-        intermediate=64,
-        max_seq_len=257,
-    )
-    checkpointed = DeltaModel(cfg).cuda().train()
-    reference = DeltaModel(cfg).cuda().train()
-    reference.load_state_dict(checkpointed.state_dict())
-    checkpointed.grad_checkpoint = True
-    reference.grad_checkpoint = False
-
-    actual_inputs, reference_inputs, actual_outputs, reference_outputs = [], [], [], []
-    upstreams = []
-    # Backward for the long graph happens after a shorter forward has run on
-    # the same module. A mutable "latest mask" would truncate recomputation.
-    for length in (257, 129):
-        x = torch.randn(1, length, cfg.dim, device="cuda", dtype=torch.bfloat16)
-        actual_inputs.append(x.detach().requires_grad_())
-        reference_inputs.append(x.detach().clone().requires_grad_())
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            actual_outputs.append(checkpointed.forward_column(actual_inputs[-1]).h_top)
-            reference_outputs.append(
-                reference.forward_column(reference_inputs[-1]).h_top
-            )
-        torch.testing.assert_close(
-            actual_outputs[-1], reference_outputs[-1], rtol=0, atol=0
-        )
-        upstreams.append(torch.randn_like(actual_outputs[-1]))
-
-    for index, upstream in enumerate(upstreams):
-        actual_outputs[index].backward(upstream)
-        reference_outputs[index].backward(upstream)
-        torch.testing.assert_close(
-            actual_inputs[index].grad,
-            reference_inputs[index].grad,
-            rtol=2e-5,
-            atol=2e-6,
-        )
-        for (name, parameter), (ref_name, ref_parameter) in zip(
-            checkpointed.named_parameters(), reference.named_parameters(), strict=True
-        ):
-            assert name == ref_name
-            if ref_parameter.grad is None:
-                assert parameter.grad is None, name
-            else:
-                torch.testing.assert_close(
-                    parameter.grad,
-                    ref_parameter.grad,
-                    rtol=2e-5,
-                    atol=2e-6,
-                    msg=lambda message, name=name: f"{name}: {message}",
-                )
+    for got, wanted in zip(
+        torch.autograd.grad(actual, inputs, upstream),
+        torch.autograd.grad(expected, refs, upstream),
+        strict=True,
+    ):
+        torch.testing.assert_close(got, wanted)

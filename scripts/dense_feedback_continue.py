@@ -48,8 +48,7 @@ def evaluate(model, data_val, rows, micro, device, *, mtp_weight):
     was_training = model.training
     model.eval()
     sums = {"val": 0.0, "val_fused": 0.0}
-    if model.cfg.mtp:
-        sums.update(val_mtp=0.0, val_mtp_fused=0.0)
+    sums.update(val_mtp=0.0, val_mtp_fused=0.0)
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
         prefix = torch.ones((1, batch.shape[0]), dtype=torch.long, device=device)
@@ -58,9 +57,8 @@ def evaluate(model, data_val, rows, micro, device, *, mtp_weight):
             result = multipass_loss(model, batch, outs, mtp_weight=mtp_weight)
         sums["val"] += result.ntp[0].item() * batch.shape[0]
         sums["val_fused"] += result.ntp[1].item() * batch.shape[0]
-        if model.cfg.mtp:
-            sums["val_mtp"] += result.mtp[0].item() * batch.shape[0]
-            sums["val_mtp_fused"] += result.mtp[1].item() * batch.shape[0]
+        sums["val_mtp"] += result.mtp[0].item() * batch.shape[0]
+        sums["val_mtp_fused"] += result.mtp[1].item() * batch.shape[0]
     model.train(was_training)
     return {name: value / rows for name, value in sums.items()}
 
@@ -129,6 +127,7 @@ def main() -> None:
             for group in optimizer.param_groups:
                 group["lr"] = group["stable_lr"] * scale
         step_loss = step_ntp = step_mtp = pass1 = 0.0
+        expert_counts = None
         t0 = time.time()
         for micro in range(micros):
             first_row = (step - 1) * saved["batch_rows"] + micro * micro_rows
@@ -141,24 +140,26 @@ def main() -> None:
                 loss_result = multipass_loss(model, rows, outs, z_coef=saved["zloss"], mtp_weight=saved["mtp_weight"])
                 loss, losses = loss_result.total, loss_result.ntp
             (loss / micros).backward()
+            counts = torch.stack([out.expert_counts for out in outs]).sum(dim=0)
+            expert_counts = counts if expert_counts is None else expert_counts + counts
             step_loss += loss.item() / micros
             step_ntp += combine_pass_losses(loss_result.ntp).item() / micros
-            if cfg.mtp:
-                step_mtp += combine_pass_losses(loss_result.mtp).item() / micros
+            step_mtp += combine_pass_losses(loss_result.mtp).item() / micros
             pass1 += losses[0].item() / micros
         gnorm = clip_gradients([p for p in model.parameters() if p.requires_grad])
         for optimizer in optimizers:
             optimizer.step()
+        if args.trainable == "all":
+            model.update_expert_bias(expert_counts)
         model.refresh_shadows()
         model.zero_grad(set_to_none=True)
         feedback = step_ntp - pass1 if args.passes > 1 else None
         rec = {"step": i, "loss": step_loss, "ntp": step_ntp, "pass1": pass1, "feedback": feedback, "gnorm": gnorm,
                "lr_scale": scale, "sec": time.time() - t0}
-        if cfg.mtp:
-            rec["mtp"] = step_mtp
+        rec["mtp"] = step_mtp
         trace["steps"].append(rec)
         feedback_text = f"{feedback:.4f}" if feedback is not None else "unavailable"
-        mtp_text = f"mtp={step_mtp:.4f} " if cfg.mtp else ""
+        mtp_text = f"mtp={step_mtp:.4f} "
         print(f"step {i:4d} loss={step_loss:.4f} ntp={step_ntp:.4f} pass1={pass1:.4f} fb={feedback_text} {mtp_text}gnorm={gnorm:.3f} "
               f"lr={scale:.3f}x {rec['sec']:.1f}s", flush=True)
         if i % args.eval_every == 0 or i == args.steps:
