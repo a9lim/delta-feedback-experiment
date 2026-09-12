@@ -27,6 +27,25 @@ def validate_expert_geometry(intermediate: int, routed: int, selected: int) -> N
         raise ValueError("experts must satisfy 1 <= experts_per_token <= num_routed_experts")
 
 
+class _DispatchGather(torch.autograd.Function):
+    """Rows of the dispatched matrix in token order, through a known permutation.
+
+    ``rows[inverse]`` gathers each token's slot rows; because ``assignments``
+    is the inverse permutation, the adjoint is the gather through it, so
+    neither direction scatters or adds atomically.
+    """
+
+    @staticmethod
+    def forward(ctx, rows: Tensor, inverse: Tensor, assignments: Tensor) -> Tensor:
+        ctx.save_for_backward(assignments)
+        return rows.index_select(0, inverse)
+
+    @staticmethod
+    def backward(ctx, gradient: Tensor) -> tuple[Tensor, None, None]:
+        (assignments,) = ctx.saved_tensors
+        return gradient.index_select(0, assignments), None, None
+
+
 class Expert(nn.Module):
     """A full-residual-width SwiGLU with its own matrix optimizer state."""
 
@@ -108,13 +127,20 @@ class MixtureOfExperts(nn.Module):
         probabilities = affinities / affinities.sum(dim=-1, keepdim=True).clamp_min(
             torch.finfo(router_dtype).tiny
         )
-        selection = F.one_hot(selected, self.num_routed_experts).sum(dim=1)
+        # Membership by comparison rather than one_hot: the compiled graph then
+        # carries no index-range assertions, and the same [pairs, experts]
+        # matrix drives the counts and the dispatch order below.
+        experts = torch.arange(self.num_routed_experts, device=flat.device)
+        flat_selected = selected.reshape(-1)
+        membership = (flat_selected.unsqueeze(1) == experts).to(torch.int32)
+        counts = membership.sum(dim=0, dtype=torch.int64)
         # The weak auxiliary controls individual sequences. The step-level
         # controller receives detached counts and never runs in this forward.
         # V3's sequence auxiliary uses affinity-only choices, independently
         # of the bias-controlled dispatch decisions used by the controller.
-        auxiliary_selection = F.one_hot(
-            affinities.topk(self.experts_per_token, dim=-1).indices, self.num_routed_experts
+        auxiliary_selection = (
+            affinities.topk(self.experts_per_token, dim=-1).indices.unsqueeze(-1)
+            == experts
         ).sum(dim=1)
         length = x.shape[-2] if x.ndim >= 2 else 1
         sequence_probabilities = probabilities.reshape(-1, length, self.num_routed_experts)
@@ -126,14 +152,26 @@ class MixtureOfExperts(nn.Module):
         auxiliary = self.num_routed_experts * (
             sequence_probabilities.mean(dim=1) * fractions
         ).sum(dim=-1).mean()
-        counts = selection.sum(dim=0)
 
         if flat.is_cuda:
             offsets = F.pad(counts.cumsum(dim=0), (1, 0))
-            _, assignments = selected.flatten().sort(stable=True)
+            # Counting sort into expert-major dispatch order, stable in
+            # (token, slot): ``inverse`` is each pair's dispatch row and
+            # ``assignments`` the pair at each dispatch row. Prefix counts
+            # replace a general sort and make the order deterministic.
+            ranks = (
+                (membership.cumsum(dim=0) - membership)
+                .gather(1, flat_selected.unsqueeze(1))
+                .squeeze(1)
+            )
+            inverse = offsets[flat_selected] + ranks
+            assignments = torch.empty_like(inverse).scatter_(
+                0, inverse, torch.arange(inverse.numel(), device=flat.device)
+            )
             routed = sparse_experts(
                 flat,
                 assignments,
+                inverse,
                 offsets,
                 tuple(expert.gate_up_proj.weight for expert in self.experts),
                 tuple(expert.down_proj.weight for expert in self.experts),
@@ -142,10 +180,13 @@ class MixtureOfExperts(nn.Module):
                 self._gate_up_shadow,
                 self._down_shadow,
             )
-            ordered = torch.empty_like(routed).index_copy(0, assignments, routed)
+            # Gather each token's slot rows and mix them in FP32: one fused
+            # read of the dispatched rows instead of a scatter and a second pass.
             mixed = (
                 (
-                    ordered.view(-1, self.experts_per_token, self.dim).to(router_dtype)
+                    _DispatchGather.apply(routed, inverse, assignments)
+                    .view(-1, self.experts_per_token, self.dim)
+                    .to(router_dtype)
                     * selected_probability.unsqueeze(-1)
                 )
                 .sum(dim=1)

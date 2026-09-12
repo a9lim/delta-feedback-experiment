@@ -146,10 +146,14 @@ ffn(x) = (S(x) + k * sum_j w_j E_j(x)) / sqrt(k+1)
 
 Router scores are FP32. The persistent bias `b` affects selection only. The
 selected scores remain differentiable; the discrete choice does not. There
-is no capacity limit or token dropping. Multiplying by `k` gives unit
-selected coefficients at equal scores; division by `sqrt(k+1)` matches the
-variance of `k+1` independent equal-variance expert outputs to one expert
-output at initialization. This does not guarantee learned variance.
+is no capacity limit or token dropping. CUDA dispatches every token's `k`
+assignments in expert-major order, stable in token and slot, through a
+counting sort, and each expert's rows form one tile range of the grouped
+GEMMs; the outputs are gathered back per token and mixed in FP32.
+Multiplying by `k` gives unit selected coefficients at equal scores; division
+by `sqrt(k+1)` matches the variance of `k+1` independent equal-variance
+expert outputs to one expert output at initialization. This does not
+guarantee learned variance.
 
 The active dense-equivalent width is derived as `H=(k+1)h`: expert matrices
 perform `3DH` multiply-accumulates per token and store `3D(n+1)h` parameters.
@@ -382,7 +386,11 @@ each optimizer step; it is runtime state, excluded from snapshots.
 
 Packed projection backpropagation writes into persistent FP32 sinks. PKDA
 Q/K/V row views share an allocation, as do dense QKV and gate gradients;
-each parameter is clipped/updated once. Head calls first accumulate classifier
+each parameter is clipped/updated once. The routed experts' backward keeps
+the SwiGLU derivative in FP32 inside the epilogue of the activation-gradient
+GEMM and recomputes the activation there, so the forward retains only the
+pre-activation; expert weight gradients accumulate in FP32 sinks, and an
+expert without assignments leaves its sink untouched. Head calls first accumulate classifier
 gradients in a BF16 buffer, flushed into the FP32 sink at the configured
 `--head-flush-every` cadence and before the optimizer update. Each pass makes
 two head calls. A captured microbatch exceeding the cadence uses the FP32
