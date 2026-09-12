@@ -48,7 +48,7 @@ up to 30M tokens form validation; training follows to the requested target.
 require matching build settings; training only reads the resulting store.
 Interrupted builds reuse the source index and encoded parts. Each split's
 `.docs.npy` sidecar maps document starts to source rows. `delta verify DIR`
-checks counts, sidecars, and sampled EOS boundaries.
+checks counts, sidecars, and up to 2,048 sampled EOS boundaries per split.
 
 A row is a nonoverlapping window of `seq_len+1` tokens. Ordinary prediction
 uses `seq_len` targets; MTP uses the same row's `seq_len-1` second-token

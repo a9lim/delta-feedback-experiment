@@ -1110,12 +1110,13 @@ class TokenData:
         return tensor.to(device) if device is not None else tensor
 
 
-def verify(directory: str | Path, *, sample_docs: int = 200_000) -> dict:
+def verify(directory: str | Path, *, sample_docs: int = 2_048) -> dict:
     """Check a store against its meta and sidecars; raise on any mismatch.
 
     Token counts must match the files, sidecar starts must be increasing and
     begin at zero, and the token before each sampled document's start must be
-    the EOS that closed its predecessor.
+    the EOS that closed its predecessor. Boundary checks sample up to 2,048
+    documents per split by default.
     """
     directory = Path(directory)
     meta = read_meta(directory)
