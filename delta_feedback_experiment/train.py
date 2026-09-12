@@ -91,6 +91,8 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 15,
         "experts_per_token": 3,
         "pkda_heads": 10,
+        "loop_iterations": 2,
+        "loop_max_iterations": 4,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -104,6 +106,8 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 23,
         "experts_per_token": 5,
         "pkda_heads": 15,
+        "loop_iterations": 3,
+        "loop_max_iterations": 6,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -117,6 +121,8 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 31,
         "experts_per_token": 7,
         "pkda_heads": 20,
+        "loop_iterations": 4,
+        "loop_max_iterations": 8,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -130,14 +136,16 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 47,
         "experts_per_token": 11,
         "pkda_heads": 30,
+        "loop_iterations": 6,
+        "loop_max_iterations": 12,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
     },
 }
-"""The geometries of ``docs/scaling.md``: the column, and the row length,
-rows per step, and single-process microbatch every scale shares, 4,096-token
-rows in one-row microbatches with ``BATCH_TOKENS`` predictions per step."""
+"""Geometry, recurrent depth, and batch presets from ``docs/scaling.md``.
+Every scale shares 4,096-token rows in one-row microbatches with
+``BATCH_TOKENS`` predictions per step."""
 
 DEFAULT_TOKENS_PER_PARAM = 25.0
 """The screen recipe's predicted tokens per reference active parameter."""
@@ -278,8 +286,9 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(SCALES),
         default="screen",
         help=(
-            "geometry and batch preset from docs/scaling.md; a trunk or recipe "
-            "flag typed alongside overrides its field (default: screen)"
+            "geometry, recurrent depth, and batch preset from docs/scaling.md; "
+            "a trunk or recipe flag typed alongside overrides its field "
+            "(default: screen)"
         ),
     )
     scale.add_argument(
@@ -369,17 +378,21 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--loop-iterations",
         type=int,
-        default=4,
+        default=SCALES["screen"]["loop_iterations"],
         help=(
-            "l: mean core iterations per column, drawn once per step; also the "
-            "fixed count evaluation and decoding use"
+            "l: uncapped mean core iterations per column, drawn once per step; "
+            "also the fixed count evaluation and decoding use "
+            "(scale defaults: screen 2, bridge 3, flagship 4, extension 6)"
         ),
     )
     recipe.add_argument(
         "--loop-max-iterations",
         type=int,
-        default=8,
-        help="l: cap of the per-step iteration draw",
+        default=SCALES["screen"]["loop_max_iterations"],
+        help=(
+            "l: cap of the per-step iteration draw "
+            "(scale defaults: screen 4, bridge 6, flagship 8, extension 12)"
+        ),
     )
 
     trunk = parser.add_argument_group("trunk (state-defining)")
@@ -1493,7 +1506,7 @@ def resolve_run_args(
 ) -> tuple[argparse.Namespace, frozenset[str]]:
     """Parse one command line and settle the recipe it names.
 
-    ``--scale`` fills every geometry and batch field the operator left unset;
+    ``--scale`` fills geometry, recurrent depth, and batch fields left unset;
     a retyped ``--seq-len`` without ``--batch-rows`` keeps ``BATCH_TOKENS``
     predictions per step; and a fresh run's ``--steps`` is derived from
     ``--tokens-per-param`` unless typed. Returns the settled arguments and the

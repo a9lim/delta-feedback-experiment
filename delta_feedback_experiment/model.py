@@ -159,11 +159,11 @@ class ModelConfig:
     runs ``iterations`` times per column, each core cell keeping its own block
     delta across iterations (``docs/architecture.md``)."""
 
-    loop_iterations: int = 4
-    """``l``: mean of the per-step iteration draw, and the fixed count that
-    evaluation and decoding use."""
+    loop_iterations: int = 2
+    """``l``: uncapped mean of the per-step iteration draw, and the fixed count
+    that evaluation and decoding use. Defaults match the screen preset."""
 
-    loop_max_iterations: int = 8
+    loop_max_iterations: int = 4
     """``l``: cap of the per-step iteration draw."""
 
     def __post_init__(self) -> None:

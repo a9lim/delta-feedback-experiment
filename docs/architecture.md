@@ -300,7 +300,9 @@ tau ~ Normal(log(r_mean - 1) - sigma^2 / 2, sigma), sigma = 1/2
 r = min(1 + Poisson(exp(tau)), r_max)
 ```
 
-The uncapped mean is `r_mean`; defaults are 4 and cap 8. Evaluation/decode
+The uncapped mean is `r_mean`. Scale defaults for mean/cap are screen `2/4`,
+bridge `3/6`, flagship `4/8`, and extension `6/12`; explicit loop flags override
+them. Capping slightly lowers the actual training mean. Evaluation/decode
 hold `r = r_mean` fixed for the request. Each iteration has its own mixer
 cache track and reads earlier token positions' writes at the same iteration.
 Every current prefill pass starts those tracks from zero. Cache position is

@@ -102,9 +102,11 @@ restart each pass; gradients cross every feedback transition.
 ### Core iterations
 
 With `l`, one independent keyed log-normal Poisson draw sets the core depth
-for the whole step. The default uncapped mean is 4 and cap is 8; the capped
-mean is about 3.88. Evaluation and decode use fixed depth 4. For `C` cells,
-each pass executes `2+(C-2)r` cells. Every preset has four cells.
+for the whole step. Default uncapped mean/cap pairs are screen `2/4`, bridge
+`3/6`, flagship `4/8`, and extension `6/12`. Capping slightly lowers the actual
+training mean. Evaluation and decode use the configured uncapped mean as
+their fixed depth. For `C` cells, each pass executes `2+(C-2)r` cells. Every
+preset has four cells; see [scaling.md](scaling.md#loop-compute-and-decode-state).
 
 ### Schedule
 

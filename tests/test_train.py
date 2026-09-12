@@ -95,14 +95,20 @@ def test_optimizer_materialization_restores_fresh_nadam_state():
         assert torch.count_nonzero(state["exp_avg_sq"]) == 0
 
 
-def test_resolved_arguments_pin_what_the_operator_fixed():
+@pytest.mark.parametrize(
+    "scale, mean, cap",
+    [("screen", 2, 4), ("bridge", 3, 6), ("flagship", 4, 8), ("extension", 6, 12)],
+)
+def test_resolved_arguments_pin_what_the_operator_fixed(scale, mean, cap):
     """A resume validates what the operator pinned and inherits the rest: an
     explicit --scale pins its fields, an explicit --tokens-per-param pins the
     derived steps, and an untyped schedule stays open for the checkpoint."""
     parser = build_parser()
     args, pinned = resolve_run_args(parser, ["x", "--resume"])
     assert pinned == frozenset({"resume"}) and args.steps is None
-    _, pinned = resolve_run_args(parser, ["x", "--resume", "--scale", "bridge"])
+    assert (args.loop_iterations, args.loop_max_iterations) == (2, 4)
+    args, pinned = resolve_run_args(parser, ["x", "--resume", "--scale", scale])
+    assert (args.loop_iterations, args.loop_max_iterations) == (mean, cap)
     assert {
         "scale",
         "dim",
@@ -113,8 +119,18 @@ def test_resolved_arguments_pin_what_the_operator_fixed():
         "expert_intermediate",
         "num_routed_experts",
         "experts_per_token",
+        "loop_iterations",
+        "loop_max_iterations",
     } <= pinned
     assert "steps" not in pinned
+    args, _ = resolve_run_args(
+        parser, ["x", "--steps", "1", "--loop-iterations", "1", "--scale", scale]
+    )
+    assert (args.loop_iterations, args.loop_max_iterations) == (1, cap)
+    args, _ = resolve_run_args(
+        parser, ["x", "--steps", "1", "--scale", scale, "--loop-max-iterations", "16"]
+    )
+    assert (args.loop_iterations, args.loop_max_iterations) == (mean, 16)
     _, pinned = resolve_run_args(parser, ["x", "--tokens-per-param", "400"])
     assert {"tokens_per_param", "steps"} <= pinned and "dim" not in pinned
     _, pinned = resolve_run_args(parser, ["x", "--seq-len", "2048"])
@@ -143,6 +159,8 @@ def test_preset_accounting_counts_shared_and_selected_experts():
 
     args = parse_run_args(["geometry", "--scale", scale])
     cfg = condition_config("fl", **model_fields(args))
+    assert cfg.loop_iterations == ModelConfig().loop_iterations == 2
+    assert cfg.loop_max_iterations == ModelConfig().loop_max_iterations == 4
     assert cfg.layers == 16 and cfg.core_layers == range(4, 12)
     assert cfg.executed_layers(4) == 40 and cfg.routing_blocks == 4
     assert cfg.dim == dim and cfg.expert_intermediate == 832
@@ -254,11 +272,11 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE).move("half", "renamed")
     with pytest.raises(ValueError, match="conflicts"):
         trainer.train(["renamed", *flags, "--resume", "--experts-per-token", "1"])
-    # Saved geometry must override new-run defaults when it is not pinned.
+    # Saved geometry and recurrent depths override unpinned new-run defaults.
     resume_flags = [
         item
         for key, value in settings.items()
-        if key != "head-dim"
+        if key not in {"head-dim", "loop-iterations", "loop-max-iterations"}
         for item in (f"--{key}", str(value))
     ]
     resumed = trainer.train(["renamed", *resume_flags, "--resume"])
@@ -267,6 +285,8 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     complete = trainer.read_checkpoint(tmp_path / "runs/full.pt.2")
     restored = trainer.read_checkpoint(tmp_path / "runs/renamed.pt.2")
     assert complete["version"] == CONTRACT.version
+    for field in ("loop_iterations", "loop_max_iterations"):
+        assert complete["args"][field] == restored["args"][field] == 2
     assert_identical(complete["state"], restored["state"])
     assert_identical(complete["optimizer"], restored["optimizer"])
     biases = [
