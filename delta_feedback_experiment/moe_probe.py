@@ -398,13 +398,14 @@ def _compiled_replay() -> None:
 
 
 @torch.no_grad()
-def _decode_parity(*, diagnose_fp32: bool = False) -> dict[str, float]:
-    """Qualify cache semantics separately from BF16 hard-routing sensitivity.
+def _decode_parity() -> dict[str, float]:
+    """Qualify cache semantics separately from finite-precision hard routing.
 
-    BF16 mixer rounding can move a near-tied third/fourth expert boundary.
-    Report ordinary BF16 trajectories; hold fixed decisions to the component
-    rounding bound and prove the full standard/feedback cache semantics with
-    the same parameters and tokens in the portable FP32 equations.
+    CUDA's full-row and cached mixer paths can move a near-tied third/fourth
+    expert boundary in either BF16 or FP32. Report ordinary trajectories;
+    hold fixed decisions to the component rounding bound and prove the full
+    standard/feedback cache semantics with the same parameters and tokens in
+    the portable FP32 equations.
     """
     from contextlib import contextmanager
 
@@ -574,26 +575,15 @@ def _decode_parity(*, diagnose_fp32: bool = False) -> dict[str, float]:
             for site, weights in whole.expert_weights.items():
                 if not torch.equal(weights.ne(0), pinned_weights[site].ne(0)):
                     raise AssertionError(f"FP32 route-conditioned cache control changed {site}")
-            conditional = finite_relative(
-                f"{condition} route-conditioned CUDA FP32 cache", pinned, whole.h_top
+            conditional = _close(
+                f"{condition} route-conditioned CUDA FP32 cache", pinned, whole.h_top, 0.01
             )
             errors[f"{condition}.cuda_fp32_raw"] = raw
             errors[f"{condition}.cuda_fp32_swapped_sites_tokens"] = swapped
             errors[f"{condition}.cuda_fp32_fixed"] = conditional
-            if diagnose_fp32:
-                changed_sites = {
-                    site: changed.nonzero().tolist()
-                    for site, changed in disagreements.items() if changed.any()
-                }
-                print(
-                    f"MoE FP32 diagnostic {condition} "
-                    f"precision={torch.get_float32_matmul_precision()} "
-                    f"raw={raw:.8g} fixed={conditional:.8g} "
-                    f"swapped_sites_tokens={swapped} sites={changed_sites}", flush=True,
-                )
-            else:
-                # Keep the existing raw bound until the explicit diagnostic
-                # establishes whether changed expert decisions explain it.
+            if not swapped:
+                # When the choices agree, the ordinary path must satisfy the
+                # same bound without the diagnostic intervention.
                 _close(f"{condition} CUDA FP32 cache", incremental, whole.h_top, 0.01)
         portable = copy.deepcopy(model).cpu().eval()
         cpu_tokens = tokens.cpu()
