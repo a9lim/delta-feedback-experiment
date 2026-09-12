@@ -9,9 +9,12 @@ import torch
 from delta_feedback_experiment.model import DeltaModel, condition_config
 from delta_feedback_experiment.optim import (
     NorMuonH,
+    _normuonh_batch,
     build_optimizers,
     split_parameters,
 )
+
+STATE_NAMES = ("momentum", "row_moment", "radius", "spectral_vector")
 
 
 def tiny_optimizer_model(**overrides):
@@ -104,6 +107,110 @@ def test_bounded_expert_buckets_match_independent_matrix_updates():
             single.step()
         for parameter, reference in zip(parameters, references):
             torch.testing.assert_close(parameter, reference)
+
+
+def test_packed_bucket_state_is_one_storage_per_kind_and_survives_resume():
+    """Every state kind lives in one bucket tensor, restored into that storage."""
+    torch.manual_seed(17)
+    parameters = [torch.nn.Parameter(torch.randn(6, 4)) for _ in range(3)]
+    optimizer = NorMuonH(parameters, lr=0.02)
+    for parameter in parameters:
+        parameter.grad = torch.randn_like(parameter)
+    optimizer.step()
+
+    def storages(owner, matrices):
+        return {
+            name: {
+                owner.state[matrix][name].untyped_storage().data_ptr()
+                for matrix in matrices
+            }
+            for name in STATE_NAMES
+        }
+
+    packed = storages(optimizer, parameters)
+    assert all(len(pointers) == 1 for pointers in packed.values())
+    assert len(set().union(*packed.values())) == len(STATE_NAMES)
+
+    restored_parameters = [
+        torch.nn.Parameter(parameter.detach().clone()) for parameter in parameters
+    ]
+    restored = NorMuonH(restored_parameters, lr=0.02)
+    restored.load_state_dict(deepcopy(optimizer.state_dict()))
+    assert all(
+        len(pointers) == 1
+        for pointers in storages(restored, restored_parameters).values()
+    )
+    for parameter, other in zip(parameters, restored_parameters):
+        for name in STATE_NAMES:
+            assert torch.equal(optimizer.state[parameter][name], restored.state[other][name])
+
+    for parameter, other in zip(parameters, restored_parameters):
+        gradient = torch.randn_like(parameter)
+        parameter.grad = gradient
+        other.grad = gradient.clone()
+    optimizer.step()
+    restored.step()
+    for parameter, other in zip(parameters, restored_parameters):
+        assert torch.equal(parameter, other)
+        for name in STATE_NAMES:
+            assert torch.equal(optimizer.state[parameter][name], restored.state[other][name])
+
+
+def test_partially_reached_buckets_match_independent_matrix_updates():
+    """Gathering the active rows leaves every absent member's state at rest."""
+    torch.manual_seed(23)
+    parameters = [torch.nn.Parameter(torch.randn(6, 4)) for _ in range(4)]
+    references = [torch.nn.Parameter(p.detach().clone()) for p in parameters]
+    optimizer = NorMuonH(parameters, lr=0.02)
+    separate = [NorMuonH([p], lr=0.02) for p in references]
+    for active in ((0, 2, 3), (1, 3), (0, 1, 2, 3), (2,), (0, 1)):
+        for index, (parameter, reference) in enumerate(zip(parameters, references)):
+            gradient = torch.randn_like(parameter) if index in active else None
+            parameter.grad = gradient
+            reference.grad = None if gradient is None else gradient.clone()
+        optimizer.step()
+        for single in separate:
+            single.step()
+        for parameter, reference in zip(parameters, references):
+            torch.testing.assert_close(parameter, reference)
+    for parameter, reference, single in zip(parameters, references, separate):
+        assert set(optimizer.state[parameter]) == set(STATE_NAMES)
+        for name in STATE_NAMES:
+            torch.testing.assert_close(
+                optimizer.state[parameter][name], single.state[reference][name]
+            )
+
+
+def test_bf16_newton_schulz_returns_fp32_and_tracks_the_fp32_direction():
+    """The CUDA precision choice only touches the orthogonalization loop."""
+    generator = torch.Generator().manual_seed(53)
+    shape = (3, 24, 16)
+    parameters = torch.randn(shape, generator=generator)
+    radii = parameters.norm(dim=(-2, -1))
+    arguments = (
+        torch.randn(shape, generator=generator) * 0.1,
+        torch.rand(3, 24, 1, generator=generator) * 0.01,
+        parameters,
+        radii,
+        torch.zeros(3, 16),
+        torch.randn(shape, generator=generator),
+        torch.tensor(0.006),
+        0.95,
+        0.95,
+        1e-8,
+        5,
+    )
+    _, _, exact, _ = _normuonh_batch(*arguments, torch.float32)
+    _, _, reduced, _ = _normuonh_batch(*arguments, torch.bfloat16)
+
+    assert reduced.dtype == torch.float32
+    torch.testing.assert_close(reduced.norm(dim=(-2, -1)), radii)
+    exact_step = (exact - parameters).flatten(1)
+    reduced_step = (reduced - parameters).flatten(1)
+    cosine = torch.nn.functional.cosine_similarity(exact_step, reduced_step, dim=-1)
+    ratio = reduced_step.norm(dim=-1) / exact_step.norm(dim=-1)
+    assert torch.all(cosine > 0.99)
+    assert torch.all((ratio - 1).abs() < 0.02)
 
 
 def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
