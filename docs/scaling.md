@@ -54,16 +54,19 @@ and omits the FBT entry; shared token budgets still use `f`.
 
 ## Expert learning rates
 
-Shared and routed experts in the trunk and MTP use separate NorMuonH rates:
+Shared and routed experts in the trunk and MTP use the same NorMuonH
+operator-step budget for their gate/up and down groups:
 
 ```text
-gate/up peak LR = lr_normuonh * sqrt(1536 / D)
+gate/up peak LR = lr_normuonh * sqrt(8 / (k+1))
 down peak LR    = lr_normuonh * sqrt(8 / (k+1))
 ```
 
-`k+1` counts the shared plus selected routed experts. The two factors match
-for every preset, but remain separate when residual width or selected count
-is overridden. With the default `lr_normuonh = 0.006`:
+`k+1` counts the shared plus selected routed experts. The count factor
+offsets coherent aggregation of expert changes after the bank's `1/sqrt(k+1)`
+forward normalization. Both groups retain this factor under overrides;
+per-matrix spectral normalization handles residual/expert width separately.
+With the default `lr_normuonh = 0.006`:
 
 | Scale | Gate/up factor | Down factor | Peak expert LR, both groups |
 |---|---:|---:|---:|
@@ -77,6 +80,15 @@ the base rate; NAdam uses its base or `1536/D` rate. The expert factors
 change optimizer updates only: forward normalization and initialization
 retain their own contracts. This is an implemented scaling candidate,
 without demonstrated full-model hyperparameter transfer across scales.
+
+`python scripts/spectral_optimizer_check.py --device cuda --benchmark --output /tmp/spectral.json`
+compares the three-step spectral estimates with exact SVD on synthetic
+screen-shaped directions, including rotating low-rank gradients and unequal
+row histories. It also times bounded optimizer buckets and weights their
+timings by screen matrix counts. Exact SVD is diagnostic only. Results measure
+estimate error and optimizer cost, not full training throughput, model quality,
+or a guaranteed norm bound. Omit `--benchmark` for accuracy alone; omit
+`--device cuda` for CPU execution.
 
 `python scripts/expert_scaling_check.py --device cuda --output /tmp/expert-scaling.json`
 records a bounded coordinate check with learned routing. It compares the

@@ -39,7 +39,7 @@ def tiny_optimizer_model(**overrides):
 def expected_stable_rates(cfg, normuonh, nadam):
     return {
         "normuonh": normuonh,
-        "normuonh_expert_in": normuonh * math.sqrt(1536 / cfg.dim),
+        "normuonh_expert_in": normuonh * math.sqrt(8 / (cfg.experts_per_token + 1)),
         "normuonh_expert_out": normuonh * math.sqrt(8 / (cfg.experts_per_token + 1)),
         "nadam": nadam,
         "nadam_width": nadam * 1536 / cfg.dim,
@@ -81,7 +81,9 @@ def test_bucket_optimizer_preserves_absent_gradients_and_resume():
     assert set(optimizer.state_dict()) == {"state", "param_groups"}
     for parameter, other in zip(parameters, restored_parameters):
         assert torch.equal(parameter, other)
-        assert set(optimizer.state[parameter]) == {"momentum", "row_moment", "radius"}
+        assert set(optimizer.state[parameter]) == {
+            "momentum", "row_moment", "radius", "spectral_vector"
+        }
         for name, value in optimizer.state[parameter].items():
             assert torch.equal(value, restored.state[other][name])
 
@@ -161,10 +163,7 @@ def test_five_rate_groups_partition_trunk_mtp_and_frozen_parameters(overrides):
     assert set(flattened) == trainable
 
     stable = expected_stable_rates(model.cfg, normuonh=0.021, nadam=0.00017)
-    assert model.cfg.expert_in_lr_scale == pytest.approx(
-        math.sqrt(1536 / model.cfg.dim)
-    )
-    assert model.cfg.expert_out_lr_scale == pytest.approx(
+    assert model.cfg.expert_lr_scale == pytest.approx(
         math.sqrt(8 / (model.cfg.experts_per_token + 1))
     )
     optimizers = build_optimizers(model, lr_normuonh=0.021, lr_nadam=0.00017)

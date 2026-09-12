@@ -56,7 +56,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=33, resumable=frozenset({33}), surface_version=33
+    version=34, resumable=frozenset({34}), surface_version=34
 )
 
 
@@ -345,8 +345,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_NORMUONH_LR,
         help=(
-            "base NorMuonH relative step; expert gate/up maps multiply by "
-            "sqrt(1536/dim), expert down maps by sqrt(8/(experts-per-token+1)) "
+            "estimated RMS-to-RMS NorMuonH trial-step budget; expert gate/up "
+            "and down maps multiply by sqrt(8/(experts-per-token+1)) "
             "(default: 0.006)"
         ),
     )
@@ -1617,8 +1617,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             grad_clip=GRAD_CLIP_NORM,
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
-            expert_in_lr_scale=model.cfg.expert_in_lr_scale,
-            expert_out_lr_scale=model.cfg.expert_out_lr_scale,
+            expert_lr_scale=model.cfg.expert_lr_scale,
             expert_shared=1,
             expert_routed=model.cfg.num_routed_experts,
             expert_top_k=model.cfg.experts_per_token,

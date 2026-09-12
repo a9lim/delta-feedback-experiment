@@ -811,17 +811,19 @@ warmup-stable-cooldown multiplier with no weight decay:
 | Group | Parameters | Peak learning rate |
 |---|---|---|
 | `normuonh` | Ordinary NorMuonH matrices outside experts | `lr_normuonh` |
-| `normuonh_expert_in` | Shared and routed expert gate/up matrices | `lr_normuonh * sqrt(1536/D)` |
+| `normuonh_expert_in` | Shared and routed expert gate/up matrices | `lr_normuonh * sqrt(8/(k+1))` |
 | `normuonh_expert_out` | Shared and routed expert down matrices | `lr_normuonh * sqrt(8/(k+1))` |
 | `nadam` | Base NAdam parameters | `lr_nadam` |
 | `nadam_width` | NAdam matrices with residual-width fan-in | `lr_nadam * 1536/D` |
 
 Here `k` is the selected routed expert count, so `k+1` includes the shared
 expert. Both expert groups include every trunk bank and the auxiliary MTP
-bank. Input and output factors are computed separately: the former follows
-residual width and the latter active expert count. They coincide at the
-presets but can differ for custom geometry. The references are the flagship
-width 1,536 and its eight active experts.
+bank. Both expert groups use the same active-count factor, anchored at
+flagship's eight active experts. Coherently aligned branch changes add as
+`sqrt(k+1)` after the bank's forward normalization; the count factor offsets
+that growth. Each matrix's spectral normalization separately handles its
+fan-in/fan-out, including geometry overrides. No extra `sqrt(1536/D)` expert
+input factor is applied.
 
 ### NorMuonH matrices
 
@@ -834,14 +836,32 @@ M_t = .95 M_(t-1) + .05 G_t
 N_t = .05 G_t + .95 M_t
 U = five_Newton_Schulz_steps(N_t)
 U = row_second_moment_normalize(U, beta=.95, eps=1e-8)
+U = Normalize_F(U)
+T = U - <W,U>_F / <W,W>_F * W
+T = Normalize_F(T)
+sigma_hat, v_next = three_power_iterations_with_restart(T, v)
 eta_t = schedule_multiplier(t) * group_peak_lr
-W_next = R * Normalize_F(W - eta_t * R * Normalize_F(U))
+W_next = R * Normalize_F(W - eta_t * sqrt(fan_out/fan_in) * T / sigma_hat)
 ```
 
-The default base relative rate is `6e-3`; the expert groups apply the factors
-above. A Frobenius-relative step alone does not establish equal functional
-updates across widths or expert counts. These factors are an implemented
-scaling candidate; full-model hyperparameter transfer remains unestablished.
+The default base rate is `6e-3`, an estimated RMS-to-RMS operator budget for
+the tangent trial step; the expert groups apply the factors above. The
+spectral estimate follows row adaptation and removal of the radial component.
+Each update compares the image of the saved right vector with the image of
+the normalized largest-energy row, then performs three paired power
+iterations from the better start and one final norm evaluation. The restart
+can recover a newly rotated direction orthogonal to the saved vector and
+consumes no RNG. The right vector is FP32 optimizer state, saved alongside
+momentum, row moments, and radius for exact resume.
+
+Zero and numerically radial directions produce no weight movement; after
+normalizing `U`, tangent norms at or below `32 * finfo(dtype).eps` are treated
+as cancellation residue. Zero-rate updates also preserve weights exactly.
+An exact spectral norm would set the trial's RMS-to-RMS norm to the group
+rate. Power iteration can underestimate it, and the sphere retraction changes
+the finite displacement, so this is not a strict final-step bound. This
+spectral/tangent extension is an implemented scaling candidate, not a result
+established by the Hyperball paper; full-model transfer remains unestablished.
 [Scaling](scaling.md#expert-learning-rates) lists the preset rates.
 CUDA compiles packing and update arithmetic by shape bucket within each
 group. All results materialize before state and parameter writebacks outside

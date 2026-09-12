@@ -80,7 +80,7 @@ references:
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
     note: >
-      Fan-in matrix initialization, fixed realized Frobenius radius, unit-norm update direction, and radial projection.
+      Fan-in matrix initialization, fixed realized Frobenius radius, and radial projection. The spectral tangent update is this repository's extension, not a Hyperball result.
 
   - arxiv: "2502.05171"
     slug: geiping2025-recurrent-depth
@@ -95,7 +95,7 @@ references:
   - arxiv: "2310.17813"
     slug: yang2023-spectral-condition
     note: >
-      Spectral scaling condition used to interpret the width behavior of NorMuonH relative updates.
+      Spectral scaling condition motivates the sqrt(fan_out/fan_in) normalization of NorMuon tangent updates; finite power estimates and sphere retraction do not provide a strict bound.
 
   - url: https://github.com/microsoft/mup/blob/19814971934ef91dd546f88e913fc963e096d11c/mup/layer.py#L32-L37
     slug: microsoft-mup-shared-readout

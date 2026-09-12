@@ -97,9 +97,9 @@ this constant to tune both families; NorMuonH's fan-in scale is independent.
 MUP_BASE_DIM = 1536
 """The fixed muP reference width: the flagship column of ``docs/scaling.md``.
 
-Ordinary hidden NorMuonH matrices keep the base relative step. Expert inputs
-use sqrt(MUP_BASE_DIM / dim), and expert outputs use the active-count scale
-below. NAdam's per-coordinate step is approximately its learning rate,
+NorMuonH matrices use spectral tangent steps with their own fan-in/fan-out
+factor. Both expert projections also use the active-count scale below.
+NAdam's per-coordinate step is approximately its learning rate,
 so a matrix with fan-in
 ``D`` moves its output by up to ``rate * D`` per step. The fan-in-``D`` NAdam
 matrices therefore run at ``lr_nadam * MUP_BASE_DIM / dim`` and initialize at
@@ -110,7 +110,7 @@ is the plain parametrization. Extension keeps this reference and uses 2/3.
 """
 
 MUP_BASE_ACTIVE_EXPERTS = 8
-"""Flagship's one shared plus seven selected experts, for expert output rates."""
+"""Flagship's one shared plus seven selected experts, for expert branch rates."""
 
 EXPERT_BALANCE_COEF = 0.0001
 """Weak sequence-balance coefficient, averaged over executed layers and passes."""
@@ -199,13 +199,12 @@ class ModelConfig:
         return MUP_BASE_DIM / self.dim
 
     @property
-    def expert_in_lr_scale(self) -> float:
-        """NorMuonH rate multiplier for each expert's fixed-width gate/up map."""
-        return math.sqrt(self.mup_ratio)
+    def expert_lr_scale(self) -> float:
+        """Operator-step multiplier for shared + selected expert aggregation.
 
-    @property
-    def expert_out_lr_scale(self) -> float:
-        """NorMuonH rate multiplier for aggregation over shared + selected experts."""
+        It applies to gate/up and down projections; matrix aspect ratio is
+        already handled by the optimizer's spectral normalization.
+        """
         return math.sqrt(MUP_BASE_ACTIVE_EXPERTS / (self.experts_per_token + 1))
 
     @property

@@ -114,8 +114,8 @@ def cuda_probe() -> None:
     )
     expected_rates = {
         "normuonh": args.lr_normuonh,
-        "normuonh_expert_in": args.lr_normuonh * cfg.expert_in_lr_scale,
-        "normuonh_expert_out": args.lr_normuonh * cfg.expert_out_lr_scale,
+        "normuonh_expert_in": args.lr_normuonh * cfg.expert_lr_scale,
+        "normuonh_expert_out": args.lr_normuonh * cfg.expert_lr_scale,
         "nadam": args.lr_nadam,
         "nadam_width": args.lr_nadam * cfg.mup_ratio,
     }

@@ -2,10 +2,10 @@
 NAdam for parameters whose norm carries semantic information, under one WSD
 learning-rate multiplier.
 
-NorMuonH uses its base relative step for ordinary hidden matrices. Expert
-gate/up maps use sqrt(1536 / dim), and expert down maps use sqrt(8 / (k+1)),
-where k is the selected routed count; both shared and MTP experts follow
-these rules. NAdam splits in two: matrices whose fan-in is the residual width
+NorMuonH uses an estimated RMS-to-RMS operator step for ordinary matrices.
+Expert gate/up and down maps additionally use sqrt(8 / (k+1)), where k is
+the selected routed count; shared and MTP experts follow the same rule.
+NAdam splits in two: matrices whose fan-in is the residual width
 run at the base rate times the muP width ratio ``MUP_BASE_DIM / dim``, every other NAdam
 parameter at the base rate. ``lr_nadam`` is therefore the rate at the
 flagship width, and the tied readout carries the same ratio as a logit
@@ -14,9 +14,13 @@ multiplier inside the model.
 NorMuonH combines NorMuon's Nesterov momentum, Newton-Schulz
 orthogonalization, and neuron-wise second-moment normalization with the
 Hyperball constraint (arXiv:2606.16899). Each constrained matrix keeps its
-initial FP32 Frobenius radius, the NorMuon direction is normalized to unit
-Frobenius norm, and every trial step is projected exactly back to the
-initial-radius sphere. No optimizer group uses weight decay.
+initial FP32 Frobenius radius. After row adaptation, the tangent direction
+is scaled by an estimated spectral norm and sqrt(fan_out / fan_in), then
+the trial step is projected back onto the initial-radius sphere. Three
+power iterations use a checkpointed right vector and an energy-row restart.
+This spectral/tangent extension is a scaling candidate, not a strict bound
+on the final displacement or an established Hyperball result.
+No optimizer group uses weight decay.
 """
 
 from __future__ import annotations
@@ -37,7 +41,10 @@ NS_COEFFS = (3.4445, -4.7750, 2.0315)
 """Quintic Newton-Schulz coefficients (Muon's standard choice)."""
 
 DEFAULT_NORMUONH_LR = 6e-3
-"""Stable dimensionless NorMuonH relative step for fresh runs."""
+"""Stable estimated RMS-to-RMS trial-step budget for fresh runs."""
+
+SPECTRAL_POWER_STEPS = 3
+"""Paired power iterations per matrix update; no extra model forward passes."""
 
 DEFAULT_NADAM_LR = 3e-4
 """Stable NAdam learning rate at the muP reference width."""
@@ -66,19 +73,81 @@ def orthogonalize(matrix: Tensor, steps: int = 5) -> Tensor:
     return x.mT if transposed else x
 
 
+def _spectral_norm(
+    matrix: Tensor, vector: Tensor, eps: float, steps: int = SPECTRAL_POWER_STEPS,
+) -> tuple[Tensor, Tensor]:
+    """Estimate batched spectral norms with a deterministic warm/restart choice.
+
+    The strongest row supplies a non-null right-vector restart whenever the
+    matrix is nonzero, including a new rank-one direction orthogonal to the
+    saved vector. Choose whichever start has the larger measured image, then
+    perform power iteration. No RNG is consumed; a zero matrix returns zero.
+    The estimate is a lower bound in exact arithmetic, not a certificate.
+    """
+    row = matrix.square().sum(dim=-1).argmax(dim=-1)
+    restart = matrix.gather(
+        -2, row[:, None, None].expand(-1, 1, matrix.shape[-1])
+    ).squeeze(-2)
+    restart = restart / restart.norm(dim=-1, keepdim=True).clamp_min(eps)
+    warm_image = (matrix @ vector.unsqueeze(-1)).squeeze(-1)
+    restart_image = (matrix @ restart.unsqueeze(-1)).squeeze(-1)
+    use_warm = warm_image.square().sum(dim=-1, keepdim=True) > (
+        restart_image.square().sum(dim=-1, keepdim=True)
+    )
+    image = torch.where(use_warm, warm_image, restart_image)
+    for iteration in range(steps):
+        if iteration:
+            image = (matrix @ vector.unsqueeze(-1)).squeeze(-1)
+        left = image / image.norm(dim=-1, keepdim=True).clamp_min(eps)
+        vector = (matrix.mT @ left.unsqueeze(-1)).squeeze(-1)
+        vector = vector / vector.norm(dim=-1, keepdim=True).clamp_min(eps)
+    image = (matrix @ vector.unsqueeze(-1)).squeeze(-1)
+    return image.norm(dim=-1), vector
+
+
+def _spectral_tangent_step(
+    parameters: Tensor, update: Tensor, radii: Tensor, vector: Tensor,
+    lr: Tensor, eps: float,
+) -> tuple[Tensor, Tensor]:
+    """Normalize a tangent trial step, then retract to the fixed weight sphere."""
+    update = update / update.norm(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    weight_sq = parameters.square().sum(dim=(-2, -1), keepdim=True)
+    radial = (parameters * update).sum(dim=(-2, -1), keepdim=True) / (
+        weight_sq.clamp_min(eps)
+    )
+    tangent = update - radial * parameters
+    tangent_norm = tangent.norm(dim=(-2, -1), keepdim=True)
+    # A radial direction has zero tangent mathematically. Do not amplify its
+    # FP32 cancellation residue into a full spectral step.
+    moving = tangent_norm > 32 * torch.finfo(parameters.dtype).eps
+    tangent = torch.where(
+        moving, tangent / tangent_norm.clamp_min(eps), torch.zeros_like(tangent)
+    )
+    sigma, vector = _spectral_norm(tangent, vector, eps)
+    factor = math.sqrt(parameters.shape[-2] / parameters.shape[-1])
+    trial = parameters - lr * factor * tangent / sigma[:, None, None].clamp_min(eps)
+    projected = radii[:, None, None] * trial / trial.norm(
+        dim=(-2, -1), keepdim=True
+    ).clamp_min(eps)
+    # Initialization, zero-rate schedule endpoints, and zero/radial updates
+    # preserve weights byte-for-byte instead of renormalizing them again.
+    return torch.where(moving & (lr != 0), projected, parameters), vector
+
+
 def _normuonh_batch(
     momentum: Tensor,
     row_moment: Tensor,
     parameters: Tensor,
     radii: Tensor,
+    spectral_vectors: Tensor,
     gradient: Tensor,
     lr: Tensor,
     momentum_beta: float,
     beta2: float,
     eps: float,
     ns_steps: int,
-) -> tuple[Tensor, Tensor, Tensor]:
-    """Batched Nesterov NorMuon direction and exact Hyperball update."""
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Batched NorMuon direction and spectral tangent update on a fixed sphere."""
     a, b, c = NS_COEFFS
     momentum = torch.lerp(momentum, gradient, 1 - momentum_beta)
     direction = torch.lerp(gradient, momentum, momentum_beta)
@@ -93,12 +162,10 @@ def _normuonh_batch(
         row_moment, update.square().mean(dim=-1, keepdim=True), 1 - beta2
     )
     update = update / (row_moment.sqrt() + eps)
-    update = update / (update.norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
-
-    radii = radii.reshape(-1, 1, 1)
-    trial = parameters - lr * radii * update
-    projected = radii * trial / (trial.norm(dim=(-2, -1), keepdim=True).clamp_min(eps))
-    return momentum, row_moment, projected
+    projected, spectral_vectors = _spectral_tangent_step(
+        parameters, update, radii, spectral_vectors, lr, eps
+    )
+    return momentum, row_moment, projected, spectral_vectors
 
 
 def _normuonh_bucket_values(
@@ -107,18 +174,20 @@ def _normuonh_bucket_values(
     momenta: list[Tensor],
     row_moments: list[Tensor],
     radii: list[Tensor],
+    spectral_vectors: list[Tensor],
     lr: Tensor,
     momentum_beta: float,
     beta2: float,
     eps: float,
     ns_steps: int,
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compile packing and update arithmetic without mutating their inputs."""
     return _normuonh_batch(
         torch.stack(momenta),
         torch.stack(row_moments),
         torch.stack(parameters),
         torch.stack(radii),
+        torch.stack(spectral_vectors),
         torch.stack(gradients),
         lr,
         momentum_beta,
@@ -142,6 +211,7 @@ def _normuonh_bucket_step(
     momenta: list[Tensor],
     row_moments: list[Tensor],
     radii: list[Tensor],
+    spectral_vectors: list[Tensor],
     lr: Tensor,
     momentum_beta: float,
     beta2: float,
@@ -155,17 +225,18 @@ def _normuonh_bucket_step(
         _compiled_normuonh_bucket_values
         if parameters[0].is_cuda else _normuonh_bucket_values
     )
-    new_momenta, new_rows, projected = values(
-        parameters, gradients, momenta, row_moments, radii, lr,
+    new_momenta, new_rows, projected, new_vectors = values(
+        parameters, gradients, momenta, row_moments, radii, spectral_vectors, lr,
         momentum_beta, beta2, eps, ns_steps,
     )
     torch._foreach_copy_(momenta, list(new_momenta.unbind()))
     torch._foreach_copy_(row_moments, list(new_rows.unbind()))
     torch._foreach_copy_(parameters, list(projected.unbind()))
+    torch._foreach_copy_(spectral_vectors, list(new_vectors.unbind()))
 
 
 class NorMuonH(torch.optim.Optimizer):
-    """Nesterov NorMuon directions on each initial Frobenius sphere."""
+    """Spectrally scaled NorMuon tangent directions on each initial sphere."""
 
     def __init__(
         self,
@@ -247,6 +318,7 @@ class NorMuonH(torch.optim.Optimizer):
             torch.zeros(shape[0], 1, device=device, dtype=dtype) for _ in parameters
         ]
         radii = [torch.ones((), device=device, dtype=dtype) for _ in parameters]
+        vectors = [torch.zeros(shape[1], device=device, dtype=dtype) for _ in parameters]
         scalar = torch.zeros((), device=device)
         _normuonh_bucket_step(
             matrices,
@@ -254,6 +326,7 @@ class NorMuonH(torch.optim.Optimizer):
             momenta,
             rows,
             radii,
+            vectors,
             scalar,
             group["momentum"],
             group["beta2"],
@@ -280,6 +353,9 @@ class NorMuonH(torch.optim.Optimizer):
                         dtype=parameter.dtype,
                     )
                     state["radius"] = self._initial_radii[parameter].clone()
+                    state["spectral_vector"] = torch.zeros(
+                        parameter.shape[1], device=parameter.device, dtype=parameter.dtype
+                    )
                 buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
                     parameter
                 )
@@ -296,6 +372,7 @@ class NorMuonH(torch.optim.Optimizer):
                             for parameter in parameters
                         ],
                         [self.state[parameter]["radius"] for parameter in parameters],
+                        [self.state[parameter]["spectral_vector"] for parameter in parameters],
                         lr,
                         group["momentum"],
                         group["beta2"],
@@ -339,16 +416,16 @@ def build_optimizers(
 ) -> list[torch.optim.Optimizer]:
     """Build the authoritative NorMuonH/NAdam stack with stable WSD rates.
 
-    Expert input/output factors modify the final NorMuonH relative step,
-    after gradient normalization. Initialization and Frobenius radii retain
-    their fan-in contract. The two expert factors remain independent under
-    geometry overrides, even though they coincide at the four presets.
+    Spectral normalization handles each matrix's fan-in/fan-out. Both expert
+    groups additionally scale their operator-step budget by active count:
+    coherently aligned branch changes add as sqrt(k+1) after the bank's
+    forward normalization. Initialization and radii retain their fan-in rule.
     """
     parameters = split_parameters(model)
     rates = {
         "normuonh": lr_normuonh,
-        "normuonh_expert_in": lr_normuonh * model.cfg.expert_in_lr_scale,
-        "normuonh_expert_out": lr_normuonh * model.cfg.expert_out_lr_scale,
+        "normuonh_expert_in": lr_normuonh * model.cfg.expert_lr_scale,
+        "normuonh_expert_out": lr_normuonh * model.cfg.expert_lr_scale,
         "nadam": lr_nadam,
         "nadam_width": lr_nadam * model.cfg.mup_ratio,
     }
