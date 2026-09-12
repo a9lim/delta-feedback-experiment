@@ -56,7 +56,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=30, resumable=frozenset({30}), surface_version=30
+    version=31, resumable=frozenset({31}), surface_version=31
 )
 
 
@@ -338,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument("--zloss", type=float, default=1e-5)
     recipe.add_argument(
         "--mtp-weight", type=nonnegative_finite, default=MTP_LOSS_WEIGHT,
-        help="m: auxiliary second-token CE and z-loss weight (default: 0.3)",
+        help="payload-based auxiliary second-token CE and z-loss weight (default: 0.3)",
     )
     recipe.add_argument(
         "--loop-iterations",
@@ -746,7 +746,7 @@ class CudaGraphTrainer:
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((len(self.model.blocks), 15), dtype=torch.int64, device=self.device),
+            torch.zeros((len(self.model.expert_banks), 15), dtype=torch.int64, device=self.device),
         )
 
     def _body(self, state: CapturedMicro) -> None:
@@ -775,12 +775,9 @@ class CudaGraphTrainer:
         state.mtp_sum.add_(combine_pass_losses(loss_result.mtp).detach() / self.micros)
         # These are outputs of logical forwards, collected outside the
         # checkpointed blocks. Recomputed backwards cannot count again.
-        state.expert_counts.add_(
-            torch.stack([out.expert_counts for out in outs]).sum(dim=0)
-        )
+        state.expert_counts.add_(loss_result.expert_counts)
         state.expert_balance_sum.add_(
-            torch.stack([out.expert_aux_loss.detach() for out in outs]).mean()
-            / self.micros
+            loss_result.expert_aux_loss.detach() / self.micros
         )
 
     def _drain_head_accum(self) -> None:
@@ -824,8 +821,8 @@ class CudaGraphTrainer:
         # those choices, so activity is structural for the entire bank.
         active.update(
             parameter
-            for block in self.model.blocks
-            for parameter in block.mlp.parameters()
+            for bank in self.model.expert_banks
+            for parameter in bank.parameters()
             if parameter.requires_grad
         )
         return active
@@ -1190,8 +1187,12 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
             else contextlib.nullcontext()
         ):
             outs = multipass(model, rows, 1, want_weights=True)
+            mtp = model.forward_mtp(
+                outs[0].payload[:, :-1], rows[:, 1:-1], want_weights=True
+            )
         records = []
-        for site, weights in outs[0].expert_weights.items():
+        weights_by_site = outs[0].expert_weights | {"mtp.experts": mtp.expert_weights}
+        for site, weights in weights_by_site.items():
             w = weights.float()
             load = (w > 0).float().mean(dim=(0, 1)) / 3
             entropy = -(w * w.clamp_min(1e-30).log()).sum(-1).mean()
@@ -1205,10 +1206,13 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
             record.update(
                 {f"expert{i}": round(value, 4) for i, value in enumerate(load.tolist())}
             )
-            layer = int(site.split(".")[0][1:].partition("i")[0])
+            bank = (
+                model.mtp.block.mlp if site == "mtp.experts"
+                else model.blocks[int(site.split(".")[0][1:].partition("i")[0])].mlp
+            )
             record.update({
                 f"bias{i}": round(value, 6)
-                for i, value in enumerate(model.blocks[layer].mlp.expert_bias.tolist())
+                for i, value in enumerate(bank.expert_bias.tolist())
             })
             records.append(record)
         return records
@@ -1316,8 +1320,8 @@ def reference_active(args) -> int:
     total = sum(parameter.numel() for parameter in model.parameters())
     inactive = sum(
         parameter.numel()
-        for block in model.blocks
-        for expert in block.mlp.experts[3:]
+        for bank in model.expert_banks
+        for expert in bank.experts[3:]
         for parameter in expert.parameters()
     )
     return total - model.embed_tokens.weight.numel() - inactive
@@ -1667,7 +1671,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 ntp_loss = mtp_loss = 0.0
                 expert_balance = 0.0
                 expert_counts = torch.zeros(
-                    (len(model.blocks), 15), dtype=torch.int64, device=device
+                    (len(model.expert_banks), 15), dtype=torch.int64, device=device
                 )
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
@@ -1701,15 +1705,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     pass1_loss += losses[0].item() / micros
                     ntp_loss += combine_pass_losses(loss_result.ntp).item() / micros
                     mtp_loss += combine_pass_losses(loss_result.mtp).item() / micros
-                    expert_counts.add_(
-                        torch.stack([out.expert_counts for out in outs]).sum(dim=0)
-                    )
-                    expert_balance += (
-                        torch.stack([out.expert_aux_loss.detach() for out in outs])
-                        .mean()
-                        .item()
-                        / micros
-                    )
+                    expert_counts.add_(loss_result.expert_counts)
+                    expert_balance += loss_result.expert_aux_loss.item() / micros
 
             grad_norm = clip_gradients(model.parameters())
             for optimizer in optimizers:
@@ -1747,7 +1744,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 violation.max().item()
             )
             fields["expert_bias_max"] = telemetry.format_metric(
-                torch.stack([block.mlp.expert_bias for block in model.blocks])
+                torch.stack([bank.expert_bias for bank in model.expert_banks])
                 .abs().max().item()
             )
             if model.cfg.loop:

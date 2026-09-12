@@ -18,11 +18,13 @@ rejected. The default is `f`.
 | `l` | Repeated application of the tied middle cells | `loop` |
 
 The model always uses `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, MHDB source
-routing, shared plus top-three-of-fifteen quarter-width experts, and a dense
-auxiliary two-token predictor. `l` alone uses embedding seeds and emits no
-payload. `f` emits a normalized top state with routed enrichment. Experts
-have no capacity limit or token dropping; intermediate width is divisible by
-four. The auxiliary block has dense RoPE GQA/SwiGLU and no recurrent state.
+routing, shared plus top-three-of-fifteen quarter-width experts, and an
+auxiliary PKDA/expert two-token predictor. Every condition produces a
+normalized top state with routed enrichment as its payload. MTP reads this
+payload; `f` also transfers it to the next column. `l` alone uses embedding
+seeds. Experts have no capacity limit or token dropping; intermediate width
+is divisible by four. The auxiliary block has independent PKDA state that
+resets for each row and pass.
 
 Shared parameters initialize identically for a given seed. Data order and
 feedback pass, prefix, and jitter draws use keyed streams. The tied-core
@@ -156,7 +158,7 @@ same draws.
 `delta tokenize --scale S --tokens-per-param R` sizes a store for a planned
 run: that schedule's rows of `seq_len + 1` tokens plus the slice's cap,
 rounded up to the next billion. The default target is the screen at 400x,
-61B stored tokens; the bridge's 400x rung is 177B.
+62B stored tokens; the bridge's 400x rung is 179B.
 
 ## Training
 
@@ -173,10 +175,12 @@ reports the pre-clip norm.
 ### Two-token prediction
 
 Every run trains one DeepSeek-style auxiliary prediction depth. On every
-pass, it combines the trunk's top state at `t` with the shared embedding of
-the ground-truth next token and predicts the token at `t + 2`. Gradients flow
-through both inputs. [Architecture](architecture.md#two-token-prediction)
-defines the causal block and exact target alignment.
+pass, it combines the payload at `t` with the shared embedding of the
+ground-truth next token and predicts the token at `t + 2`. Gradients flow
+through both inputs, directly training the payload writer in every condition.
+This requires payload construction on single-pass batches and the final
+feedback pass too. [Architecture](architecture.md#two-token-prediction)
+defines the causal PKDA/expert block and exact target alignment.
 
 The auxiliary cross-entropy averages over `seq_len - 1` positions per row.
 It uses the same pass-1-plus-mean-feedback combination as ordinary
@@ -200,7 +204,8 @@ A sigmoid router selects the top three scores after adding each
 expert's persistent selection bias. The output mixture uses the original
 scores, normalized over the selected experts. Each physical bank accumulates
 assignment counts over the update's microbatches, feedback passes, and repeated
-core invocations. After the optimizer step, overused experts decrease their
+core invocations. The auxiliary bank contributes once per pass over its
+`seq_len - 1` positions. After the optimizer step, overused experts decrease their
 bias by `0.001` and underused experts increase it by `0.001`; equal load leaves
 it unchanged. Forward execution and activation recomputation never update the
 bias, and evaluation holds it fixed.
@@ -209,8 +214,10 @@ A complementary load-balance loss is computed separately for each sequence,
 using sigmoid scores normalized over all experts and a detached top-three
 selection fraction computed before adding the bias. Actual biased dispatch
 counts drive the separate bias controller. The loss is averaged over
-sequences, executed layer invocations, then feedback passes, and added with
-coefficient `1e-4`. Its weight therefore stays
+sequences within each bank, over all executed trunk invocations plus the one
+auxiliary invocation, then over feedback passes, and added with coefficient
+`1e-4`. The auxiliary contribution is independent of `--mtp-weight`, which
+weights only its prediction cross-entropy and z-loss. The balancing weight stays
 fixed as depth or pass count changes. Reported cross-entropy and perplexity
 exclude it. [Architecture](architecture.md#shared-and-routed-experts)
 defines the exact equations and count normalization.
@@ -267,7 +274,7 @@ otherwise, which targets a 75% / 22% / 3% pass mixture over the run and 1.28
 expected pass-tokens per predicted token. Conditions without `f` use one pass
 throughout.
 
-The default screen schedule is 7,257 steps, or 3,804,758,016 predicted
+The default screen schedule is 7,359 steps, or 3,858,235,392 predicted
 tokens. Its budget is derived from 25 tokens per training-active non-embedding
 parameter of `f`, including MTP, rounded up to whole steps. All conditions
 at a geometry share the same schedule; [scaling.md](scaling.md) gives the
@@ -292,15 +299,15 @@ reference counts and larger budgets.
 | `--mtp-weight` | 0.3 | finite nonnegative weight for auxiliary cross-entropy and its z-loss, constant across the run |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v30 snapshot |
+| `--resume` | | continues a tag from its latest v31 snapshot |
 
 ### Checkpoints and queue
 
-Checkpoint v30 is the only accepted contract for resume, evaluation, and
+Checkpoint v31 is the only accepted contract for resume, evaluation, and
 forks. Conditions are `f`, `l`, or `fl`; every state dictionary includes the
-auxiliary prediction parameters, and state-defining arguments include
-`mtp_weight`. Snapshots bind to the
-current GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token
+payload writer and auxiliary PKDA/expert prediction parameters, and
+state-defining arguments include `mtp_weight`. Snapshots bind to the current
+GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token
 store carry the same deterministic
 `tokenizer_id`, derived from the pinned vocabulary, delimiter IDs, and full
 ChatML template; mismatches are rejected. Every snapshot records its condition
@@ -308,8 +315,8 @@ as letters. A snapshot holds the model, both optimizer states, the fixed NorMuon
 cumulative step, and Python/Torch/CUDA RNG state. A resume inherits every
 state-defining field and rejects explicit conflicts; runtime paths, device,
 evaluation cadence, snapshot cadence, and evaluation-row count may change.
-Snapshots include the current per-bank `expert_bias` buffers; strict
-state restoration requires them. Assignment counts are transient and are
+Snapshots include the current per-bank `expert_bias` buffers, including MTP's;
+strict state restoration requires them. Assignment counts are transient and are
 consumed before a step's snapshot is staged.
 
 Each run keeps the latest two snapshots plus protected ones at the cooldown
@@ -324,9 +331,9 @@ cooldown boundary otherwise. Warmup is fixed per scale, so from that step on
 a continuation of any run at or above 25x is the longer run exactly, and a
 shorter source differs only in the warmup it inherited, which the `continue`
 record reports as `exact`. A screen 25x run continued to 50x restores step
-5,443 and trains 9,070 more steps of a 14,513-step schedule. The queue stores arguments, not Git state; a
-source change never stops an active child, and the worker refreshes before
-the next job.
+5,519 and trains 9,199 more steps of a 14,718-step schedule. The queue stores
+arguments, not Git state; a source change never stops an active child, and the
+worker refreshes before the next job.
 
 ## Evaluation
 
@@ -337,7 +344,7 @@ the slice's first `--eval-rows` rows, 128 by default: 524,288 predictions at
 the screen, every `--eval-every` steps. Conditions with `f` also report `val_fused`, a
 second pass with plain-prefix length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
 Every condition reports `val_mtp` over the valid second-token targets;
-with `f`, `val_mtp_fused` reads the second pass's top states. These auxiliary
+with `f`, `val_mtp_fused` reads the second pass's payloads. These auxiliary
 metrics exclude their training weight and z-loss. `val` and `val_fused` remain
 ordinary next-token losses over all `seq_len` positions.
 Decoding has three modes, each at one fixed `r` under `l`:

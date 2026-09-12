@@ -25,7 +25,8 @@ across generated tokens. The two execution modes can behave differently.
 
 | Surface | What it shows | Notes |
 |---|---|---|
-| `DeltaModel.forward_column` / `ColumnOutput` | Top residual state, feedback payload, final source bank, optional per-site/group route weights with source labels; expert weights and mean balancing loss | The analysis interface everything below builds on |
+| `DeltaModel.forward_column` / `ColumnOutput` | Top residual state, payload, final source bank, optional per-site/group route weights with source labels; trunk expert weights and mean balancing loss | The analysis interface everything below builds on |
+| `DeltaModel.forward_mtp` | Auxiliary prediction state, balancing loss, assignment counts, and optional expert weights | Reads a payload and the ground-truth next-token embedding with independent PKDA state |
 | `scripts/route_report.py` | Plain and fused route summaries, source and null scales, query geometry | Route mass is a mixing weight, not an importance score |
 | `scripts/payload_swap.py` | Top-only, uniform, and forced-source payload enrichment, optionally one routing group at a time | Top-only keeps the payload's `h_top` term |
 | `scripts/fused_diagnostics.py` | Fused minus pass-1 loss by position, fused-in-token surprise, and token frequency; gate, seed-decodability, and scale statistics; a 30-iteration self-composition trace | Conditioning on a position's own pass-1 loss selects on noise; condition on entropy or frequency instead |
@@ -71,16 +72,18 @@ core iteration as well as token and pass when comparing expert selections.
 Each physical bank also carries a persistent `expert_bias` that affects expert
 selection without entering the mixture weights. Hold that bias fixed during
 matched replay. `ColumnOutput.expert_counts` sums actual selections by physical
-bank across repeated invocations; the trainer combines these counts across the
-whole update before adjusting the biases once.
+trunk bank across repeated invocations. `LossOutput.expert_counts` adds the MTP
+bank as its final row; the trainer combines these counts across the whole
+update before adjusting every bank's biases once.
 The auxiliary loss regularizes unbiased expert preferences within sequences;
 actual dispatch can differ because of the selection bias. Expert choice and
 gate mass alone do not establish specialization or causal importance.
 Trainer `expert_balance` telemetry reports the unweighted mean sequence
-auxiliary loss, while the expert summary reports per-site assignment fractions and
-selected-gate entropy and `bias0` through `bias14` on up to two validation
-rows. Its Standard-mode sample does not describe expert use during later
-feedback passes. Step-level `expert_max_violation` uses actual whole-update
+auxiliary loss over executed trunk and MTP invocations, while the expert summary
+reports per-site assignment fractions, selected-gate entropy, and `bias0`
+through `bias14` on up to two validation rows. The `mtp.experts` site uses the
+cropped second-token alignment. This plain-pass sample does not describe expert
+use during later feedback passes. Step-level `expert_max_violation` uses actual whole-update
 assignment counts: the worst physical bank's `max / mean - 1` load ratio.
 `expert_bias_max` records the maximum absolute post-update bias.
 
@@ -105,14 +108,18 @@ prettiest trajectory.
 
 ## Dynamics
 
-Auxiliary validation predicts a second token after receiving the
+Auxiliary validation predicts a second token from the payload and the
 ground-truth next token's embedding. `val_mtp` and `val_mtp_fused` therefore
 measure a different predictor and target alignment from `val` and
 `val_fused`. Compare the ordinary next-token metrics between paired runs to
 assess the effect on the model used for generation. Auxiliary accuracy alone
-does not establish speculative-decoding speed or payload usefulness. The MTP
-block adds no recurrent state or payload path to the ordinary model's
-inference computation.
+does not establish speculative-decoding speed or causal payload usefulness.
+Its PKDA recurrence can combine earlier payloads and supplied tokens, so a
+good auxiliary predictor does not establish that any one payload is a
+sufficient predictive state. MTP trains the payload writer in every condition;
+under `f`, feedback adds a second objective for that representation. The
+auxiliary recurrence is absent from ordinary generation and never supplies
+state to the trunk.
 
 Track state movement and behavior together. Small updates can mean a settled
 representation, an unproductive fixed point, numerical resolution, or an

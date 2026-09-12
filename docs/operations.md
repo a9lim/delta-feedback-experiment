@@ -107,7 +107,10 @@ Choose `--condition f` (default), `l`, or `fl`. All runs include PKDA,
 MHDB routing, experts, and auxiliary two-token prediction. Expert width is
 one quarter of `--intermediate`, which must be divisible by four. The finite
 nonnegative `--mtp-weight` defaults to 0.3 and is restored on resume. MTP uses
-existing token-store rows; ordinary generation does not execute it.
+the payload and next-token embedding from existing token-store rows in its
+own PKDA/expert block. Every supervised pass constructs the payload, including
+without `f`; `f` controls feedback consumption. Ordinary generation does not
+execute MTP.
 
 ```bash
 delta probe
@@ -148,7 +151,7 @@ outside `runs/`; custom output paths are not renamed. Both tags must be idle,
 with no queued references and no destination collision. Ordinary I/O failures
 roll back; a multi-file rename is not crash-atomic.
 
-Current snapshots use checkpoint v30 and the pinned tokenizer identity.
+Current snapshots use checkpoint v31 and the pinned tokenizer identity.
 Resume inherits state-defining settings and rejects explicit conflicts;
 runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and
@@ -161,14 +164,17 @@ validation is `val_mtp` and, with feedback, `val_mtp_fused`. On feedback
 steps, use `ntp - pass1` for mean feedback next-token cross-entropy.
 
 Training logs `expert_balance`, the unweighted per-sequence auxiliary loss
-averaged over the update. Its coefficient is `1e-4`; the monitor plots it
-separately from cross-entropy. Expert selection biases update once after the
+averaged over executed trunk invocations plus one MTP invocation per pass,
+then over passes and the update. Its coefficient is `1e-4`, independent of
+`--mtp-weight`; the monitor plots it separately from cross-entropy.
+Expert selection biases, including the auxiliary bank's, update once after the
 optimizer step at rate `0.001`, using the whole update's assignment counts,
 and remain fixed during evaluation. `expert_max_violation` is the largest
 `max(load) / mean(load) - 1` across physical banks for that update, and
 `expert_bias_max` is the largest absolute bias after its update. Evaluation
-also records expert assignment fractions, current biases, and selected-gate entropy by layer
-invocation on up to two validation rows; those summaries describe that sample,
+also records expert assignment fractions, current biases, and selected-gate
+entropy by trunk layer invocation and at `mtp.experts` on up to two validation
+rows; those summaries describe that sample,
 not the full training distribution.
 
 ## Format a conversation

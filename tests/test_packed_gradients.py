@@ -56,8 +56,9 @@ def test_gradient_slabs_cover_parameters_without_overlap():
     assert sum(allocated.values()) == sum(p.numel() * 4 for p in buffers)
 
     model.bind_gradient_sinks(buffers)
-    first_binding = [block.attn.packed_qkv_sink for block in model.blocks]
-    for block, packed in zip(model.blocks, first_binding, strict=True):
+    blocks = [*model.blocks, model.mtp.block]
+    first_binding = [block.attn.packed_qkv_sink for block in blocks]
+    for block, packed in zip(blocks, first_binding, strict=True):
         assert packed is not None
         if block.is_pkda:
             parameters = (
@@ -80,10 +81,10 @@ def test_gradient_slabs_cover_parameters_without_overlap():
     model.bind_gradient_sinks(buffers)
     assert all(
         block.attn.packed_qkv_sink is packed
-        for block, packed in zip(model.blocks, first_binding, strict=True)
+        for block, packed in zip(blocks, first_binding, strict=True)
     )
     model.bind_gradient_sinks(None)
-    assert all(block.attn.packed_qkv_sink is None for block in model.blocks)
+    assert all(block.attn.packed_qkv_sink is None for block in blocks)
 
 
 def test_packed_linear_repeated_backward_preserves_segment_gradients():

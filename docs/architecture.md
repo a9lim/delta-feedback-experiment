@@ -27,9 +27,13 @@ token embedding + previous payload -- FBT when f --> column seed
                          |                            |
                        h_top                    block deltas
                          |                            |
-               tied next-token readout       routed payload when f
-                         |
-           auxiliary block + next-token embedding --> second-token readout
+               tied next-token readout    payload_norm(h_top + routed read)
+                                                      |
+                         +----------------------------+
+                         |                            |
+                  FBT when f             + next-token embedding
+                                              PKDA + expert FFN
+                                           tied second-token readout
 ```
 
 Pass 1 and Standard decoding seed the column from the token embedding. The
@@ -125,15 +129,10 @@ Flash SDPA for BF16/FP16 and math SDPA for FP32 diagnostics. Cached decoding
 stores BF16 K/V and uses FlexAttention over the valid prefix. Only the single
 GQA layer in each trunk cell owns K/V storage.
 
-The auxiliary prediction block also uses gated GQA, with full-head RoPE after
-Q/K RMSNorm. Adjacent coordinate pair `(2j,2j+1)` rotates by
-`position * 10000^(-2j/d)`. Phases and rotation are FP32 before the activation
-cast. Positions start at zero for each cropped row; values are not rotated.
-
 ## Shared and routed experts
 
-Every trunk FFN holds sixteen independent quarter-width SwiGLUs: shared `S`
-and routed `E_0..E_14`. Each reads/writes residual width `D` and uses
+Every trunk and auxiliary FFN holds sixteen independent quarter-width SwiGLUs:
+shared `S` and routed `E_0..E_14`. Each reads/writes residual width `D` and uses
 intermediate width `H/4`; `H` must be divisible by four. For normalized input:
 
 ```text
@@ -180,19 +179,25 @@ U = top3(s)
 P_j = mean_tokens(q_j)
 F_j = stop_gradient(count_tokens(j in U) / (3T))
 aux_layer = mean_sequences(15 * sum_j P_j F_j)
-aux = mean_passes(mean_executed_layers(aux_layer))
+aux_pass = (sum_executed_trunk_layers(aux_layer) + aux_mtp) / (N_trunk + 1)
+aux = mean_passes(aux_pass)
 training_loss += 1e-4 * aux
 ```
 
 Selection-only bias, sigmoid scores, and sequence regularization follow
 [DeepSeek-V3](https://arxiv.org/abs/2412.19437). Layer/pass averaging keeps the
-coefficient independent of depth and pass count. Its within-sequence gradient
+coefficient independent of depth and pass count. The auxiliary bank contributes
+once per pass, with its own `T-1` positions. Its within-sequence gradient
 coupling does not change causal forward activations. Cross-entropy excludes it.
 
-`ColumnOutput.expert_aux_loss` holds the layer mean and `expert_counts` holds
-transient `[layers,15]` counts summed over physical-bank invocations. With
-`want_weights=True`, `expert_weights` maps each invocation to `[B,T,15]`
-sparse normalized weights, distinct from MHDB's source weights.
+`ColumnOutput.expert_aux_loss` holds the trunk layer mean and `expert_counts`
+holds transient `[L,15]` counts summed over physical-bank invocations.
+`LossOutput.expert_aux_loss` includes the auxiliary bank using the averaging
+above; its `[L+1,15]` counts place that bank last. Bias updates include every
+bank once per optimizer step. With `want_weights=True`, column `expert_weights`
+maps each trunk invocation to `[B,T,15]` sparse normalized weights, distinct
+from MHDB's source weights. `forward_mtp` can return the auxiliary block's
+weights over its `T-1` positions.
 
 ## Multi-Head Delta Block routing
 
@@ -219,7 +224,7 @@ the following RMSNorm makes pass-1 routed reads inert up to epsilon. With
 cell deltas. MHDB uses the source-selection idea of multi-head Delta Attention
 Residuals with cell-level addresses.
 
-## Letter f: feedback
+## Payload and letter f: feedback
 
 At a feedback position, token embedding `e_t` controls the gate on incoming
 payload `p_(t-1)`:
@@ -230,8 +235,8 @@ seed_t = entry_norm(W_U p_(t-1) * sigmoid(W_G gate_norm(e_t)))
 
 There is no additive embedding bypass at that position. Plain-prefix, pass-1,
 and Standard-decoding positions use `e_t`. The actual seed is both residual
-origin and MHDB source. A dedicated payload router then reads its null, seed,
-and every completed cell delta:
+origin and MHDB source. Every condition has a dedicated payload router that
+reads its null, seed, and every completed cell delta:
 
 ```text
 r_payload = route(null, seed, Delta_0 .. Delta_(C-1))
@@ -242,6 +247,10 @@ The direct `h_top` term remains alongside routed enrichment. Initially the
 uniform enrichment is `h_top/(C+2)`, making the normalized payload equal to a
 normalized top state up to epsilon. Payload routing is not conditioned on
 the next token; token control happens at the next column's entry gate.
+Every supervised pass constructs this payload for MTP, including single-pass
+batches, `l` without `f`, and the final feedback pass. The `f` letter controls
+consumption by the next column. Generation can skip payload construction when
+no feedback or auxiliary read needs it.
 
 Jacobi training shifts the previous pass's undetached payload right, adds
 keyed jitter, and fuses a suffix after a per-row plain prefix. Mixer states
@@ -307,22 +316,27 @@ One auxiliary prediction depth follows
 [DeepSeek-V3 section 2.2](https://arxiv.org/html/2412.19437v2#S2.SS2):
 
 ```text
-u_t = M concat(RMSNorm_h(h_top,t), RMSNorm_e(Emb(x_(t+1))))
-v = DenseCausalTransformer(u)
+u_t = M concat(RMSNorm_p(p_t), RMSNorm_e(Emb(x_(t+1))))
+v = PKDAExpertBlock(u)
 logits_mtp,t = (final_norm(v_t) * 1536 / D) @ Emb.weight.T
 ```
 
 `M` is bias-free `2D -> D`. The two entry norms are independent. The auxiliary
-block has gated RoPE GQA and dense SwiGLU at the trunk width and intermediate
-width, with the same `1/sqrt(2L)` branch scale. It shares the final norm and
-embedding/readout but has no experts, MHDB, PKDA, payload, or tied loop.
+block has its own PKDA mixer and one shared plus top-three-of-fifteen
+quarter-width SwiGLU experts, at the trunk width and with the same
+`1/sqrt(2L)` branch scale. It shares the final norm and embedding/readout.
+It has no MHDB read or tied loop. Its independent matrix, diagonal, and
+convolution states start from zero for each row and pass.
 
 For a stored row of `T+1` tokens, ordinary inputs/targets are
-`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs are `h_top[:,:-1]` and
+`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs are `payload[:,:-1]` and
 `Emb(tokens[:,1:-1])`, with targets `tokens[:,2:]`: `T-1` fully supervised
-positions, no padding or ignored labels. Both inputs remain differentiable.
-Causal attention never sees the second-token target, and auxiliary state
-never feeds into the column or payload.
+positions, no padding or ignored labels. Both inputs remain differentiable,
+so the auxiliary objective trains the payload router, payload normalization,
+and trunk as well as the shared token embedding. The causal PKDA recurrence
+never sees the second-token target, and auxiliary activations never feed into
+the column or payload. `DeltaModel.forward_mtp` exposes the block output,
+including balancing loss, assignment counts, and optional expert weights.
 
 Each head averages over its own valid positions. For either head,
 `combine(ell)=ell_1` with one pass, otherwise

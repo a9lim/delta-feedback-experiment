@@ -140,7 +140,7 @@ def main() -> None:
                 loss_result = multipass_loss(model, rows, outs, z_coef=saved["zloss"], mtp_weight=saved["mtp_weight"])
                 loss, losses = loss_result.total, loss_result.ntp
             (loss / micros).backward()
-            counts = torch.stack([out.expert_counts for out in outs]).sum(dim=0)
+            counts = loss_result.expert_counts
             expert_counts = counts if expert_counts is None else expert_counts + counts
             step_loss += loss.item() / micros
             step_ntp += combine_pass_losses(loss_result.ntp).item() / micros

@@ -42,7 +42,7 @@ import torch.utils.checkpoint
 from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
-from .attention import causal_attention, prefix_attention, rotary_qk
+from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
 from .moe import EXPERT_BIAS_RATE, NUM_ROUTED_EXPERTS, MixtureOfExperts
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
@@ -61,7 +61,7 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "f": (
         "feedback",
-        "full-bandwidth feedback: the FBT entry and a payload for the next column",
+        "full-bandwidth feedback: consume the preceding column's payload at the FBT entry",
     ),
     "l": (
         "loop",
@@ -138,7 +138,7 @@ class ModelConfig:
     """Exact MHDB cell width in transformer layers."""
 
     feedback: bool = True
-    """``f``: FBT gated entry plus a payload for the next column."""
+    """``f``: consume the preceding column's payload through the FBT gated entry."""
 
     loop: bool = False
     """``l``: the cells between the first and last become one tied core that
@@ -401,14 +401,11 @@ class KVCache:
 
 
 class Attention(nn.Module):
-    """Dense causal gated GQA; RoPE is used only by the auxiliary predictor."""
+    """Dense causal NoPE gated GQA."""
 
-    def __init__(self, cfg: ModelConfig, *, rope: bool = False):
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.cfg = cfg
-        self.rope = rope
-        if self.rope and (cfg.head_dim < 2 or cfg.head_dim % 2):
-            raise ValueError("RoPE requires a positive even attention head dimension")
         self.q_size = cfg.heads * cfg.head_dim
         self.kv_size = cfg.kv_heads * cfg.head_dim
         self.qkv_proj = nn.Linear(cfg.dim, self.q_size + 2 * self.kv_size, bias=False)
@@ -445,8 +442,6 @@ class Attention(nn.Module):
         v = v.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
         q = self.q_norm(q)
         k = self.k_norm(k)
-        if self.rope:
-            q, k = rotary_qk(q, k, 0 if cache is None else cache.pos)
         if cache is not None and length > 1 and cache.pos != 0:
             raise ValueError("multi-column append to a non-empty cache")
         causal = cache is None or length > 1
@@ -471,28 +466,6 @@ class Attention(nn.Module):
         out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
         out = out * torch.sigmoid(gate_logits)
         return sink_linear(out, (self.o_proj.weight,), (self.o_sink,), self.o_shadow)
-
-
-class SwiGLU(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.gate_up_proj = nn.Linear(cfg.dim, 2 * cfg.intermediate, bias=False)
-        self.down_proj = nn.Linear(cfg.intermediate, cfg.dim, bias=False)
-        self.gate_up_sink: Tensor | None = None
-        self.down_sink: Tensor | None = None
-        self.gate_up_shadow: Tensor | None = None
-        self.down_shadow: Tensor | None = None
-
-    def forward(self, x: Tensor) -> Tensor:
-        gate, up = sink_linear(
-            x, (self.gate_up_proj.weight,), (self.gate_up_sink,), self.gate_up_shadow
-        ).chunk(2, dim=-1)
-        return sink_linear(
-            F.silu(gate) * up,
-            (self.down_proj.weight,),
-            (self.down_sink,),
-            self.down_shadow,
-        )
 
 
 def _check_route_geometry(dim: int, num_heads: int) -> int:
@@ -655,7 +628,7 @@ class Block(nn.Module):
     def __init__(self, cfg: ModelConfig, layer: int, *, auxiliary: bool = False):
         super().__init__()
         self.layer = layer
-        self.is_pkda = not auxiliary and cfg.is_pkda_layer(layer)
+        self.is_pkda = auxiliary or cfg.is_pkda_layer(layer)
         self.global_gate_index = (
             None if self.is_pkda or auxiliary else cfg.global_attention_layers.index(layer)
         )
@@ -670,9 +643,9 @@ class Block(nn.Module):
                 norm_eps=cfg.norm_eps,
             )
             if self.is_pkda
-            else Attention(cfg, rope=auxiliary)
+            else Attention(cfg)
         )
-        self.mlp = SwiGLU(cfg) if auxiliary else MixtureOfExperts(cfg.dim, cfg.intermediate)
+        self.mlp = MixtureOfExperts(cfg.dim, cfg.intermediate)
         self.branch_scale = 1.0 / math.sqrt(2 * cfg.layers)
         if not auxiliary:
             self.attn_router = Router(cfg)
@@ -742,51 +715,62 @@ class Block(nn.Module):
         x, w_mlp = self._read(
             h, self.mlp_router, mlp_sources, accumulators, want_weights
         )
-        aux = expert_weights = expert_counts = None
         normalized = self.mlp_norm(x)
-        if isinstance(self.mlp, MixtureOfExperts):
-            mixed, aux, expert_weights, expert_counts = self.mlp(
-                normalized, want_weights=want_weights
-            )
-        else:
-            mixed = self.mlp(normalized)
+        mixed, aux, expert_weights, expert_counts = self.mlp(
+            normalized, want_weights=want_weights
+        )
         m = self.branch_scale * mixed
         h = h + m
         return h, h - start, w_attn, w_mlp, aux, expert_weights, expert_counts
 
 
+@dataclass
+class MTPOutput:
+    """Auxiliary states and expert statistics from one logical forward."""
+
+    hidden: Tensor
+    expert_aux_loss: Tensor
+    expert_counts: Tensor
+    expert_weights: Tensor | None
+
+
 class MultiTokenPrediction(nn.Module):
     """One sequential prediction depth; embedding and readout belong to the model.
 
-    Position t consumes the trunk state at t and the embedding of token t+1.
-    Causal attention over those pairs cannot see the target at t+2. The
-    auxiliary block has the trunk's geometry and residual scaling, with a
-    dense RoPE mixer and dense SwiGLU.
+    Position t consumes the payload at t and the embedding of token t+1.
+    Its own causal PKDA recurrence over those pairs cannot see target t+2.
+    Every invocation starts with fresh state; no trunk cache is consumed.
+    The auxiliary PKDA/MoE block has the trunk's geometry and residual scaling
+    without MHDB reads or a tied loop.
     """
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.hidden_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.embedding_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.projection = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
         self.projection_sink: Tensor | None = None
         self.projection_shadow: Tensor | None = None
-        self.attention_gate = nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
         self.block = Block(cfg, 0, auxiliary=True)
 
-    def forward(self, h: Tensor, next_embedding: Tensor) -> Tensor:
+    def forward(
+        self, payload: Tensor, next_embedding: Tensor, want_weights: bool = False
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         joined = torch.cat(
-            (self.hidden_norm(h), self.embedding_norm(next_embedding)), dim=-1
+            (self.payload_norm(payload), self.embedding_norm(next_embedding)), dim=-1
         )
         x = sink_linear(
             joined, (self.projection.weight,), (self.projection_sink,),
             self.projection_shadow,
         )
-        return self.block(x, None, None, self.attention_gate.weight, False)[0]
+        h, _, _, _, aux, weights, counts = self.block(
+            x, None, None, None, want_weights
+        )
+        return h, aux, counts, weights
 
 
-def _mtp_forward(module, h, next_embedding):
-    return module(h, next_embedding)
+def _mtp_forward(module, payload, next_embedding, want_weights):
+    return module(payload, next_embedding, want_weights)
 
 
 _compiled_mtp = torch.compile(
@@ -867,7 +851,8 @@ class ColumnOutput:
     """Top-of-stack residual stream [B, T, D], pre final norm."""
 
     payload: Tensor | None
-    """What rides to the next column (conditions with ``f``), [B, T, D]."""
+    """Shared predictive payload [B,T,D], consumed by MTP and, with f, feedback.
+    None only when the caller explicitly skips the payload read."""
 
     route_weights: dict[str, Tensor]
     """Site → per-head softmax weights [N, B, T, H], when requested."""
@@ -916,6 +901,8 @@ class DeltaModel(nn.Module):
         self.register_buffer("_classifier_accum", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.payload_router = Router(cfg)
         # Capture the exact common-trunk initialization boundary before
         # constructing the attention gates and the letter-private matrices,
         # which draw from their own streams. Restoring it below keeps every
@@ -935,8 +922,6 @@ class DeltaModel(nn.Module):
             self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
             self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
             self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-            self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-            self.payload_router = Router(cfg)
         self.grad_checkpoint = False
         """Runtime switch: retain cell-final activations, checkpoint other blocks."""
         self.bank_sources = True
@@ -949,6 +934,8 @@ class DeltaModel(nn.Module):
         self.embed_tokens.apply(self._init_weights)
         self.blocks.apply(self._init_weights)
         self.final_norm.apply(self._init_weights)
+        self.payload_norm.apply(self._init_weights)
+        self.payload_router.apply(self._init_weights)
         self._init_factor_linears(
             self.attention_gates, factor_seed ^ 0x4152434849544543
         )
@@ -1026,18 +1013,27 @@ class DeltaModel(nn.Module):
         )
         return self.entry_norm(value * gate)
 
-    def mtp_hidden(self, h_top: Tensor, next_tokens: Tensor) -> Tensor:
-        """Predictor states aligned with supplied next tokens, before readout."""
-        if h_top.ndim != 3 or next_tokens.shape != h_top.shape[:2] or not h_top.shape[1]:
-            raise ValueError("MTP needs aligned nonempty hidden states and next tokens")
+    def forward_mtp(
+        self, payload: Tensor, next_tokens: Tensor, *, want_weights: bool = False
+    ) -> MTPOutput:
+        """Predict from payloads and supplied next tokens, returning expert stats."""
+        if payload.ndim != 3 or next_tokens.shape != payload.shape[:2] or not payload.shape[1]:
+            raise ValueError("MTP needs aligned nonempty payloads and next tokens")
         embedding = self.embed_tokens(next_tokens)
-        fn = _compiled_mtp if h_top.is_cuda else _mtp_forward
+        fn = _compiled_mtp if payload.is_cuda else _mtp_forward
         if self.grad_checkpoint and self.training and torch.is_grad_enabled():
-            return torch.utils.checkpoint.checkpoint(
-                fn, self.mtp, h_top, embedding,
+            result = torch.utils.checkpoint.checkpoint(
+                fn, self.mtp, payload, embedding, want_weights,
                 use_reentrant=False, preserve_rng_state=False,
             )
-        return fn(self.mtp, h_top, embedding)
+        else:
+            result = fn(self.mtp, payload, embedding, want_weights)
+        return MTPOutput(*result)
+
+    @property
+    def expert_banks(self) -> tuple[MixtureOfExperts, ...]:
+        """Physical expert banks in count order: trunk layers, then MTP."""
+        return (*(block.mlp for block in self.blocks), self.mtp.block.mlp)
 
     def _parameter_blocks(self):
         """Physical trunk and auxiliary blocks with their separately owned gates."""
@@ -1047,7 +1043,7 @@ class DeltaModel(nn.Module):
                 else self.attention_gates[block.global_gate_index].weight
             )
             yield block, gate
-        yield self.mtp.block, self.mtp.attention_gate.weight
+        yield self.mtp.block, None
 
     # -- persistent gradient sinks -------------------------------------------
 
@@ -1100,10 +1096,10 @@ class DeltaModel(nn.Module):
         """Update each physical expert bank once after a complete training step."""
         if not self.training:
             return
-        if counts.shape != (len(self.blocks), NUM_ROUTED_EXPERTS):
-            raise ValueError("expert counts must have shape [physical layers, 15]")
-        for block, layer_counts in zip(self.blocks, counts, strict=True):
-            block.mlp.update_bias(layer_counts, rate=rate)
+        if counts.shape != (len(self.expert_banks), NUM_ROUTED_EXPERTS):
+            raise ValueError("expert counts must have shape [trunk layers + MTP, 15]")
+        for bank, bank_counts in zip(self.expert_banks, counts, strict=True):
+            bank.update_bias(bank_counts, rate=rate)
 
     def bind_gradient_sinks(
         self, sinks: dict[nn.Parameter, Tensor] | None
@@ -1206,19 +1202,9 @@ class DeltaModel(nn.Module):
             # would strand the head's gradient.
             self._classifier_accum = None
         for block, gate in self._parameter_blocks():
-            if isinstance(block.mlp, MixtureOfExperts):
-                expert_bound, expert_refresh = block.mlp.bind_gradient_sinks(sinks)
-                bound.update(expert_bound)
-                refresh.extend(expert_refresh)
-            else:
-                block.mlp.gate_up_sink = sink(block.mlp.gate_up_proj.weight)
-                block.mlp.down_sink = sink(block.mlp.down_proj.weight)
-                block.mlp.gate_up_shadow = shadow(
-                    block.mlp.gate_up_shadow, block.mlp.gate_up_proj.weight
-                )
-                block.mlp.down_shadow = shadow(
-                    block.mlp.down_shadow, block.mlp.down_proj.weight
-                )
+            expert_bound, expert_refresh = block.mlp.bind_gradient_sinks(sinks)
+            bound.update(expert_bound)
+            refresh.extend(expert_refresh)
             attn = block.attn
             if block.is_pkda:
                 attn.q_sink = sink(attn.q_proj.weight)
@@ -1508,7 +1494,7 @@ class DeltaModel(nn.Module):
             and x.is_cuda
             and torch.is_grad_enabled()
         )
-        payload_reads = cfg.feedback and need_payload
+        payload_reads = need_payload
 
         h = x
         sources: list[Tensor]
@@ -1652,7 +1638,7 @@ class DeltaModel(nn.Module):
             cache.advance(x.shape[1])
 
         payload = None
-        if cfg.feedback and need_payload:
+        if need_payload:
             enriched = h
             payload_sources = [sources[seeds - 1], *sources[seeds:]]
             routed, weights = self.payload_router(
@@ -1749,7 +1735,7 @@ def multipass(
     out = model.forward_column(
         e,
         want_weights=want_weights,
-        need_payload=n_passes > 1 or want_weights,
+        need_payload=True,
         iterations=iterations,
     )
     outs = [out]
@@ -1768,7 +1754,7 @@ def multipass(
         out = model.forward_column(
             torch.where(plain[..., None], e, fused),
             want_weights=want_weights,
-            need_payload=i < n_passes - 2 or want_weights,
+            need_payload=True,
             iterations=iterations,
         )
         outs.append(out)
@@ -1966,6 +1952,10 @@ class LossOutput:
     total: Tensor
     ntp: list[Tensor]
     mtp: list[Tensor]
+    expert_aux_loss: Tensor
+    """Mean over passes of the mean over trunk and auxiliary layer invocations."""
+    expert_counts: Tensor
+    """Actual assignments summed over passes, [trunk layers + MTP, 15]."""
 
 
 def multipass_loss(
@@ -1994,26 +1984,34 @@ def multipass_loss(
     targets = tokens[:, 1:]
     losses, z_terms = [], []
     mtp_losses, mtp_z = [], []
+    expert_losses, expert_counts = [], []
     for out in outs:
+        if out.payload is None:
+            raise ValueError("MTP loss needs a payload from every model pass")
         ce, z = sequence_ce(model, out.h_top, targets)
         losses.append(ce)
         z_terms.append(z)
-        h_mtp = model.mtp_hidden(out.h_top[:, :-1], tokens[:, 1:-1])
-        ce, z = sequence_ce(model, h_mtp, tokens[:, 2:])
+        mtp = model.forward_mtp(out.payload[:, :-1], tokens[:, 1:-1])
+        ce, z = sequence_ce(model, mtp.hidden, tokens[:, 2:])
         mtp_losses.append(ce)
         mtp_z.append(z)
+        invocations = model.cfg.executed_layers(out.iterations)
+        expert_losses.append(
+            (out.expert_aux_loss * invocations + mtp.expert_aux_loss)
+            / (invocations + 1)
+        )
+        expert_counts.append(torch.cat((out.expert_counts, mtp.expert_counts[None])))
 
     total = combine_pass_losses(losses)
     total = total + z_coef * combine_pass_losses(z_terms)
     total = total + mtp_weight * (
         combine_pass_losses(mtp_losses) + z_coef * combine_pass_losses(mtp_z)
     )
-    total = (
-        total
-        + EXPERT_BALANCE_COEF
-        * torch.stack([out.expert_aux_loss for out in outs]).mean()
+    expert_aux_loss = torch.stack(expert_losses).mean()
+    total = total + EXPERT_BALANCE_COEF * expert_aux_loss
+    return LossOutput(
+        total, losses, mtp_losses, expert_aux_loss, torch.stack(expert_counts).sum(0)
     )
-    return LossOutput(total, losses, mtp_losses)
 
 
 def _monitor_autocast(tokens: Tensor):

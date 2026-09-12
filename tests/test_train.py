@@ -406,9 +406,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 30
-    assert CONTRACT.resumable == frozenset({30})
-    assert CONTRACT.surface_version == 30
+    assert CONTRACT.version == 31
+    assert CONTRACT.resumable == frozenset({31})
+    assert CONTRACT.surface_version == 31
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(10.0)
@@ -583,10 +583,11 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
         assert (
             counts.sum(-1).tolist()
             == [per_layer] * 4 + [2 * per_layer] * 4 + [per_layer] * 4
+            + [3 * 2 * 3 * 2]  # MTP predicts one fewer token on each pass.
         )
-        before = torch.stack([block.mlp.expert_bias.clone() for block in model.blocks])
+        before = torch.stack([bank.expert_bias.clone() for bank in model.expert_banks])
         update_bias(model, counts, **kwargs)
-        after = torch.stack([block.mlp.expert_bias for block in model.blocks])
+        after = torch.stack([bank.expert_bias for bank in model.expert_banks])
         torch.testing.assert_close(
             after,
             before + 0.001 * (counts.sum(-1, keepdim=True) - 15 * counts).sign(),
@@ -625,10 +626,11 @@ def test_full_training_resume_and_rename_preserve_model_optimizer_and_bias(
 
     identical(complete["state"], restored["state"])
     identical(complete["optimizer"], restored["optimizer"])
-    assert complete["version"] == CONTRACT.version == 30
+    assert complete["version"] == CONTRACT.version == 31
     assert any(
         value.count_nonzero()
         for name, value in restored["state"].items()
         if name.endswith("expert_bias")
     )
+    assert restored["state"]["mtp.block.mlp.expert_bias"].count_nonzero()
     assert [name for name in optimizer_events if name == "bias"] == ["bias"] * 4

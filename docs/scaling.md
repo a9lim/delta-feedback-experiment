@@ -11,32 +11,38 @@ Preset availability does not establish GPU fit or throughput.
 |---|---:|---:|---:|
 | Residual width `D` | 768 | 1,152 | 1,536 |
 | Layers / four-layer cells | 12 / 3 | 16 / 4 | 24 / 6 |
-| Dense auxiliary SwiGLU width | 3,328 | 4,992 | 6,656 |
-| Trunk per-expert width | 832 | 1,248 | 1,664 |
+| Dense-equivalent FFN width `H` | 3,328 | 4,992 | 6,656 |
+| Trunk and MTP per-expert width | 832 | 1,248 | 1,664 |
 | GQA query / KV heads, width 96 | 8 / 4 | 12 / 6 | 16 / 8 |
 | MHDB groups | 4 | 6 | 8 |
 | PKDA heads, width 128 | 10 | 15 | 20 |
 | PKDA projection width | 1,280 | 1,920 | 2,560 |
-| `f` / `fl` total parameters | 466,847,208 | 1,328,193,552 | 3,433,000,416 |
-| `f` training-active non-embedding parameters | 152,176,104 | 442,130,448 | 1,147,432,416 |
-| Included auxiliary MTP parameters | 11,209,920 | 25,219,776 | 44,832,960 |
+| `f` / `fl` total parameters | 491,999,952 | 1,384,371,980 | 3,532,504,048 |
+| `f` training-active non-embedding parameters | 154,325,712 | 446,551,820 | 1,154,923,504 |
+| Included auxiliary MTP total parameters | 36,362,664 | 81,398,204 | 144,336,592 |
+| Included auxiliary MTP active parameters | 13,359,528 | 29,641,148 | 52,324,048 |
 
 Every scale has a 50,304-row tied embedding/readout, 4,096 predictions per
 row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
 per step. Each stored row includes one additional target. Width multipliers
 and optimizer ownership are in [architecture.md](architecture.md#nadam-parameters).
 
-Each trunk FFN stores one shared plus fifteen routed quarter-width experts.
-One shared and three selected experts run per token. Active counts include
-those four experts, the router, and the auxiliary dense prediction block.
+Each trunk and MTP FFN stores one shared plus fifteen routed quarter-width
+experts. One shared and three selected experts run per token. Active counts
+include those four experts and the router in every bank, plus all mixer and
+payload-writer parameters.
 A microbatch can touch all experts; all parameters, gradients, and optimizer
-state occupy memory. Per-layer selection biases are buffers, excluded from
-parameter counts; transient assignment counts have shape `[layers,15]`.
+state occupy memory. Per-bank selection biases are buffers, excluded from
+parameter counts. Training's transient assignment counts have shape
+`[layers+1,15]`, with MTP last; column-only counts remain `[layers,15]`.
 
-The auxiliary module adds `19D^2 + 4D + 192` parameters and runs once per
-training pass over `seq_len-1` positions, with a second vocabulary-loss call.
-It shares the embedding/final norm/readout and does not execute in generation.
-Condition `l` omits the FBT interface; shared token budgets still use `f`.
+The auxiliary module adds `P_PKDA + 12DH + 2D^2 + 19D` parameters: its PKDA
+mixer, expert matrices, concatenation projection, expert router, and four
+RMSNorm scales. Its active count replaces `12DH` with `3DH`. It runs once per training
+pass over `seq_len-1` positions, with a second vocabulary-loss call, and shares
+the embedding/final norm/readout. It does not execute in generation. Condition
+`l` retains the payload writer and omits the FBT entry; shared token budgets
+still use `f`.
 
 ## Token budgets
 
@@ -54,23 +60,23 @@ ratio is 25; larger ratios are supported arithmetic scenarios.
 
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|
-| Screen | 7,257 | 3,804,758,016 | 116,102 | 60,870,885,376 |
-| Bridge | 21,083 | 11,053,563,904 | 337,319 | 176,852,303,872 |
-| Flagship | 54,714 | 28,685,893,632 | 875,422 | 458,973,249,536 |
+| Screen | 7,359 | 3,858,235,392 | 117,742 | 61,730,717,696 |
+| Bridge | 21,294 | 11,164,188,672 | 340,693 | 178,621,251,584 |
+| Flagship | 55,072 | 28,873,588,736 | 881,137 | 461,969,555,456 |
 
-Warmup is 2% of the shorter of the run and its 25x length: 145, 422, and
-1,094 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
+Warmup is 2% of the shorter of the run and its 25x length: 147, 426, and
+1,101 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
 the default mixture costs about 1.28 pass-tokens per prediction. See
 [design.md](design.md#schedule).
 
 `--continue TAG` extends a finished run by restoring the last snapshot the
 longer schedule reproduces. A 25x screen run continued to 50x restores step
-5,443 and trains 9,070 more steps to reach 14,513.
+5,519 and trains 9,199 more steps to reach 14,718.
 
 Token stores include validation and each row's extra target.
 `delta tokenize --scale S --tokens-per-param R` computes that requirement and
 rounds up to the next billion stored tokens. Screen 100x needs 16B, screen
-400x needs 61B, bridge 400x needs 177B, and flagship 400x needs 460B.
+400x needs 62B, bridge 400x needs 179B, and flagship 400x needs 463B.
 Full DCLM supports larger stores. Its stream and held-out slice differ from
 the publisher's DCLM-100B subset, preventing paired per-token comparisons.
 

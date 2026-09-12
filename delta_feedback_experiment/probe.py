@@ -112,6 +112,11 @@ def cuda_probe() -> None:
     runner = ProbeTrainer(model, optimizers, args, build_schedule(args))
     data = Rows()
     spec = next(iter(runner.states))
+    expert_parameters = {
+        parameter for bank in model.expert_banks for parameter in bank.parameters()
+    }
+    assert expert_parameters <= runner.states[spec].active
+    assert expert_parameters <= runner.grad_buffers.keys()
     initial = model.embed_tokens.weight.detach().clone()
     for step in (1, 2):
         runner.zero_grad()
@@ -126,6 +131,10 @@ def cuda_probe() -> None:
             "fuse_value.weight",
             "payload_router.query",
             "mtp.projection.weight",
+            "mtp.block.attn.q_proj.weight",
+            "mtp.block.attn.control_proj.weight",
+            "mtp.block.mlp.router.weight",
+            "mtp.block.mlp.shared.down_proj.weight",
             "blocks.0.mlp.shared.down_proj.weight",
         ):
             gradient = dict(model.named_parameters())[name].grad
@@ -133,9 +142,14 @@ def cuda_probe() -> None:
             assert gradient.abs().sum() > 0 and torch.isfinite(gradient).all(), name
         for optimizer in optimizers:
             optimizer.step()
-        bias_before = model.blocks[0].mlp.expert_bias.clone()
+        bias_before = torch.stack([bank.expert_bias for bank in model.expert_banks])
+        assert state.expert_counts.shape == (cfg.layers + 1, 15)
+        assert state.expert_counts[-1].sum().item() == (
+            3 * args.batch_rows * (args.seq_len - 1) * spec.n_passes
+        )
         model.update_expert_bias(state.expert_counts)
-        assert not torch.equal(bias_before, model.blocks[0].mlp.expert_bias)
+        assert not torch.equal(bias_before[0], model.blocks[0].mlp.expert_bias)
+        assert not torch.equal(bias_before[-1], model.mtp.block.mlp.expert_bias)
         model.refresh_shadows()
     assert not torch.equal(initial, model.embed_tokens.weight)
     runner.zero_grad()

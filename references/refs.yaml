@@ -4,7 +4,7 @@ references:
   - arxiv: "2401.06066"
     slug: dai2024-deepseekmoe
     note: >
-      Fine-grained expert segmentation and shared experts; condition e uses one shared plus three of fifteen routed quarter-width SwiGLUs.
+      Fine-grained expert segmentation and shared experts; every trunk and auxiliary FFN uses one shared plus three of fifteen routed quarter-width SwiGLUs.
 
   - arxiv: "2408.15664"
     slug: wang2024-auxiliary-loss-free-balancing
@@ -15,7 +15,7 @@ references:
     slug: deepseek2025-v3
     note: >
       Sigmoid affinity scores, selection-only balancing bias, normalized mixture weights, and a complementary per-sequence balance loss.
-      Section 2.2 supplies sequential multi-token prediction with separately normalized state and next-token embedding, a dedicated transformer block, and shared embedding/output weights; condition m uses one auxiliary depth with a dense GGQA/SwiGLU block.
+      Section 2.2 supplies sequential multi-token prediction with separately normalized state and next-token embedding, a dedicated transformer block, and shared embedding/output weights. This model uses the routed payload as the state input and one auxiliary PKDA/expert block.
 
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals

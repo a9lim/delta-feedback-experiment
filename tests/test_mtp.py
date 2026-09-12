@@ -1,5 +1,6 @@
 """Numerical and causal contracts for the teacher-forced second-token head."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -10,6 +11,7 @@ from delta_feedback_experiment.model import (
     multipass,
     multipass_loss,
 )
+from delta_feedback_experiment.moe import EXPERTS_PER_TOKEN, NUM_ROUTED_EXPERTS
 
 GEOMETRY = {
     "vocab_size": 41,
@@ -23,12 +25,15 @@ GEOMETRY = {
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
     "max_seq_len": 16,
+    "loop_iterations": 2,
+    "loop_max_iterations": 2,
 }
 
 
 def tiny(condition="f", *, seed=13):
     torch.manual_seed(seed)
-    return DeltaModel(condition_config(condition, **GEOMETRY)).eval()
+    geometry = GEOMETRY | ({"layers": 12} if "l" in condition else {})
+    return DeltaModel(condition_config(condition, **geometry)).eval()
 
 
 def tokens(length=8):
@@ -77,8 +82,12 @@ def test_second_token_prediction_cannot_see_its_target():
     changed_out = passes(model, changed, count)
 
     for before, after in zip(original_out, changed_out, strict=True):
-        original_hidden = model.mtp_hidden(before.h_top[:, :-1], original[:, 1:-1])
-        changed_hidden = model.mtp_hidden(after.h_top[:, :-1], changed[:, 1:-1])
+        original_hidden = model.forward_mtp(
+            before.payload[:, :-1], original[:, 1:-1]
+        ).hidden
+        changed_hidden = model.forward_mtp(
+            after.payload[:, :-1], changed[:, 1:-1]
+        ).hidden
         # Auxiliary index t-2 predicts x[t]; neither x[t] nor later tokens may
         # influence it, even through an earlier feedback pass.
         torch.testing.assert_close(
@@ -93,15 +102,15 @@ def test_second_token_prediction_cannot_see_its_target():
         )
 
 
-def test_next_token_conditioning_and_hidden_stream_are_differentiable():
+def test_next_token_conditioning_and_payload_are_differentiable():
     model = tiny()
     supplied = tokens(length=5)
-    hidden = torch.randn(2, 5, model.cfg.dim, requires_grad=True)
-    result = model.mtp_hidden(hidden, supplied)
-    assert result.shape == hidden.shape
+    payload = torch.randn(2, 5, model.cfg.dim, requires_grad=True)
+    result = model.forward_mtp(payload, supplied).hidden
+    assert result.shape == payload.shape
     weights = torch.linspace(-1, 1, result.numel()).reshape_as(result)
     (result * weights).sum().backward()
-    assert hidden.grad is not None and hidden.grad.abs().sum() > 0
+    assert payload.grad is not None and payload.grad.abs().sum() > 0
     assert model.embed_tokens.weight.grad is not None
     assert model.embed_tokens.weight.grad[supplied.unique()].abs().sum() > 0
     # The supplied next token goes through the same embedding used by the
@@ -111,19 +120,81 @@ def test_next_token_conditioning_and_hidden_stream_are_differentiable():
     )
 
 
-def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
-    count, z_coef = 2, 0.017
-    model = tiny("f")
+@pytest.mark.parametrize("condition,count", [("l", 1), ("f", 1), ("f", 2)])
+def test_mtp_trains_the_payload_writer_on_every_supervised_pass(condition, count):
+    model = tiny(condition)
+    toks = tokens(length=5)
+    outs = passes(model, toks, count)
+    for out in outs:
+        assert out.payload is not None
+        auxiliary = model.forward_mtp(out.payload[:, :-1], toks[:, 1:-1])
+        loss, _ = explicit_head_losses(model, auxiliary.hidden, toks[:, 2:])
+        gradients = torch.autograd.grad(
+            loss,
+            (
+                out.payload,
+                model.payload_router.query,
+                model.payload_norm.weight,
+                model.blocks[0].attn.q_proj.weight,
+            ),
+            retain_graph=True,
+        )
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert all(gradient.abs().sum() > 0 for gradient in gradients)
+        # The final payload position has no second-token target.
+        assert torch.count_nonzero(gradients[0][:, -1]) == 0
+
+
+@torch.no_grad()
+def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
+    model = tiny("fl")
+    supplied = tokens(length=5)
+    payload = torch.randn(2, 5, model.cfg.dim)
+    before = model.forward_mtp(payload, supplied)
+    model.forward_mtp(-payload, supplied.flip(1))
+    passes(model, tokens(), 2)
+    after = model.forward_mtp(payload, supplied)
+    torch.testing.assert_close(before.hidden, after.hidden, atol=0, rtol=0)
+    # Another row cannot seed this row's convolution, preconditioner, or KDA
+    # memory. Running each row alone must reproduce the batched predictor.
+    for row in range(payload.shape[0]):
+        isolated = model.forward_mtp(payload[row : row + 1], supplied[row : row + 1])
+        torch.testing.assert_close(
+            isolated.hidden, before.hidden[row : row + 1], atol=2e-6, rtol=1e-5
+        )
+
+
+@pytest.mark.parametrize("coefficient", [0.0, 0.23])
+def test_mtp_loss_matches_materialized_logits_and_feedback_weighting(coefficient):
+    count, z_coef = 3, 0.017
+    model = tiny("fl")
     toks = tokens(length=6)
     outs = passes(model, toks, count)
-    coefficient = 0.23
     actual = multipass_loss(model, toks, outs, mtp_weight=coefficient, z_coef=z_coef)
     assert len(actual.ntp) == count and len(actual.mtp) == count
     ntp, mtp, ntp_z, mtp_z = [], [], [], []
+    expert_aux, expert_counts = [], []
     for index, out in enumerate(outs):
         ce, z = explicit_head_losses(model, out.h_top, toks[:, 1:])
-        second_hidden = model.mtp_hidden(out.h_top[:, :-1], toks[:, 1:-1])
-        second_ce, second_z = explicit_head_losses(model, second_hidden, toks[:, 2:])
+        auxiliary = model.forward_mtp(
+            out.payload[:, :-1], toks[:, 1:-1], want_weights=True
+        )
+        second_ce, second_z = explicit_head_losses(model, auxiliary.hidden, toks[:, 2:])
+        invocations = model.cfg.executed_layers(out.iterations)
+        expert_aux.append(
+            (out.expert_aux_loss * invocations + auxiliary.expert_aux_loss)
+            / (invocations + 1)
+        )
+        # Check dispatch accounting against actual selected expert weights,
+        # independently of the loss implementation's count aggregation.
+        selected_counts = auxiliary.expert_weights.count_nonzero(dim=(0, 1))
+        torch.testing.assert_close(auxiliary.expert_counts, selected_counts)
+        assert auxiliary.expert_counts.sum() == (
+            toks.shape[0] * (toks.shape[1] - 2) * EXPERTS_PER_TOKEN
+        )
+        expert_counts.append(
+            torch.cat((out.expert_counts, selected_counts.unsqueeze(0)))
+        )
         ntp.append(ce)
         ntp_z.append(z)
         mtp.append(second_ce)
@@ -135,6 +206,9 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
         + z_coef * feedback_sum(ntp_z)
         + coefficient * (feedback_sum(mtp) + z_coef * feedback_sum(mtp_z))
         + EXPERT_BALANCE_COEF
-        * torch.stack([out.expert_aux_loss for out in outs]).mean()
+        * torch.stack(expert_aux).mean()
     )
     torch.testing.assert_close(actual.total, expected)
+    torch.testing.assert_close(actual.expert_aux_loss, torch.stack(expert_aux).mean())
+    assert actual.expert_counts.shape == (model.cfg.layers + 1, NUM_ROUTED_EXPERTS)
+    torch.testing.assert_close(actual.expert_counts, torch.stack(expert_counts).sum(0))

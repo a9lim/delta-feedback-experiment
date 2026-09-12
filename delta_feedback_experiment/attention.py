@@ -12,39 +12,6 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from . import INDUCTOR_MODE
 
-ROPE_THETA = 10_000.0
-
-
-def rotary_qk(query, key, offset: int = 0):
-    """Rotate every adjacent feature pair after Q/K normalization.
-
-    Inputs are [B,H,T,D], with possibly different Q/K head counts. Positions
-    count tokens, never feedback passes or core iterations. Construct phases
-    and rotate in FP32 even under autocast; only the outputs return to the
-    activation dtype. No mutable tables or checkpoint state are needed.
-    """
-    dim = query.shape[-1]
-    frequency = ROPE_THETA ** (
-        -torch.arange(0, dim, 2, device=query.device, dtype=torch.float32) / dim
-    )
-    position = (
-        torch.arange(query.shape[-2], device=query.device, dtype=torch.float32) + offset
-    )
-    phase = position[:, None] * frequency[None, :]
-    cosine, sine = phase.cos(), phase.sin()
-
-    def rotate(value):
-        even, odd = value.float()[..., 0::2], value.float()[..., 1::2]
-        return (
-            torch.stack(
-                (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
-            )
-            .flatten(-2)
-            .to(value.dtype)
-        )
-
-    return rotate(query), rotate(key)
-
 
 def _causal_attention(query, key, value):
     # Flash accepts half precision; FP32 analysis uses the explicit math path.

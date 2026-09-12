@@ -74,14 +74,29 @@ def test_current_conditions_and_permanent_structure():
         for block in model.blocks
     )
     assert model.mtp is not None
-    assert not any(
-        isinstance(module, MixtureOfExperts) for module in model.mtp.modules()
+    assert isinstance(model.mtp.block.attn, PreconditionedKDA)
+    assert isinstance(model.mtp.block.mlp, MixtureOfExperts)
+    assert model.mtp.block.attn_router is None and model.mtp.block.mlp_router is None
+    assert all(model.mtp.block.attn is not block.attn for block in model.blocks)
+    assert model.expert_banks == (
+        *(block.mlp for block in model.blocks), model.mtp.block.mlp
     )
     loop = tiny("l").cfg
     assert not loop.feedback and loop.core_layers == range(4, 8)
     assert loop.executed_layers(2) == 16
     with pytest.raises(ValueError):
         loop.resolve_iterations(3)
+
+
+def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
+    states = [tiny(condition, layers=12).state_dict() for condition in ("f", "l", "fl")]
+    common = states[0].keys() & states[1].keys() & states[2].keys()
+    assert "payload_router.query" in common and "payload_norm.weight" in common
+    assert any(name.startswith("mtp.block.attn.") for name in common)
+    assert any(name.startswith("mtp.block.mlp.experts.") for name in common)
+    for name in common:
+        for state in states[1:]:
+            torch.testing.assert_close(states[0][name], state[name], atol=0, rtol=0, msg=name)
 
 
 def test_routing_matches_normalized_math_and_telescopes():
@@ -179,14 +194,28 @@ def test_loop_once_pairs_with_flat_values_and_gradients():
 def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
     models = [tiny("fl").train(), tiny("fl").train()]
     models[1].grad_checkpoint = True
-    losses = []
+    losses, counts = [], []
     for model in models:
         outs = multipass(
             model, tokens(), 2, prefix_lens=torch.ones(1, 1, dtype=torch.long)
         )
-        loss = multipass_loss(model, tokens(), outs, z_coef=0.017).total
-        loss.backward()
-        losses.append(loss.detach())
+        result = multipass_loss(model, tokens(), outs, z_coef=0.017)
+        logical_counts = result.expert_counts.clone()
+        biases = [bank.expert_bias.clone() for bank in model.expert_banks]
+        result.total.backward()
+        losses.append(result.total.detach())
+        counts.append(logical_counts)
+        # Checkpoint recomputation is backward work, not another dispatch for
+        # the next-step controller. It must neither count twice nor move bias.
+        torch.testing.assert_close(result.expert_counts, logical_counts, atol=0, rtol=0)
+        for bank, before in zip(model.expert_banks, biases, strict=True):
+            torch.testing.assert_close(bank.expert_bias, before, atol=0, rtol=0)
+        trunk_count = 3 * (tokens().shape[1] - 1) * 2
+        auxiliary_count = 3 * (tokens().shape[1] - 2) * 2
+        assert logical_counts.sum(-1).tolist() == (
+            [trunk_count] * 4 + [2 * trunk_count] * 4 + [trunk_count] * 4
+            + [auxiliary_count]
+        )
         for name in (
             "fuse_value.weight",
             "fuse_gate.weight",
@@ -202,6 +231,7 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
             for p in model.mtp.parameters()
         )
     torch.testing.assert_close(*losses, atol=0, rtol=0)
+    torch.testing.assert_close(*counts, atol=0, rtol=0)
     for (name, left), (_, right) in zip(
         models[0].named_parameters(), models[1].named_parameters(), strict=True
     ):

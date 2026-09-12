@@ -12,7 +12,8 @@ The core model always uses:
 - four-layer cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`;
 - Multi-Head Delta Block (MHDB) reads over the seed and block deltas;
 - one shared plus top-three-of-fifteen quarter-width SwiGLU experts per layer;
-- an auxiliary dense RoPE-GGQA/SwiGLU block for second-token prediction.
+- a routed payload trained by an auxiliary PKDA/expert block for second-token
+  prediction.
 
 Two condition letters control its recurrent computation:
 
@@ -27,9 +28,12 @@ identically for a given seed, and data and feedback draws use keyed streams.
 
 The screen has width 768 and twelve layers. Four quarter-width experts are
 active per token; all sixteen experts occupy parameter and optimizer memory.
-The auxiliary prediction block shares the embedding/readout and trains on
-existing rows; `--mtp-weight` defaults to 0.3. Ordinary generation uses the
-main column. [Scaling](docs/scaling.md) gives parameter and token accounting.
+The auxiliary prediction block combines the payload with the next token's
+embedding and trains on existing rows; `--mtp-weight` defaults to 0.3. It
+shares the embedding/readout and uses its own PKDA recurrence and expert bank.
+Every condition produces payloads for this supervision; `f` also feeds them
+into later columns. Ordinary generation uses the main column.
+[Scaling](docs/scaling.md) gives parameter and token accounting.
 
 The tokenizer is pinned GPT-NeoX with two generic ChatML delimiters, 50,279
 token IDs, and a 50,304-row tied embedding/readout. It formats arbitrary and
