@@ -171,7 +171,7 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
         for bank, before in zip(model.expert_banks, biases, strict=True):
             torch.testing.assert_close(bank.expert_bias, before, atol=0, rtol=0)
         trunk_count = 2 * (tokens().shape[1] - 1) * 2
-        auxiliary_count = 2 * (tokens().shape[1] - 2) * 2
+        auxiliary_count = 2 * (tokens().shape[1] - 1) * 2
         assert logical_counts.sum(-1).tolist() == (
             [trunk_count] * 4
             + [2 * trunk_count] * 8

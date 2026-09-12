@@ -47,8 +47,9 @@ parameter counts. Training's transient assignment counts have shape
 The auxiliary module adds `P_PKDA + 3D(n+1)h + 2D^2 + (n+4)D` parameters:
 its PKDA mixer, expert matrices, concatenation projection, expert router, and
 four RMSNorm scales. Its active count replaces `(n+1)` with `(k+1)` in the
-expert term. It runs once per training pass over `seq_len-1` positions, with
-a second vocabulary-loss call, and shares the embedding/final norm/readout.
+expert term. It runs once per training pass over `seq_len` positions, of
+which `seq_len-1` are supervised, and shares the embedding/final norm/readout
+with the main head, including that pass's single vocabulary-loss call.
 It does not execute in generation. Condition `l` retains the payload writer
 and omits the FBT entry; shared token budgets still use `f`.
 

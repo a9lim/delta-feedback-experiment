@@ -59,12 +59,11 @@ _dynamo_config.accumulated_recompile_limit = max(
 
 try:
     from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
-    from cut_cross_entropy.utils import _handle_eps, compute_z_loss
+    from cut_cross_entropy.utils import _handle_eps
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     CCEParams = None
     linear_cross_entropy_apply = None
     _handle_eps = None
-    compute_z_loss = None
 
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "f": (
@@ -813,6 +812,16 @@ _compiled_mtp = torch.compile(
 )
 
 
+def _payload_epilogue(norm, h, routed):
+    """The column's payload: the routed read added to the top state, normalized."""
+    return norm(h + routed)
+
+
+_compiled_payload_epilogue = torch.compile(
+    _payload_epilogue, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+
 def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
     """Pure checkpoint wrapper with a positional source-bank interface.
 
@@ -914,6 +923,11 @@ class ColumnOutput:
 
     expert_counts: Tensor
     """Assignment counts [physical layers, routed experts], summed over core uses."""
+
+    next_embedding: Tensor | None = None
+    """[B, T, D] embeddings of the stored row's positions 1..T: the auxiliary
+    head's next-token input, taken from the same lookup as the column seed.
+    ``multipass`` attaches it to every pass; a bare column leaves it None."""
 
 
 class DeltaModel(nn.Module):
@@ -1048,9 +1062,27 @@ class DeltaModel(nn.Module):
         self, payload: Tensor, next_tokens: Tensor, *, want_weights: bool = False
     ) -> MTPOutput:
         """Predict from payloads and supplied next tokens, returning expert stats."""
-        if payload.ndim != 3 or next_tokens.shape != payload.shape[:2] or not payload.shape[1]:
-            raise ValueError("MTP needs aligned nonempty payloads and next tokens")
-        embedding = self.embed_tokens(next_tokens)
+        if next_tokens.shape != payload.shape[:2]:
+            raise ValueError("MTP needs next tokens aligned with the payloads")
+        return self.forward_mtp_embedded(
+            payload, self.embed_tokens(next_tokens), want_weights=want_weights
+        )
+
+    def forward_mtp_embedded(
+        self, payload: Tensor, embedding: Tensor, *, want_weights: bool = False
+    ) -> MTPOutput:
+        """The same prediction from already-looked-up next-token embeddings.
+
+        The training objective embeds the whole stored row once and hands both
+        heads their slice of it, so the auxiliary head costs no second lookup
+        and no second scatter into the embedding gradient.
+        """
+        if (
+            payload.ndim != 3
+            or embedding.shape[:2] != payload.shape[:2]
+            or not payload.shape[1]
+        ):
+            raise ValueError("MTP needs aligned nonempty payloads and embeddings")
         fn = _compiled_mtp if payload.is_cuda else _mtp_forward
         if self._checkpoint_left > 0 and self.training and torch.is_grad_enabled():
             self._checkpoint_left -= 1
@@ -1672,7 +1704,6 @@ class DeltaModel(nn.Module):
 
         payload = None
         if need_payload:
-            enriched = h
             payload_sources = [sources[seeds - 1], *sources[seeds:]]
             routed, weights = self.payload_router(
                 payload_sources,
@@ -1686,9 +1717,13 @@ class DeltaModel(nn.Module):
                     "seed",
                     *source_names[seeds:],
                 )
-            if routed is not None:
-                enriched = h + routed
-            payload = self.payload_norm(enriched)
+            if routed is None:
+                payload = self.payload_norm(h)
+            else:
+                epilogue = (
+                    _compiled_payload_epilogue if h.is_cuda else _payload_epilogue
+                )
+                payload = epilogue(self.payload_norm, h, routed)
 
         return ColumnOutput(
             h_top=h,
@@ -1736,6 +1771,34 @@ def shift_right(x: Tensor) -> Tensor:
     return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
 
 
+def _entry_body(model, payload, e, positions, prefix):
+    plain = positions[None, :] < prefix[:, None]  # [B, T]
+    fused = model.fuse(shift_right(payload), e)
+    return torch.where(plain[..., None], e, fused)
+
+
+# The jittered and plain entries compile through their own code objects: the
+# draw is present on training passes and absent on evaluation and monitor
+# passes, and one code object per call shape keeps Dynamo from re-guarding.
+def _feedback_entry(model, payload, e, positions, prefix):
+    """The next pass's column input: plain prefix, FBT-fused suffix."""
+    return _entry_body(model, payload, e, positions, prefix)
+
+
+def _jittered_feedback_entry(model, payload, jitter, e, positions, prefix):
+    """The same entry with this pass's keyed payload jitter added first."""
+    return _entry_body(model, payload + jitter, e, positions, prefix)
+
+
+_compiled_feedback_entry = torch.compile(
+    _feedback_entry, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+_compiled_jittered_entry = torch.compile(
+    _jittered_feedback_entry, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+
 def multipass(
     model: DeltaModel,
     tokens: Tensor,
@@ -1767,32 +1830,51 @@ def multipass(
     # One logical forward: its trunk passes here and the auxiliary blocks in
     # ``multipass_loss`` share this recomputation budget in execution order.
     model._checkpoint_left = model.checkpoint_blocks
-    e = model.embed_tokens(tokens[:, :-1])
+    # One lookup of the whole stored row feeds both heads: the column seed is
+    # positions 0..T-1 and the auxiliary head's next-token input is 1..T, so
+    # the second lookup and its scatter into the embedding gradient are gone.
+    # The seed is copied dense because the routing bank allocates its gradient
+    # accumulator with ``zeros_like`` and the routing and FLA kernels read
+    # packed rows; the auxiliary input stays a view, normalized and
+    # concatenated inside the compiled auxiliary block.
+    e_all = model.embed_tokens(tokens)
+    e = e_all[:, :-1].contiguous()
+    next_embedding = e_all[:, 1:]
     out = model.forward_column(
         e,
         want_weights=want_weights,
         need_payload=True,
         iterations=iterations,
     )
+    out.next_embedding = next_embedding
     outs = [out]
     if n_passes == 1:
         return outs
 
     length = e.shape[1]
     positions = torch.arange(length, device=tokens.device)
+    compiled = e.is_cuda
     for i in range(n_passes - 1):
-        p = outs[-1].payload
-        if jitter is not None:
-            p = p + jitter[i][:, :length]
-        p_shifted = shift_right(p)
-        plain = positions[None, :] < prefix_lens[i][:, None]  # [B, T]
-        fused = model.fuse(p_shifted, e)
+        if jitter is None:
+            entry = _compiled_feedback_entry if compiled else _feedback_entry
+            x = entry(model, outs[-1].payload, e, positions, prefix_lens[i])
+        else:
+            entry = _compiled_jittered_entry if compiled else _jittered_feedback_entry
+            x = entry(
+                model,
+                outs[-1].payload,
+                jitter[i][:, :length],
+                e,
+                positions,
+                prefix_lens[i],
+            )
         out = model.forward_column(
-            torch.where(plain[..., None], e, fused),
+            x,
             want_weights=want_weights,
             need_payload=True,
             iterations=iterations,
         )
+        out.next_embedding = next_embedding
         outs.append(out)
     return outs
 
@@ -1805,6 +1887,7 @@ def _head_losses(
     norm_eps: float,
     readout_scale: float,
 ) -> tuple[Tensor, Tensor]:
+    """Per-row NLL and log-partition [B, chunk] of one materialized readout."""
     dtype = h_chunk.dtype
     normalized = h_chunk.float()
     normalized = normalized * torch.rsqrt(
@@ -1812,8 +1895,10 @@ def _head_losses(
     )
     normalized = (normalized * (norm_weight.float() * readout_scale)).to(dtype)
     logits = F.linear(normalized, classifier).float()
-    ce = F.cross_entropy(logits.flatten(0, 1), target_chunk.flatten(), reduction="sum")
-    return ce, logits.logsumexp(dim=-1).square().sum()
+    nll = F.cross_entropy(
+        logits.flatten(0, 1), target_chunk.flatten(), reduction="none"
+    )
+    return nll.view_as(target_chunk), logits.logsumexp(dim=-1)
 
 
 @torch.no_grad()
@@ -1844,7 +1929,7 @@ def batch_vocab_order(embeddings: Tensor, classifier: Tensor) -> Tensor:
     return torch.argsort(logit_avg[0], stable=True).to(torch.int32)
 
 
-def _fixed_cce_z(
+def _fixed_cce_rows(
     embeddings: Tensor,
     classifier: Tensor,
     targets: Tensor,
@@ -1853,6 +1938,10 @@ def _fixed_cce_z(
     c_grad_accum: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Current CCE with capture-safe preprocessing and differentiable LSE.
+
+    The request is unreduced, so one call serves several heads with different
+    per-row weights: the caller weights the returned rows and the fork's
+    backward takes the resulting per-row upstream gradient.
 
     Every training target is a real vocabulary id, so CCE's public
     ``ignore_index`` discovery would always produce ``valids=None``. Construct
@@ -1870,12 +1959,7 @@ def _fixed_cce_z(
     classifier receives no autograd gradient at all; the caller flushes the
     buffer into its FP32 sink and clears it on its own cadence.
     """
-    if (
-        CCEParams is None
-        or linear_cross_entropy_apply is None
-        or _handle_eps is None
-        or compute_z_loss is None
-    ):
+    if CCEParams is None or linear_cross_entropy_apply is None or _handle_eps is None:
         raise RuntimeError("cut-cross-entropy is unavailable")
     embeddings = embeddings.contiguous().flatten(0, -2)
     targets = targets.contiguous().flatten()
@@ -1885,7 +1969,7 @@ def _fixed_cce_z(
         targets=targets,
         valids=None,
         softcap=None,
-        reduction="mean",
+        reduction="none",
         filter_eps=_handle_eps("auto", embeddings.dtype),
         shift=0,
         batch_shape=targets.shape,
@@ -1900,14 +1984,98 @@ def _fixed_cce_z(
         tile_flags=None,
         c_grad_accum=c_grad_accum,
     )
-    ce, lse = linear_cross_entropy_apply(
+    nll, lse = linear_cross_entropy_apply(
         embeddings,
         classifier,
         None,
         params,
     )
     assert lse is not None
-    return ce, compute_z_loss(lse)
+    return nll, lse
+
+
+def _readout_pair(model: DeltaModel, main: Tensor, auxiliary: Tensor) -> Tensor:
+    """Both heads' readout rows as one [2*B*T, D] cross-entropy input."""
+    return torch.cat(
+        (model.readout_input(main), model.readout_input(auxiliary))
+    ).flatten(0, -2)
+
+
+_compiled_readout_pair = torch.compile(
+    _readout_pair, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+
+def head_row_losses(
+    model: DeltaModel,
+    hiddens: tuple[Tensor, ...],
+    targets: tuple[Tensor, ...],
+    *,
+    chunk: int = 1024,
+) -> tuple[Tensor, Tensor]:
+    """Per-row NLL and log-partition [heads, B, T] through the tied readout.
+
+    The heads share one vocabulary pass: CUDA concatenates their readout rows
+    into a single cut cross-entropy request, so the classifier is tiled, its
+    gradient filtered, and its accumulated gradient written once per pass
+    rather than once per head. CCE fuses tied unembedding and CE, never
+    materializing [B,T,V]; its high-threshold gradient filter is an
+    intentional throughput-first numerical divergence of the authoritative
+    CUDA recipe. CPU/MPS checkpoint sequence chunks per head to bound the
+    materialized vocabulary logits in forward and backward.
+
+    The rows come back unweighted, so a row a head does not supervise simply
+    takes no weight; the caller owns every reduction.
+    """
+    if hiddens[0].is_cuda:
+        normalized = (
+            _compiled_readout_pair(model, *hiddens)
+            if len(hiddens) == 2
+            else torch.cat([model.readout_input(h) for h in hiddens]).flatten(0, -2)
+        )
+        # The ordering is a scheduling hint for the backward, so evaluation
+        # (no backward) tiles the classifier in place.
+        ordering = (
+            batch_vocab_order(normalized, model._classifier_shadow)
+            if torch.is_grad_enabled()
+            else None
+        )
+        # The call uses the bound accumulator or the per-call FP32 sink.
+        # Evaluation has no backward to accumulate.
+        classifier, accum = model.classifier_for_loss()
+        nll, lse = _fixed_cce_rows(
+            normalized, classifier, torch.cat(targets), ordering, c_grad_accum=accum
+        )
+        shape = (len(hiddens), *targets[0].shape)
+        return nll.view(shape), lse.view(shape)
+
+    rows, partitions = [], []
+    for hidden, target in zip(hiddens, targets, strict=True):
+        nll_pieces, lse_pieces = [], []
+        recompute = torch.is_grad_enabled() and hidden.requires_grad
+        for start in range(0, target.shape[1], chunk):
+            arguments = (
+                hidden[:, start : start + chunk],
+                target[:, start : start + chunk],
+                model.final_norm.weight,
+                model.embed_tokens.weight,
+                model.final_norm.eps,
+                model.cfg.mup_ratio,
+            )
+            if recompute:
+                nll, lse = torch.utils.checkpoint.checkpoint(
+                    _head_losses,
+                    *arguments,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                nll, lse = _head_losses(*arguments)
+            nll_pieces.append(nll)
+            lse_pieces.append(lse)
+        rows.append(torch.cat(nll_pieces, dim=1))
+        partitions.append(torch.cat(lse_pieces, dim=1))
+    return torch.stack(rows), torch.stack(partitions)
 
 
 def sequence_ce(
@@ -1917,61 +2085,9 @@ def sequence_ce(
     *,
     chunk: int = 1024,
 ) -> tuple[Tensor, Tensor]:
-    """Mean CE and z² over [B, T] targets.
-
-    CUDA uses fused cut cross-entropy. CPU/MPS checkpoint sequence chunks
-    to bound the materialized vocabulary logits in forward and backward.
-    """
-    count = targets.numel()
-    if h_top.is_cuda:
-        # CCE fuses tied unembedding and CE, never materializing [B,T,V].
-        # Its high-threshold gradient filter is an intentional throughput-
-        # first numerical divergence of the authoritative CUDA recipe.
-        normalized = model.readout_input(h_top)
-        # The ordering is a scheduling hint for the backward, so evaluation
-        # (no backward) tiles the classifier in place.
-        ordering = (
-            batch_vocab_order(normalized, model._classifier_shadow)
-            if torch.is_grad_enabled()
-            else None
-        )
-        # Both heads use the bound accumulator or the per-call FP32 sink.
-        # Evaluation has no backward to accumulate.
-        classifier, accum = model.classifier_for_loss()
-        return _fixed_cce_z(
-            normalized, classifier, targets, ordering, c_grad_accum=accum
-        )
-
-    ce_sum = h_top.new_zeros((), dtype=torch.float32)
-    z_sum = h_top.new_zeros((), dtype=torch.float32)
-    recompute = torch.is_grad_enabled() and h_top.requires_grad
-    for start in range(0, targets.shape[1], chunk):
-        h_piece = h_top[:, start : start + chunk]
-        t_piece = targets[:, start : start + chunk]
-        if recompute:
-            ce, z = torch.utils.checkpoint.checkpoint(
-                _head_losses,
-                h_piece,
-                t_piece,
-                model.final_norm.weight,
-                model.embed_tokens.weight,
-                model.final_norm.eps,
-                model.cfg.mup_ratio,
-                use_reentrant=False,
-                preserve_rng_state=False,
-            )
-        else:
-            ce, z = _head_losses(
-                h_piece,
-                t_piece,
-                model.final_norm.weight,
-                model.embed_tokens.weight,
-                model.final_norm.eps,
-                model.cfg.mup_ratio,
-            )
-        ce_sum = ce_sum + ce
-        z_sum = z_sum + z
-    return ce_sum / count, z_sum / count
+    """Mean CE and z² of one head over [B, T] targets, for the monitors."""
+    nll, lse = head_row_losses(model, (h_top,), (targets,), chunk=chunk)
+    return nll.mean(), lse.square().mean()
 
 
 def combine_pass_losses(values: list[Tensor]) -> Tensor:
@@ -2007,9 +2123,11 @@ def multipass_loss(
 
     MTP adds one sequential second-token predictor per executed pass. Its CE
     and z-loss have the same pass weighting, scaled by ``mtp_weight``. Each
-    head is normalized over its own real targets; MTP drops the last input
-    position, retaining the original token-store and NTP row geometry.
-    ``ntp[0]`` is the Standard-mode tracking metric.
+    head is normalized over its own real targets; the auxiliary head runs over
+    every executed position, and its last row, whose second token is past the
+    end of the stored row, takes a dummy target and no weight. Both heads'
+    rows go through one vocabulary pass per model pass. ``ntp[0]`` is the
+    Standard-mode tracking metric.
     """
     if not outs:
         raise ValueError("loss needs at least one model pass")
@@ -2018,19 +2136,25 @@ def multipass_loss(
     if tokens.shape[1] < 3:
         raise ValueError("MTP needs at least three stored tokens")
     targets = tokens[:, 1:]
+    mtp_targets = F.pad(tokens[:, 2:], (0, 1))
     losses, z_terms = [], []
     mtp_losses, mtp_z = [], []
     expert_losses, expert_counts = [], []
     for out in outs:
         if out.payload is None:
             raise ValueError("MTP loss needs a payload from every model pass")
-        ce, z = sequence_ce(model, out.h_top, targets)
-        losses.append(ce)
-        z_terms.append(z)
-        mtp = model.forward_mtp(out.payload[:, :-1], tokens[:, 1:-1])
-        ce, z = sequence_ce(model, mtp.hidden, tokens[:, 2:])
-        mtp_losses.append(ce)
-        mtp_z.append(z)
+        if out.next_embedding is None:
+            raise ValueError("MTP loss needs the row's next-token embeddings")
+        mtp = model.forward_mtp_embedded(out.payload, out.next_embedding)
+        nll, lse = head_row_losses(
+            model, (out.h_top, mtp.hidden), (targets, mtp_targets)
+        )
+        losses.append(nll[0].mean())
+        z_terms.append(lse[0].square().mean())
+        # The padded row is the auxiliary head's causally last one, so leaving
+        # it out of both means leaves every earlier row untouched.
+        mtp_losses.append(nll[1][:, :-1].mean())
+        mtp_z.append(lse[1][:, :-1].square().mean())
         invocations = model.cfg.executed_layers(out.iterations)
         expert_losses.append(
             (out.expert_aux_loss * invocations + mtp.expert_aux_loss)

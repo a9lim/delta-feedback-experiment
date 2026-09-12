@@ -138,7 +138,9 @@ CUDA uses BF16 activations with FP32 parameters, accumulated gradients,
 optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native Flash
 SDPA handles full-row attention and FlexAttention handles cached prefixes.
 CCE reads a BF16 classifier shadow and flushes gradients to the FP32 sink at
-`--head-flush-every` calls and before each optimizer update.
+`--head-flush-every` calls and before each optimizer update. A pass makes one
+head call, covering both prediction depths, so the default cadence of 2 holds
+one two-pass microbatch.
 
 Training compiles blocks and captures fixed-address graphs for reachable
 pass/depth pairs. Inductor caches persist at

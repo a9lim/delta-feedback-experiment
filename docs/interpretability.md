@@ -22,7 +22,8 @@ source bank and labels, expert balance loss/counts, and optional route/expert
 weights. The sources obey `h_top = seed + sum(completed cell deltas)`.
 `want_weights=True` exposes MHDB source weights separately from sparse routed
 expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
-`forward_mtp` exposes the auxiliary block over its cropped second-token rows.
+`forward_mtp` exposes the auxiliary block over the column's own rows; its
+last row has no second token and carries no training weight.
 
 ## Tools
 

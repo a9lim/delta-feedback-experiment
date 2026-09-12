@@ -46,17 +46,31 @@ def passes(model, toks, count):
     return multipass(model, toks, count, prefix_lens=prefixes)
 
 
-def explicit_head_losses(model, hidden, targets):
-    """Independent materialized-logit reference for both readout objectives."""
+def explicit_head_rows(model, hidden, targets):
+    """Independent materialized-logit reference: per-row NLL and squared LSE."""
     normalized = hidden.float()
     normalized = normalized * torch.rsqrt(
         normalized.square().mean(-1, keepdim=True) + model.cfg.norm_eps
     )
     normalized = normalized * model.final_norm.weight.float() * model.cfg.mup_ratio
     logits = F.linear(normalized, model.embed_tokens.weight.float())
-    ce = F.cross_entropy(logits.flatten(0, 1), targets.reshape(-1))
-    z = torch.logsumexp(logits, dim=-1).square().mean()
-    return ce, z
+    nll = F.cross_entropy(
+        logits.flatten(0, 1), targets.reshape(-1), reduction="none"
+    ).view_as(targets)
+    return nll, torch.logsumexp(logits, dim=-1).square()
+
+
+def explicit_head_losses(model, hidden, targets):
+    """The main head's objective: every row supervised."""
+    nll, z = explicit_head_rows(model, hidden, targets)
+    return nll.mean(), z.mean()
+
+
+def explicit_mtp_losses(model, hidden, toks):
+    """The auxiliary head's objective: the padded last row carries no weight."""
+    targets = F.pad(toks[:, 2:], (0, 1))
+    nll, z = explicit_head_rows(model, hidden, targets)
+    return nll[:, :-1].mean(), z[:, :-1].mean()
 
 
 def feedback_sum(values):
@@ -86,12 +100,8 @@ def test_second_token_prediction_cannot_see_its_target():
     changed_out = passes(model, changed, count)
 
     for before, after in zip(original_out, changed_out, strict=True):
-        original_hidden = model.forward_mtp(
-            before.payload[:, :-1], original[:, 1:-1]
-        ).hidden
-        changed_hidden = model.forward_mtp(
-            after.payload[:, :-1], changed[:, 1:-1]
-        ).hidden
+        original_hidden = model.forward_mtp(before.payload, original[:, 1:]).hidden
+        changed_hidden = model.forward_mtp(after.payload, changed[:, 1:]).hidden
         # Auxiliary index t-2 predicts x[t]; neither x[t] nor later tokens may
         # influence it, even through an earlier feedback pass.
         torch.testing.assert_close(
@@ -124,6 +134,17 @@ def test_next_token_conditioning_and_payload_are_differentiable():
     )
 
 
+@torch.no_grad()
+def test_the_padded_auxiliary_row_leaves_the_supervised_rows_unchanged():
+    """Appending the unsupervised last row cannot move any earlier row."""
+    model = tiny()
+    toks = tokens(length=6)
+    out = passes(model, toks, 1)[0]
+    full = model.forward_mtp(out.payload, toks[:, 1:]).hidden
+    cropped = model.forward_mtp(out.payload[:, :-1], toks[:, 1:-1]).hidden
+    torch.testing.assert_close(full[:, :-1], cropped, atol=2e-6, rtol=1e-5)
+
+
 def test_mtp_trains_the_payload_writer_on_every_supervised_pass():
     count = 2
     model = tiny("fl")
@@ -131,8 +152,8 @@ def test_mtp_trains_the_payload_writer_on_every_supervised_pass():
     outs = passes(model, toks, count)
     for out in outs:
         assert out.payload is not None
-        auxiliary = model.forward_mtp(out.payload[:, :-1], toks[:, 1:-1])
-        loss, _ = explicit_head_losses(model, auxiliary.hidden, toks[:, 2:])
+        auxiliary = model.forward_mtp(out.payload, toks[:, 1:])
+        loss, _ = explicit_mtp_losses(model, auxiliary.hidden, toks)
         gradients = torch.autograd.grad(
             loss,
             (
@@ -179,10 +200,8 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
     expert_aux, expert_counts = [], []
     for index, out in enumerate(outs):
         ce, z = explicit_head_losses(model, out.h_top, toks[:, 1:])
-        auxiliary = model.forward_mtp(
-            out.payload[:, :-1], toks[:, 1:-1], want_weights=True
-        )
-        second_ce, second_z = explicit_head_losses(model, auxiliary.hidden, toks[:, 2:])
+        auxiliary = model.forward_mtp(out.payload, toks[:, 1:], want_weights=True)
+        second_ce, second_z = explicit_mtp_losses(model, auxiliary.hidden, toks)
         invocations = model.cfg.executed_layers(out.iterations)
         expert_aux.append(
             (out.expert_aux_loss * invocations + auxiliary.expert_aux_loss)
@@ -193,7 +212,7 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
         selected_counts = auxiliary.expert_weights.count_nonzero(dim=(0, 1))
         torch.testing.assert_close(auxiliary.expert_counts, selected_counts)
         assert auxiliary.expert_counts.sum() == (
-            toks.shape[0] * (toks.shape[1] - 2) * model.cfg.experts_per_token
+            toks.shape[0] * (toks.shape[1] - 1) * model.cfg.experts_per_token
         )
         expert_counts.append(
             torch.cat((out.expert_counts, selected_counts.unsqueeze(0)))
