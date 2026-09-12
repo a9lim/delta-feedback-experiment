@@ -1593,8 +1593,9 @@ def train(argv: list[str] | None = None) -> dict:
 def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
     device = pick_device(args.device)
     if device.type == "cuda":
-        # Ada's TF32 tensor cores materially accelerate NorMuonH's FP32 batched
-        # Newton-Schulz products; the trunk itself runs BF16 under autocast.
+        # TF32 for the FP32 matmuls that remain outside autocast: NorMuonH's
+        # spectral power iterations and the FP32 diagnostics. The Newton-Schulz
+        # loop runs in BF16 on CUDA and the trunk runs BF16 under autocast.
         torch.set_float32_matmul_precision("high")
 
     start_step = 0
