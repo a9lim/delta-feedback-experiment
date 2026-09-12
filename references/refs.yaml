@@ -1,6 +1,16 @@
 # Sources for mechanisms implemented by the current model.
 # Fetch optional local paper copies with python -m transformer_experiments.references.
 references:
+  - arxiv: "2401.06066"
+    slug: dai2024-deepseekmoe
+    note: >
+      Fine-grained expert segmentation and shared experts; condition e uses one shared plus three of fifteen routed quarter-width SwiGLUs.
+
+  - arxiv: "2101.03961"
+    slug: fedus2022-switch-transformers
+    note: >
+      Router-probability times assignment-load balancing loss, adapted here to top-three selection with a detached assignment fraction.
+
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals
     note: >

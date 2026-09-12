@@ -90,3 +90,22 @@ def test_bucket_optimizer_preserves_absent_gradients_and_resume():
         assert set(optimizer.state[parameter]) == {"momentum", "row_moment", "radius"}
         for name, value in optimizer.state[parameter].items():
             assert torch.equal(value, restored.state[other][name])
+
+
+def test_bounded_expert_buckets_match_independent_matrix_updates():
+    torch.manual_seed(87)
+    parameters = [torch.nn.Parameter(torch.randn(7, 5)) for _ in range(7)]
+    references = [torch.nn.Parameter(p.detach().clone()) for p in parameters]
+    optimizer = NorMuonH(parameters, lr=0.02, max_bucket_elements=70)
+    separate = [NorMuonH([p], lr=0.02) for p in references]
+    assert [len(batch) for batch in optimizer._batches(parameters)] == [2, 2, 2, 1]
+    for _ in range(3):
+        for parameter, reference in zip(parameters, references):
+            gradient = torch.randn_like(parameter)
+            parameter.grad = gradient
+            reference.grad = gradient.clone()
+        optimizer.step()
+        for reference, single in zip(references, separate):
+            single.step()
+        for parameter, reference in zip(parameters, references):
+            torch.testing.assert_close(parameter, reference)

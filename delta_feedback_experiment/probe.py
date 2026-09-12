@@ -1061,6 +1061,11 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(result.returncode)
     if torch.cuda.is_available():
         cuda_gate()
+        gc.collect()
+        torch.cuda.empty_cache()
+        from .moe_probe import cuda_moe_gate
+
+        cuda_moe_gate()
 
 
 if __name__ == "__main__":

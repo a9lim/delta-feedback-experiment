@@ -25,7 +25,7 @@ across generated tokens. The two execution modes can behave differently.
 
 | Surface | What it shows | Notes |
 |---|---|---|
-| `DeltaModel.forward_column` / `ColumnOutput` | Top residual state, feedback payload, final source bank, optional per-site/group route weights with source labels | The analysis interface everything below builds on |
+| `DeltaModel.forward_column` / `ColumnOutput` | Top residual state, feedback payload, final source bank, optional per-site/group route weights with source labels; under `e`, expert weights and mean balancing loss | The analysis interface everything below builds on |
 | `scripts/route_report.py` | Plain and fused route summaries, source and null scales, query geometry | Route mass is a mixing weight, not an importance score |
 | `scripts/payload_swap.py` | Top-only, uniform, and forced-source payload enrichment, optionally one routing group at a time | Top-only keeps the payload's `h_top` term |
 | `scripts/fused_diagnostics.py` | Fused minus pass-1 loss by position, fused-in-token surprise, and token frequency; gate, seed-decodability, and scale statistics; a 30-iteration self-composition trace | Conditioning on a position's own pass-1 loss selects on noise; condition on entropy or frequency instead |
@@ -62,6 +62,18 @@ include feedback through changed text.
 
 Keep the snapshot, data rows, mode, state coordinates, and precision with an
 analysis result so the measured intervention can be reproduced.
+
+Under `e`, request `want_weights=True` to obtain `expert_weights`, keyed by
+layer invocation, alongside the separate MHDB `route_weights`. Each expert
+tensor is `[B, T, 15]`: three nonzero routed weights per token, normalized to
+sum to one. The shared expert always runs and is absent from that axis. Align
+core iteration as well as token and pass when comparing expert selections.
+The auxiliary loss describes load balance; expert choice and gate mass alone
+do not establish specialization or causal importance.
+Trainer `expert_balance` telemetry reports the unweighted mean auxiliary
+loss, while the expert summary reports per-site assignment fractions and
+selected-gate entropy on up to two validation rows. Its Standard-mode sample
+does not describe expert use during later feedback passes.
 
 ## Interventions
 

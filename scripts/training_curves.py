@@ -100,6 +100,7 @@ def step_arrays(steps: dict, *, loop: bool) -> dict[str, np.ndarray]:
         cols[name] = np.array([steps[s][name] for s in keys], dtype=float)
     cols["r"] = np.array([steps[s]["r"] for s in keys], dtype=float) if loop else np.ones(len(keys))
     cols["phase"] = np.array([steps[s]["phase"] for s in keys])
+    cols["expert_balance"] = np.array([steps[s].get("expert_balance", 0) for s in keys], dtype=float)
     return cols
 
 
@@ -130,6 +131,7 @@ def main() -> None:
     for run in runs:
         a = step_arrays(run["steps"], loop="l" in run["run"]["condition"])
         tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
+        a["loss"] -= a["expert_balance"] * float(run["run"].get("expert_balance_coef", 0))
         passes = a["k"]
         a["cum_pass_tokens"] = np.cumsum(passes) * tokens_per_step
         a["cum_cell_tokens"] = np.cumsum(passes * cells_per_pass(run, a["r"])) * tokens_per_step

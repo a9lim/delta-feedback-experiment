@@ -1,7 +1,8 @@
 """delta-feedback-experiment: a nursery for a small recurrent model organism.
 
 One ``DeltaModel`` family, addressed by condition letters: ``a`` for the
-PKDA/gated-GQA hybrid trunk, ``r`` for MHDB block-delta reads, ``f`` for FBT
+PKDA/gated-GQA hybrid trunk, ``e`` for one shared plus top-three-of-fifteen
+quarter-width experts, ``r`` for MHDB block-delta reads, ``f`` for FBT
 latent feedback between token columns, ``l`` for the tied-depth loop. See
 docs/architecture.md for the model and docs/design.md for the recipe.
 """

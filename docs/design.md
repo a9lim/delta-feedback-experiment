@@ -8,7 +8,7 @@ and evaluation.
 
 ## Conditions
 
-A condition is a string of letters from `arfl`, each one change from the
+A condition is a string of letters from `aerfl`, each one change from the
 plain twelve-layer gated GQA decoder. `parse_condition` accepts the
 letters in any order and returns them in that order; the empty string is the
 plain decoder, and `ModelConfig.condition` renders a configuration's letters
@@ -17,11 +17,12 @@ back.
 | Letter | Change | `ModelConfig` flag |
 |---|---|---|
 | `a` | Kimi Delta Attention: replace the three RoPE-GGQA layers per cell with PKDA, giving `[PKDA, PKDA, PKDA, NoPE-GGQA] x 3` | `hybrid` |
+| `e` | Replace every dense FFN with one shared plus top-three-of-fifteen routed quarter-width SwiGLU experts | `experts` |
 | `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
 | `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
 | `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([architecture.md](architecture.md#letter-l-the-tied-depth-loop)) | `loop` |
 
-Every subset of `arfl` builds; their parameter counts at the screen are in
+Every subset of `aerfl` builds; their parameter counts at the screen are in
 [scaling.md](scaling.md#the-screen).
 
 Without `a`, each cell is `[RoPE-GGQA, RoPE-GGQA, RoPE-GGQA, NoPE-GGQA]`.
@@ -30,13 +31,17 @@ per-head RMSNorm at theta 10,000. The fourth layer stays NoPE in every
 condition. The pattern holds at every scale and core iteration and adds no
 learned parameters or recipe knob.
 
-`arfl` is the full built stack and `arf` the flat column. `a` alone already
+`aerfl` is the full built stack and `aerf` its flat column. `arf` remains the
+dense reference for shared token budgets. `a` alone already
 has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
 emits no payload; `f` without `r` emits `payload_norm(h_top)`; `r` with `f`
 uses the fused seed as a routing source and enriches the payload with routed
 sources. `l` adds no parameters: it holds the first and last cells and runs
 the cells between them as one tied core, so every looped condition has its
-unlooped condition's counts.
+unlooped condition's counts. `e` changes only the channel mixers and their
+training regularizer. Its router reads the current token's normalized residual;
+there is no expert capacity limit or token dropping. Intermediate width must
+be divisible by four.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every
 parameter they share byte-identically for a given seed
@@ -46,6 +51,8 @@ see the same rows in the same order with the same keyed feedback draws, and
 can be compared token by token. A looped condition pairs with its unlooped
 one the same way: the iteration draw is its own keyed sub-stream, so `arfl`
 and `arf` share every pass, prefix, and jitter draw.
+Adding `e` preserves all shared non-FFN parameters; its expert and router
+weights use their own deterministic stream and pair across `r`, `f`, and `l`.
 
 Initialization uses the single `BASE_NORMAL_INIT_STD = 0.02` constant in
 `delta_feedback_experiment/model.py` for the tied embedding and NAdam dense
@@ -194,6 +201,19 @@ After all microbatches have accumulated, the single global FP32 gradient
 vector is clipped to L2 norm 10.0 before both optimizer steps; telemetry
 reports the pre-clip norm.
 
+### Expert balancing
+
+With `e`, each layer adds a differentiable load-balance term computed over the
+microbatch's tokens: `15 * sum(mean(router_probabilities) * assignment_fraction)`.
+The assignment fraction counts each selected expert once and divides by three
+times the token count; it is detached from autograd. The regularizer is averaged
+over executed layer invocations, including repeated core layers, then over
+feedback passes, and added to the training objective with coefficient `0.01`.
+Its weight therefore stays fixed as depth or pass count changes. Reported
+cross-entropy and perplexity exclude this regularizer. Routing of the forward
+activations remains token-local even though the training regularizer couples
+the token statistics of a microbatch.
+
 ### Feedback passes
 
 Conditions with `f` train with parallel Jacobi passes over a full sequence. Pass 1
@@ -264,9 +284,9 @@ rounded up to whole steps, and every condition at a scale shares it.
 
 | Flag | Default | What it changes |
 |---|---:|---|
-| `--condition` | `""` | letters from `arfl` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
+| `--condition` | `""` | letters from `aerfl` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
-| `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the flat full stack at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
+| `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the dense flat `arf` reference at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
 | `--steps` | derived | schedule length, typed instead of derived |
 | `--continue TAG` | | extend finished run TAG to this longer schedule under a new tag: its last snapshot that the longer schedule reproduces is restored, every setting but the length inherited |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | 4,096, 128, 1 at every scale | predictions per row, rows per step, and the microbatch; the scale keeps 524,288 predictions per step, as does a retyped `--seq-len` alone |
@@ -283,8 +303,10 @@ rounded up to whole steps, and every condition at a scale shares it.
 ### Checkpoints and queue
 
 Checkpoint v28 is the only accepted contract for resume, evaluation, and
-forks. It binds snapshots to the current GPT-NeoX/ChatML tokenizer and
-50,304-row head. The snapshot and token store carry the same deterministic
+forks. `e` uses the existing condition field and model state dictionary, so
+dense snapshots retain their current resume contract. Snapshots bind to the
+current GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token
+store carry the same deterministic
 `tokenizer_id`, derived from the pinned vocabulary, delimiter IDs, and full
 ChatML template; mismatches are rejected. Every snapshot records its condition
 as letters. A snapshot holds the model, both optimizer states, the fixed NorMuonH radii, the state-defining arguments, the

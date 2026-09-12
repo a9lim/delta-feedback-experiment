@@ -3,6 +3,7 @@
 from torch import Tensor
 
 _NADAM_MATRIX_MARKERS = (
+    ".mlp.router.",
     ".attn.control_proj.",
     ".attn.decay_up.",
     ".attn.output_gate_up.",
@@ -40,4 +41,5 @@ def is_width_scaled_parameter(name: str, parameter: Tensor) -> bool:
         name.startswith("attention_gates.")
         or name == "fuse_gate.weight"
         or ".attn.control_proj." in name
+        or ".mlp.router." in name
     )

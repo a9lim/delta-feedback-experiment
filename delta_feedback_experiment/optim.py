@@ -149,6 +149,7 @@ class NorMuonH(torch.optim.Optimizer):
         beta2: float = 0.95,
         eps: float = 1e-8,
         ns_steps: int = 5,
+        max_bucket_elements: int | None = None,
     ):
         defaults = {
             "lr": lr,
@@ -158,6 +159,7 @@ class NorMuonH(torch.optim.Optimizer):
             "ns_steps": ns_steps,
         }
         super().__init__(params, defaults)
+        self.max_bucket_elements = max_bucket_elements
         self._initial_radii: dict[torch.nn.Parameter, Tensor] = {}
         for group in self.param_groups:
             for parameter in group["params"]:
@@ -175,6 +177,14 @@ class NorMuonH(torch.optim.Optimizer):
                     )
                 self._initial_radii[parameter] = radius
 
+    def _batches(self, parameters: list[Tensor]):
+        """Bound expert packing temporaries without splitting any matrix."""
+        size = len(parameters)
+        if self.max_bucket_elements is not None:
+            size = max(1, self.max_bucket_elements // parameters[0].numel())
+        for start in range(0, len(parameters), size):
+            yield parameters[start : start + size]
+
     @torch.no_grad()
     def warmup(self, active: set[torch.nn.Parameter] | None = None) -> None:
         """Compile every CUDA shape bucket without touching optimizer state."""
@@ -186,41 +196,44 @@ class NorMuonH(torch.optim.Optimizer):
                 buckets[(parameter.device, parameter.dtype, parameter.shape)].append(
                     parameter
                 )
-            for (device, dtype, shape), parameters in buckets.items():
+            for (device, dtype, shape), bucket in buckets.items():
                 if device.type != "cuda":
                     continue
-                matrices = [
-                    torch.nn.Parameter(
-                        torch.full(
-                            shape,
-                            1 / math.sqrt(shape[0] * shape[1]),
-                            device=device,
-                            dtype=dtype,
-                        ),
-                        requires_grad=parameter.requires_grad,
-                    )
-                    for parameter in parameters
-                ]
-                gradients = [torch.zeros_like(matrix) for matrix in matrices]
-                momenta = [torch.zeros_like(matrix) for matrix in matrices]
-                rows = [
-                    torch.zeros(shape[0], 1, device=device, dtype=dtype)
-                    for _ in parameters
-                ]
-                radii = [torch.ones((), device=device, dtype=dtype) for _ in parameters]
-                scalar = torch.zeros((), device=device)
-                _compiled_normuonh_bucket_step(
-                    matrices,
-                    gradients,
-                    momenta,
-                    rows,
-                    radii,
-                    scalar,
-                    group["momentum"],
-                    group["beta2"],
-                    group["eps"],
-                    group["ns_steps"],
-                )
+                for parameters in self._batches(bucket):
+                    self._warm_bucket(parameters, device, dtype, shape, group)
+
+    def _warm_bucket(self, parameters, device, dtype, shape, group) -> None:
+        matrices = [
+            torch.nn.Parameter(
+                torch.full(
+                    shape,
+                    1 / math.sqrt(shape[0] * shape[1]),
+                    device=device,
+                    dtype=dtype,
+                ),
+                requires_grad=parameter.requires_grad,
+            )
+            for parameter in parameters
+        ]
+        gradients = [torch.zeros_like(matrix) for matrix in matrices]
+        momenta = [torch.zeros_like(matrix) for matrix in matrices]
+        rows = [
+            torch.zeros(shape[0], 1, device=device, dtype=dtype) for _ in parameters
+        ]
+        radii = [torch.ones((), device=device, dtype=dtype) for _ in parameters]
+        scalar = torch.zeros((), device=device)
+        _compiled_normuonh_bucket_step(
+            matrices,
+            gradients,
+            momenta,
+            rows,
+            radii,
+            scalar,
+            group["momentum"],
+            group["beta2"],
+            group["eps"],
+            group["ns_steps"],
+        )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -245,25 +258,29 @@ class NorMuonH(torch.optim.Optimizer):
                     parameter
                 )
 
-            for (device, _dtype, _shape), parameters in buckets.items():
+            for (device, _dtype, _shape), bucket in buckets.items():
                 lr = torch.scalar_tensor(group["lr"], device=device)
                 update_fn = (
                     _compiled_normuonh_bucket_step
                     if device.type == "cuda"
                     else _normuonh_bucket_step
                 )
-                update_fn(
-                    parameters,
-                    [parameter.grad for parameter in parameters],
-                    [self.state[parameter]["momentum"] for parameter in parameters],
-                    [self.state[parameter]["row_moment"] for parameter in parameters],
-                    [self.state[parameter]["radius"] for parameter in parameters],
-                    lr,
-                    group["momentum"],
-                    group["beta2"],
-                    group["eps"],
-                    group["ns_steps"],
-                )
+                for parameters in self._batches(bucket):
+                    update_fn(
+                        parameters,
+                        [parameter.grad for parameter in parameters],
+                        [self.state[parameter]["momentum"] for parameter in parameters],
+                        [
+                            self.state[parameter]["row_moment"]
+                            for parameter in parameters
+                        ],
+                        [self.state[parameter]["radius"] for parameter in parameters],
+                        lr,
+                        group["momentum"],
+                        group["beta2"],
+                        group["eps"],
+                        group["ns_steps"],
+                    )
         return loss
 
 
@@ -305,7 +322,11 @@ def build_optimizers(
     the width-scaled group runs at ``lr_nadam * model.cfg.mup_ratio``.
     """
     matrices, nadam_parameters, width_parameters = split_parameters(model)
-    normuonh = NorMuonH(matrices, lr=lr_normuonh)
+    normuonh = NorMuonH(
+        matrices,
+        lr=lr_normuonh,
+        max_bucket_elements=32 * 1024 * 1024 if model.cfg.experts else None,
+    )
     lr_width = lr_nadam * model.cfg.mup_ratio
     use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda
     nadam = torch.optim.NAdam(

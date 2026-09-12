@@ -7,24 +7,28 @@ on their computation.
 
 ## Model
 
-One `DeltaModel` implements every subset of four condition letters:
+One `DeltaModel` implements every subset of five condition letters:
 
 | Letter | Change |
 |---|---|
 | `a` | Preconditioned Kimi Delta Attention (PKDA) in three layers of each four-layer cell; the fourth is gated global GQA |
+| `e` | Quarter-width SwiGLU experts: one always shared plus three selected from fifteen routed experts in every layer |
 | `r` | Multi-Head Delta Block (MHDB) routing over the column seed and block deltas before every sublayer |
 | `f` | Full-Bandwidth Transformer (FBT) fusion of the previous column's latent payload with the current token embedding |
 | `l` | Repeated application of the tied core between the first and last cells |
 
-`arfl` is the full stack, `arf` the flat column, and the empty condition the
+`aerfl` is the full stack, `aerf` its flat column, and the empty condition the
 plain gated GQA decoder. Without `a`, the first three layers of each cell use
 full-head RoPE after Q/K RMSNorm; every fourth layer uses no positional
 encoding. Conditions on the same attention trunk pair their shared parameters
 at initialization and can train on identical rows and keyed feedback draws.
 
-The default screen has width 768, twelve layers, and 179,461,416 parameters
-under `arf` or `arfl`. It uses a pinned GPT-NeoX tokenizer with two generic
-ChatML delimiters, 50,279 token IDs, and a 50,304-row tied embedding/readout.
+The default screen has width 768, twelve layers, and 455,637,288 parameters
+under `aerf` or `aerfl` (179,461,416 without `e`). Four quarter-width experts
+are active per token; their matrix arithmetic matches the dense FFN before
+routing overhead. Token budgets retain the dense `arf` reference. The model
+uses a pinned GPT-NeoX tokenizer with two generic ChatML delimiters, 50,279
+token IDs, and a 50,304-row tied embedding/readout.
 The tokenizer formats arbitrary and repeated roles; pretraining uses raw web
 text.
 

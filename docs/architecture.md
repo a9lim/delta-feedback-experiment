@@ -1,12 +1,13 @@
-# Architecture: the four letters and the column
+# Architecture: the five letters and the column
 
 This page defines the computation and state of the `DeltaModel` family: the
-column every condition shares and the four packages the condition letters
+column every condition shares and the five packages the condition letters
 add. `a` puts Preconditioned Kimi Delta Attention (PKDA) in three of every
-four token mixers, `r` adds Multi-Head Delta Block routing (MHDB), `f` adds
+four token mixers, `e` adds shared and routed quarter-width SwiGLU experts,
+`r` adds Multi-Head Delta Block routing (MHDB), `f` adds
 Full-Bandwidth Transformer (FBT) feedback between token columns, and `l` ties
 the cells between the first and last into one core iterated within the
-column. `arfl` is the full built stack, `arf` the flat column, and the empty
+column. `aerfl` is the full built stack, `aerf` its flat column, and the empty
 condition the plain decoder; dropping a letter removes that package from the
 computation.
 
@@ -26,6 +27,7 @@ token embedding e_t -------------------+
 previous payload p_(t-1) --------------+                  |
                                                           v
         [ PKDA - PKDA - PKDA - gated global GQA ] x C     (a)
+           each FFN selects 1 shared + 3/15 experts       (e)
            each sublayer transiently reads MHDB sources   (r)
            the cells between the first and last tied and
            iterated r times                               (l)
@@ -37,8 +39,9 @@ previous payload p_(t-1) --------------+                  |
 ```
 
 The decoder is a bias-free pre-norm stack with tied embedding and readout, a
-final RMSNorm, packed SwiGLU channel mixers, and no dropout. Every RMSNorm,
-including PKDA's gated output norm, uses epsilon `1e-6`. Layers come in
+final RMSNorm, packed SwiGLU channel mixers (shared and routed under `e`),
+and no dropout. Every RMSNorm, including PKDA's gated output norm, uses
+epsilon `1e-6`. Layers come in
 four-layer **cells**, the unit MHDB addresses and the unit the loop ties.
 Under `a` each cell is `[PKDA, PKDA, PKDA, NoPE-GGQA]`, so PKDA carries
 token-mixer state, order, and recency and every fourth layer supplies a gated
@@ -59,7 +62,7 @@ already-scaled branch deltas `a_l` and `m_l`:
 ```text
 a_l = mixer_l(rmsnorm(routed_read(h_l))) / sqrt(2L)
 h'_l = h_l + a_l
-m_l = swiglu_l(rmsnorm(routed_read(h'_l))) / sqrt(2L)
+m_l = ffn_l(rmsnorm(routed_read(h'_l))) / sqrt(2L)
 h_(l+1) = h'_l + m_l
 ```
 
@@ -226,6 +229,62 @@ compiled region and restores the caller's preferences. Cached decoding writes
 BF16 K/V explicitly, then uses compiled FlexAttention over the valid prefix;
 a one-token query sees every key in that prefix. Only the dense attention
 layers own KV storage: one per cell under `a`, every layer without it.
+
+## Letter e: shared and routed experts
+
+Every dense SwiGLU is replaced by sixteen independent SwiGLUs: one shared
+expert `S` and fifteen routed experts `E_j`. Each reads and writes the full
+residual width `D`, with intermediate width `H / 4` for dense width `H`.
+`H` must be divisible by four. Every token uses the shared expert and exactly
+three routed experts. The expert bank is tied wherever its enclosing core
+layer is tied; routing is recomputed from the current state at each iteration.
+
+For normalized FFN input `x`, a bias-free `D -> 15` router computes:
+
+```text
+p = softmax(W_router x)
+J = top3(p)
+w_j = p_j / sum_(i in J) p_i  if j in J, else 0
+ffn(x) = (S(x) + 3 * sum_j w_j E_j(x)) / 2
+```
+
+Softmax is evaluated in FP32 during ordinary training. Selection is token-local,
+has no expert capacity limit, and never drops tokens. The selected gate values
+remain differentiable; the discrete choice has no gradient. The factor of
+three keeps each selected expert's coefficient at one under equal gates;
+division by two matches the variance of four independent, equal-variance
+expert outputs to one dense output at equal gates. This is an initialization
+scaling rationale, not a guarantee about learned output variance.
+
+The expert matrices have four times the dense FFN's stored parameters and
+the same active matrix arithmetic per token. The router adds `15D` parameters
+per layer and dispatch overhead. Shared and finely segmented experts follow
+the architectural ideas in [DeepSeekMoE](https://arxiv.org/abs/2401.06066);
+the specific output normalization and fixed configuration are local choices.
+
+The training load-balance term uses full router probabilities, including
+unselected experts. For `N` microbatch tokens:
+
+```text
+P_j = mean_tokens(p_j)
+F_j = stop_gradient(count_tokens(j in J) / (3N))
+aux_layer = 15 * sum_j P_j F_j
+aux = mean_passes(mean_executed_layers(aux_layer))
+training_loss += 0.01 * aux
+```
+
+This adapts the probability/load product from
+[Switch Transformers](https://arxiv.org/abs/2101.03961) to three selections.
+Each recurrent invocation is one term in the layer mean. The pass mean is
+independent of the feedback cross-entropy weighting; neither more depth nor
+more passes increases the regularizer's coefficient. Cross-entropy reporting
+excludes it. Microbatch statistics couple the regularizer's gradients across
+tokens without changing causal forward activations.
+
+`ColumnOutput.expert_aux_loss` holds the layer mean (`None` without `e`).
+With `want_weights=True`, `expert_weights` maps each layer invocation to a
+`[B, T, 15]` tensor containing the sparse normalized `w`: three nonzero values
+per token summing to one. These are separate from MHDB's source weights.
 
 ## Letter r: Multi-Head Delta Block routing
 
@@ -562,13 +621,16 @@ K > 1:  loss = ell_1 + mean(ell_2, ..., ell_K)
 ```
 
 Readout happens only after the coda at the final iteration. The cooldown
-log-partition penalty applies unchanged.
+log-partition penalty applies unchanged. With `e`, the expert balancing term
+is added with the layer and pass normalization defined above.
 
 Backpropagation is complete: every iteration of every pass is in the graph.
 The trainer's activation policy counts executed layers per pass against a
 configured raw budget. Deeper modes retain the final block of each four-layer
 cell and checkpoint its preceding three blocks. With `a`, the retained block
 is dense attention; without `a`, the same quarter of blocks is retained.
+`e` halves the raw activation budget (20 executed layers at the screen,
+versus 40 for dense FFNs) to allow for expert dispatch and parameter storage.
 The checkpoint wrapper stays outside each compiled block, so both retained
 and recomputed blocks use the same compilation boundaries. Every iteration
 remains differentiable.
@@ -621,7 +683,8 @@ distributions here are specified by standard deviation. The single tuning
 constant `BASE_NORMAL_INIT_STD = 0.02` in `delta_feedback_experiment/model.py`
 sets the base scale for NAdam-owned matrices:
 
-- GGQA gates, the FBT token gate, and PKDA's packed control projection use
+- GGQA gates, the expert router, the FBT token gate, and PKDA's packed control
+  projection use
   `BASE_NORMAL_INIT_STD * sqrt(1536 / D)`: approximately 0.02828 at the
   screen, 0.02309 at the bridge, and 0.02 at the flagship.
 - The tied embedding/readout and PKDA's fixed-head-width main-decay and
@@ -648,8 +711,12 @@ Pairing is built in. Two conditions on the same trunk letter initialize every
 parameter they share byte-identically for a given seed: the trunk from the
 common stream, the attention gates from their own deterministic stream, and
 `f`'s fusion matrices from `f`'s own, neither of which advances the common
-one; routers initialize to zero. The plain trunk and the `a` trunk consume
-the common stream differently, so parameters do not pair across `a`.
+one; MHDB routing queries initialize to zero. The plain trunk and the `a` trunk consume
+the common stream differently, so parameters do not pair across `a`. The
+expert bank and router use a separate deterministic stream after common
+initialization, preserving every shared non-FFN parameter when `e` is added.
+Expert weights pair across `r`, `f`, and `l`; MHDB's zero-initialized queries
+are distinct from the randomly initialized expert router.
 
 Embedding parameters and optimizer state are FP32. On CUDA, the residual
 stream, routed values, payloads, mixer activations, and caches are BF16 except
@@ -686,7 +753,7 @@ at the muP reference width. No group uses weight decay.
 NorMuonH owns ordinary trainable two-dimensional hidden weights, including:
 
 - attention and PKDA Q/K/V/output projections;
-- SwiGLU input and output matrices;
+- dense, shared, and routed SwiGLU input and output matrices;
 - the FBT payload-value projection.
 
 For matrix `W`, its initial FP32 Frobenius radius `R = ||W_0||_F` is fixed for
@@ -728,6 +795,7 @@ parameter, in two groups. The **width-scaled group** holds the NAdam matrices
 whose fan-in is the residual width `D`:
 
 - GGQA gate matrices;
+- expert router matrices;
 - the FBT token-gate matrix;
 - PKDA's packed control projection.
 
@@ -773,6 +841,10 @@ CPU, while both moment tensors and all parameters remain FP32 on-device.
 NorMuonH compiles each active shape bucket's packing, mathematical update, and
 in-place state writeback together. Its checkpoint state remains ordinary
 per-parameter tensors; the compiled path retains no second packed state.
+With `e`, packing is split into batches of at most 33,554,432 matrix elements
+(128 MiB per FP32 packed tensor), except that a larger individual matrix
+remains whole. This bounds each temporary without splitting a matrix's
+NorMuonH update.
 
 After synchronized microbatch accumulation, the single global FP32 gradient
 vector is clipped to L2 norm 10.0 immediately before both optimizer steps. The

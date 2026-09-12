@@ -1339,7 +1339,7 @@ def condition_args(condition: str) -> list[str]:
 
 @pytest.mark.parametrize(
     "condition",
-    ["", "a", "r", "f", "ar", "af", "rf", "arf", "l", "arl", "afl", "arfl"],
+    ["", "a", "r", "f", "ar", "af", "rf", "arf", "l", "arl", "afl", "arfl", "e", "aerfl"],
     ids=lambda condition: condition or "plain",
 )
 def test_tiny_run_completes(tmp_path, capsys, condition):
@@ -1368,7 +1368,7 @@ def test_tiny_run_completes(tmp_path, capsys, condition):
     assert all(("| r=" in line) == ("l" in condition) for line in step_records)
 
 
-@pytest.mark.parametrize("condition", ["arf", "arfl"])
+@pytest.mark.parametrize("condition", ["arf", "arfl", "aerfl"])
 @pytest.mark.parametrize("rename", [False, True], ids=["same-tag", "renamed"])
 def test_resume_is_exact(tmp_path, capsys, condition, rename):
     full = run(tmp_path, "full", condition_args(condition))

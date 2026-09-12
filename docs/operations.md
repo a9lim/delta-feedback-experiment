@@ -92,6 +92,12 @@ parts and source indexes allow interrupted builds to resume.
 are in [scaling.md](scaling.md); recipe flags are in
 [design.md](design.md#knobs) and `delta train --help`.
 
+Add `e` for the one-shared-plus-three-of-fifteen expert configuration, for
+example `--condition aerf` or `--condition aerfl`. Expert width is one quarter
+of `--intermediate`, which must be divisible by four. These runs keep the
+dense `arf` token-budget reference and use more parameter memory; preset
+availability is not a measured GPU fit. Distributed training is not implemented.
+
 ```bash
 delta probe
 # Foreground training or detached queueing.
@@ -135,6 +141,12 @@ Resume inherits state-defining settings and rejects explicit conflicts;
 runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and
 continuation. See [design.md](design.md#checkpoints-and-queue).
+
+Expert runs log `expert_balance`, the unweighted auxiliary loss averaged over
+the update. The monitor plots it separately from cross-entropy. Evaluation
+also records expert assignment fractions and selected-gate entropy by layer
+invocation on up to two validation rows; those summaries describe that sample,
+not the full training distribution.
 
 ## Format a conversation
 

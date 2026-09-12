@@ -34,6 +34,7 @@ from transformer_experiments.schedule import Schedule
 from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
     CONDITION_LETTERS,
+    EXPERT_BALANCE_COEF,
     DeltaModel,
     condition_config,
     depth_trace,
@@ -60,8 +61,13 @@ def read_checkpoint(path: str | Path) -> dict:
     """Read a snapshot whose vocabulary and model state have current meaning."""
     payload = checkpoints.read(path, CONTRACT, map_location="cpu")
     CONTRACT.check_resumable(path, payload["version"])
-    if payload["args"].get("tokenizer_id") not in (TOKENIZER_ID, SYNTHETIC_TOKENIZER_ID):
-        raise ValueError(f"{path}: checkpoint tokenizer identity differs from current code")
+    if payload["args"].get("tokenizer_id") not in (
+        TOKENIZER_ID,
+        SYNTHETIC_TOKENIZER_ID,
+    ):
+        raise ValueError(
+            f"{path}: checkpoint tokenizer identity differs from current code"
+        )
     return payload
 
 
@@ -511,6 +517,10 @@ def automatic_checkpoint(
     # those are the global-attention blocks. Count actual executed layers
     # and tokens, including repeated core iterations.
     raw_work = 4096 * 768 * 40
+    if cfg.experts:
+        # The screen expert bank adds 3.6 GiB of persistent training state.
+        # Reserve room for sparse dispatch and optimizer workspace as well.
+        raw_work //= 2
     work = (
         args.micro_rows
         * args.seq_len
@@ -537,6 +547,7 @@ class CapturedMicro:
     z_coef: torch.Tensor
     loss_sum: torch.Tensor
     pass1_sum: torch.Tensor
+    expert_balance_sum: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
     active: frozenset[torch.nn.Parameter] = frozenset()
 
@@ -720,6 +731,7 @@ class CudaGraphTrainer:
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
         )
 
     def _body(self, state: CapturedMicro) -> None:
@@ -739,6 +751,11 @@ class CudaGraphTrainer:
         (loss / self.micros).backward()
         state.loss_sum.add_(loss.detach() / self.micros)
         state.pass1_sum.add_(losses[0].detach() / self.micros)
+        if self.model.cfg.experts:
+            state.expert_balance_sum.add_(
+                torch.stack([out.expert_aux_loss.detach() for out in outs]).mean()
+                / self.micros
+            )
 
     def _drain_head_accum(self) -> None:
         """Add the head's accumulated BF16 gradient into its FP32 sink.
@@ -777,6 +794,15 @@ class CudaGraphTrainer:
         torch.cuda.synchronize()
         active = {p for p in self.parameters if p.grad is not None}
         active |= {p for p in self.sink_fed if bool(self._buffers[p].any())}
+        if self.model.cfg.experts:
+            # Warm-up rows can select only a few experts. Replay data changes
+            # those choices, so activity is structural for the entire bank.
+            active.update(
+                parameter
+                for block in self.model.blocks
+                for parameter in block.mlp.parameters()
+                if parameter.requires_grad
+            )
         return active
 
     def _capture(self, state: CapturedMicro, pool) -> None:
@@ -789,6 +815,7 @@ class CudaGraphTrainer:
             self._head_pending = 0
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+        state.expert_balance_sum.zero_()
         # Capturing on a blocking stream cannot inherit unfinished
         # default-stream writes from optimizer/kernel preparation.
         torch.cuda.synchronize()
@@ -798,6 +825,7 @@ class CudaGraphTrainer:
         state.graph = graph
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+        state.expert_balance_sum.zero_()
 
     def _initialize_optimizers(self) -> None:
         """Materialize persistent state before the graph-private pool grows."""
@@ -835,6 +863,7 @@ class CudaGraphTrainer:
         state.z_coef.fill_(z_coef)
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+        state.expert_balance_sum.zero_()
         return state
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
@@ -1089,6 +1118,42 @@ def route_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[
         records.append(record)
     model.train()
     return records
+
+
+@torch.no_grad()
+def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[dict]:
+    """Actual routed assignment fractions and gate entropy by executed site."""
+    if not model.cfg.experts:
+        return []
+    was_training = model.training
+    model.eval()
+    try:
+        rows = data_val.batch(0, min(2, args.eval_rows), device)
+        with (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if device.type == "cuda"
+            else contextlib.nullcontext()
+        ):
+            outs = multipass(model, rows, 1, want_weights=True)
+        records = []
+        for site, weights in outs[0].expert_weights.items():
+            w = weights.float()
+            load = (w > 0).float().mean(dim=(0, 1)) / 3
+            entropy = -(w * w.clamp_min(1e-30).log()).sum(-1).mean()
+            record = {
+                "site": site,
+                "used": int((load > 0).sum()),
+                "max_load": round(load.max().item(), 4),
+                "min_load": round(load.min().item(), 4),
+                "entropy": round(entropy.item(), 4),
+            }
+            record.update(
+                {f"expert{i}": round(value, 4) for i, value in enumerate(load.tolist())}
+            )
+            records.append(record)
+        return records
+    finally:
+        model.train(was_training)
 
 
 # -- checkpointing -------------------------------------------------------------
@@ -1439,6 +1504,17 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             grad_clip=GRAD_CLIP_NORM,
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
+            **(
+                {
+                    "expert_shared": 1,
+                    "expert_routed": 15,
+                    "expert_top_k": 3,
+                    "expert_width": model.cfg.intermediate // 4,
+                    "expert_balance_coef": EXPERT_BALANCE_COEF,
+                }
+                if model.cfg.experts
+                else {}
+            ),
             **{name: getattr(args, name) for name in EXACT_FIELDS},
         )
         if args.continue_from:
@@ -1514,11 +1590,13 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 )
                 step_loss = graph_state.loss_sum.item()
                 pass1_loss = graph_state.pass1_sum.item()
+                expert_balance = graph_state.expert_balance_sum.item()
                 graph_runner.prepare_optimizer(graph_state)
             else:
                 model.grad_checkpoint = checkpointing
                 step_loss = 0.0
                 pass1_loss = 0.0
+                expert_balance = 0.0
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
                     rows = data_train.batch(first_row, args.micro_rows, device)
@@ -1546,6 +1624,13 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     (loss / micros).backward()
                     step_loss += loss.item() / micros
                     pass1_loss += losses[0].item() / micros
+                    if model.cfg.experts:
+                        expert_balance += (
+                            torch.stack([out.expert_aux_loss.detach() for out in outs])
+                            .mean()
+                            .item()
+                            / micros
+                        )
 
             grad_norm = clip_gradients(model.parameters())
             for optimizer in optimizers:
@@ -1571,6 +1656,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 "pass1": telemetry.format_metric(pass1_loss),
                 "k": n_passes,
             }
+            if model.cfg.experts:
+                fields["expert_balance"] = telemetry.format_metric(expert_balance)
             if model.cfg.loop:
                 fields["r"] = iterations
             fields |= {
@@ -1611,6 +1698,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 summary.update(scores)
                 for record in route_summary(model, data_val, args, device):
                     telemetry.log("route", step=address, **record)
+                for record in expert_summary(model, data_val, args, device):
+                    telemetry.log("expert", step=address, **record)
                 if model.cfg.feedback:
                     trace = iterate_fused(
                         model, data_val.batch(0, 2, device), n_iters=8

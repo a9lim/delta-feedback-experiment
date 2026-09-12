@@ -77,15 +77,15 @@ def forward(model, toks, **kwargs):
 def test_condition_grammar():
     """One letter per change from the plain decoder; any order in, canonical
     order out; the configuration renders its own letters back."""
-    assert tuple(CONDITION_LETTERS) == ("a", "r", "f", "l")
+    assert tuple(CONDITION_LETTERS) == ("a", "e", "r", "f", "l")
     assert parse_condition("") == ""
     assert parse_condition("fra") == "arf"
     assert parse_condition("lfra") == "arfl"
     for text in ("dar", "mhdb", "df", "vanilla", "aa", "arfx"):
         with pytest.raises(ValueError, match="condition"):
             parse_condition(text)
-    for count in range(5):
-        for letters in itertools.combinations("lfra", count):
+    for count in range(6):
+        for letters in itertools.combinations("lfrea", count):
             text = "".join(letters)
             config = condition_config(text, **geometry(text))
             assert config.condition == parse_condition(text)

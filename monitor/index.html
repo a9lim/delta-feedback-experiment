@@ -38,7 +38,7 @@
 <section class="mech" id="sec-train">
   <h3>training <small id="sum-train"></small></h3>
   <div class="grid two">
-    <div class="chart"><h2>train NLL <small>nats per step · solid loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
+    <div class="chart"><h2>training objective <small>per step · solid loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
     <div class="chart"><h2>held-out NLL <small>nats at eval cadence · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-val"></div></div>
   </div>
   <div class="grid two">
@@ -54,6 +54,12 @@
 <section class="mech" data-letter="a" hidden>
   <h3>a · attention <small id="sum-a"></small></h3>
   <p class="note">Kimi Delta Attention holds three of every four attention layers; the fourth is gated global GQA. Nothing about the mixers is in the per-step telemetry yet, so this letter has configuration only.</p>
+</section>
+
+<section class="mech" data-letter="e" hidden>
+  <h3>e · mixture of experts <small id="sum-e"></small></h3>
+  <p class="note">One shared expert and three of fifteen routed experts per token, each at quarter FFN width. Balance is averaged over executed layers and passes; uniform aggregate assignment has balance 1. Its weighted contribution is included in the training objective; pass-1 and validation remain cross-entropy.</p>
+  <div class="chart"><h2>expert balance loss <small>unweighted · coefficient in run configuration</small></h2><div class="plot" id="p-expert-balance"></div></div>
 </section>
 
 <section class="mech" data-letter="r" hidden>
@@ -110,7 +116,7 @@
 'use strict';
 // Delta-feedback view: what this experiment's records mean and which panels
 // they fill.  The page is organized by condition letter: a training section
-// every condition shares, then one section per letter (a, r, f, l) shown when
+// every condition shares, then one section per letter (a, e, r, f, l) shown when
 // a displayed run has it.  Every generic mechanism — parsing, lineage,
 // polling, uPlot setup — comes from the chassis.
 const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
@@ -118,7 +124,7 @@ const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         makeChart, setData, bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs,
         state, runFor } = M;
 
-const LETTERS = ['a', 'r', 'f', 'l'];
+const LETTERS = ['a', 'e', 'r', 'f', 'l'];
 const ROLL = 200;
 
 // ---------------------------------------------------------------- records
@@ -131,7 +137,7 @@ function onStep(run, rec) {
   return {
     loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
     lr_normuonh: num(rec.lr_normuonh), lr_nadam: num(rec.lr_nadam), lr_nadam_width: num(rec.lr_nadam_width),
-    gnorm: num(rec.gnorm),
+    gnorm: num(rec.gnorm), expert_balance: num(rec.expert_balance),
     tok_s: num(rec.tok_s), pass_tok_s: num(rec.pass_tok_s), cell_tok_s: num(rec.cell_tok_s),
     mem: num(rec.mem), elapsed: num(rec.elapsed),
   };
@@ -285,6 +291,7 @@ const CONFIG_GROUPS = [
   ['run', null, ['condition', 'seed', 'data_seed', 'params', 'device']],
   ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'intermediate', 'vocab_size', 'seq_len']],
   ['a · attention', 'a', ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
+  ['e · experts', 'e', ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef']],
   ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
   ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
   ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'grad_clip', 'zloss']],
@@ -318,11 +325,12 @@ function renderConfig(view) {
 // that mechanism, so the state of every letter reads without scrolling.
 function summaries(view) {
   const setup = view.run.meta.run || {};
-  const out = { train: 'every condition · pass-1 is the common number · loss adds the mean fused pass on multi-pass steps' };
+  const out = { train: 'every condition · pass-1 is the common number · loss adds fused CE, z-loss and expert balance where enabled' };
   if (setup.layers != null) {
     const layers = +setup.layers, pkda = layers - Math.floor(layers / 4);
     out.a = `PKDA in ${pkda} of ${layers} attention layers · ${setup.pkda_heads} heads × ${setup.pkda_head_dim} · conv ${setup.pkda_conv_size} · configuration only`;
   }
+  if (has(view, 'e')) out.e = `1 shared + 3/15 routed · width ${setup.expert_width ?? '–'} · balance ${fmt(view.steps.at(-1)?.expert_balance, 4)}`;
   const step = latestRouteStep(view);
   if (has(view, 'r') && step != null) {
     const sites = orderedSites([view]);
@@ -391,6 +399,8 @@ function rebuild() {
   step('p-tput', perRun((c, t) => [line(`tok/s${t}`, c, v0), dashed(`pass tok/s${t}`, c, v0), dotted(`cell tok/s${t}`, c, v0)]), { yScale: yLog });
   step('p-cum', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
 
+  step('p-expert-balance', perRun((c, t) => [line(`balance${t}`, c, v3)]));
+
   // r · residual routing
   site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, SPTS), dashed(`seed${t}`, c, SPTS)]), { yScale: unit });
   site('p-site-sharp', perRun((c, t) => [line(`max${t}`, c, SPTS), dashed(`head JS${t}`, c, SPTS)]), { yScale: unit });
@@ -422,7 +432,7 @@ function seriesOf(view) {
   const loss = col('loss'), pass1 = col('pass1');
   // On a k-pass step loss = pass-1 + mean fused, so the train-time fused gap
   // is loss − 2·pass-1; one-pass steps carry no fused pass.
-  const trainGap = steps.map((s) => (s.k > 1 && s.loss != null && s.pass1 != null ? s.loss - 2 * s.pass1 : null));
+  const trainGap = steps.map((s) => (s.k > 1 && s.loss != null && s.pass1 != null ? s.loss - 2 * s.pass1 - (s.expert_balance ?? 0) * (view.run.meta.run?.expert_balance_coef ?? 0) : null));
   // Cumulative tokens from the step records and the geometry: a pass executes
   // layers / cell cell-equivalents on a flat column and 2 + r · core / cell
   // under l, so cell-tokens are the matched-compute axis.
@@ -460,6 +470,7 @@ function seriesOf(view) {
     val: ev(vals, 'val', 'val_fused'),
     lr: [[xs, col('lr_normuonh'), col('lr_nadam_width'), col('lr_nadam')]],
     gnorm: [[xs, col('gnorm')]],
+    expertBalance: [[xs, col('expert_balance')]],
     tput: [[xs, col('tok_s'), col('pass_tok_s'), col('cell_tok_s')]],
     cum: [[xs, cum.map((c) => c[0]), cum.map((c) => c[1]), cum.map((c) => c[2])]],
     siteMass: profile('nul', 'seed'),
@@ -497,6 +508,7 @@ function render(view) {
   setData('p-val', join(merged.val), lastEval);
   setData('p-lr', join(merged.lr), lastX);
   setData('p-gnorm', join(merged.gnorm), lastX);
+  setData('p-expert-balance', join(merged.expertBalance), lastX);
   setData('p-tput', join(merged.tput), lastX);
   setData('p-cum', join(merged.cum), lastX);
   setData('p-site-mass', join(merged.siteMass));

@@ -14,12 +14,15 @@ training is not implemented.
 | Residual width `D` | 768 | 1,152 | 1,536 |
 | Layers / four-layer cells | 12 / 3 | 16 / 4 | 24 / 6 |
 | SwiGLU intermediate width | 3,328 | 4,992 | 6,656 |
+| Per-expert intermediate width under `e` | 832 | 1,248 | 1,664 |
 | Global query / KV heads, head width 96 | 8 / 4 | 12 / 6 | 16 / 8 |
 | Routing groups | 4 | 6 | 8 |
 | PKDA heads, head width 128 | 10 | 15 | 20 |
 | PKDA Q/K/V projection width | 1,280 | 1,920 | 2,560 |
 | `arf` / `arfl` total parameters | 179,461,416 | 474,584,400 | 1,179,313,440 |
 | Active non-embedding parameters | 140,827,944 | 416,634,192 | 1,102,046,496 |
+| `aerf` / `aerfl` total parameters | 455,637,288 | 1,302,973,776 | 3,388,167,456 |
+| `aerf` active non-embedding per token | 140,966,184 | 416,910,672 | 1,102,599,456 |
 
 Every scale uses a 50,304-row tied embedding/readout, 4,096 predictions per
 row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
@@ -45,6 +48,15 @@ Counts below are for `arf`; `arfl` has identical parameters.
 | Trunk, entry, and payload norms | 21,504 | 41,472 | 79,872 |
 | Within-column and payload routers | 57,600 | 114,048 | 225,792 |
 
+Under `e`, every FFN stores one shared plus fifteen routed quarter-width
+experts. Its stored matrix parameters are four times the dense row above;
+one shared plus three routed experts keep active matrix parameters equal to
+the dense FFN. Each layer adds a `D x 15` router: 138,240, 276,480, or 552,960
+parameters over the full model. Active counts refer to one token; a microbatch
+can touch all experts, whose gradients and optimizer state still occupy memory.
+Routing and optimizer overhead mean equal active arithmetic does not imply
+equal training time or measured GPU fit.
+
 ### The screen
 
 Every looped condition has the same count as the corresponding row without `l`:
@@ -60,6 +72,10 @@ Every looped condition has the same count as the corresponding row without `l`:
 | `af` | 179,403,816 | 140,770,344 |
 | `arf` | 179,461,416 | 140,827,944 |
 
+Adding `e` to any row adds 276,175,872 stored parameters and 138,240 active
+parameters per token. `l` continues to add no parameters, including when its
+core contains experts.
+
 ## Token budgets
 
 `--tokens-per-param R` derives the step count from the flat `arf` active
@@ -69,7 +85,9 @@ non-embedding parameter count at the selected geometry:
 steps = ceil(R * reference_active / (batch_rows * seq_len))
 ```
 
-Every condition at a scale shares that schedule. `--steps` sets a length
+Every condition at a scale shares that schedule, including `e`; the dense
+`arf` reference remains fixed and does not count the expert bank or its router.
+`--steps` sets a length
 directly instead. The default ratio is 25; 400 is another supported ratio,
 not a scheduled run.
 
