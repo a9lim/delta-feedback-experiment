@@ -421,8 +421,8 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument(
         "--head-flush-every",
         type=int,
-        default=4,
-        help="head calls (two per pass) whose "
+        default=2,
+        help="head calls (one per pass, shared by both prediction depths) whose "
         "classifier gradient accumulates in BF16 before it is flushed into "
         "the FP32 embedding sink; 1 is the per-call path exactly, and wider "
         "windows trade the head's gradient precision for the flush's bandwidth; "
@@ -930,7 +930,8 @@ class CudaGraphTrainer:
         return state
 
     def _head_calls(self, state: CapturedMicro) -> int:
-        return state.spec.n_passes * 2
+        """Head calls one replay makes: both depths share one call per pass."""
+        return state.spec.n_passes
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
         state.rows.copy_(rows, non_blocking=rows.is_cuda)

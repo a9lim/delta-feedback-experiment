@@ -51,9 +51,10 @@ Interrupted builds reuse the source index and encoded parts. Each split's
 checks counts, sidecars, and up to 2,048 sampled EOS boundaries per split.
 
 A row is a nonoverlapping window of `seq_len+1` tokens. Ordinary prediction
-uses `seq_len` targets; MTP uses the same row's `seq_len-1` second-token
-targets. Rows and attention can cross document boundaries. Step `n` starts
-at row `(n-1)*batch_rows`. Feedback draws depend on data seed and step;
+uses `seq_len` targets; MTP runs over the same `seq_len` positions and
+supervises the `seq_len-1` of them that have a second token. Rows and
+attention can cross document boundaries. Step `n` starts at row
+`(n-1)*batch_rows`. Feedback draws depend on data seed and step;
 prefix/jitter draws also depend on the first global row of the microbatch.
 
 `delta tokenize --scale S --tokens-per-param R` includes validation and
@@ -158,8 +159,10 @@ changes do not stop an active child. Operational commands are in
 
 `val` is plain held-out next-token CE. With `f`, `val_fused` is a second pass
 with plain-prefix length 1. `val_mtp` and `val_mtp_fused` measure the separate
-second-token predictor before weights and z-loss. Evaluation uses the first
-`--eval-rows` validation rows, 128 by default.
+second-token predictor over its supervised positions, before weights and
+z-loss. All four come from the same per-row head results the training
+objective uses. Evaluation reads the first `--eval-rows` validation rows, 128
+by default.
 
 Generation uses three modes: **Standard** prefills and decodes without
 feedback; **Soft** prefills plainly and feeds payloads back during decode;

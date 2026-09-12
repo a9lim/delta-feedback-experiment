@@ -188,8 +188,11 @@ training_loss += 1e-4 * aux
 
 Layer/pass averaging keeps the
 coefficient independent of depth and pass count. The auxiliary bank contributes
-once per pass, with its own `T-1` positions. Its within-sequence gradient
-coupling does not change causal forward activations. Cross-entropy excludes it.
+once per pass, with its own `T` positions, including the padded last one whose
+cross-entropy is unweighted: it still selects experts, so it enters that bank's
+counts and sequence balance as a one-in-`T` perturbation. The bank's
+within-sequence gradient coupling does not change causal forward activations.
+Cross-entropy excludes it.
 
 `ColumnOutput.expert_aux_loss` holds the trunk layer mean and `expert_counts`
 holds transient `[L,n]` counts summed over physical-bank invocations.
@@ -198,7 +201,7 @@ above; its `[L+1,n]` counts place that bank last. Bias updates include every
 bank once per optimizer step. With `want_weights=True`, column `expert_weights`
 maps each trunk invocation to `[B,T,n]` sparse normalized weights, distinct
 from MHDB's source weights. `forward_mtp` can return the auxiliary block's
-weights over its `T-1` positions.
+weights over its `T` positions.
 
 ## Multi-Head Delta Block routing
 
@@ -298,9 +301,11 @@ Every current prefill pass starts those tracks from zero. Cache position is
 shared across tracks. A pass executes `2+c*r` cells.
 
 All passes and iterations remain differentiable. Readout occurs after the
-coda, and auxiliary prediction runs once per pass. Above the raw activation
-budget, each cell retains its final GQA block and checkpoints its preceding
-three PKDA blocks. Checkpoint wrappers remain outside compiled blocks.
+coda, and auxiliary prediction runs once per pass. On CUDA the per-pass
+epilogues around the compiled blocks — the payload's routed add and norm, the
+feedback entry's jitter/shift/fuse/select, and both heads' readout — compile
+as their own small regions. Above the raw activation budget, each cell retains
+its final GQA block and checkpoints its preceding three PKDA blocks. Checkpoint wrappers remain outside compiled blocks.
 CUDA captures one training graph per reachable `(pass count,r)` pair and
 no-grad evaluation graphs at the fixed depth.
 
@@ -329,16 +334,25 @@ It has no MHDB read or tied loop. Its independent matrix, diagonal, and
 convolution states start from zero for each row and pass.
 
 For a stored row of `T+1` tokens, ordinary inputs/targets are
-`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs are `payload[:,:-1]` and
-`Emb(tokens[:,1:-1])`, with targets `tokens[:,2:]`: `T-1` fully supervised
-positions, no padding or ignored labels. Both inputs remain differentiable,
-so the auxiliary objective trains the payload router, payload normalization,
-and trunk as well as the shared token embedding. The causal PKDA recurrence
-never sees the second-token target, and auxiliary activations never feed into
-the column or payload. `DeltaModel.forward_mtp` exposes the block output,
-including balancing loss, assignment counts, and optional expert weights.
+`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs are the whole `payload`
+and `Emb(tokens[:,1:])`, with targets `tokens[:,2:]` plus one dummy target:
+`T-1` supervised positions and a padded last one, whose second token lies past
+the end of the stored row and which therefore carries no loss weight. That row
+is causally last in the auxiliary recurrence, so the supervised rows are the
+same ones the cropped geometry produced. One lookup of the whole stored row
+serves both heads, the column seed taking positions `0..T-1` and the auxiliary
+head `1..T`. Both inputs remain differentiable, so the auxiliary objective
+trains the payload router, payload normalization, and trunk as well as the
+shared token embedding. The causal PKDA recurrence never sees the second-token
+target, and auxiliary activations never feed into the column or payload.
+`DeltaModel.forward_mtp` exposes the block output from supplied tokens and
+`forward_mtp_embedded` from supplied embeddings, both with balancing loss,
+assignment counts, and optional expert weights.
 
-Each head averages over its own valid positions. For either head,
+Each head averages over its own valid positions, and both heads' rows go
+through one unreduced vocabulary pass per model pass: their readout rows are
+concatenated into a single cut cross-entropy request, and the pass scalars are
+weighted sums of the returned rows. For either head,
 `combine(ell)=ell_1` with one pass, otherwise
 `ell_1 + mean(ell_2,...,ell_K)`:
 
@@ -385,8 +399,9 @@ Q/K/V row views share an allocation, as do dense QKV and gate gradients;
 each parameter is clipped/updated once. Head calls first accumulate classifier
 gradients in a BF16 buffer, flushed into the FP32 sink at the configured
 `--head-flush-every` cadence and before the optimizer update. Each pass makes
-two head calls. A captured microbatch exceeding the cadence uses the FP32
-sink per call; cadence 1 therefore gives per-call precision throughout.
+one head call, covering both prediction depths. A captured microbatch
+exceeding the cadence uses the FP32 sink per call; cadence 1 therefore gives
+per-call precision throughout.
 
 ## NorMuonH and NAdam
 
