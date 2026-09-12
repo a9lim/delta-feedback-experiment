@@ -389,7 +389,9 @@ def build_parser() -> argparse.ArgumentParser:
     trunk.add_argument("--layers", type=int, default=16)
     trunk.add_argument("--heads", type=int, default=8)
     trunk.add_argument("--kv-heads", type=int, default=4)
-    trunk.add_argument("--head-dim", type=int, default=96)
+    trunk.add_argument(
+        "--head-dim", type=int, default=192, help="GQA head width (default: 192)"
+    )
     trunk.add_argument(
         "--expert-intermediate",
         type=int,

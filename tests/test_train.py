@@ -127,17 +127,22 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         768,
         3,
         15,
-        630606216,
-        200919432,
+        640044168,
+        210357384,
     )
-    from delta_feedback_experiment.model import DeltaModel, condition_config
+    from delta_feedback_experiment.model import (
+        DeltaModel,
+        ModelConfig,
+        condition_config,
+    )
 
     args = parse_run_args(["geometry", "--scale", scale])
     cfg = condition_config("fl", **model_fields(args))
     assert cfg.layers == 16 and cfg.core_layers == range(4, 12)
     assert cfg.executed_layers(4) == 40 and cfg.routing_blocks == 4
     assert cfg.dim == dim and cfg.expert_intermediate == 832
-    assert cfg.heads * cfg.head_dim == dim
+    assert cfg.head_dim == ModelConfig().head_dim == 192
+    assert cfg.heads * cfg.head_dim == 2 * dim
     assert cfg.heads == 2 * cfg.kv_heads
     assert cfg.pkda_heads * cfg.pkda_head_dim * 3 == dim * 5
     assert cfg.mup_ratio == 1536 / dim
@@ -243,7 +248,14 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE).move("half", "renamed")
     with pytest.raises(ValueError, match="conflicts"):
         trainer.train(["renamed", *flags, "--resume", "--experts-per-token", "1"])
-    resumed = trainer.train(["renamed", *flags, "--resume"])
+    # Saved geometry must override new-run defaults when it is not pinned.
+    resume_flags = [
+        item
+        for key, value in settings.items()
+        if key != "head-dim"
+        for item in (f"--{key}", str(value))
+    ]
+    resumed = trainer.train(["renamed", *resume_flags, "--resume"])
     for key in ("step", "loss", "val", "val_fused", "val_mtp", "val_mtp_fused"):
         assert resumed[key] == full[key]
     complete = trainer.read_checkpoint(tmp_path / "runs/full.pt.2")

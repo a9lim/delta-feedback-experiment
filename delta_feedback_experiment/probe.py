@@ -24,8 +24,8 @@ def cuda_probe() -> None:
         parse_run_args,
     )
 
-    # Three four-layer cells exercise both mixers and a repeated core. PKDA
-    # keeps its CUDA head width; sparse experts and token rows stay tiny.
+    # Three four-layer cells exercise both mixers and a repeated core. Both
+    # mixers keep their production head widths; experts and rows stay tiny.
     args = parse_run_args(
         [
             "probe",
@@ -55,8 +55,6 @@ def cuda_probe() -> None:
             "4",
             "--kv-heads",
             "2",
-            "--head-dim",
-            "16",
             "--expert-intermediate",
             "32",
             "--num-routed-experts",
@@ -117,6 +115,9 @@ def cuda_probe() -> None:
             "fuse_value.weight",
             "payload_router.query",
             "mtp.projection.weight",
+            "blocks.3.attn.qkv_proj.weight",
+            "blocks.3.attn.o_proj.weight",
+            "attention_gates.0.weight",
             "blocks.4.attn.control_proj.weight",
             "blocks.0.mlp.shared.down_proj.weight",
         ):

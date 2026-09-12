@@ -19,7 +19,7 @@ def tiny(condition):
             layers=16 if "l" in condition else 4,
             heads=2,
             kv_heads=2,
-            head_dim=16,
+            head_dim=32,
             expert_intermediate=8,
             num_routed_experts=3,
             experts_per_token=2,

@@ -59,7 +59,7 @@ prefix/jitter draws also depend on the first global row of the microbatch.
 
 `delta tokenize --scale S --tokens-per-param R` includes validation and
 extra row targets, then rounds storage up to a billion tokens. The default
-screen 400x store is 81B tokens. Allow roughly twice the final store size
+screen 400x store is 85B tokens. Allow roughly twice the final store size
 while parts and output coexist. `--scratch` moves downloads only.
 `--workers` controls encoding processes; `--readers` controls assembly
 concurrency; `RAYON_NUM_THREADS` controls tokenizer threads per process.

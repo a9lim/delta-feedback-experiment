@@ -139,7 +139,7 @@ class ModelConfig:
     layers: int = 16
     heads: int = 8
     kv_heads: int = 4
-    head_dim: int = 96
+    head_dim: int = 192
     expert_intermediate: int = 832
     num_routed_experts: int = 15
     experts_per_token: int = 3

@@ -9,7 +9,7 @@ from delta_feedback_experiment.attention import _causal_attention
 
 def test_causal_gqa_matches_repeated_heads_and_restores_backend():
     inputs = tuple(
-        torch.randn(1, heads, 7, 8, requires_grad=True) for heads in (4, 2, 2)
+        torch.randn(1, heads, 7, 192, requires_grad=True) for heads in (4, 2, 2)
     )
     refs = tuple(value.detach().clone().requires_grad_() for value in inputs)
     with sdpa_kernel(SDPBackend.MATH):

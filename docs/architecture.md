@@ -111,7 +111,9 @@ advance normally during generation.
 
 ### Gated global GQA
 
-The fourth layer of each cell uses causal NoPE GQA, head width 96:
+The fourth layer of each cell uses causal NoPE GQA, head width 192. At every
+preset, the query/output-gate projection width is `2D` and each K/V projection
+width is `D`; the output projection returns to residual width `D`:
 
 ```text
 q, k, v = split(W_qkv x)
