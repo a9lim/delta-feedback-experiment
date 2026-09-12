@@ -7,7 +7,7 @@ on their computation.
 
 ## Model
 
-One `DeltaModel` implements every subset of five condition letters:
+One `DeltaModel` implements every subset of six condition letters:
 
 | Letter | Change |
 |---|---|
@@ -16,8 +16,9 @@ One `DeltaModel` implements every subset of five condition letters:
 | `r` | Multi-Head Delta Block (MHDB) routing over the column seed and block deltas before every sublayer |
 | `f` | Full-Bandwidth Transformer (FBT) fusion of the previous column's latent payload with the current token embedding |
 | `l` | Repeated application of the tied core between the first and last cells |
+| `m` | One auxiliary transformer block predicts a second token from the top state and the next token's shared embedding |
 
-`aerfl` is the full stack, `aerf` its flat column, and the empty condition the
+`aerflm` is the full stack, `aerfm` its flat column, and the empty condition the
 plain gated GQA decoder. Without `a`, the first three layers of each cell use
 full-head RoPE after Q/K RMSNorm; every fourth layer uses no positional
 encoding. Conditions on the same attention trunk pair their shared parameters
@@ -35,6 +36,12 @@ text.
 Expert selection uses sigmoid scores with a separate load-balancing bias
 updated after each optimizer step. A small per-sequence regularizer supplements
 that update; reported cross-entropy excludes it.
+
+With `m`, DeepSeek-style two-token prediction adds a dense causal RoPE-GGQA
+and SwiGLU block after each pass's top state. It shares the embedding and
+readout, and its loss trains the main model as well as the auxiliary block.
+`--mtp-weight` defaults to 0.3. Ordinary next-token validation remains
+separate from MTP validation; generation uses the main model alone.
 
 ## Current state
 

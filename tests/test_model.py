@@ -77,7 +77,7 @@ def forward(model, toks, **kwargs):
 def test_condition_grammar():
     """One letter per change from the plain decoder; any order in, canonical
     order out; the configuration renders its own letters back."""
-    assert tuple(CONDITION_LETTERS) == ("a", "e", "r", "f", "l")
+    assert tuple(CONDITION_LETTERS) == ("a", "e", "r", "f", "l", "m")
     assert parse_condition("") == ""
     assert parse_condition("fra") == "arf"
     assert parse_condition("lfra") == "arfl"
@@ -522,7 +522,7 @@ def test_gradient_sinks_bind_every_large_projection_and_unbind_cleanly():
     toks = tokens()
     prefix = torch.ones((1, toks.shape[0]), dtype=torch.long)
     outs = multipass(model, toks, 2, prefix_lens=prefix)
-    total, _ = multipass_loss(model, toks, outs)
+    total = multipass_loss(model, toks, outs).total
     total.backward()
     for name, p in model.named_parameters():
         if p in bound:
@@ -533,7 +533,7 @@ def test_gradient_sinks_bind_every_large_projection_and_unbind_cleanly():
     assert model.bind_gradient_sinks(None) == set()
     model.zero_grad(set_to_none=True)
     outs = multipass(model, toks, 2, prefix_lens=prefix)
-    multipass_loss(model, toks, outs)[0].backward()
+    multipass_loss(model, toks, outs).total.backward()
     assert model.blocks[0].attn.q_proj.weight.grad is not None
 
 
@@ -663,7 +663,7 @@ def test_null_value_follows_activation_dtype_with_fp32_gradient():
 def test_single_head_routing_and_unknown_letters_are_rejected():
     with pytest.raises(ValueError, match="unknown condition letters 'd'"):
         condition_config("dar", **TINY)
-    with pytest.raises(ValueError, match="unknown condition letters 'bdhm'"):
+    with pytest.raises(ValueError, match="unknown condition letters 'bdh'"):
         condition_config("mhdb", **TINY)
     with pytest.raises(ValueError, match="repeated letter"):
         condition_config("arra", **TINY)
@@ -773,7 +773,8 @@ def test_multipass_matches_the_causally_equivalent_full_row_forward():
             prefix_lens=prefix if n_passes > 1 else None,
             jitter=jitter if n_passes > 1 else None,
         )
-        total, losses = multipass_loss(model, toks, outs)
+        loss_result = multipass_loss(model, toks, outs)
+        total, losses = loss_result.total, loss_result.ntp
         assert len(losses) == n_passes and torch.isfinite(total)
 
         # Literal full-row reference: run every stored token and drop the last.
@@ -792,9 +793,9 @@ def test_multipass_matches_the_causally_equivalent_full_row_forward():
             )
         for out, full in zip(outs, ref, strict=True):
             assert torch.allclose(out.h_top, full.h_top[:, :-1], atol=1e-5), condition
-        ref_total, _ = multipass_loss(
+        ref_total = multipass_loss(
             model, toks, [type(o)(**{**vars(o), "h_top": o.h_top[:, :-1]}) for o in ref]
-        )
+        ).total
         assert torch.allclose(total, ref_total, atol=1e-5), condition
 
 
@@ -835,7 +836,8 @@ def test_multipass_loss_shape():
     toks = tokens()
     prefix = torch.ones((2, toks.shape[0]), dtype=torch.long)
     outs = multipass(model, toks, 3, prefix_lens=prefix)
-    total, losses = multipass_loss(model, toks, outs)
+    loss_result = multipass_loss(model, toks, outs)
+    total, losses = loss_result.total, loss_result.ntp
     assert len(losses) == 3
     expected = losses[0] + (losses[1] + losses[2]) / 2
     assert torch.allclose(total, expected)
@@ -846,8 +848,8 @@ def test_multipass_loss_accepts_a_device_side_z_coefficient():
     toks = tokens()
     prefix = torch.ones((1, toks.shape[0]), dtype=torch.long)
     outs = multipass(model, toks, 2, prefix_lens=prefix)
-    float_total, _ = multipass_loss(model, toks, outs, z_coef=1e-5)
-    tensor_total, _ = multipass_loss(model, toks, outs, z_coef=torch.tensor(1e-5))
+    float_total = multipass_loss(model, toks, outs, z_coef=1e-5).total
+    tensor_total = multipass_loss(model, toks, outs, z_coef=torch.tensor(1e-5)).total
     assert torch.equal(float_total, tensor_total)
 
 
@@ -867,7 +869,7 @@ def test_gradients_reach_the_feedback_machinery():
     prefix = torch.ones((2, toks.shape[0]), dtype=torch.long)
     jitter = torch.zeros((2, *toks.shape, TINY["dim"]))
     outs = multipass(model, toks, 3, prefix_lens=prefix, jitter=jitter)
-    total, _ = multipass_loss(model, toks, outs)
+    total = multipass_loss(model, toks, outs).total
     total.backward()
     for name in (
         "attention_gates.0.weight",
@@ -998,8 +1000,8 @@ def test_loop_at_one_iteration_is_the_unlooped_condition():
                 for site, names in out_l.route_source_names.items()
             }
             assert translated_names == out_f.route_source_names, condition
-        total_l, _ = multipass_loss(looped, toks, outs_l)
-        total_f, _ = multipass_loss(flat, toks, outs_f)
+        total_l = multipass_loss(looped, toks, outs_l).total
+        total_f = multipass_loss(flat, toks, outs_f).total
         assert torch.equal(total_l, total_f), condition
         total_l.backward()
         total_f.backward()
@@ -1104,7 +1106,7 @@ def test_loop_gradients_sum_across_iterations():
     def gradient(iterations):
         model.zero_grad(set_to_none=True)
         outs = multipass(model, toks, 2, prefix_lens=prefix, iterations=iterations)
-        total, _ = multipass_loss(model, toks, outs)
+        total = multipass_loss(model, toks, outs).total
         total.backward()
         return dict(model.named_parameters())[core_name].grad.clone()
 

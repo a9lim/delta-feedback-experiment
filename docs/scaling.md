@@ -79,6 +79,19 @@ Adding `e` to any row adds 276,175,872 stored parameters and 138,240 active
 parameters per token. `l` continues to add no parameters, including when its
 core contains experts.
 
+`m` adds one dense gated-GQA/SwiGLU block, two entry norms, and a `2D -> D`
+concatenation projection. Its embedding, final norm, and vocabulary projection
+are shared with the trunk. The tables above exclude this auxiliary module.
+At the presets its parameter addition is `19D^2 + 4D + 192`:
+
+| Auxiliary MTP module | Screen | Bridge | Flagship |
+|---|---:|---:|---:|
+| Additional stored and training-active parameters | 11,209,920 | 25,219,776 | 44,832,960 |
+
+It runs once per training pass over `seq_len - 1` positions and adds a second
+vocabulary-loss call per pass, even with `e` or `l`. Ordinary inference does
+not execute it and needs no auxiliary decode cache.
+
 ## Token budgets
 
 `--tokens-per-param R` derives the step count from the flat `arf` active
@@ -88,8 +101,11 @@ non-embedding parameter count at the selected geometry:
 steps = ceil(R * reference_active / (batch_rows * seq_len))
 ```
 
-Every condition at a scale shares that schedule, including `e`; the dense
-`arf` reference remains fixed and does not count the expert bank or its router.
+Every condition at a scale shares that schedule, including `e` and `m`; the
+dense `arf` reference remains fixed and does not count the expert bank, its
+router, or the auxiliary MTP module. Auxiliary second-token targets are
+additional supervision on the same rows and do not increase the recorded
+ordinary predicted-token budget.
 `--steps` sets a length
 directly instead. The default ratio is 25; 400 is another supported ratio,
 not a scheduled run.
@@ -131,6 +147,9 @@ iteration count `r` executes `2 + (C - 2) r` cells:
 The default capped log-normal Poisson draw has uncapped mean 4, cap 8, and
 actual mean about 3.88. Report realized pass-tokens and cell-tokens with
 predicted tokens; equal data does not imply equal compute.
+These counters describe the trunk. With `m`, include the auxiliary block and
+second vocabulary loss when accounting for compute; equal cell-tokens alone
+do not match compute between conditions with and without MTP.
 
 For the `a` trunk at 4,096 cached positions, BF16 GQA K/V and convolution
 histories plus FP32 PKDA matrix/diagonal states cost:

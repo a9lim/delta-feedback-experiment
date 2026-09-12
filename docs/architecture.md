@@ -1,13 +1,14 @@
-# Architecture: the five letters and the column
+# Architecture: the six letters and the column
 
 This page defines the computation and state of the `DeltaModel` family: the
-column every condition shares and the five packages the condition letters
+column every condition shares and the six packages the condition letters
 add. `a` puts Preconditioned Kimi Delta Attention (PKDA) in three of every
 four token mixers, `e` adds shared and routed quarter-width SwiGLU experts,
 `r` adds Multi-Head Delta Block routing (MHDB), `f` adds
-Full-Bandwidth Transformer (FBT) feedback between token columns, and `l` ties
+Full-Bandwidth Transformer (FBT) feedback between token columns, `l` ties
 the cells between the first and last into one core iterated within the
-column. `aerfl` is the full built stack, `aerf` its flat column, and the empty
+column, and `m` adds an auxiliary second-token predictor after the column.
+`aerflm` is the full built stack, `aerfm` its flat column, and the empty
 condition the plain decoder; dropping a letter removes that package from the
 computation.
 
@@ -51,7 +52,9 @@ pattern holds at every geometry and core iteration.
 
 On pass 1 and in Standard decoding the seed is the token embedding. The
 readout uses `final_norm(h_top)` times the muP readout multiplier `1536 / D`;
-the outgoing payload has its own routing and normalization. The mixer caches are additional state paths outside the
+the outgoing payload has its own routing and normalization. With `m`, an
+auxiliary branch reads `h_top` together with the next token's embedding to
+predict a second token. The mixer caches are additional state paths outside the
 diagram's explicit payload edge.
 
 ### Residual shell
@@ -661,6 +664,7 @@ The trainer's activation policy counts executed layers per pass against a
 configured raw budget. Deeper modes retain the final block of each four-layer
 cell and checkpoint its preceding three blocks. With `a`, the retained block
 is dense attention; without `a`, the same quarter of blocks is retained.
+With `m`, the budget also counts the auxiliary block executed once per pass.
 `e` halves the raw activation budget (20 executed layers at the screen,
 versus 40 for dense FFNs) to allow for expert dispatch and parameter storage.
 The checkpoint wrapper stays outside each compiled block, so both retained
@@ -707,6 +711,69 @@ iteration, which is the learned input-injection profile.
 The payload self-composition trace of `design.md` runs at `r = r_mean` and
 tests the horizontal channel at fixed core depth.
 
+## Letter `m`: two-token prediction
+
+`m` adds one auxiliary prediction depth following
+[DeepSeek-V3 section 2.2](https://arxiv.org/html/2412.19437v2#S2.SS2).
+At input position `t`, the trunk still predicts `x_(t+1)` from `h_top,t`.
+The auxiliary branch also receives the ground-truth `x_(t+1)` embedding and
+predicts `x_(t+2)`:
+
+```text
+u_t = M concat(RMSNorm_h(h_top,t), RMSNorm_e(Emb(x_(t+1))))
+v = DenseCausalTransformer(u)
+logits_mtp,t = (final_norm(v_t) * 1536 / D) @ Emb.weight.T
+```
+
+The two entry norms are separate learned RMSNorms. `M` is a bias-free
+`2D -> D` projection. The auxiliary transformer is one dedicated pre-norm
+block at the trunk width, with dense gated GQA, full-head RoPE at theta
+10,000, and a dense SwiGLU at the configured intermediate width. It uses
+causal attention across the cropped sequence. Its weights are separate from
+the trunk; it has no PKDA, experts, MHDB routing, feedback payload, or tied
+core iterations. `e` and `l` continue to describe the trunk. Both the final
+norm and the tied embedding/readout are shared with ordinary prediction.
+Its two residual branches use the trunk's `1 / sqrt(2L)` scaling, where `L`
+is the configured unique trunk layer count.
+
+For a stored row of `T + 1` tokens, the trunk processes `tokens[:, :-1]`.
+The auxiliary inputs are `h_top[:, :-1]` and
+`Emb(tokens[:, 1:-1])`, and the targets are `tokens[:, 2:]`. This yields
+`T - 1` valid auxiliary predictions without padding, ignored labels, or a
+change to token stores. The branch can see the next token provided to it, but
+never its second-token target or a later token. Its state does not feed back
+into the column or its payload. Both inputs remain differentiable, so the
+auxiliary loss updates the trunk, shared embedding/readout, and auxiliary
+parameters.
+
+Every training pass computes both ordinary and auxiliary cross-entropy.
+Each head averages over its own valid positions: `T` for ordinary prediction,
+`T - 1` for MTP. This valid-position normalization is a Delta choice;
+DeepSeek-V3 equation 24 divides its cropped sum by the original length.
+For either head, `combine(ell) = ell_1` at one pass and
+`ell_1 + mean(ell_2, ..., ell_K)` at multiple passes. The objective is:
+
+```text
+loss = combine(CE_ntp) + z_coef * combine(z_ntp)
+     + mtp_weight * (combine(CE_mtp) + z_coef * combine(z_mtp))
+     + expert_balance_weight * expert_balance       # with e
+```
+
+The auxiliary head uses the existing cooldown log-partition penalty and its
+own position mean. `--mtp-weight` is a finite nonnegative run setting,
+constant across the schedule, defaulting to 0.3. The dense auxiliary block,
+valid-position normalization, and integration with Delta's feedback and
+z-loss recipe are local choices. The `ntp` and `mtp` metrics are the combined
+ordinary and auxiliary cross-entropies before coefficients or z-loss. `loss`
+reports the full optimized objective; `pass1` remains ordinary first-pass
+cross-entropy. `val_mtp` and, with `f`, `val_mtp_fused` report separate
+auxiliary validation losses.
+
+Ordinary Standard, Soft, and Fused inference does not execute this branch or
+allocate an auxiliary cache. MTP is an additional training objective here;
+speculative candidate generation, verification, and cache rollback are not
+implemented.
+
 ## Precision and initialization
 
 Each NorMuonH-owned matrix `W` with shape `[d_out, d_in]` is initialized from
@@ -749,6 +816,8 @@ expert bank and router use a separate deterministic stream after common
 initialization, preserving every shared non-FFN parameter when `e` is added.
 Expert weights pair across `r`, `f`, and `l`; MHDB's zero-initialized queries
 are distinct from the randomly initialized expert router.
+The MTP module also uses its own deterministic initialization stream, so
+adding `m` preserves all shared parameters byte-identically.
 
 Embedding parameters and optimizer state are FP32. On CUDA, the residual
 stream, routed values, payloads, mixer activations, and caches are BF16 except
@@ -768,9 +837,12 @@ The head's own classifier gradient reaches that FP32 gradient through a second
 address-stable BF16 buffer: every head call lock-adds into it, and the captured
 trainer adds it into the FP32 sink and clears it whenever another microbatch
 would take the buffer past `--head-flush-every` head calls, and once more before
-the optimizer reads the step. A feedback pass is a head call, so the number of
-BF16 additions between two FP32 flushes is the same under every pass count. The
-buffer is a runtime operand like the shadow, not state.
+the optimizer reads the step. A pass makes one head call without `m` and two
+with it. Flush scheduling counts the actual head calls, including auxiliary
+heads, rather than treating a pass as one call. A captured microbatch whose
+head count exceeds `--head-flush-every` uses per-call accumulation into the
+FP32 sink instead; setting the limit to one gives per-call precision in every mode.
+The BF16 buffer is a runtime operand like the shadow, not state.
 
 ## NorMuonH and NAdam
 
@@ -786,7 +858,8 @@ NorMuonH owns ordinary trainable two-dimensional hidden weights, including:
 
 - attention and PKDA Q/K/V/output projections;
 - dense, shared, and routed SwiGLU input and output matrices;
-- the FBT payload-value projection.
+- the FBT payload-value projection;
+- the MTP concatenation projection and auxiliary attention/SwiGLU matrices.
 
 For matrix `W`, its initial FP32 Frobenius radius `R = ||W_0||_F` is fixed for
 the life of the run. With the fan-in initialization above, `E[R^2] = d_out`;

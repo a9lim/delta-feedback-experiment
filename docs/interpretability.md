@@ -105,6 +105,15 @@ prettiest trajectory.
 
 ## Dynamics
 
+With `m`, auxiliary validation predicts a second token after receiving the
+ground-truth next token's embedding. `val_mtp` and `val_mtp_fused` therefore
+measure a different predictor and target alignment from `val` and
+`val_fused`. Compare the ordinary next-token metrics between paired runs to
+assess the effect on the model used for generation. Auxiliary accuracy alone
+does not establish speculative-decoding speed or payload usefulness. The MTP
+block adds no recurrent state or payload path to the ordinary model's
+inference computation.
+
 Track state movement and behavior together. Small updates can mean a settled
 representation, an unproductive fixed point, numerical resolution, or an
 unused channel; large updates can mean purposeful change or instability. Loss

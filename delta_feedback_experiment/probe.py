@@ -732,7 +732,7 @@ def cuda_gate() -> None:
             )
             # Index rather than unpack: a lingering per-pass losses list would
             # keep the whole eager graph, parameters, and gradients alive.
-            parity_loss = multipass_loss(parity_model, parity_rows, parity_outs)[0]
+            parity_loss = multipass_loss(parity_model, parity_rows, parity_outs).total
         parity_loss.backward()
         parity[label] = (
             parity_loss.item(),
@@ -810,7 +810,7 @@ def cuda_gate() -> None:
         loop_outs = multipass(
             loop_model, loop_rows, 1, iterations=args.loop_max_iterations
         )
-        loop_loss = multipass_loss(loop_model, loop_rows, loop_outs)[0]
+        loop_loss = multipass_loss(loop_model, loop_rows, loop_outs).total
     loop_loss.backward()
     torch.cuda.synchronize()
     if not math.isfinite(loop_loss.item()):
@@ -1066,6 +1066,11 @@ def main(argv: list[str] | None = None) -> None:
         from .moe_probe import cuda_moe_gate
 
         cuda_moe_gate()
+        gc.collect()
+        torch.cuda.empty_cache()
+        from .mtp_probe import cuda_mtp_gate
+
+        cuda_mtp_gate()
 
 
 if __name__ == "__main__":

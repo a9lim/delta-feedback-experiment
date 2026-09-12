@@ -38,7 +38,7 @@
 <section class="mech" id="sec-train">
   <h3>training <small id="sum-train"></small></h3>
   <div class="grid two">
-    <div class="chart"><h2>training objective <small>per step · solid loss · dashed pass-1 · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
+    <div class="chart"><h2>training objective <small>per step · solid loss · dashed pass-1 · dotted combined NTP CE · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
     <div class="chart"><h2>held-out NLL <small>nats at eval cadence · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-val"></div></div>
   </div>
   <div class="grid two">
@@ -47,7 +47,7 @@
   </div>
   <div class="grid two">
     <div class="chart"><h2>throughput <small>per second · solid predicted tokens · dashed pass-tokens · dotted cell-tokens</small></h2><div class="plot" id="p-tput"></div></div>
-    <div class="chart"><h2>cumulative tokens <small>solid predicted (matched data) · dashed pass-tokens · dotted cell-tokens (matched compute) · from k, r, and the geometry</small></h2><div class="plot" id="p-cum"></div></div>
+    <div class="chart"><h2>cumulative tokens <small>solid predicted (matched data) · dashed pass-tokens · dotted trunk cell-tokens · from k, r, and the geometry</small></h2><div class="plot" id="p-cum"></div></div>
   </div>
 </section>
 
@@ -108,6 +108,15 @@
   </div>
 </section>
 
+<section class="mech" data-letter="m" hidden>
+  <h3>m · two-token prediction <small id="sum-m"></small></h3>
+  <p class="note">The auxiliary block predicts the second token from the trunk state and the supplied next token. Training CE is pass-1 plus mean fused CE, before its weight and z-loss. Held-out CE uses the same teacher forcing. Token and cell counters above count trunk work; they exclude the auxiliary block and vocabulary loss.</p>
+  <div class="grid two">
+    <div class="chart"><h2>auxiliary training CE <small>unweighted · pass-1 plus mean feedback passes</small></h2><div class="plot" id="p-mtp-train"></div></div>
+    <div class="chart"><h2>auxiliary held-out CE <small>nats · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-mtp-val"></div></div>
+  </div>
+</section>
+
 <h3>log tail <small>non-step records</small></h3>
 <pre id="tail"></pre>
 </div>
@@ -118,7 +127,7 @@
 'use strict';
 // Delta-feedback view: what this experiment's records mean and which panels
 // they fill.  The page is organized by condition letter: a training section
-// every condition shares, then one section per letter (a, e, r, f, l) shown when
+// every condition shares, then one section per letter (a, e, r, f, l, m) shown when
 // a displayed run has it.  Every generic mechanism — parsing, lineage,
 // polling, uPlot setup — comes from the chassis.
 const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
@@ -126,18 +135,18 @@ const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
         makeChart, setData, bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs,
         state, runFor } = M;
 
-const LETTERS = ['a', 'e', 'r', 'f', 'l'];
+const LETTERS = ['a', 'e', 'r', 'f', 'l', 'm'];
 const ROLL = 200;
 
 // ---------------------------------------------------------------- records
-// step: loss/pass1/k (+r under l)/learning rates/gnorm/throughputs/mem/
-// elapsed.  eval: val (+val_fused with f).  route: per-site weights at eval
+// step: loss/ntp/pass1/k (+mtp under m, r under l)/learning rates/gnorm/throughputs/mem/
+// elapsed.  eval: val (+val_fused with f, val_mtp/val_mtp_fused with m).  route: per-site weights at eval
 // cadence.  contract: the standing self-composition diagnostic (f).  depth:
 // the loop's fixed-r sweep (l).  Non-step series live in run.evals so the
 // chassis's resume-fold rewinds them with everything else.
 function onStep(run, rec) {
   return {
-    loss: num(rec.loss), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
+    loss: num(rec.loss), ntp: num(rec.ntp), mtp: num(rec.mtp), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
     lr_normuonh: num(rec.lr_normuonh), lr_nadam: num(rec.lr_nadam), lr_nadam_width: num(rec.lr_nadam_width),
     gnorm: num(rec.gnorm), expert_balance: num(rec.expert_balance),
     expert_max_violation: num(rec.expert_max_violation), expert_bias_max: num(rec.expert_bias_max),
@@ -153,7 +162,10 @@ function entryAt(run, key, step) {
   return entry;
 }
 function onEval(run, rec, step) {
-  Object.assign(entryAt(run, 'val', step), { val: num(rec.val), val_fused: num(rec.val_fused) });
+  Object.assign(entryAt(run, 'val', step), {
+    val: num(rec.val), val_fused: num(rec.val_fused),
+    val_mtp: num(rec.val_mtp), val_mtp_fused: num(rec.val_mtp_fused),
+  });
 }
 function onRecord(run, rec) {
   if (rec.event === 'route') {
@@ -297,10 +309,11 @@ const CONFIG_GROUPS = [
   ['e · experts', 'e', ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
   ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
   ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
+  ['m · prediction', 'm', ['mtp_weight']],
   ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'grad_clip', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
 ];
-const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap' };
+const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap', mtp_weight: 'auxiliary weight' };
 function renderConfig(view) {
   const run = view.run, setup = run.meta.run, condition = conditionOf(view);
   const cards = [];
@@ -328,7 +341,7 @@ function renderConfig(view) {
 // that mechanism, so the state of every letter reads without scrolling.
 function summaries(view) {
   const setup = view.run.meta.run || {};
-  const out = { train: 'every condition · pass-1 is the common number · loss adds fused CE, z-loss and expert balance where enabled' };
+  const out = { train: 'every condition · pass-1 is the common number · loss adds fused CE, weighted MTP, z-loss and expert balance where enabled' };
   if (setup.layers != null) {
     const layers = +setup.layers, pkda = layers - Math.floor(layers / 4);
     out.a = `PKDA in ${pkda} of ${layers} attention layers · ${setup.pkda_heads} heads × ${setup.pkda_head_dim} · conv ${setup.pkda_conv_size} · configuration only`;
@@ -355,6 +368,10 @@ function summaries(view) {
   if (has(view, 'l') && setup.loop_iterations != null) l.push(`r drawn per step · mean ${setup.loop_iterations} · cap ${setup.loop_max_iterations}`);
   if (has(view, 'l') && lastD) l.push(`gain at r_mean ${signed(lastD.loss_mean - lastD.loss_one, 3)}`, `at r_max ${signed(lastD.loss_max - lastD.loss_one, 3)}`, `‖Δcore‖ ${fmt(lastD.upd_max, 3)} @ ${lastD.step.toLocaleString()}`);
   out.l = l.join(' · ');
+  if (has(view, 'm')) {
+    out.m = `weight ${fmt(num(setup.mtp_weight), 3)} · train CE ${fmt(view.steps.at(-1)?.mtp, 4)}`;
+    if (lastVal?.val_mtp != null) out.m += ` · held-out ${fmt(lastVal.val_mtp, 4)}${lastVal.val_mtp_fused != null ? ` · fused ${fmt(lastVal.val_mtp_fused, 4)}` : ''} @ ${lastVal.step.toLocaleString()}`;
+  }
   return out;
 }
 
@@ -395,7 +412,7 @@ function rebuild() {
 
   // training
   step('p-nll', perRun((c, t) => [
-    line(`loss${t}`, c), dashed(`pass-1${t}`, c)]), { yScale: yLog, marks });
+    line(`loss${t}`, c), dashed(`pass-1${t}`, c), dotted(`NTP CE${t}`, c)]), { yScale: yLog, marks });
   step('p-val', perRun((c, t) => [line(`val${t}`, c, PTS), dashed(`val fused${t}`, c, PTS)]), { yScale: yLog });
   step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dashed(`NAdam width${t}`, c, v3), dotted(`NAdam${t}`, c, v3)]), { yScale: yLog });
   step('p-gnorm', perRun((c, t) => [line(`gnorm${t}`, c, v3)]), { yScale: yLog });
@@ -428,6 +445,10 @@ function rebuild() {
   step('p-depthgain', [...perRun((c, t) => [dashed(`r_mean${t}`, c, vs), dotted(`r_max${t}`, c, vs)]), ref('0')]);
   step('p-depthupd', perRun((c, t) => [line(`‖Δcore‖${t}`, c, PTS)]), { yScale: yLog });
   step('p-r', [...perRun((c, t) => [line(`r mean${t}`, c, v3)]), ref('r_mean')]);
+
+  // m · sequential second-token prediction
+  step('p-mtp-train', perRun((c, t) => [line(`MTP CE${t}`, c)]), { yScale: yLog });
+  step('p-mtp-val', perRun((c, t) => [line(`MTP val${t}`, c, PTS), dashed(`MTP val fused${t}`, c, PTS)]), { yScale: yLog });
 }
 
 // One run's tables per chart, in the series order `rebuild` declared.
@@ -435,12 +456,15 @@ function seriesOf(view) {
   const steps = view.steps, xs = steps.map((s) => s.step);
   const col = (f) => steps.map((s) => s[f] ?? null);
   const loss = col('loss'), pass1 = col('pass1');
-  // On a k-pass step loss = pass-1 + mean fused, so the train-time fused gap
-  // is loss − 2·pass-1; one-pass steps carry no fused pass.
-  const trainGap = steps.map((s) => (s.k > 1 && s.loss != null && s.pass1 != null ? s.loss - 2 * s.pass1 - (s.expert_balance ?? 0) * (view.run.meta.run?.expert_balance_coef ?? 0) : null));
+  // Combined NTP CE = pass-1 + mean fused. The total objective also contains
+  // auxiliary losses, so it cannot identify a fused NTP gap for m records.
+  // Older non-m logs retain their original loss-minus-expert approximation.
+  const ntp = steps.map((s) => s.ntp ?? (!has(view, 'm') && s.loss != null
+    ? s.loss - (s.expert_balance ?? 0) * (view.run.meta.run?.expert_balance_coef ?? 0) : null));
+  const trainGap = steps.map((s, i) => (s.k > 1 && ntp[i] != null && s.pass1 != null ? ntp[i] - 2 * s.pass1 : null));
   // Cumulative tokens from the step records and the geometry: a pass executes
   // layers / cell cell-equivalents on a flat column and 2 + r · core / cell
-  // under l, so cell-tokens are the matched-compute axis.
+  // under l. These counters measure trunk work and exclude the MTP branch.
   const setup = view.run.meta.run || {};
   const batch = num(setup.batch_rows), length = num(setup.seq_len);
   const per = batch > 0 && length > 0 ? batch * length : null;
@@ -471,7 +495,7 @@ function seriesOf(view) {
     ...fields.map((f) => SITES.map((s) => finite((view.evals.get(`route|${s.name}`) || []).find((e) => e.step === last)?.[f]))),
   ]];
   return {
-    nll: [[xs, loss, pass1]],
+    nll: [[xs, loss, pass1, col('ntp')]],
     val: ev(vals, 'val', 'val_fused'),
     lr: [[xs, col('lr_normuonh'), col('lr_nadam_width'), col('lr_nadam')]],
     gnorm: [[xs, col('gnorm')]],
@@ -484,7 +508,7 @@ function seriesOf(view) {
     siteSharp: profile('max', 'headjs'),
     siteNullrms: profile('nulrms'),
     seed: headline('seed'), null: headline('nul'), route: headline('max'), headjs: headline('headjs'), nullrms: headline('nulrms'),
-    gap: [...ev(vals, (e) => e.val_fused - e.val), [xs, trainGap]],
+    gap: [...ev(vals, (e) => e.val_fused != null && e.val != null ? e.val_fused - e.val : null), [xs, trainGap]],
     k: [[xs, rolling(col('k'), ROLL)]],
     drift: ev(contract, (e) => e.loss8 - e.loss0),
     upd: ev(contract, 'upd8'),
@@ -492,6 +516,8 @@ function seriesOf(view) {
     depthgain: ev(depth, (e) => e.loss_mean - e.loss_one, (e) => e.loss_max - e.loss_one),
     depthupd: ev(depth, 'upd_max'),
     r: [[xs, rolling(col('r'), ROLL)]],
+    mtpTrain: [[xs, col('mtp')]],
+    mtpVal: ev(vals, 'val_mtp', 'val_mtp_fused'),
   };
 }
 function render(view) {
@@ -536,6 +562,8 @@ function render(view) {
   setData('p-depthgain', withRef(join(merged.depthgain), 0), lastX);
   setData('p-depthupd', join(merged.depthupd), lastX);
   setData('p-r', withRef(join(merged.r), num(view.run.meta.run?.loop_iterations)), lastX);
+  setData('p-mtp-train', join(merged.mtpTrain), lastX);
+  setData('p-mtp-val', join(merged.mtpVal), lastEval);
 }
 
 M.configure({

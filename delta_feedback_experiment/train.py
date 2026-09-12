@@ -36,7 +36,9 @@ from .model import (
     CONDITION_LETTERS,
     EXPERT_BALANCE_COEF,
     EXPERT_BIAS_RATE,
+    MTP_LOSS_WEIGHT,
     DeltaModel,
+    combine_pass_losses,
     condition_config,
     depth_trace,
     iterate_fused,
@@ -54,7 +56,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=28, resumable=frozenset({28}), surface_version=28
+    version=29, resumable=frozenset({29}), surface_version=29
 )
 
 
@@ -139,6 +141,7 @@ EXACT_FIELDS = (
     "lr_nadam",
     "jitter",
     "zloss",
+    "mtp_weight",
     "vocab_size",
     "dim",
     "layers",
@@ -176,6 +179,13 @@ def probability(value: str) -> float:
             f"probability must be finite and in [0, 1], got {value!r}"
         )
     return parsed
+
+
+def nonnegative_finite(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be finite and nonnegative")
+    return number
 
 
 def condition(value: str) -> str:
@@ -328,6 +338,10 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument("--jitter", type=float, default=0.02)
     recipe.add_argument("--zloss", type=float, default=1e-5)
     recipe.add_argument(
+        "--mtp-weight", type=nonnegative_finite, default=MTP_LOSS_WEIGHT,
+        help="m: auxiliary second-token CE and z-loss weight (default: 0.3)",
+    )
+    recipe.add_argument(
         "--loop-iterations",
         type=int,
         default=4,
@@ -377,10 +391,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--head-flush-every",
         type=int,
         default=4,
-        help="head calls -- one per feedback pass per microbatch -- whose "
+        help="head calls -- two per pass with m, otherwise one -- whose "
         "classifier gradient accumulates in BF16 before it is flushed into "
         "the FP32 embedding sink; 1 is the per-call path exactly, and wider "
-        "windows trade the head's gradient precision for the flush's bandwidth",
+        "windows trade the head's gradient precision for the flush's bandwidth; "
+        "microbatches wider than the window use per-call FP32 accumulation",
     )
     return parser
 
@@ -526,7 +541,7 @@ def automatic_checkpoint(
         args.micro_rows
         * args.seq_len
         * cfg.dim
-        * cfg.executed_layers(iterations)
+        * (cfg.executed_layers(iterations) + int(cfg.mtp))
         * n_passes
     )
     return work > raw_work
@@ -548,6 +563,8 @@ class CapturedMicro:
     z_coef: torch.Tensor
     loss_sum: torch.Tensor
     pass1_sum: torch.Tensor
+    ntp_sum: torch.Tensor
+    mtp_sum: torch.Tensor
     expert_balance_sum: torch.Tensor
     expert_counts: torch.Tensor | None = None
     graph: torch.cuda.CUDAGraph | None = None
@@ -659,6 +676,7 @@ class CudaGraphTrainer:
         self.grad_buffers = {p: self._buffers[p] for p in self.parameters if p in union}
         del self._buffers
         # Rebinding drops the sinks of parameters no reachable mode ever touches.
+        model.bind_classifier_accum(self.head_accum)
         self.sink_fed = model.bind_gradient_sinks(self.grad_buffers)
         # A dropped embedding sink takes the head's accumulator with it.
         self.head_accum = model._classifier_accum
@@ -734,12 +752,17 @@ class CudaGraphTrainer:
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((len(self.model.blocks), 15), dtype=torch.int64, device=self.device)
             if self.model.cfg.experts else None,
         )
 
     def _body(self, state: CapturedMicro) -> None:
         self.model.grad_checkpoint = state.spec.checkpoint
+        self.model.bind_classifier_accum(
+            self.head_accum if self._head_calls(state) <= self.head_flush_every else None
+        )
         with self.autocast:
             outs = multipass(
                 self.model,
@@ -749,12 +772,17 @@ class CudaGraphTrainer:
                 jitter=state.jitter,
                 iterations=state.spec.iterations,
             )
-            loss, losses = multipass_loss(
-                self.model, state.rows, outs, z_coef=state.z_coef
+            loss_result = multipass_loss(
+                self.model, state.rows, outs, z_coef=state.z_coef,
+                mtp_weight=self.args.mtp_weight,
             )
+            loss, losses = loss_result.total, loss_result.ntp
         (loss / self.micros).backward()
         state.loss_sum.add_(loss.detach() / self.micros)
         state.pass1_sum.add_(losses[0].detach() / self.micros)
+        state.ntp_sum.add_(combine_pass_losses(loss_result.ntp).detach() / self.micros)
+        if loss_result.mtp:
+            state.mtp_sum.add_(combine_pass_losses(loss_result.mtp).detach() / self.micros)
         if self.model.cfg.experts:
             # These are outputs of logical forwards, collected outside the
             # checkpointed blocks. Recomputed backwards cannot count again.
@@ -876,10 +904,15 @@ class CudaGraphTrainer:
         state.z_coef.fill_(z_coef)
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+        state.ntp_sum.zero_()
+        state.mtp_sum.zero_()
         state.expert_balance_sum.zero_()
         if state.expert_counts is not None:
             state.expert_counts.zero_()
         return state
+
+    def _head_calls(self, state: CapturedMicro) -> int:
+        return state.spec.n_passes * (2 if self.model.cfg.mtp else 1)
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
         state.rows.copy_(rows, non_blocking=rows.is_cuda)
@@ -897,15 +930,16 @@ class CudaGraphTrainer:
                 generator=self.generator,
             )
         state.graph.replay()
-        if self.head_accum is not None:
-            # The window counts head calls, not replays: a k-pass microbatch
-            # calls the head k times and every call rounds the running BF16
+        calls = self._head_calls(state)
+        if self.head_accum is not None and calls <= self.head_flush_every:
+            # The window counts actual NTP and MTP head calls, not replays.
+            # Every call rounds the running BF16
             # sum, so the cadence has to hold the number of contributions
             # between flushes fixed across conditions. Draining before the
             # next replay would overrun keeps that number at or under the
             # window even when it is not a multiple of the pass count.
-            self._head_pending += state.spec.n_passes
-            if self._head_pending + state.spec.n_passes > self.head_flush_every:
+            self._head_pending += calls
+            if self._head_pending + calls > self.head_flush_every:
                 self._drain_head_accum()
 
     def replay_batch(
@@ -950,7 +984,15 @@ class CapturedEval:
     prefix: torch.Tensor | None
     val_sum: torch.Tensor
     fused_sum: torch.Tensor
+    mtp_sum: torch.Tensor
+    mtp_fused_sum: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
+
+    def reset(self) -> None:
+        self.val_sum.zero_()
+        self.fused_sum.zero_()
+        self.mtp_sum.zero_()
+        self.mtp_fused_sum.zero_()
 
 
 class CudaEvalRunner:
@@ -976,11 +1018,18 @@ class CudaEvalRunner:
                 n_passes,
                 prefix_lens=state.prefix,
             )
-            _, losses = multipass_loss(self.model, state.rows, outs)
+            result = multipass_loss(
+                self.model, state.rows, outs, mtp_weight=self.args.mtp_weight
+            )
+            losses = result.ntp
         rows = state.rows.shape[0]
         state.val_sum.add_(losses[0].detach() * rows)
         if n_passes > 1:
             state.fused_sum.add_(losses[1].detach() * rows)
+        if result.mtp:
+            state.mtp_sum.add_(result.mtp[0].detach() * rows)
+            if n_passes > 1:
+                state.mtp_fused_sum.add_(result.mtp[1].detach() * rows)
 
     @torch.no_grad()
     def _capture(self, rows: int, pool) -> CapturedEval:
@@ -998,23 +1047,22 @@ class CudaEvalRunner:
             ),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
+            torch.zeros((), dtype=torch.float32, device=self.device),
         )
         was_training = self.model.training
         self.model.eval()
         self.model.grad_checkpoint = False
         for _ in range(2):
-            state.val_sum.zero_()
-            state.fused_sum.zero_()
+            state.reset()
             self._body(state)
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        state.val_sum.zero_()
-        state.fused_sum.zero_()
+        state.reset()
         with _capture_without_gc(graph, pool):
             self._body(state)
         state.graph = graph
-        state.val_sum.zero_()
-        state.fused_sum.zero_()
+        state.reset()
         self.model.train(was_training)
         return state
 
@@ -1024,19 +1072,27 @@ class CudaEvalRunner:
         self.model.eval()
         total_val = torch.zeros((), dtype=torch.float32, device=self.device)
         total_fused = torch.zeros_like(total_val)
+        total_mtp = torch.zeros_like(total_val)
+        total_mtp_fused = torch.zeros_like(total_val)
         for first in range(0, self.args.eval_rows, self.args.micro_rows):
             rows = min(self.args.micro_rows, self.args.eval_rows - first)
             state = self.states[rows]
-            state.val_sum.zero_()
-            state.fused_sum.zero_()
+            state.reset()
             state.rows.copy_(data_val.batch(first, rows))
             state.graph.replay()
             total_val.add_(state.val_sum)
             if self.model.cfg.feedback:
                 total_fused.add_(state.fused_sum)
+            if self.model.cfg.mtp:
+                total_mtp.add_(state.mtp_sum)
+                total_mtp_fused.add_(state.mtp_fused_sum)
         result = {"val": (total_val / self.args.eval_rows).item()}
         if self.model.cfg.feedback:
             result["val_fused"] = (total_fused / self.args.eval_rows).item()
+        if self.model.cfg.mtp:
+            result["val_mtp"] = (total_mtp / self.args.eval_rows).item()
+            if self.model.cfg.feedback:
+                result["val_mtp_fused"] = (total_mtp_fused / self.args.eval_rows).item()
         self.model.train(was_training)
         return result
 
@@ -1077,13 +1133,20 @@ def evaluate(
         outs = multipass(
             model, rows, n_passes, prefix_lens=prefix if n_passes > 1 else None
         )
-        _, losses = multipass_loss(model, rows, outs)
+        result = multipass_loss(model, rows, outs, mtp_weight=args.mtp_weight)
+        losses = result.ntp
         sums["val"] = sums.get("val", 0.0) + losses[0].item() * rows.shape[0]
         if n_passes > 1:
             sums["val_fused"] = (
                 sums.get("val_fused", 0.0) + losses[1].item() * rows.shape[0]
             )
         counted += rows.shape[0]
+        if result.mtp:
+            sums["val_mtp"] = sums.get("val_mtp", 0.0) + result.mtp[0].item() * rows.shape[0]
+            if n_passes > 1:
+                sums["val_mtp_fused"] = (
+                    sums.get("val_mtp_fused", 0.0) + result.mtp[1].item() * rows.shape[0]
+                )
     model.train()
     return {key: value / counted for key, value in sums.items()}
 
@@ -1298,6 +1361,8 @@ def resolve_run_args(
     against the checkpoint rather than inherits from it.
     """
     args = parser.parse_args(argv)
+    if "m" in args.condition and args.seq_len < 2:
+        parser.error("m requires --seq-len at least 2")
     explicit = checkpoints.explicit_destinations(parser, argv)
     pinned = set(explicit)
     for field, value in SCALES[args.scale].items():
@@ -1611,6 +1676,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 )
                 step_loss = graph_state.loss_sum.item()
                 pass1_loss = graph_state.pass1_sum.item()
+                ntp_loss = graph_state.ntp_sum.item()
+                mtp_loss = graph_state.mtp_sum.item()
                 expert_balance = graph_state.expert_balance_sum.item()
                 expert_counts = graph_state.expert_counts
                 graph_runner.prepare_optimizer(graph_state)
@@ -1618,6 +1685,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 model.grad_checkpoint = checkpointing
                 step_loss = 0.0
                 pass1_loss = 0.0
+                ntp_loss = mtp_loss = 0.0
                 expert_balance = 0.0
                 expert_counts = (
                     torch.zeros((len(model.blocks), 15), dtype=torch.int64, device=device)
@@ -1646,10 +1714,16 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                             jitter=jitter,
                             iterations=iterations,
                         )
-                        loss, losses = multipass_loss(model, rows, outs, z_coef=z_coef)
+                        loss_result = multipass_loss(
+                            model, rows, outs, z_coef=z_coef, mtp_weight=args.mtp_weight
+                        )
+                        loss, losses = loss_result.total, loss_result.ntp
                     (loss / micros).backward()
                     step_loss += loss.item() / micros
                     pass1_loss += losses[0].item() / micros
+                    ntp_loss += combine_pass_losses(loss_result.ntp).item() / micros
+                    if loss_result.mtp:
+                        mtp_loss += combine_pass_losses(loss_result.mtp).item() / micros
                     if model.cfg.experts:
                         expert_counts.add_(
                             torch.stack([out.expert_counts for out in outs]).sum(dim=0)
@@ -1685,8 +1759,11 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 "phase": phase,
                 "loss": telemetry.format_metric(step_loss),
                 "pass1": telemetry.format_metric(pass1_loss),
+                "ntp": telemetry.format_metric(ntp_loss),
                 "k": n_passes,
             }
+            if model.cfg.mtp:
+                fields["mtp"] = telemetry.format_metric(mtp_loss)
             if model.cfg.experts:
                 fields["expert_balance"] = telemetry.format_metric(expert_balance)
                 # Each physical bank has its own target, including the core

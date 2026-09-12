@@ -85,6 +85,10 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
         "loop",
         "Huginn loop: the middle cells become one tied core iterated per column",
     ),
+    "m": (
+        "mtp",
+        "two-token prediction: one sequential auxiliary block with shared readout",
+    ),
 }
 """Letter -> (``ModelConfig`` flag, one-line change), in canonical order."""
 
@@ -131,6 +135,9 @@ the plain parametrization.
 EXPERT_BALANCE_COEF = 0.0001
 """Weak sequence-balance coefficient, averaged over executed layers and passes."""
 
+MTP_LOSS_WEIGHT = 0.3
+"""Default weight of the one-token-ahead auxiliary prediction objective."""
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -168,6 +175,9 @@ class ModelConfig:
 
     feedback: bool = False
     """``f``: FBT gated entry plus a payload for the next column."""
+
+    mtp: bool = False
+    """``m``: one sequential auxiliary block predicts the second future token."""
 
     loop: bool = False
     """``l``: the cells between the first and last become one tied core that
@@ -819,6 +829,49 @@ class Block(nn.Module):
         return h, h - start, w_attn, w_mlp, aux, expert_weights, expert_counts
 
 
+class MultiTokenPrediction(nn.Module):
+    """One sequential prediction depth; embedding and readout belong to the model.
+
+    Position t consumes the trunk state at t and the embedding of token t+1.
+    Causal attention over those pairs cannot see the target at t+2. The
+    auxiliary block has the trunk's geometry and residual scaling, with a
+    dense RoPE mixer and dense SwiGLU independently of the trunk's factors.
+    """
+
+    def __init__(self, cfg: ModelConfig):
+        super().__init__()
+        self.hidden_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.embedding_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.projection = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
+        self.projection_sink: Tensor | None = None
+        self.projection_shadow: Tensor | None = None
+        self.attention_gate = nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
+        self.block = Block(
+            replace(cfg, hybrid=False, experts=False, block_routing=False,
+                    feedback=False, loop=False, mtp=False),
+            0,
+        )
+
+    def forward(self, h: Tensor, next_embedding: Tensor) -> Tensor:
+        joined = torch.cat(
+            (self.hidden_norm(h), self.embedding_norm(next_embedding)), dim=-1
+        )
+        x = sink_linear(
+            joined, (self.projection.weight,), (self.projection_sink,),
+            self.projection_shadow,
+        )
+        return self.block(x, None, None, self.attention_gate.weight, False)[0]
+
+
+def _mtp_forward(module, h, next_embedding):
+    return module(h, next_embedding)
+
+
+_compiled_mtp = torch.compile(
+    _mtp_forward, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+
 def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
     """Pure checkpoint wrapper with a positional source-bank interface.
 
@@ -1005,6 +1058,14 @@ class DeltaModel(nn.Module):
                 for block in self.blocks:
                     block.mlp = MixtureOfExperts(cfg.dim, cfg.intermediate)
                     block.mlp.apply(self._init_weights)
+        self.mtp = None
+        if cfg.mtp:
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(
+                    (factor_seed ^ 0x4D54505F44455054) % ((1 << 63) - 1)
+                )
+                self.mtp = MultiTokenPrediction(cfg)
+                self.mtp.apply(self._init_weights)
         self._scale_initialization()
 
     def _init_weights(self, module: nn.Module) -> None:
@@ -1068,6 +1129,32 @@ class DeltaModel(nn.Module):
         )
         return self.entry_norm(value * gate)
 
+    def mtp_hidden(self, h_top: Tensor, next_tokens: Tensor) -> Tensor:
+        """Predictor states aligned with supplied next tokens, before readout."""
+        if self.mtp is None:
+            raise ValueError("multi-token prediction needs a condition with m")
+        if h_top.ndim != 3 or next_tokens.shape != h_top.shape[:2] or not h_top.shape[1]:
+            raise ValueError("MTP needs aligned nonempty hidden states and next tokens")
+        embedding = self.embed_tokens(next_tokens)
+        fn = _compiled_mtp if h_top.is_cuda else _mtp_forward
+        if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(
+                fn, self.mtp, h_top, embedding,
+                use_reentrant=False, preserve_rng_state=False,
+            )
+        return fn(self.mtp, h_top, embedding)
+
+    def _parameter_blocks(self):
+        """Physical trunk and auxiliary blocks with their separately owned gates."""
+        for block in self.blocks:
+            gate = (
+                None if block.is_pkda
+                else self.attention_gates[block.global_gate_index].weight
+            )
+            yield block, gate
+        if self.mtp is not None:
+            yield self.mtp.block, self.mtp.attention_gate.weight
+
     # -- persistent gradient sinks -------------------------------------------
 
     def allocate_gradient_buffers(self) -> dict[nn.Parameter, Tensor]:
@@ -1079,7 +1166,7 @@ class DeltaModel(nn.Module):
         without materializing or combining per-parameter gradients.
         """
         buffers: dict[nn.Parameter, Tensor] = {}
-        for block in self.blocks:
+        for block, gate in self._parameter_blocks():
             attn = block.attn
             if block.is_pkda:
                 parameters = (
@@ -1090,7 +1177,7 @@ class DeltaModel(nn.Module):
             else:
                 parameters = (
                     attn.qkv_proj.weight,
-                    self.attention_gates[block.global_gate_index].weight,
+                    gate,
                 )
             if not all(parameter.requires_grad for parameter in parameters):
                 continue
@@ -1224,7 +1311,7 @@ class DeltaModel(nn.Module):
             # The classifier accumulator drains into that sink; without one it
             # would strand the head's gradient.
             self._classifier_accum = None
-        for block in self.blocks:
+        for block, gate in self._parameter_blocks():
             if isinstance(block.mlp, MixtureOfExperts):
                 expert_bound, expert_refresh = block.mlp.bind_gradient_sinks(sinks)
                 bound.update(expert_bound)
@@ -1269,7 +1356,6 @@ class DeltaModel(nn.Module):
                     attn.output_gate_shadow, attn.output_gate_up.weight
                 )
             else:
-                gate = self.attention_gates[block.global_gate_index].weight
                 attn.qkv_sink = sink(attn.qkv_proj.weight)
                 attn.gate_sink = sink(gate)
                 attn.packed_qkv_sink = packed_sink(
@@ -1285,6 +1371,11 @@ class DeltaModel(nn.Module):
                 self.fuse_value_shadow, self.fuse_value.weight
             )
             self.fuse_gate_shadow = shadow(self.fuse_gate_shadow, self.fuse_gate.weight)
+        if self.mtp is not None:
+            self.mtp.projection_sink = sink(self.mtp.projection.weight)
+            self.mtp.projection_shadow = shadow(
+                self.mtp.projection_shadow, self.mtp.projection.weight
+            )
         self._shadow_refresh = refresh
         return bound
 
@@ -1945,8 +2036,9 @@ def sequence_ce(
             if torch.is_grad_enabled()
             else None
         )
-        # Every gradient-bearing head call of a microbatch -- one per feedback
-        # pass -- accumulates into the one bound buffer; evaluation has no
+        # Every gradient-bearing head call of a microbatch -- two per pass
+        # with MTP -- uses the bound accumulator or the per-call FP32 sink;
+        # evaluation has no
         # backward to accumulate and reads the classifier as before.
         classifier, accum = model.classifier_for_loss()
         return _fixed_cce_z(
@@ -1985,40 +2077,71 @@ def sequence_ce(
     return ce_sum / count, z_sum / count
 
 
+def combine_pass_losses(values: list[Tensor]) -> Tensor:
+    """Pass 1 plus the mean over feedback passes (FBT Eq. 12, lambda=1)."""
+    if len(values) == 1:
+        return values[0]
+    return values[0] + torch.stack(values[1:]).mean()
+
+
+@dataclass
+class LossOutput:
+    """Training objective and unregularized CE for each pass and prediction depth."""
+
+    total: Tensor
+    ntp: list[Tensor]
+    mtp: list[Tensor]
+
+
 def multipass_loss(
     model: DeltaModel,
     tokens: Tensor,
     outs: list[ColumnOutput],
     *,
     z_coef: float | Tensor = 0.0,
-) -> tuple[Tensor, list[Tensor]]:
+    mtp_weight: float = MTP_LOSS_WEIGHT,
+) -> LossOutput:
     """FBT Eq. 12 with λ=1: pass-1 NTP plus the mean over feedback passes,
     plus (in cooldown) the z-loss under the same per-pass weighting.
 
-    Returns (total, per-pass CE losses); per-pass loss 0 is the
-    Standard-mode tracking metric.
+    MTP adds one sequential second-token predictor per executed pass. Its CE
+    and z-loss have the same pass weighting, scaled by ``mtp_weight``. Each
+    head is normalized over its own real targets; MTP drops the last input
+    position, retaining the original token-store and NTP row geometry.
+    ``ntp[0]`` is the Standard-mode tracking metric.
     """
+    if not outs:
+        raise ValueError("loss needs at least one model pass")
+    if not math.isfinite(mtp_weight) or mtp_weight < 0:
+        raise ValueError("mtp_weight must be finite and nonnegative")
+    if model.cfg.mtp and tokens.shape[1] < 3:
+        raise ValueError("MTP needs at least three stored tokens")
     targets = tokens[:, 1:]
     losses, z_terms = [], []
+    mtp_losses, mtp_z = [], []
     for out in outs:
         ce, z = sequence_ce(model, out.h_top, targets)
         losses.append(ce)
         z_terms.append(z)
+        if model.cfg.mtp:
+            h_mtp = model.mtp_hidden(out.h_top[:, :-1], tokens[:, 1:-1])
+            ce, z = sequence_ce(model, h_mtp, tokens[:, 2:])
+            mtp_losses.append(ce)
+            mtp_z.append(z)
 
-    def combine(values: list[Tensor]) -> Tensor:
-        if len(values) == 1:
-            return values[0]
-        return values[0] + torch.stack(values[1:]).mean()
-
-    total = combine(losses)
-    total = total + z_coef * combine(z_terms)
+    total = combine_pass_losses(losses)
+    total = total + z_coef * combine_pass_losses(z_terms)
+    if mtp_losses:
+        total = total + mtp_weight * (
+            combine_pass_losses(mtp_losses) + z_coef * combine_pass_losses(mtp_z)
+        )
     if model.cfg.experts:
         total = (
             total
             + EXPERT_BALANCE_COEF
             * torch.stack([out.expert_aux_loss for out in outs]).mean()
         )
-    return total, losses
+    return LossOutput(total, losses, mtp_losses)
 
 
 def _monitor_autocast(tokens: Tensor):

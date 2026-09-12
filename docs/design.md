@@ -8,9 +8,9 @@ and evaluation.
 
 ## Conditions
 
-A condition is a string of letters from `aerfl`, each one change from the
+A condition is a string of letters from `aerflm`, each one change from the
 plain twelve-layer gated GQA decoder. `parse_condition` accepts the
-letters in any order and returns them in that order; the empty string is the
+letters in any order and returns them in canonical `aerflm` order; the empty string is the
 plain decoder, and `ModelConfig.condition` renders a configuration's letters
 back.
 
@@ -21,8 +21,9 @@ back.
 | `r` | MHDB: transient grouped reads of the seed and block deltas before every sublayer; with `f`, routed enrichment of the payload | `block_routing` |
 | `f` | FBT: token-gated latent payload transfer between token columns | `feedback` |
 | `l` | Huginn loop: the cells between the first and last become one tied core, iterated a drawn number of times per column ([architecture.md](architecture.md#letter-l-the-tied-depth-loop)) | `loop` |
+| `m` | One auxiliary transformer predicts the second token using the top state and the next token's shared embedding ([architecture.md](architecture.md#letter-m-two-token-prediction)) | `mtp` |
 
-Every subset of `aerfl` builds; their parameter counts at the screen are in
+Every subset of `aerflm` builds; their parameter counts at the screen are in
 [scaling.md](scaling.md#the-screen).
 
 Without `a`, each cell is `[RoPE-GGQA, RoPE-GGQA, RoPE-GGQA, NoPE-GGQA]`.
@@ -31,7 +32,7 @@ per-head RMSNorm at theta 10,000. The fourth layer stays NoPE in every
 condition. The pattern holds at every scale and core iteration and adds no
 learned parameters or recipe knob.
 
-`aerfl` is the full built stack and `aerf` its flat column. `arf` remains the
+`aerflm` is the full built stack and `aerfm` its flat column. `arf` remains the
 dense reference for shared token budgets. `a` alone already
 has recurrent mixer memory. `r` without `f` seeds from the plain embedding and
 emits no payload; `f` without `r` emits `payload_norm(h_top)`; `r` with `f`
@@ -42,6 +43,9 @@ unlooped condition's counts. `e` changes only the channel mixers and their
 training regularizer. Its router reads the current token's normalized residual;
 there is no expert capacity limit or token dropping. Intermediate width must
 be divisible by four.
+`m` adds a separate dense transformer block and training objective after the
+column; the auxiliary block has no experts, routing, or depth loop. It leaves
+ordinary inference's computation and recurrent state unchanged.
 
 Pairing is built in. Two conditions on the same trunk letter initialize every
 parameter they share byte-identically for a given seed
@@ -53,6 +57,8 @@ one the same way: the iteration draw is its own keyed sub-stream, so `arfl`
 and `arf` share every pass, prefix, and jitter draw.
 Adding `e` preserves all shared non-FFN parameters; its expert and router
 weights use their own deterministic stream and pair across `r`, `f`, and `l`.
+Adding `m` preserves every shared parameter and uses its own initialization
+stream for the auxiliary module.
 
 Initialization uses the single `BASE_NORMAL_INIT_STD = 0.02` constant in
 `delta_feedback_experiment/model.py` for the tied embedding and NAdam dense
@@ -178,6 +184,10 @@ addresses:
 first_row(n) = (n - 1) * batch_rows
 ```
 
+With `m`, the same row also supplies `seq_len - 1` auxiliary second-token
+targets. Cropping keeps every auxiliary target supervised and preserves the
+stored-row format, row order, and ordinary predicted-token budget.
+
 Feedback pass counts are keyed by data seed and step; prefix lengths and
 jitter are additionally keyed by the microbatch's first global row. None of
 them depend on ambient RNG state, so a resume returns to the same row and the
@@ -200,6 +210,30 @@ Every condition uses the NorMuonH/NAdam partition in [architecture.md](architect
 After all microbatches have accumulated, the single global FP32 gradient
 vector is clipped to L2 norm 10.0 before both optimizer steps; telemetry
 reports the pre-clip norm.
+
+### Two-token prediction
+
+Add `m` to train one DeepSeek-style auxiliary prediction depth. On every
+pass, it combines the trunk's top state at `t` with the shared embedding of
+the ground-truth next token and predicts the token at `t + 2`. Gradients flow
+through both inputs. [Architecture](architecture.md#letter-m-two-token-prediction)
+defines the causal block and exact target alignment.
+
+The auxiliary cross-entropy averages over `seq_len - 1` positions per row.
+It uses the same pass-1-plus-mean-feedback combination as ordinary
+cross-entropy and the same cooldown z-loss coefficient, then multiplies both
+by `--mtp-weight` (default 0.3). The weight is constant for the run, finite,
+and nonnegative; it is stored among the exact-resume settings. The reported
+`ntp` and `mtp` metrics are the combined ordinary and auxiliary
+cross-entropies before coefficients or z-loss. `pass1` remains ordinary
+first-pass cross-entropy; `loss` reports the complete optimized objective,
+including MTP, z-loss, and expert balancing. On multiple-pass steps,
+`ntp - pass1` gives the mean feedback-pass next-token cross-entropy.
+
+The extra block and vocabulary loss run once per pass, regardless of the
+trunk's tied-core iteration count. They add training computation without
+changing the schedule's predicted-token count; equal steps between paired
+conditions with and without `m` are matched data, not matched compute.
 
 ### Expert balancing
 
@@ -292,7 +326,7 @@ rounded up to whole steps, and every condition at a scale shares it.
 
 | Flag | Default | What it changes |
 |---|---:|---|
-| `--condition` | `""` | letters from `aerfl` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
+| `--condition` | `""` | letters from `aerflm` in any order; empty is the plain decoder with three RoPE-GGQA layers and one NoPE-GGQA layer per cell |
 | `--scale` | `screen` | geometry and batch preset from [scaling.md](scaling.md): `screen`, `bridge`, or `flagship`; a trunk or recipe flag typed alongside overrides its field |
 | `--tokens-per-param` | 25 | predicted tokens per active non-embedding parameter of the dense flat `arf` reference at the scale; derives `--steps`, rounded up to whole steps, so every condition at a scale shares one schedule |
 | `--steps` | derived | schedule length, typed instead of derived |
@@ -304,15 +338,17 @@ rounded up to whole steps, and every condition at a scale shares it.
 | `--three-pass` | 0.12 | probability of three passes after the boundary; 1 makes every feedback step three-pass |
 | `--loop-iterations`, `--loop-max-iterations` | 4, 8 | `l`: mean and cap of the per-step core iteration draw; the mean is also the fixed evaluation and decode count |
 | `--jitter` | 0.02 | payload jitter half-width |
+| `--mtp-weight` | 0.3 | `m`: finite nonnegative weight for auxiliary cross-entropy and its z-loss, constant across the run |
 | `--warmup-frac`, `--cooldown-frac` | 0.02, 0.20 | schedule shape; the warmup fraction applies to the shorter of the run and the 25x recipe, the cooldown fraction to the run |
 | `--max-steps` | | caps this invocation without changing the schedule |
-| `--resume` | | continues a tag from its latest v28 snapshot |
+| `--resume` | | continues a tag from its latest v29 snapshot |
 
 ### Checkpoints and queue
 
-Checkpoint v28 is the only accepted contract for resume, evaluation, and
-forks. `e` uses the existing condition field and model state dictionary, so
-dense snapshots retain their current resume contract. Snapshots bind to the
+Checkpoint v29 is the only accepted contract for resume, evaluation, and
+forks. The condition records whether `m` is enabled, its state dictionary
+stores the auxiliary parameters, and the state-defining arguments include
+`mtp_weight`. Snapshots bind to the
 current GPT-NeoX/ChatML tokenizer and 50,304-row head. The snapshot and token
 store carry the same deterministic
 `tokenizer_id`, derived from the pinned vocabulary, delimiter IDs, and full
@@ -350,12 +386,20 @@ Every evaluation point reports pass-1 held-out cross-entropy as `val` over
 the slice's first `--eval-rows` rows, 128 by default: 524,288 predictions at
 the screen, every `--eval-every` steps. Conditions with `f` also report `val_fused`, a
 second pass with plain-prefix length 1. Conditions with `l` evaluate at the fixed count `r = r_mean`.
+Conditions with `m` also report `val_mtp` over the valid second-token targets;
+with `f`, `val_mtp_fused` reads the second pass's top states. These auxiliary
+metrics exclude their training weight and z-loss. `val` and `val_fused` remain
+ordinary next-token losses over all `seq_len` positions.
 Decoding has three modes, each at one fixed `r` under `l`:
 
 - **Standard:** one plain prompt prefill, no feedback during decode.
 - **Soft:** one plain prefill, then one feedback transition per generated
   token.
 - **Fused:** an additional fused prompt pass, then the same feedback decode.
+
+All three modes use ordinary next-token prediction. The MTP module is a
+training and auxiliary-validation branch; speculative decoding is not
+implemented.
 
 ### Comparing conditions
 
@@ -371,7 +415,10 @@ Positive `I` is superadditive loss reduction. Computed on paired checkpoints
 by mode; writing `plain` for the empty condition, `L_plain - L_a` is the
 whole-trunk contrast. Report parameters, predicted tokens, pass-tokens, and
 cell-tokens with every number; a matched-compute view compares at equal
-cumulative cell-tokens, since a loop pass is deeper than a flat one.
+cumulative cell-tokens for the loop, since a loop pass is deeper than a flat
+one. MTP adds a block and a vocabulary-loss call outside those trunk
+cell-tokens, so a comparison involving `m` needs measured device time or
+accounting that includes the auxiliary computation.
 `L_arf - L_arfl` at equal steps is the loop's matched-data contrast.
 
 ### Downstream tasks

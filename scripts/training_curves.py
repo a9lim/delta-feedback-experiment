@@ -2,7 +2,7 @@
 
 Parses the trainer's telemetry (`step`, `eval`, `route`, `contract`,
 `schedule`, `run` lines) and draws validation curves, paired differences
-against a reference run, matched-compute curves, exponentially smoothed
+against a reference run, curves against trunk work, exponentially smoothed
 training losses (including the per-step paired pass-1 difference, which is
 exact because paired runs share every row), gradient norms, routing
 trajectories per site, and the repeated-fused-prefill monitor.
@@ -101,6 +101,8 @@ def step_arrays(steps: dict, *, loop: bool) -> dict[str, np.ndarray]:
     cols["r"] = np.array([steps[s]["r"] for s in keys], dtype=float) if loop else np.ones(len(keys))
     cols["phase"] = np.array([steps[s]["phase"] for s in keys])
     cols["expert_balance"] = np.array([steps[s].get("expert_balance", 0) for s in keys], dtype=float)
+    for name in ("ntp", "mtp"):
+        cols[name] = np.array([steps[s].get(name, np.nan) for s in keys], dtype=float)
     return cols
 
 
@@ -131,12 +133,16 @@ def main() -> None:
     for run in runs:
         a = step_arrays(run["steps"], loop="l" in run["run"]["condition"])
         tokens_per_step = int(run["run"]["batch_rows"]) * int(run["run"]["seq_len"])
-        a["loss"] -= a["expert_balance"] * float(run["run"].get("expert_balance_coef", 0))
+        if "m" not in run["run"]["condition"]:
+            # Historical non-MTP records lack separate NTP CE. Retain their
+            # old approximation; any z-loss in those objectives is inseparable.
+            fallback = a["loss"] - a["expert_balance"] * float(run["run"].get("expert_balance_coef", 0))
+            a["ntp"] = np.where(np.isnan(a["ntp"]), fallback, a["ntp"])
         passes = a["k"]
         a["cum_pass_tokens"] = np.cumsum(passes) * tokens_per_step
         a["cum_cell_tokens"] = np.cumsum(passes * cells_per_pass(run, a["r"])) * tokens_per_step
         a["cum_tokens"] = a["step"] * tokens_per_step
-        a["fused_train"] = np.where(a["k"] > 1, a["loss"] - a["pass1"], np.nan)
+        a["fused_train"] = np.where(a["k"] > 1, a["ntp"] - a["pass1"], np.nan)
         arrays.append(a)
     evals = []
     for run in runs:
@@ -146,6 +152,8 @@ def main() -> None:
                 "step": np.array([r["step"] for r in e], dtype=float),
                 "val": np.array([r["val"] for r in e], dtype=float),
                 "val_fused": np.array([r.get("val_fused", np.nan) for r in e], dtype=float),
+                "val_mtp": np.array([r.get("val_mtp", np.nan) for r in e], dtype=float),
+                "val_mtp_fused": np.array([r.get("val_mtp_fused", np.nan) for r in e], dtype=float),
             }
         )
     feedback = [not np.all(np.isnan(e["val_fused"])) for e in evals]
@@ -190,7 +198,7 @@ def main() -> None:
     ax.legend(loc="lower left")
     fs.save(fig, out_dir / "validation.png")
 
-    # -- matched compute -------------------------------------------------------
+    # -- data and trunk work (MTP block/readout costs excluded) -----------------
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
     for e, a, lab, col, fb in zip(evals, arrays, labels, colors, feedback):
         idx = np.searchsorted(a["step"], e["step"]).clip(0, len(a["step"]) - 1)
@@ -199,7 +207,7 @@ def main() -> None:
         if fb:
             axes[1].plot(a["cum_cell_tokens"][idx], e["val_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
     axes[0].set(xlabel="predicted tokens (matched data)", ylabel="held-out CE", title="Against predicted tokens", xscale="log")
-    axes[1].set(xlabel="cell-tokens (matched compute)", ylabel="held-out CE", title="Against cell-tokens", xscale="log")
+    axes[1].set(xlabel="trunk cell-tokens (excludes MTP)", ylabel="held-out CE", title="Against trunk work", xscale="log")
     for ax in axes:
         ax.legend()
     fs.save(fig, out_dir / "matched-compute.png")
@@ -233,8 +241,10 @@ def main() -> None:
     for a, lab, col, fb in zip(arrays, labels, colors, feedback):
         if not fb:
             continue
-        any_fb = True
         m = ~np.isnan(a["fused_train"])
+        if not m.any():
+            continue
+        any_fb = True
         ax.plot(a["step"][m], ema((a["fused_train"] - a["pass1"])[m], args.ema), color=col, label=f"{lab}: mean fused pass − pass 1")
         summary["runs"].setdefault(lab, {})["train_fused_minus_pass1_last1000"] = float((a["fused_train"] - a["pass1"])[m][-1000:].mean())
     fs.zero_line(ax)
@@ -247,6 +257,29 @@ def main() -> None:
     ax.set(xlabel="optimizer step", ylabel=f"pre-clip gradient norm (EMA {args.ema})", title="Gradient norm", yscale="log")
     ax.legend()
     fs.save(fig, out_dir / "training-loss.png")
+
+    # -- auxiliary second-token prediction ------------------------------------
+    mtp_runs = [
+        (run, a, e, lab, col)
+        for run, a, e, lab, col in zip(runs, arrays, evals, labels, colors)
+        if "m" in run["run"]["condition"]
+    ]
+    if mtp_runs:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 3.8), constrained_layout=True)
+        for run, a, e, lab, col in mtp_runs:
+            observed = np.isfinite(a["mtp"])
+            weight = run["run"].get("mtp_weight", "unknown")
+            if observed.any():
+                axes[0].plot(a["step"][observed], ema(a["mtp"][observed], args.ema), color=col, label=f"{lab}: weight {weight}")
+            axes[1].plot(e["step"], e["val_mtp"], color=col, label=f"{lab}: pass 1")
+            if np.isfinite(e["val_mtp_fused"]).any():
+                axes[1].plot(e["step"], e["val_mtp_fused"], color=col, ls="--", lw=1.2, label=f"{lab}: fused")
+        axes[0].set(xlabel="optimizer step", ylabel=f"unweighted CE (EMA {args.ema})", title="Auxiliary train: pass 1 + mean fused")
+        axes[1].set(xlabel="optimizer step", ylabel="held-out CE", title="Auxiliary validation (teacher forcing)")
+        for ax in axes:
+            if ax.lines:
+                ax.legend()
+        fs.save(fig, out_dir / "multi-token-prediction.png")
 
     # -- routing trajectories -------------------------------------------------
     routed = [r for r in runs if r["routes"]]
@@ -352,6 +385,12 @@ def main() -> None:
                 "mean_step_seconds": float(tokens_per_step / np.nanmean(a["tok_s"])),
             }
         )
+        if "m" in run["run"]["condition"]:
+            entry.update({
+                "mtp_weight": run["run"].get("mtp_weight"),
+                "final_val_mtp": None if np.isnan(e["val_mtp"][-1]) else float(e["val_mtp"][-1]),
+                "final_val_mtp_fused": None if np.isnan(e["val_mtp_fused"][-1]) else float(e["val_mtp_fused"][-1]),
+            })
     (out_dir / "training_curves.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({k: {kk: vv for kk, vv in v.items() if not isinstance(vv, list)} for k, v in summary["runs"].items()}, indent=2))
     print(f"figures -> {out_dir}/")

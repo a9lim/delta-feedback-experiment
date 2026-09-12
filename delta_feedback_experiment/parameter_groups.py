@@ -16,6 +16,7 @@ def is_normuonh_parameter(name: str, parameter: Tensor) -> bool:
         return False
     nadam_matrix = (
         name.startswith("attention_gates.")
+        or name == "mtp.attention_gate.weight"
         or name == "fuse_gate.weight"
         or any(marker in name for marker in _NADAM_MATRIX_MARKERS)
     )
@@ -39,6 +40,7 @@ def is_width_scaled_parameter(name: str, parameter: Tensor) -> bool:
         return False
     return (
         name.startswith("attention_gates.")
+        or name == "mtp.attention_gate.weight"
         or name == "fuse_gate.weight"
         or ".attn.control_proj." in name
         or ".mlp.router." in name

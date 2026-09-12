@@ -25,7 +25,12 @@ from transformer_experiments import checkpoints
 
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import DeltaModel, multipass, multipass_loss
+from delta_feedback_experiment.model import (
+    DeltaModel,
+    combine_pass_losses,
+    multipass,
+    multipass_loss,
+)
 from delta_feedback_experiment.optim import OptimizerPair, build_optimizers
 from delta_feedback_experiment.train import (
     CONTRACT,
@@ -39,20 +44,25 @@ FUSION_NAMES = ("fuse_value.weight", "fuse_gate.weight", "gate_norm.weight", "en
 
 
 @torch.no_grad()
-def evaluate(model, data_val, rows, micro, device):
+def evaluate(model, data_val, rows, micro, device, *, mtp_weight):
     was_training = model.training
     model.eval()
-    sums = [0.0, 0.0]
+    sums = {"val": 0.0, "val_fused": 0.0}
+    if model.cfg.mtp:
+        sums.update(val_mtp=0.0, val_mtp_fused=0.0)
     for first in range(0, rows, micro):
         batch = data_val.batch(first, min(micro, rows - first), device)
         prefix = torch.ones((1, batch.shape[0]), dtype=torch.long, device=device)
         with analysis.autocast(device):
             outs = multipass(model, batch, 2, prefix_lens=prefix)
-            _, losses = multipass_loss(model, batch, outs)
-        sums[0] += losses[0].item() * batch.shape[0]
-        sums[1] += losses[1].item() * batch.shape[0]
+            result = multipass_loss(model, batch, outs, mtp_weight=mtp_weight)
+        sums["val"] += result.ntp[0].item() * batch.shape[0]
+        sums["val_fused"] += result.ntp[1].item() * batch.shape[0]
+        if model.cfg.mtp:
+            sums["val_mtp"] += result.mtp[0].item() * batch.shape[0]
+            sums["val_mtp_fused"] += result.mtp[1].item() * batch.shape[0]
     model.train(was_training)
-    return sums[0] / rows, sums[1] / rows
+    return {name: value / rows for name, value in sums.items()}
 
 
 def main() -> None:
@@ -105,10 +115,11 @@ def main() -> None:
     model.grad_checkpoint = True
     model.refresh_shadows()
 
-    trace = {"args": vars(args) | {"snapshot": str(args.snapshot)}, "start_step": start_step, "steps": [], "evals": []}
-    val, fused = evaluate(model, data_val, args.eval_rows, micro_rows, device)
-    trace["evals"].append({"step": 0, "val": val, "val_fused": fused})
-    print(f"eval step 0: val={val:.4f} val_fused={fused:.4f} gap={fused - val:+.4f}", flush=True)
+    trace = {"args": vars(args) | {"snapshot": str(args.snapshot), "mtp_weight": saved["mtp_weight"]}, "start_step": start_step, "steps": [], "evals": []}
+    metrics = evaluate(model, data_val, args.eval_rows, micro_rows, device, mtp_weight=saved["mtp_weight"])
+    trace["evals"].append({"step": 0, **metrics})
+    print("eval step 0: " + " ".join(f"{name}={value:.4f}" for name, value in metrics.items())
+          + f" gap={metrics['val_fused'] - metrics['val']:+.4f}", flush=True)
 
     t_start = time.time()
     for i in range(1, args.steps + 1):
@@ -117,7 +128,7 @@ def main() -> None:
         for optimizer in optimizers:
             for group in optimizer.param_groups:
                 group["lr"] = group["stable_lr"] * scale
-        step_loss = pass1 = 0.0
+        step_loss = step_ntp = step_mtp = pass1 = 0.0
         t0 = time.time()
         for micro in range(micros):
             first_row = (step - 1) * saved["batch_rows"] + micro * micro_rows
@@ -127,24 +138,34 @@ def main() -> None:
                 prefix, jitter = micro_draws(run, step, first_row, args.passes, rows.shape[0], cfg.dim, device)
             with analysis.autocast(device):
                 outs = multipass(model, rows, args.passes, prefix_lens=prefix, jitter=jitter)
-                loss, losses = multipass_loss(model, rows, outs, z_coef=saved["zloss"])
+                loss_result = multipass_loss(model, rows, outs, z_coef=saved["zloss"], mtp_weight=saved["mtp_weight"])
+                loss, losses = loss_result.total, loss_result.ntp
             (loss / micros).backward()
             step_loss += loss.item() / micros
+            step_ntp += combine_pass_losses(loss_result.ntp).item() / micros
+            if cfg.mtp:
+                step_mtp += combine_pass_losses(loss_result.mtp).item() / micros
             pass1 += losses[0].item() / micros
         gnorm = clip_gradients([p for p in model.parameters() if p.requires_grad])
         for optimizer in optimizers:
             optimizer.step()
         model.refresh_shadows()
         model.zero_grad(set_to_none=True)
-        rec = {"step": i, "loss": step_loss, "pass1": pass1, "feedback": step_loss - pass1, "gnorm": gnorm,
+        feedback = step_ntp - pass1 if args.passes > 1 else None
+        rec = {"step": i, "loss": step_loss, "ntp": step_ntp, "pass1": pass1, "feedback": feedback, "gnorm": gnorm,
                "lr_scale": scale, "sec": time.time() - t0}
+        if cfg.mtp:
+            rec["mtp"] = step_mtp
         trace["steps"].append(rec)
-        print(f"step {i:4d} loss={step_loss:.4f} pass1={pass1:.4f} fb={step_loss - pass1:.4f} gnorm={gnorm:.3f} "
+        feedback_text = f"{feedback:.4f}" if feedback is not None else "unavailable"
+        mtp_text = f"mtp={step_mtp:.4f} " if cfg.mtp else ""
+        print(f"step {i:4d} loss={step_loss:.4f} ntp={step_ntp:.4f} pass1={pass1:.4f} fb={feedback_text} {mtp_text}gnorm={gnorm:.3f} "
               f"lr={scale:.3f}x {rec['sec']:.1f}s", flush=True)
         if i % args.eval_every == 0 or i == args.steps:
-            val, fused = evaluate(model, data_val, args.eval_rows, micro_rows, device)
-            trace["evals"].append({"step": i, "val": val, "val_fused": fused})
-            print(f"eval step {i}: val={val:.4f} val_fused={fused:.4f} gap={fused - val:+.4f}  [{(time.time() - t_start) / 60:.1f} min]", flush=True)
+            metrics = evaluate(model, data_val, args.eval_rows, micro_rows, device, mtp_weight=saved["mtp_weight"])
+            trace["evals"].append({"step": i, **metrics})
+            print(f"eval step {i}: " + " ".join(f"{name}={value:.4f}" for name, value in metrics.items())
+                  + f" gap={metrics['val_fused'] - metrics['val']:+.4f}  [{(time.time() - t_start) / 60:.1f} min]", flush=True)
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(json.dumps(trace, indent=2, default=str) + "\n")
     args.out.parent.mkdir(parents=True, exist_ok=True)

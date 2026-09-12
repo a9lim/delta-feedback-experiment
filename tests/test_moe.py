@@ -414,9 +414,10 @@ def test_expert_loss_averages_passes_without_polluting_ce(monkeypatch, passes):
         "delta_feedback_experiment.model.sequence_ce",
         lambda *args: (torch.tensor(3.0), torch.tensor(7.0)),
     )
-    loss, per_pass = multipass_loss(
+    loss_result = multipass_loss(
         model, torch.zeros(1, 4, dtype=torch.long), outs, z_coef=0.2
     )
+    loss, per_pass = loss_result.total, loss_result.ntp
     weight = 1 if passes == 1 else 2
     torch.testing.assert_close(
         loss,

@@ -82,7 +82,7 @@ def test_fused_inputs_match_multipass(tmp_path):
     prefix = torch.tensor([[1, 5, 15]])
     with torch.no_grad():
         outs = multipass(model, tokens, 2, prefix_lens=prefix)
-        _, losses = multipass_loss(model, tokens, outs)
+        losses = multipass_loss(model, tokens, outs).ntp
         e = model.embed_tokens(tokens[:, :-1])
         first = model.forward_column(e, need_payload=True)
         x = analysis.fused_inputs(model, e, first.payload, prefix[0])

@@ -48,7 +48,10 @@ accumulated gradients, optimizer state, and PKDA recurrent boundaries:
   backward runs. Packed projection gradients accumulate into FP32 sinks.
 - CCE reads an address-stable BF16 classifier shadow. Its BF16 gradient buffer
   flushes into the FP32 embedding sink at `--head-flush-every` head calls and
-  before the optimizer update.
+  before the optimizer update. Each pass makes two head calls with `m`, one
+  otherwise; auxiliary calls count toward the flush cadence. A captured
+  microbatch that would exceed the limit uses the FP32 sink per call;
+  `--head-flush-every 1` gives per-call precision in every mode.
 - Compiled blocks sit inside fixed-address CUDA graphs, one per reachable
   `(pass count, core iteration count)`, plus no-grad evaluation graphs.
   All iterations and feedback passes remain differentiable. Above the raw
@@ -98,6 +101,13 @@ of `--intermediate`, which must be divisible by four. These runs keep the
 dense `arf` token-budget reference and use more parameter memory; preset
 availability is not a measured GPU fit. Distributed training is not implemented.
 
+Add `m` for two-token prediction, for example `--condition arfm --mtp-weight 0.3`.
+The auxiliary block shares the embedding and output head, consumes the next
+ground-truth token during training, and predicts one token further ahead.
+The finite nonnegative weight is constant across the run and restored on
+resume. Existing token stores supply all targets. This adds training and
+auxiliary-validation work; ordinary generation does not run the module.
+
 ```bash
 delta probe
 # Foreground training or detached queueing.
@@ -136,11 +146,18 @@ outside `runs/`; custom output paths are not renamed. Both tags must be idle,
 with no queued references and no destination collision. Ordinary I/O failures
 roll back; a multi-file rename is not crash-atomic.
 
-Current snapshots use checkpoint v28 and the pinned tokenizer identity.
+Current snapshots use checkpoint v29 and the pinned tokenizer identity.
 Resume inherits state-defining settings and rejects explicit conflicts;
 runtime paths and evaluation/snapshot cadence may change. Latest snapshots
 and the protected feedback, cooldown, and final boundaries support resume and
 continuation. See [design.md](design.md#checkpoints-and-queue).
+
+Training logs `ntp`, the combined ordinary cross-entropy before z-loss, and
+MTP runs also log `mtp`, the combined auxiliary cross-entropy before its
+weight and z-loss. `loss` reports the full optimized objective. `pass1`,
+`val`, and `val_fused` keep their ordinary next-token meaning; auxiliary
+validation is `val_mtp` and, with feedback, `val_mtp_fused`. On feedback
+steps, use `ntp - pass1` for mean feedback next-token cross-entropy.
 
 Expert runs log `expert_balance`, the unweighted per-sequence auxiliary loss
 averaged over the update. Its coefficient is `1e-4`; the monitor plots it

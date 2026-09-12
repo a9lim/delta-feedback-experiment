@@ -900,9 +900,9 @@ def test_global_gradient_clip_uses_one_accumulated_vector():
     preclip = clip_gradients([first, second])
 
     assert GRAD_CLIP_NORM == 10.0
-    assert CONTRACT.version == 28
-    assert CONTRACT.resumable == frozenset({28})
-    assert CONTRACT.surface_version == 28
+    assert CONTRACT.version == 29
+    assert CONTRACT.resumable == frozenset({29})
+    assert CONTRACT.surface_version == 29
     assert preclip == pytest.approx(13.0)
     clipped = torch.cat([first.grad, second.grad])
     assert clipped.norm().item() == pytest.approx(10.0)
@@ -1368,7 +1368,7 @@ def test_tiny_run_completes(tmp_path, capsys, condition):
     assert all(("| r=" in line) == ("l" in condition) for line in step_records)
 
 
-@pytest.mark.parametrize("condition", ["arf", "arfl", "aerfl"])
+@pytest.mark.parametrize("condition", ["arf", "arfl", "aerfl", "arfm", "aerflm"])
 @pytest.mark.parametrize("rename", [False, True], ids=["same-tag", "renamed"])
 def test_resume_is_exact(tmp_path, capsys, condition, rename):
     full = run(tmp_path, "full", condition_args(condition))
@@ -1387,6 +1387,26 @@ def test_resume_is_exact(tmp_path, capsys, condition, rename):
     assert resumed["step"] == 8
     assert resumed["loss"] == full["loss"]
     assert resumed["val"] == full["val"]
+    if "m" in condition:
+        assert resumed["val_mtp"] == full["val_mtp"]
+        assert resumed["val_mtp_fused"] == full["val_mtp_fused"]
+        complete = torch.load(tmp_path / "runs" / "full.pt.8", weights_only=False)
+        restored = torch.load(tmp_path / "runs" / f"{tag}.pt.8", weights_only=False)
+        def identical(left, right):
+            if isinstance(left, torch.Tensor):
+                assert torch.equal(left, right)
+            elif isinstance(left, dict):
+                assert left.keys() == right.keys()
+                for key in left:
+                    identical(left[key], right[key])
+            elif isinstance(left, (tuple, list)):
+                assert len(left) == len(right)
+                for a, b in zip(left, right, strict=True):
+                    identical(a, b)
+            else:
+                assert left == right
+        identical(complete["state"], restored["state"])
+        identical(complete["optimizer"], restored["optimizer"])
     # The spool folds the log at the resume record and requires its path.
     assert any(
         line.startswith("resume") and "path=" in line
@@ -1402,6 +1422,27 @@ def test_resume_rejects_conflicting_exact_field(tmp_path):
         run(tmp_path, "conf", ["--condition", "ar", "--resume"])
 
 
+@pytest.mark.parametrize("weight", ["-0.1", "nan", "inf", "-inf"])
+def test_mtp_weight_rejects_invalid_values(weight):
+    with pytest.raises(SystemExit):
+        parse_run_args(["mtp", "--condition", "m", f"--mtp-weight={weight}"])
+
+
+def test_mtp_recipe_resume_and_metrics(tmp_path, capsys):
+    run(tmp_path, "mtp", ["--condition", "fm", "--mtp-weight", "0.17", "--max-steps", "2"])
+    captured = capsys.readouterr().out
+    step = next(line for line in captured.splitlines() if line.startswith("step "))
+    assert "ntp=" in step and "mtp=" in step
+    with pytest.raises(ValueError, match="mtp_weight"):
+        run(tmp_path, "mtp", ["--resume", "--mtp-weight", "0.3"])
+    run(tmp_path, "mtp", ["--resume"])
+    checkpoint = torch.load(tmp_path / "runs" / "mtp.pt.8", weights_only=False)
+    assert checkpoint["args"]["mtp_weight"] == 0.17
+    assert checkpoint["args"]["condition"] == "fm"
+    with pytest.raises(SystemExit):
+        parse_run_args(["mtp", "--condition", "m", "--seq-len", "1"])
+
+
 def test_resume_inherits_data_root_and_source_independently(tmp_path, monkeypatch):
     saved_root = tmp_path / "saved-data"
     saved_source = "dclm"
@@ -1412,7 +1453,7 @@ def test_resume_inherits_data_root_and_source_independently(tmp_path, monkeypatc
         "--out-dir", str(out), *TINY_ARGS, "--condition", "", "--max-steps", "2",
     ])
     checkpoint = torch.load(next(out.glob("inherit-data.pt.*")), map_location="cpu", weights_only=False)
-    assert checkpoint["version"] == 28
+    assert checkpoint["version"] == 29
     assert checkpoint["args"]["data_root"] == str(saved_root)
     assert checkpoint["args"]["source"] == saved_source
     assert "data_dir" not in checkpoint["args"]
@@ -1503,7 +1544,7 @@ def test_multipass_checkpoint_parity():
         model = DeltaModel(cfg)
         model.grad_checkpoint = flag
         outs = multipass(model, tokens, 2, prefix_lens=prefix, iterations=iterations)
-        loss, _ = multipass_loss(model, tokens, outs)
+        loss = multipass_loss(model, tokens, outs).total
         loss.backward()
         grads = torch.cat(
             [p.grad.flatten() for p in model.parameters() if p.grad is not None]

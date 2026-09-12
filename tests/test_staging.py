@@ -49,7 +49,7 @@ def test_staged_replay_preserves_addressed_rows_and_feedback_draws(tmp_path):
     runner.generator = torch.Generator(device="cuda")
     runner.batch_stager = CudaBatchStager(12, 17, runner.device)
     # A dense model stub needs no expert counts or head accumulator.
-    runner.model = SimpleNamespace(cfg=SimpleNamespace(experts=False))
+    runner.model = SimpleNamespace(cfg=SimpleNamespace(experts=False, mtp=False))
     runner.head_accum = None
     runner.head_flush_every = 1
     runner._head_pending = 0
@@ -108,7 +108,7 @@ def test_head_accumulator_reaches_the_sink_once_per_window(
     runner._head_pending = 0
     sink = torch.zeros(5, 3, device="cuda")
     runner.model = SimpleNamespace(
-        cfg=SimpleNamespace(experts=False),
+        cfg=SimpleNamespace(experts=False, mtp=False),
         embed_tokens=SimpleNamespace(grad_sink=sink),
     )
     flushes = []

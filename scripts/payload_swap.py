@@ -69,7 +69,7 @@ def main() -> None:
             prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
             with analysis.autocast(device):
                 outs = multipass(model, rows, 2, prefix_lens=prefix)
-                _, per_pass = multipass_loss(model, rows, outs)
+                per_pass = multipass_loss(model, rows, outs).ntp
             sums[0] += per_pass[0].item()
             sums[1] += per_pass[1].item()
             batches += 1

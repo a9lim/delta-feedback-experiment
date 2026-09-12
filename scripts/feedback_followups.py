@@ -188,7 +188,7 @@ def main() -> None:
                 prefix, jitter = micro_draws(run, start_step, first_row, n_passes, rows.shape[0], cfg.dim, device)
             with analysis.autocast(device):
                 outs = multipass(model, rows, n_passes, prefix_lens=prefix, jitter=jitter)
-                _, losses = multipass_loss(model, rows, outs)
+                losses = multipass_loss(model, rows, outs).ntp
             (losses[-1] / args.gradient_micros).backward()
         for n, p in model.named_parameters():
             if p.grad is not None:
