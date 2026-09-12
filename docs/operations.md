@@ -68,7 +68,8 @@ neither path sweeps full geometry or condition matrices. Queue startup runs
 neither tests nor a probe. Run the probe explicitly after changing execution
 code or hardware. The CUDA smoke skips Inductor compilation and uses eager
 cached attention; it checks kernel execution and graph replay, not compiler
-output or production memory fit. First-use kernel JIT can still add startup
+output or production memory fit. Exact cache parity is tested on CPU; CUDA
+decode checks shapes, position, and finite output. First-use kernel JIT can still add startup
 time. Training's Inductor artifacts persist
 at `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
 that cache. Keep cyclic Python garbage collection outside graph capture.
