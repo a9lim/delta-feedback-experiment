@@ -2,8 +2,10 @@
 
 `DeltaModel` has one core architecture: PKDA/GQA token mixers, Multi-Head Delta
 Block (MHDB) routing, shared and routed SwiGLU experts, and auxiliary two-token
-prediction. Conditions select Full-Bandwidth Transformer (FBT) feedback (`f`),
-tied depth (`l`), or both (`fl`); the default is `f`. There is no empty condition.
+prediction. Conditions select cross-column feedback (`f`), tied depth (`l`),
+or both (`fl`); the default is `f`. Feedback retains the Full-Bandwidth
+Transformer (FBT) recurrence and Jacobi training, with DeepSeek-style
+normalized concat-linear fusion. There is no empty condition.
 
 [Scaling](scaling.md) owns geometry and accounting, [design](design.md) owns
 data and training, and [references](../references/refs.yaml) records sources.
@@ -25,7 +27,7 @@ token embedding + incoming payload (f)
   -> top state -> tied readout -> next-token logits
        + routed block deltas -> payload
                                   + next-token embedding
-                                  -> shared FBT fusion (shared jitter in training)
+                                  -> shared concat-linear fusion (shared jitter in training)
                                      -> next column seed (f)
                                      -> independent auxiliary PKDA/expert block
                                         -> tied readout -> second-token logits
@@ -241,18 +243,24 @@ Residuals with cell-level addresses.
 
 ## Payload and letter f: feedback
 
-At a feedback position, token embedding `e_t` controls the gate on incoming
-payload `p_(t-1)`. The same fusion is the MTP entry in every condition:
+At a feedback position, token embedding `e_t` and incoming payload `p_(t-1)`
+are separately normalized, concatenated in that order, and projected back to
+width `D`. The same fusion is the MTP entry in every condition:
 
 ```text
-seed_t = entry_norm(W_U p_(t-1) * sigmoid(W_G gate_norm(e_t)))
+seed_t = fuse_proj(concat(fuse_token_norm(e_t), fuse_payload_norm(p_(t-1))))
 ```
 
-The value and gate projections and the two norms belong to the model and are
-shared by MTP and feedback. There is no additive embedding bypass at that
-position. Plain-prefix, pass-1, and Standard-decoding positions use `e_t`.
-The actual seed is both residual origin and MHDB source. Every condition has a dedicated payload router that
-reads its null, seed, and every completed cell delta:
+The bias-free `fuse_proj: 2D -> D` and the two learned RMSNorms belong to the
+model and are shared by MTP and feedback. There is no activation or output
+normalization inside this fusion. Splitting its matrix into two width-`D`
+blocks gives `W_e norm_e(e_t) + W_p norm_p(p_(t-1))`, so both inputs contribute
+directly to the seed. This follows [DeepSeek-V3's MTP entry, Equation 21](https://arxiv.org/html/2412.19437v2#S2.SS2),
+using the routed payload in place of its preceding hidden state and sharing
+the result with cross-column feedback. Plain-prefix, pass-1, and
+Standard-decoding positions use `e_t`. The actual seed is both residual origin
+and MHDB source. Every condition has a dedicated payload router that reads its
+null, seed, and every completed cell delta:
 
 ```text
 r_payload = route(null, seed, Delta_0 .. Delta_(C-1))
@@ -262,7 +270,7 @@ p_t = payload_norm(h_top + r_payload)
 The direct `h_top` term remains alongside routed enrichment. Initially the
 uniform enrichment is `h_top/(C+2)`, making the normalized payload equal to a
 normalized top state up to epsilon. Payload routing is not conditioned on
-the next token; token control happens at the next column's entry gate.
+the next token; that token enters through the shared fusion at the next column.
 Every supervised pass constructs this payload for MTP, including single-pass
 batches, `l` without `f`, and the final feedback pass. The `f` letter controls
 consumption by the next column. Generation can skip payload construction when
@@ -321,9 +329,9 @@ All passes and iterations remain differentiable. Readout occurs after the
 coda, and auxiliary prediction runs once per pass. On CUDA the per-pass
 epilogues around the compiled blocks (the payload's routed add and norm,
 shared jittered fusion, feedback shift/prefix selection, and both heads'
-readout) compile as their own small regions. The token-only gate has its own
-compiled region and runs once per logical multipass forward. The compiled
-blocks carry an Inductor activation memory budget of 0.9, the
+readout) compile as their own small regions. Token embedding normalization
+has its own compiled region and runs once per logical multipass forward. The
+compiled blocks carry an Inductor activation memory budget of 0.9, the
 partitioner tier that recomputes cheap fused tensors in backward and never a
 custom operator. CUDA captures one training graph per reachable
 `(pass count,r)` pair and no-grad evaluation graphs at the fixed depth. Every
@@ -352,20 +360,22 @@ data; compute comparisons need cell-tokens and auxiliary work or device time.
 ## Two-token prediction
 
 One independent auxiliary prediction block runs after each column pass.
-Its input is computed by the model's shared FBT fusion:
+Its input is computed by the model's shared normalized concat-linear fusion:
 
 ```text
-g_(t+1) = sigmoid(W_G gate_norm(Emb(x_(t+1))))
-u_t = entry_norm(W_U (p_t + jitter_t) * g_(t+1))
+e_bar_(t+1) = fuse_token_norm(Emb(x_(t+1)))
+p_bar_t = fuse_payload_norm(p_t + jitter_t)
+u_t = fuse_proj(concat(e_bar_(t+1), p_bar_t))
 v = PKDAExpertBlock(u)
 logits_mtp,t = (final_norm(v_t) * 1536 / D) @ Emb.weight.T
 ```
 
-`W_U`, `W_G`, `gate_norm`, and `entry_norm` are the exact parameters used by
-feedback, present in every condition. There is no auxiliary fusion projection
-or pair of input norms. One token-only gate computation serves all passes;
-each pass computes `u` once for both consumers. The auxiliary block has its
-own PKDA mixer and one shared plus top-`k`-of-`n` routed
+`fuse_proj`, `fuse_token_norm`, and `fuse_payload_norm` are the exact parameters
+used by feedback, present in every condition. The two inputs each have width
+`D`, and the concatenation places the token first and payload second. One
+token normalization serves all passes; each pass adds jitter before payload
+normalization and computes `u` once for both consumers. The auxiliary block has
+its own PKDA mixer and one shared plus top-`k`-of-`n` routed
 SwiGLU experts, using the trunk's residual width, expert intermediate width,
 expert counts, output normalization, and `1/sqrt(2L)` branch scale. It shares the final norm and embedding/readout.
 It has no MHDB read or tied loop. Its independent matrix, diagonal, and
@@ -387,7 +397,7 @@ the end of the stored row and which therefore carries no loss weight. That row
 is causally last in the auxiliary recurrence, so the supervised rows are the
 same ones the cropped geometry produced. One lookup of the whole stored row
 serves both heads, the column seed taking positions `0..T-1` and the shared
-gate taking next-token embeddings at `1..T`. Both inputs and the reused fused
+fusion taking next-token embeddings at `1..T`. Both inputs and the reused fused
 tensor remain differentiable, so the auxiliary objective trains the payload
 router, payload normalization, trunk, shared fusion, and token embedding.
 The causal PKDA recurrence never sees the second-token target. The auxiliary
@@ -422,7 +432,7 @@ block or allocate its cache; speculative decoding is not implemented.
 
 NorMuonH matrices initialize from `Normal(0,1/sqrt(fan_in))`. The shared
 `BASE_NORMAL_INIT_STD=0.02` sets NAdam matrix standard deviations. GGQA gates,
-expert routers, the FBT gate, and PKDA's packed control projection multiply
+expert routers, and PKDA's packed control projection multiply
 it by `sqrt(1536/D)`. Embeddings and PKDA fixed-head-width expansions use
 0.02 directly. This preserves initial control-logit variance across widths.
 `MUP_BASE_DIM` stays at the flagship width 1,536: extension uses a width ratio
@@ -430,13 +440,15 @@ of `1536/2304 = 2/3` for NAdam rates and readout scaling, and its square root
 for the specified initialization scales. The reference does not depend on
 the largest configured preset. Expert optimizer rates have their own factors
 below; they do not change initialization or forward computation.
-Depthwise convolutions retain Kaiming-uniform initialization. RMSNorm scales
-start at one; MHDB queries and nulls start at zero.
+The fusion projection uses NorMuonH initialization with fan-in `2D`, hence
+standard deviation `1/sqrt(2D)`. Depthwise convolutions retain Kaiming-uniform
+initialization. RMSNorm scales start at one; MHDB queries and nulls start at zero.
 
 Shared parameters pair byte-identically across conditions for a given seed.
 Experts are constructed directly as part of the common model initialization.
-Attention gates, feedback matrices, and the auxiliary module use separate
-deterministic streams. The FBT stream does not advance shared draws. Feedback/depth recipe draws are separately keyed.
+Attention gates, the fusion matrix, and the auxiliary module use separate
+deterministic streams. Fusion initialization does not advance shared draws.
+Feedback/depth recipe draws are separately keyed.
 
 Parameters, accumulated gradients, and optimizer state are FP32, except
 NorMuonH's momentum, which CUDA stores in BF16 rounded to nearest with its
@@ -483,7 +495,7 @@ input factor is applied.
 ### NorMuonH matrices
 
 NorMuonH owns ordinary 2D hidden matrices: token-mixer projections, expert and
-auxiliary FFNs, and the shared FBT value projection. Every matrix
+auxiliary FFNs, and the entire shared `D x 2D` fusion projection. Every matrix
 keeps its initial FP32 Frobenius radius `R`, stored in the checkpoint:
 
 ```text
@@ -540,12 +552,12 @@ boundary, preserving reads of the previous momentum.
 
 ### NAdam parameters
 
-The width-scaled group owns matrices with fan-in `D`: GGQA and FBT gates,
+The width-scaled group owns matrices with fan-in `D`: GGQA gates,
 expert routers, and PKDA packed controls. It uses `lr_nadam * 1536/D`; the
 base group uses `lr_nadam`, default `3e-4`. The base group owns the tied
 embedding/readout, fixed-head-width PKDA expansions, and every non-matrix
-parameter. The readout also multiplies by `1536/D`, while embedding lookup
-keeps its base rate.
+parameter, including both fusion RMSNorm scales. The readout also multiplies
+by `1536/D`, while embedding lookup keeps its base rate.
 
 NAdam uses betas `(.9,.95)`, momentum decay `psi=.004`, epsilon `1e-8`:
 

@@ -112,9 +112,10 @@ def cuda_probe() -> None:
             parameters = dict(model.named_parameters())
             for name in (
                 "embed_tokens.weight",
-                "fuse_value.weight",
+                "fuse_proj.weight",
+                "fuse_token_norm.weight",
+                "fuse_payload_norm.weight",
                 "payload_router.query",
-                "fuse_gate.weight",
                 "mtp.block.attn.q_proj.weight",
                 "blocks.3.attn.qkv_proj.weight",
                 "blocks.3.attn.o_proj.weight",

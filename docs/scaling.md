@@ -55,11 +55,13 @@ Its active count replaces `(n+1)` with `(k+1)` in the expert term. It runs
 once per training pass over `seq_len` positions, of
 which `seq_len-1` are supervised, and shares the embedding/final norm/readout
 with the main head, including that pass's single vocabulary-loss call.
-It does not execute in generation. MTP and feedback share the model's FBT
-entry, whose `2D^2 + 2D` parameters are counted once outside the auxiliary
+It does not execute in generation. MTP and feedback share a normalized
+concat-linear entry: one `2D -> D` matrix and two width-`D` RMSNorm scales.
+Its `2D^2 + 2D` parameters are counted once outside the auxiliary
 block. Every condition retains the payload writer and shared entry, so `f`,
 `l`, and `fl` have identical parameter counts. MTP trains the shared entry
 even on single-pass batches; `f` selects its consumption by the trunk.
+The entire fusion matrix uses ordinary NorMuonH; both norms use base NAdam.
 
 ## Expert learning rates
 
@@ -141,7 +143,7 @@ every scale executes its 16 unique layers once per pass.
 Resumes and continuations inherit saved depths unless explicitly pinned.
 An explicit `--scale` pins its depth defaults along with its geometry, so
 resuming a different saved depth requires omitting `--scale` or supplying
-matching loop overrides. These settings are part of the checkpoint v35 contract.
+matching loop overrides. These settings are part of the checkpoint v36 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its

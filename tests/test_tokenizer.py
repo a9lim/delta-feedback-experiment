@@ -67,8 +67,9 @@ def test_checkpoint_requires_tokenizer_identity(tmp_path):
         read_checkpoint(path)
 
 
-def test_checkpoint_requires_current_version(tmp_path):
-    version = CONTRACT.version + 1
+@pytest.mark.parametrize("offset", [-1, 1])
+def test_checkpoint_requires_current_version(tmp_path, offset):
+    version = CONTRACT.version + offset
     path = tmp_path / "test.pt.1"
     torch.save({"version": version, "state": {}, "args": {}}, path)
     with pytest.raises(ValueError, match="checkpoint version"):

@@ -8,7 +8,7 @@ references:
     note: Selection-only expert balancing biases.
   - arxiv: "2412.19437"
     slug: deepseek2025-v3
-    note: Sigmoid expert routing, sequence balancing, and auxiliary next-token prediction.
+    note: Sigmoid expert routing, sequence balancing, and normalized concat-linear MTP fusion (Eq. 21).
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals
     note: Grouped softmax over depth sources.
@@ -23,7 +23,7 @@ references:
     note: Diagonal apply-to-key preconditioning.
   - arxiv: "2608.08888"
     slug: wang2026-full-bandwidth-transformer
-    note: Token-gated payload fusion and Jacobi feedback training.
+    note: Cross-column payload recurrence and Jacobi feedback training; this repo uses DeepSeek-style fusion.
   - arxiv: "2510.05491"
     slug: li2025-normuon
     note: Matrix orthogonalization with row-wise adaptation.

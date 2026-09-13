@@ -266,7 +266,7 @@ def test_prepare_caches_the_row_indices_a_step_will_gather():
 def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
     model = tiny_optimizer_model()
     frozen = {
-        model.fuse_value.weight,
+        model.blocks[0].attn.q_proj.weight,
         model.blocks[0].mlp.experts[0].gate_up_proj.weight,
         model.mtp.block.mlp.shared.down_proj.weight,
         model.mtp.block.mlp.router.weight,
@@ -276,9 +276,8 @@ def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
         parameter.requires_grad_(False)
 
     # Derive ownership from physical modules, independently of name predicates.
-    ordinary = {model.fuse_value.weight}
-    width = {model.fuse_gate.weight}
-    width.update(gate.weight for gate in model.attention_gates)
+    ordinary = {model.fuse_proj.weight}
+    width = {gate.weight for gate in model.attention_gates}
     expert_in, expert_out = set(), set()
     for block in (*model.blocks, model.mtp.block):
         attention = block.attn
@@ -307,6 +306,9 @@ def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
     }
     partition = split_parameters(model)
     assert {name: set(parameters) for name, parameters in partition.items()} == expected
+    assert {model.fuse_token_norm.weight, model.fuse_payload_norm.weight} <= expected[
+        "nadam"
+    ]
     flattened = [
         parameter for parameters in partition.values() for parameter in parameters
     ]

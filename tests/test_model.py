@@ -68,8 +68,13 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     common = states[0].keys() & states[1].keys() & states[2].keys()
     assert "payload_router.query" in common and "payload_norm.weight" in common
     assert {
-        "fuse_value.weight", "fuse_gate.weight", "gate_norm.weight", "entry_norm.weight"
+        "fuse_proj.weight", "fuse_token_norm.weight", "fuse_payload_norm.weight"
     } <= common
+    projection = states[0]["fuse_proj.weight"]
+    assert projection.shape == (TINY["dim"], 2 * TINY["dim"])
+    torch.testing.assert_close(
+        projection.std(), torch.tensor((2 * TINY["dim"]) ** -0.5), atol=0, rtol=0.12
+    )
     assert any(name.startswith("mtp.block.attn.") for name in common)
     assert any(name.startswith("mtp.block.mlp.experts.") for name in common)
     for name in common:
@@ -210,8 +215,9 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
             + [auxiliary_count]
         )
         for name in (
-            "fuse_value.weight",
-            "fuse_gate.weight",
+            "fuse_proj.weight",
+            "fuse_token_norm.weight",
+            "fuse_payload_norm.weight",
             "payload_router.query",
             "embed_tokens.weight",
             "attention_gates.0.weight",

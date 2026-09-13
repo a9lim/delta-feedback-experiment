@@ -14,9 +14,10 @@ Conditions, token streams, and schedules for the current model.
 
 Every condition includes PKDA/GQA cells, MHDB routing, shared and routed
 experts, and auxiliary second-token prediction (MTP). MTP and feedback share
-the same FBT fusion, including its parameters and per-pass jitter. Shared
-parameters pair identically for a given initialization seed. Data rows and feedback draws use
-keyed streams; tied depth uses a separate stream. At one core iteration,
+the same normalized concat-linear fusion, including its parameters and
+per-pass jitter. Shared parameters pair identically for a given initialization
+seed. Data rows and feedback draws use keyed streams; tied depth uses a
+separate stream. At one core iteration,
 `fl` and `f` have identical values and gradients.
 
 ## Data
@@ -96,7 +97,8 @@ and balancing equations.
 
 A feedback step starts with plain teacher forcing. Every supervised pass
 adds keyed uniform jitter in `[-0.02,0.02]` to its undetached payload, then
-fuses it with the next-token embedding through the shared FBT gate. This
+separately normalizes it and the next-token embedding, then concatenates them
+and applies the shared bias-free `2D -> D` projection. This
 includes single-pass batches, the final pass, and `l` without `f`. The
 independent MTP block consumes that fused tensor. When another feedback pass
 follows, it right-shifts the same tensor and restores plain embeddings before
@@ -104,8 +106,9 @@ a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
 plain. Mixer states restart each pass; both consumers backpropagate through
 the shared fusion.
 
-One embedding lookup serves the whole stored row, and the token-only gate
-is computed once for all passes. Jitter has shape
+One embedding lookup serves the whole stored row, and the next-token embedding
+normalization is computed once for all passes. The payload is normalized after
+each pass's jitter is added. Jitter has shape
 `[n_passes, B, seq_len+1, dim]`, where `B` is the number of rows in the
 microbatch or replay; the first `seq_len` positions of each pass's draw
 perturb its payload. Evaluation and diagnostics use no jitter.
@@ -156,13 +159,14 @@ ordinary predicted-token budget.
 
 ### Checkpoints and queue
 
-Checkpoint v35 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v36 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v35 snapshots are accepted: the shared fusion changes parameter and
-optimizer ownership and the per-pass jitter recipe.
+Only v36 snapshots are accepted: normalized concat-linear fusion defines the
+current parameter shapes and optimizer ownership. Its projection belongs to
+ordinary NorMuonH and its two input norms belong to base NAdam.
 
 The trainer keeps the latest two snapshots and protected feedback, cooldown,
 and final boundaries. `--continue TAG` extends a finished run under a new tag

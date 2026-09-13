@@ -16,7 +16,6 @@ def is_normuonh_parameter(name: str, parameter: Tensor) -> bool:
         return False
     nadam_matrix = (
         name.startswith("attention_gates.")
-        or name == "fuse_gate.weight"
         or any(marker in name for marker in _NADAM_MATRIX_MARKERS)
     )
     return parameter.ndim == 2 and not nadam_matrix
@@ -35,7 +34,7 @@ def normuonh_rate_name(name: str) -> str:
 def is_width_scaled_parameter(name: str, parameter: Tensor) -> bool:
     """Whether an NAdam-owned matrix reads the full residual width.
 
-    The GGQA gate matrices, the FBT token gate, and PKDA's packed control
+    The GGQA gate matrices and PKDA's packed control
     projection have fan-in ``D``, so their NAdam rate carries the muP width
     ratio and their initialization standard deviation its square root.
     Every other NAdam parameter has a fan-in that does not change
@@ -49,7 +48,6 @@ def is_width_scaled_parameter(name: str, parameter: Tensor) -> bool:
         return False
     return (
         name.startswith("attention_gates.")
-        or name == "fuse_gate.weight"
         or ".attn.control_proj." in name
         or ".mlp.router." in name
     )

@@ -55,18 +55,22 @@ def jitter_for(model, toks, count):
 
 
 def explicit_fusion(model, payload, embedding):
-    """Independent FBT equation, without the prepared gate or fusion helpers."""
-    normalized = embedding * torch.rsqrt(
+    """Independent DeepSeek-style equation, without prepared fusion inputs."""
+    token = embedding * torch.rsqrt(
         embedding.square().mean(-1, keepdim=True) + model.cfg.norm_eps
     )
-    gate = F.linear(
-        normalized * model.gate_norm.weight, model.fuse_gate.weight
-    ).sigmoid()
-    product = F.linear(payload, model.fuse_value.weight) * gate
-    return (
-        product
-        * torch.rsqrt(product.square().mean(-1, keepdim=True) + model.cfg.norm_eps)
-        * model.entry_norm.weight
+    payload = payload * torch.rsqrt(
+        payload.square().mean(-1, keepdim=True) + model.cfg.norm_eps
+    )
+    return F.linear(
+        torch.cat(
+            (
+                token * model.fuse_token_norm.weight,
+                payload * model.fuse_payload_norm.weight,
+            ),
+            dim=-1,
+        ),
+        model.fuse_proj.weight,
     )
 
 
@@ -103,6 +107,26 @@ def feedback_sum(values):
         if len(values) > 1
         else values[0]
     )
+
+
+@torch.no_grad()
+def test_fusion_preserves_independent_token_and_payload_contributions():
+    """Either input can supply features, and output scale belongs to the map."""
+    model = tiny()
+    payload, embedding = torch.randn(2, 4, model.cfg.dim), torch.randn(
+        2, 4, model.cfg.dim
+    )
+    model.fuse_token_norm.weight.uniform_(0.5, 1.5)
+    model.fuse_payload_norm.weight.uniform_(0.5, 1.5)
+    fused = model.fuse(payload, embedding)
+    token_only = model.fuse(torch.zeros_like(payload), embedding)
+    payload_only = model.fuse(payload, torch.zeros_like(embedding))
+    assert torch.all(token_only.norm(dim=-1) > 0)
+    assert torch.all(payload_only.norm(dim=-1) > 0)
+    torch.testing.assert_close(fused, explicit_fusion(model, payload, embedding))
+    torch.testing.assert_close(fused, token_only + payload_only)
+    model.fuse_proj.weight.mul_(2)
+    torch.testing.assert_close(model.fuse(payload, embedding), 2 * fused)
 
 
 @torch.no_grad()
@@ -187,15 +211,18 @@ def test_mtp_trains_shared_fusion_and_payload_on_every_pass(condition, count):
                 model.payload_router.query,
                 model.payload_norm.weight,
                 model.blocks[0].attn.q_proj.weight,
-                model.fuse_value.weight,
-                model.fuse_gate.weight,
-                model.gate_norm.weight,
-                model.entry_norm.weight,
+                model.fuse_proj.weight,
+                model.fuse_token_norm.weight,
+                model.fuse_payload_norm.weight,
             ),
             retain_graph=True,
         )
         assert all(torch.isfinite(gradient).all() for gradient in gradients)
         assert all(gradient.abs().sum() > 0 for gradient in gradients)
+        assert all(
+            gradient.abs().sum() > 0
+            for gradient in gradients[4].split(model.cfg.dim, dim=1)
+        )
         # The final payload position has no second-token target.
         assert torch.count_nonzero(gradients[0][:, -1]) == 0
 
@@ -220,8 +247,8 @@ def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
 
 
 def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
-    """Independent consumers recompute the jittered FBT equation; sharing that
-    input and the token-only gate must preserve both objectives' derivatives."""
+    """Independent consumers recompute the jittered concat equation; sharing that
+    input and normalized token must preserve both objectives' derivatives."""
     count, z_coef, coefficient = 3, 0.017, 0.23
     model, reference = tiny("fl"), tiny("fl")
     for candidate in (model, reference):
@@ -305,36 +332,39 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     ):
         assert (parameter.grad is None) == (expected_parameter.grad is None), name
         if parameter.grad is not None:
-            # Reusing the gate and fusion changes FP32 gradient summation
-            # order. Bound both aggregate drift and individual coordinates
-            # against the tensor's scale, including near-zero coordinates.
+            # Reusing normalization and fusion changes FP32 gradient summation
+            # order through the repeated feedback and core iterations. Bound
+            # aggregate drift and individual coordinates against the tensor's
+            # scale, including near-zero coordinates.
             error = parameter.grad - expected_parameter.grad
             scale = expected_parameter.grad.square().mean().sqrt()
-            assert error.square().mean().sqrt() < 1e-6 + 1e-5 * scale, name
-            assert error.abs().max() < 1e-6 + 5e-5 * scale, name
+            assert error.square().mean().sqrt() < 2e-6 + 2e-5 * scale, name
+            assert error.abs().max() < 2e-6 + 1e-4 * scale, name
 
 
-def test_training_reuses_one_lookup_one_token_gate_and_one_fusion_per_pass(monkeypatch):
+def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monkeypatch):
     import delta_feedback_experiment.model as implementation
 
     model = tiny()
     toks, count = tokens(length=5), 3
-    calls = {"embedding": 0, "gate": 0, "value": 0}
+    calls = {"embedding": 0, "token_norm": 0, "fusion": 0}
     auxiliary_inputs = []
     sink_linear = implementation.sink_linear
 
     def count_linear(x, weights, *args, **kwargs):
-        if weights[0] is model.fuse_gate.weight:
-            calls["gate"] += 1
-        if weights[0] is model.fuse_value.weight:
-            calls["value"] += 1
+        if weights[0] is model.fuse_proj.weight:
+            calls["fusion"] += 1
         return sink_linear(x, weights, *args, **kwargs)
 
     def count_embedding(module, args, result):
         calls["embedding"] += 1
 
+    def count_token_norm(module, args, result):
+        calls["token_norm"] += 1
+
     monkeypatch.setattr(implementation, "sink_linear", count_linear)
     embedding_hook = model.embed_tokens.register_forward_hook(count_embedding)
+    token_norm_hook = model.fuse_token_norm.register_forward_hook(count_token_norm)
     mtp_hook = model.mtp.register_forward_pre_hook(
         lambda module, args: auxiliary_inputs.append(args[0])
     )
@@ -343,8 +373,9 @@ def test_training_reuses_one_lookup_one_token_gate_and_one_fusion_per_pass(monke
         multipass_loss(model, toks, outs)
     finally:
         embedding_hook.remove()
+        token_norm_hook.remove()
         mtp_hook.remove()
-    assert calls == {"embedding": 1, "gate": 1, "value": count}
+    assert calls == {"embedding": 1, "token_norm": 1, "fusion": count}
     assert len(auxiliary_inputs) == count
     assert all(
         auxiliary is out.fused_input

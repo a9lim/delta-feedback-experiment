@@ -96,7 +96,7 @@ def plain_mask(length: int, prefix: int | Tensor, device) -> Tensor:
 def fused_inputs(
     model: DeltaModel, e: Tensor, payload: Tensor, prefix: int | Tensor = 1
 ) -> Tensor:
-    """The next pass's column input: plain prefix, FBT-fused suffix.
+    """The next pass's column input: plain prefix, concat-fused suffix.
 
     ``payload`` is the preceding pass's payload at the same positions; it is
     shifted one column right (position 0 receives zero) before fusion, as in

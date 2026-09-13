@@ -68,7 +68,8 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "f": (
         "feedback",
-        "full-bandwidth feedback: consume the preceding column's payload at the FBT entry",
+        "full-bandwidth feedback: fuse the preceding column's payload "
+        "with the token by normalized concatenation",
     ),
     "l": (
         "loop",
@@ -152,7 +153,7 @@ class ModelConfig:
     """Exact MHDB cell width in transformer layers."""
 
     feedback: bool = True
-    """``f``: consume the preceding column's payload through the FBT gated entry."""
+    """``f``: consume the preceding column's payload through shared concat fusion."""
 
     loop: bool = False
     """``l``: the cells between the first and last become one tied core that
@@ -769,7 +770,7 @@ class MTPOutput:
 
 
 class MultiTokenPrediction(nn.Module):
-    """One auxiliary layer over the model's shared FBT-fused inputs.
+    """One auxiliary layer over the model's shared concat-fused inputs.
 
     Position t consumes the payload at t and the embedding of token t+1.
     Its own causal PKDA recurrence over those pairs cannot see target t+2.
@@ -957,7 +958,7 @@ class DeltaModel(nn.Module):
         self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_router = Router(cfg)
         # Capture the exact common-trunk initialization boundary before
-        # constructing the attention and shared fusion matrices,
+        # constructing the attention gates and shared fusion projection,
         # which draw from their own streams. Restoring it below keeps every
         # shared parameter byte-identical across conditions.
         common_init_state = torch.random.get_rng_state()
@@ -965,15 +966,12 @@ class DeltaModel(nn.Module):
             nn.Linear(cfg.dim, cfg.heads * cfg.head_dim, bias=False)
             for _ in cfg.global_attention_layers
         )
-        self.fuse_value_sink: Tensor | None = None
-        self.fuse_gate_sink: Tensor | None = None
-        self.fuse_value_shadow: Tensor | None = None
-        self.fuse_gate_shadow: Tensor | None = None
+        self.fuse_proj_sink: Tensor | None = None
+        self.fuse_proj_shadow: Tensor | None = None
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
-        self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
-        self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.fuse_proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
+        self.fuse_token_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.fuse_payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.checkpoint_blocks = 0
         """Runtime switch: how many PKDA and auxiliary block invocations of
         each logical forward, in execution order, recompute in backward
@@ -996,7 +994,7 @@ class DeltaModel(nn.Module):
             self.attention_gates, factor_seed ^ 0x4152434849544543
         )
         self._init_factor_linears(
-            (self.fuse_value, self.fuse_gate),
+            (self.fuse_proj,),
             factor_seed ^ 0x524543555252454E,
         )
         with torch.random.fork_rng(devices=[]):
@@ -1020,7 +1018,7 @@ class DeltaModel(nn.Module):
     def _init_factor_linears(linears: Iterable[nn.Linear], seed: int) -> None:
         """Initialize one module family from its own seed-stable random stream.
 
-        The attention gates and the shared FBT matrices never advance
+        The attention gates and the shared fusion projection never advance
         the common trunk stream, so a module initializes identically in every
         condition that has it. Models are constructed on CPU (or meta for
         accounting) before moving to an execution device, so one local CPU
@@ -1051,29 +1049,17 @@ class DeltaModel(nn.Module):
     # -- pieces ----------------------------------------------------------------
 
     def fuse(self, payload: Tensor, e: Tensor) -> Tensor:
-        """FBT entry: u = rmsnorm(W_U p ⊙ σ(W_G rmsnorm(e))) (Appendix C)."""
-        return self.fuse_gated(payload, self.token_gate(e))
+        """Shared DeepSeek-style entry: W [rmsnorm_token(e); rmsnorm_payload(p)]."""
+        return self.fuse_normalized_token(payload, self.fuse_token_norm(e))
 
-    def token_gate(self, e: Tensor) -> Tensor:
-        """Token-only fusion component, shared across all supervised passes."""
-        return torch.sigmoid(
-            sink_linear(
-                self.gate_norm(e),
-                (self.fuse_gate.weight,),
-                (self.fuse_gate_sink,),
-                self.fuse_gate_shadow,
-            )
+    def fuse_normalized_token(self, payload: Tensor, normalized_token: Tensor) -> Tensor:
+        """Fuse a payload with token features normalized once across all passes."""
+        return sink_linear(
+            torch.cat((normalized_token, self.fuse_payload_norm(payload)), dim=-1),
+            (self.fuse_proj.weight,),
+            (self.fuse_proj_sink,),
+            self.fuse_proj_shadow,
         )
-
-    def fuse_gated(self, payload: Tensor, gate: Tensor) -> Tensor:
-        """Fuse a payload with an already computed token gate."""
-        value = sink_linear(
-            payload,
-            (self.fuse_value.weight,),
-            (self.fuse_value_sink,),
-            self.fuse_value_shadow,
-        )
-        return self.entry_norm(value * gate)
 
     def forward_mtp(
         self, payload: Tensor, next_tokens: Tensor, *, want_weights: bool = False
@@ -1184,7 +1170,7 @@ class DeltaModel(nn.Module):
     ) -> set[nn.Parameter]:
         """Attach trainer-owned FP32 gradient buffers to every sink-capable site.
 
-        The tied embedding, every large projection, and the fusion matrices
+        The tied embedding, every large projection, and the fusion projection
         then accumulate their gradients in place and return no autograd
         gradient; ``None`` restores ordinary autograd accumulation.  Returns
         the parameters that were bound, so the trainer can treat a touched
@@ -1322,12 +1308,8 @@ class DeltaModel(nn.Module):
                 attn.o_sink = sink(attn.o_proj.weight)
                 attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight, gate)
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-        self.fuse_value_sink = sink(self.fuse_value.weight)
-        self.fuse_gate_sink = sink(self.fuse_gate.weight)
-        self.fuse_value_shadow = shadow(
-            self.fuse_value_shadow, self.fuse_value.weight
-        )
-        self.fuse_gate_shadow = shadow(self.fuse_gate_shadow, self.fuse_gate.weight)
+        self.fuse_proj_sink = sink(self.fuse_proj.weight)
+        self.fuse_proj_shadow = shadow(self.fuse_proj_shadow, self.fuse_proj.weight)
         self._shadow_refresh = refresh
         return bound
 
@@ -1543,7 +1525,7 @@ class DeltaModel(nn.Module):
         """Run the stack once over inputs x [B, T, D].
 
         ``x`` is the actual column input: plain embeddings on pass 1 and
-        Standard decoding, or the fused FBT input on feedback passes. With a
+        Standard decoding, or the concat-fused input on feedback passes. With a
         cache, positions start at ``cache.pos`` and every mixer cache advances
         by ``T`` exactly once. ``iterations`` is the core iteration count
         under ``l``; the default is the configured mean, or the count the
@@ -1778,16 +1760,16 @@ def shift_right(x: Tensor) -> Tensor:
     return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
 
 
-def _token_gate(model, embedding):
-    return model.token_gate(embedding)
+def _normalized_fusion_token(model, embedding):
+    return model.fuse_token_norm(embedding)
 
 
-def _fused_input(model, payload, gate):
-    return model.fuse_gated(payload, gate)
+def _fused_input(model, payload, normalized_token):
+    return model.fuse_normalized_token(payload, normalized_token)
 
 
-def _jittered_fused_input(model, payload, jitter, gate):
-    return model.fuse_gated(payload + jitter, gate)
+def _jittered_fused_input(model, payload, jitter, normalized_token):
+    return model.fuse_normalized_token(payload + jitter, normalized_token)
 
 
 def _feedback_entry(fused_input, e, positions, prefix):
@@ -1796,8 +1778,8 @@ def _feedback_entry(fused_input, e, positions, prefix):
     return torch.where(plain[..., None], e, shift_right(fused_input))
 
 
-_compiled_token_gate = torch.compile(
-    _token_gate, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+_compiled_normalized_fusion_token = torch.compile(
+    _normalized_fusion_token, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
 )
 
 _compiled_fused_input = torch.compile(
@@ -1860,15 +1842,17 @@ def multipass(
     # strides: a seed left as a view of the T+1 row (which ``contiguous`` is,
     # a size-one batch never breaking contiguity) gives pass 1 its own compiled
     # copy of every block, rounding differently from the passes whose entry is
-    # a fresh tensor. The token gate reads the shifted embedding view once;
+    # a fresh tensor. Fusion normalizes the shifted embedding view once;
     # each pass produces one fresh fusion shared by its two consumers.
     e_all = model.embed_tokens(tokens)
     e = e_all[:, :-1].clone(memory_format=torch.contiguous_format)
     length = e.shape[1]
     positions = torch.arange(length, device=tokens.device)
     compiled = e.is_cuda
-    gate_fn = _compiled_token_gate if compiled else _token_gate
-    gate = gate_fn(model, e_all[:, 1:])
+    token_norm_fn = (
+        _compiled_normalized_fusion_token if compiled else _normalized_fusion_token
+    )
+    normalized_token = token_norm_fn(model, e_all[:, 1:])
     entry = _compiled_feedback_entry if compiled else _feedback_entry
     outs = []
     x = e
@@ -1885,10 +1869,12 @@ def multipass(
         )
         if jitter is None:
             fusion = _compiled_fused_input if compiled else _fused_input
-            out.fused_input = fusion(model, out.payload, gate)
+            out.fused_input = fusion(model, out.payload, normalized_token)
         else:
             fusion = _compiled_jittered_fused_input if compiled else _jittered_fused_input
-            out.fused_input = fusion(model, out.payload, jitter[i][:, :length], gate)
+            out.fused_input = fusion(
+                model, out.payload, jitter[i][:, :length], normalized_token
+            )
         outs.append(out)
     return outs
 

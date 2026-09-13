@@ -9,7 +9,7 @@ General capture and readout tooling belongs to the sibling
 | Axis | State | Conditions |
 |---|---|---|
 | Token position | PKDA matrix/diagonal/convolution state and GQA prefix K/V | All |
-| Latent feedback | Previous column's payload enters the next token's gate | `f`, `fl` |
+| Latent feedback | Previous column's payload is fused with the next token's embedding | `f`, `fl` |
 | Core depth | Tied middle cells repeatedly update the column | `l`, `fl` |
 
 A Jacobi pass recomputes mixer state from zero and consumes the prior pass's
@@ -22,7 +22,7 @@ source bank and labels, expert balance loss/counts, and optional route/expert
 weights. The sources obey `h_top = seed + sum(completed cell deltas)`.
 `want_weights=True` exposes MHDB source weights separately from sparse routed
 expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
-Outputs from `multipass` also expose `fused_input`: the shared gated tensor
+Outputs from `multipass` also expose `fused_input`: the shared projected tensor
 supplied to MTP and the following feedback pass. `forward_mtp_fused`
 runs the independent auxiliary block directly on that tensor; `forward_mtp`
 accepts payloads and next-token IDs and computes their fusion first. The
@@ -61,12 +61,13 @@ specific effect from generic damage. Donors must contain no future information
 relative to the patched position. Autoregressive comparisons allow text to
 diverge and measure that additional feedback as part of the outcome.
 
-MTP predicts a second token using the same gated fusion of payload and
-ground-truth next-token embedding that feedback consumes. Training shares
+MTP predicts a second token using the same normalized concat-linear fusion of
+payload and ground-truth next-token embedding that feedback consumes. Training shares
 the jittered fused tensor between both consumers; diagnostics and evaluation
 disable jitter. The auxiliary block retains its own PKDA memory, so its
 accuracy measures that auxiliary predictor. Sharing the fusion aligns the
 input interface but does not establish useful feedback. Compare ordinary
 next-token behavior and payload interventions to assess usefulness for
 generation; recoverability from the payload alone does not show how the main
-column uses it.
+column uses it. The projection can supply token-derived features even when
+the payload contribution vanishes, so assess payload use through interventions.
