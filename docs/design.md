@@ -95,21 +95,24 @@ and balancing equations.
 
 ### Feedback passes
 
-A feedback step starts with plain teacher forcing. Every supervised pass
-normalizes its payload once at the writer, then adds keyed uniform jitter in
+A feedback step starts with plain teacher forcing, using normalized token
+embeddings as column seeds. Every supervised pass normalizes its payload once
+at the writer, then adds keyed uniform jitter in
 `[-0.02,0.02]` without detaching it. It concatenates the normalized next-token
 embedding and jittered payload, then applies the shared bias-free `2D -> D`
-projection. Fusion adds no further payload normalization or gain. This
-includes single-pass batches, the final pass, and `l` without `f`. The
+projection. Fusion applies no further normalization or gain to either input.
+This includes single-pass batches, the final pass, and `l` without `f`. The
 independent MTP block consumes that fused tensor. When another feedback pass
-follows, it right-shifts the same tensor and restores plain embeddings before
-a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
+follows, it right-shifts the same tensor and restores normalized embeddings
+before a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
 plain. Mixer states restart each pass; both consumers backpropagate through
 the shared fusion.
 
-One embedding lookup serves the whole stored row, and the next-token embedding
-normalization is computed once for all passes. The writer's learned payload
-normalization precedes each pass's jitter. Jitter has shape
+One `embed_tokens` call looks up and normalizes the whole stored row before
+slicing. Its shared `embed_tokens.norm` serves plain seeds and both fusion
+consumers across all passes; the tied classifier retains the raw embedding
+weight. The writer's learned payload normalization precedes each pass's
+jitter. Jitter has shape
 `[n_passes, B, seq_len+1, dim]`, where `B` is the number of rows in the
 microbatch or replay; the first `seq_len` positions of each pass's draw
 perturb its payload. Evaluation and diagnostics use no jitter.
@@ -160,15 +163,17 @@ ordinary predicted-token budget.
 
 ### Checkpoints and queue
 
-Checkpoint v37 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v38 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v37 snapshots are accepted: payload normalization at the writer, followed
-by jitter and concat-linear fusion, defines the current parameter shapes and
-optimizer ownership. The fusion projection belongs to ordinary NorMuonH;
-the writer's payload norm and fusion's token norm belong to base NAdam.
+Only v38 snapshots are accepted: every input token lookup uses the shared
+`embed_tokens.norm`, while the payload is normalized at its writer before
+jitter. Fusion concatenates these prepared inputs and projects them. This
+defines the current parameter names and optimizer ownership. The fusion
+projection belongs to ordinary NorMuonH; the writer's payload norm and shared
+input norm belong to base NAdam.
 
 The trainer keeps the latest two snapshots and protected feedback, cooldown,
 and final boundaries. `--continue TAG` extends a finished run under a new tag

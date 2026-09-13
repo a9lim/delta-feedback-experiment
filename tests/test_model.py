@@ -1,6 +1,7 @@
 """One tiny model per distinct causal, recurrence, and numerical contract."""
 
 import torch
+import torch.nn.functional as F
 
 from delta_feedback_experiment.cuda_kernels import MAX_ROUTE_TILES, _route_launch
 from delta_feedback_experiment.model import (
@@ -52,6 +53,38 @@ def test_multipass_seed_has_standard_strides():
     assert outs[1].sources[0].stride() == seed.stride()
 
 
+def test_plain_and_standard_inputs_share_lookup_norm_without_normalizing_classifier():
+    model = tiny()
+    toks = tokens()
+    with torch.no_grad():
+        model.embed_tokens.norm.weight.uniform_(0.5, 1.5)
+    raw = F.embedding(toks, model.embed_tokens.weight)
+    expected = raw * torch.rsqrt(
+        raw.square().mean(-1, keepdim=True) + model.cfg.norm_eps
+    ) * model.embed_tokens.norm.weight
+    torch.testing.assert_close(model.embed_tokens(toks), expected)
+    outs = multipass(model, toks, 2, prefix_lens=torch.tensor([[2]]))
+    torch.testing.assert_close(outs[0].sources[0], expected[:, :-1])
+    torch.testing.assert_close(outs[1].sources[0][:, :2], expected[:, :2])
+    cache = KVCache(model.cfg, batch=1, device="cpu", dtype=torch.float32)
+    standard = model.step(toks[:, :1], None, cache)
+    torch.testing.assert_close(standard.sources[0], expected[:, :1])
+
+    # Plain next-token training reaches the shared input gain without MTP.
+    loss = model.logits(outs[0].h_top).square().mean()
+    loss.backward()
+    gradient = model.embed_tokens.norm.weight.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+    # The readout consumes the original tied weights, independently of the
+    # input gain. Changing that gain must not change logits of a fixed state.
+    hidden = outs[0].h_top.detach()
+    expected_logits = F.linear(model.readout_input(hidden), model.embed_tokens.weight)
+    with torch.no_grad():
+        model.embed_tokens.norm.weight.mul_(2)
+    torch.testing.assert_close(model.logits(hidden), expected_logits, atol=0, rtol=0)
+
+
 @torch.no_grad()
 def separate_expert_selection(model):
     """Keep causal/cache comparisons away from discrete selection boundaries.
@@ -67,9 +100,8 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     states = [tiny(condition, layers=16).state_dict() for condition in ("f", "l", "fl")]
     common = states[0].keys() & states[1].keys() & states[2].keys()
     assert "payload_router.query" in common and "payload_norm.weight" in common
-    assert {name for name in common if name.startswith("fuse_")} == {
-        "fuse_proj.weight", "fuse_token_norm.weight"
-    }
+    assert "embed_tokens.norm.weight" in common
+    assert {name for name in common if name.startswith("fuse_")} == {"fuse_proj.weight"}
     projection = states[0]["fuse_proj.weight"]
     assert projection.shape == (TINY["dim"], 2 * TINY["dim"])
     torch.testing.assert_close(
@@ -216,7 +248,7 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
         )
         for name in (
             "fuse_proj.weight",
-            "fuse_token_norm.weight",
+            "embed_tokens.norm.weight",
             "payload_norm.weight",
             "payload_router.query",
             "embed_tokens.weight",

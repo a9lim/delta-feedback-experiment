@@ -98,9 +98,11 @@ def fused_inputs(
 ) -> Tensor:
     """The next pass's column input: plain prefix, concat-fused suffix.
 
+    ``e`` is the normalized lookup returned by ``model.embed_tokens``.
     ``payload`` is the preceding pass's payload at the same positions; it is
-    shifted one column right (position 0 receives zero) before fusion, as in
-    ``multipass``.  ``prefix`` is a plain-prefix length or a per-row tensor.
+    shifted one column right (position 0 receives zero) before fusion. This
+    has the same causal alignment as ``multipass``, which shifts the shared
+    fused tensor instead. ``prefix`` is a plain-prefix length or a per-row tensor.
     """
     fused = model.fuse(shift_right(payload), e)
     return torch.where(plain_mask(e.shape[1], prefix, e.device), e, fused)

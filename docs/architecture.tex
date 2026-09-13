@@ -80,12 +80,15 @@
 \node[font=\smalltext] (tokens) at (8.2,3.7) {Input token $x_t$};
 \node[box,fill=pink,text width=4.6cm] (embedding) at (8.2,5.05)
   {\textbf{Token embedding $E$}\\$e_t=E(x_t)$};
+\node[box,fill=yellow,text width=4.6cm] (tokennorm) at (8.2,6.6)
+  {\textbf{Shared token RMSNorm $N_e$}\\$\bar e_t=N_e(e_t)$};
 \node[box,fill=purple!50,text width=4.6cm] (seed) at (8.2,9.7)
-  {\textbf{Column seed $s_t$}\\plain $e_t$ or incoming fusion};
+  {\textbf{Column seed $s_t$}\\plain $\bar e_t$ or incoming fusion};
 \draw[flow] (tokens) -- (embedding);
-\draw[flow] (embedding) -- (seed);
-\node[note,anchor=east,text width=2.5cm] at (7.95,7.25)
-  {Pass 1 / plain prefix:\\embedding entry};
+\draw[flow] (embedding) -- (tokennorm);
+\draw[flow] (tokennorm) -- (seed);
+\node[note,anchor=east,text width=2.8cm] at (7.95,8.02)
+  {Plain token entry:\\pass 1 / prefix\\Standard decode};
 \draw[flow] (seed) -- (prelude);
 \draw[flow] (prelude) -- (coreone);
 \draw[flow] (coreone) -- (coretwo);
@@ -144,7 +147,8 @@
 \draw[flow] (payloadadd) -- (payloadnorm);
 \draw[flow] (payloadnorm) -- (payload);
 
-% The outer feedback path carries p_t to fusion with E(x_{t+1}).
+% The outer feedback path carries p_t to fusion with N_e(E(x_{t+1})).
+% Both token paths share E and N_e; the whole row is normalized once.
 % Fusion is computed once and reused by MTP and shifted feedback.
 \node[box,fill=purple!65,text width=3.3cm] (jitter) at (20.2,3.1)
   {\textbf{Payload + jitter}\\$p_t+\xi_t$};
@@ -154,14 +158,14 @@
   at (.3,15.6) {Full-bandwidth payload feedback};
 \node[box,fill=pink,text width=3.3cm] (nextembedding) at (15.2,3.1)
   {\textbf{Token embedding $E$}\\$e_{t+1}=E(x_{t+1})$};
-\node[box,fill=yellow,text width=3.3cm] (fusiontoken) at (15.2,4.62)
-  {Token RMSNorm $N_e$};
-\draw[flow] (nextembedding) -- (fusiontoken);
+\node[box,fill=yellow,text width=3.3cm] (nexttokennorm) at (15.2,4.62)
+  {\textbf{Shared RMSNorm}\\$\bar e_{t+1}=N_e(e_{t+1})$};
+\draw[flow] (nextembedding) -- (nexttokennorm);
 \node[box,fill=purple,text width=7.5cm,minimum height=1.12cm]
   (fusion) at (17.7,6.35)
   {\textbf{Shared concat-linear fusion}\quad $2D\to D$\\
-   $u_t=W_f\,[N_e(e_{t+1});\,p_t+\xi_t]$};
-\draw[flow,rounded corners=3pt] (fusiontoken.north) -- (15.2,5.5)
+   $u_t=W_f\,[\bar e_{t+1};\,p_t+\xi_t]$};
+\draw[flow,rounded corners=3pt] (nexttokennorm.north) -- (15.2,5.5)
   -| ($(fusion.south)+(-1.5,0)$);
 \draw[flow,rounded corners=3pt] (jitter.north) -- (20.2,5.5)
   -| ($(fusion.south)+(1.5,0)$);

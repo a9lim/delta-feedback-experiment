@@ -54,20 +54,18 @@ def jitter_for(model, toks, count):
     )
 
 
-def explicit_fusion(model, payload, embedding):
-    """Independent concat equation; the supplied payload is already written."""
-    token = embedding * torch.rsqrt(
-        embedding.square().mean(-1, keepdim=True) + model.cfg.norm_eps
-    )
+def explicit_embedding(model, toks):
+    """Independent normalized lookup, leaving the tied classifier untouched."""
+    raw = F.embedding(toks, model.embed_tokens.weight)
+    return raw * torch.rsqrt(
+        raw.square().mean(-1, keepdim=True) + model.cfg.norm_eps
+    ) * model.embed_tokens.norm.weight
+
+
+def explicit_fusion(model, payload, normalized_token):
+    """Independent concat equation; both inputs have already been normalized."""
     return F.linear(
-        torch.cat(
-            (
-                token * model.fuse_token_norm.weight,
-                payload,
-            ),
-            dim=-1,
-        ),
-        model.fuse_proj.weight,
+        torch.cat((normalized_token, payload), dim=-1), model.fuse_proj.weight
     )
 
 
@@ -113,7 +111,8 @@ def test_fusion_preserves_independent_token_and_payload_contributions():
     payload, embedding = torch.randn(2, 4, model.cfg.dim), torch.randn(
         2, 4, model.cfg.dim
     )
-    model.fuse_token_norm.weight.uniform_(0.5, 1.5)
+    model.embed_tokens.norm.weight.uniform_(0.5, 1.5)
+    embedding = model.embed_tokens.norm(embedding)
     fused = model.fuse(payload, embedding)
     token_only = model.fuse(torch.zeros_like(payload), embedding)
     payload_only = model.fuse(payload, torch.zeros_like(embedding))
@@ -218,7 +217,7 @@ def test_mtp_trains_shared_fusion_and_payload_on_every_pass(condition, count):
                 model.payload_norm.weight,
                 model.blocks[0].attn.q_proj.weight,
                 model.fuse_proj.weight,
-                model.fuse_token_norm.weight,
+                model.embed_tokens.norm.weight,
             ),
             retain_graph=True,
         )
@@ -268,7 +267,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
 
     # Feedback and MTP deliberately perform their own embedding lookups and
     # fusion. They share parameters, but have no shared prepared tensor.
-    e = reference.embed_tokens(toks[:, :-1])
+    e = explicit_embedding(reference, toks[:, :-1])
     reference_outs = [reference.forward_column(e)]
     length = e.shape[1]
     for index in range(count - 1):
@@ -277,7 +276,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         # presented to the matrix product adds FP32 roundoff that the deep
         # recurrence amplifies. The two consumers still recompute separately.
         unshifted = explicit_fusion(
-            reference, payload, reference.embed_tokens(toks[:, 1:])
+            reference, payload, explicit_embedding(reference, toks[:, 1:])
         )
         fused = torch.cat((torch.zeros_like(unshifted[:, :1]), unshifted[:, :-1]), 1)
         plain = torch.arange(length)[None, :] < prefixes[index, :, None]
@@ -294,7 +293,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         fused = explicit_fusion(
             reference,
             expected_out.payload + jitter[index, :, :length],
-            reference.embed_tokens(toks[:, 1:]),
+            explicit_embedding(reference, toks[:, 1:]),
         )
         torch.testing.assert_close(out.fused_input, fused)
         hidden, _, _, _, aux, weights, counts = reference.mtp.block(
@@ -357,6 +356,8 @@ def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monke
 
     model = tiny()
     toks, count = tokens(length=5), 3
+    with torch.no_grad():
+        model.embed_tokens.norm.weight.uniform_(0.5, 1.5)
     calls = {"embedding": 0, "token_norm": 0, "payload_norm": 0, "fusion": 0}
     auxiliary_inputs = []
     sink_linear = implementation.sink_linear
@@ -370,6 +371,7 @@ def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monke
         calls["embedding"] += 1
 
     def count_token_norm(module, args, result):
+        assert args[0].shape == (*toks.shape, model.cfg.dim)
         calls["token_norm"] += 1
 
     def count_payload_norm(module, args, result):
@@ -377,7 +379,7 @@ def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monke
 
     monkeypatch.setattr(implementation, "sink_linear", count_linear)
     embedding_hook = model.embed_tokens.register_forward_hook(count_embedding)
-    token_norm_hook = model.fuse_token_norm.register_forward_hook(count_token_norm)
+    token_norm_hook = model.embed_tokens.norm.register_forward_hook(count_token_norm)
     payload_norm_hook = model.payload_norm.register_forward_hook(count_payload_norm)
     mtp_hook = model.mtp.register_forward_pre_hook(
         lambda module, args: auxiliary_inputs.append(args[0])

@@ -43,7 +43,9 @@ routed experts selected per token. `expert_intermediate` is the actual
 per-expert width `h`; the active dense-equivalent width `H = (k+1)h` is derived.
 The presets keep `(k+1)/(n+1) = 1/4`, so a quarter of the stored expert
 matrices run per token. Active counts include those experts and the full router
-in every bank, plus all mixer, payload-writer, and shared fusion parameters.
+in every bank, plus all mixer, payload-writer, shared input-norm, and fusion
+parameters. Only the raw tied embedding weight is excluded from non-embedding
+counts; the width-`D` `embed_tokens.norm` remains included.
 A microbatch can touch all experts; all parameters, gradients, and optimizer
 state occupy memory. Per-bank selection biases are buffers, excluded from
 parameter counts. Training's transient assignment counts have shape
@@ -56,13 +58,16 @@ once per training pass over `seq_len` positions, of
 which `seq_len-1` are supervised, and shares the embedding/final norm/readout
 with the main head, including that pass's single vocabulary-loss call.
 It does not execute in generation. MTP and feedback share a concat-linear
-entry: one `2D -> D` matrix and one width-`D` token RMSNorm scale. The payload
-is normalized at its writer, before training jitter, and enters fusion directly.
-The shared entry's `2D^2 + D` parameters are counted once outside the auxiliary
-block. Every condition retains the payload writer and shared entry, so `f`,
+entry containing one `2D -> D` matrix, or `2D^2` parameters. The shared
+width-`D` token RMSNorm belongs to the embedding input path and serves every
+token lookup, including plain seeds. The payload is normalized at its writer,
+before training jitter, and enters fusion directly. Both the fusion matrix and
+input norm are counted once outside the auxiliary block. Every condition
+retains the payload writer and shared entry, so `f`,
 `l`, and `fl` have identical parameter counts. MTP trains the shared entry
 even on single-pass batches; `f` selects its consumption by the trunk.
-The entire fusion matrix uses ordinary NorMuonH; its token norm uses base NAdam.
+The entire fusion matrix uses ordinary NorMuonH; the shared input norm uses
+base NAdam.
 
 ## Expert learning rates
 
@@ -144,7 +149,7 @@ every scale executes its 16 unique layers once per pass.
 Resumes and continuations inherit saved depths unless explicitly pinned.
 An explicit `--scale` pins its depth defaults along with its geometry, so
 resuming a different saved depth requires omitting `--scale` or supplying
-matching loop overrides. These settings are part of the checkpoint v37 contract.
+matching loop overrides. These settings are part of the checkpoint v38 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its

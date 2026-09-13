@@ -17,6 +17,12 @@ shifted payload. Sequential feedback decode advances mixer caches and carries
 the previous token's payload. Core iterations have separate mixer-cache
 tracks. Label token, pass, and depth coordinates when comparing states.
 
+Every token input passes through the shared `embed_tokens.norm`, including
+pass 1, plain-prefix positions, Standard decoding, and fusion inputs.
+`embed_tokens(tokens)` exposes these normalized features; `embed_tokens.weight`
+is the raw tied embedding/classifier matrix. Patches to plain column seeds
+therefore act on normalized token features.
+
 `DeltaModel.forward_column` returns `ColumnOutput`: top residual, payload,
 source bank and labels, expert balance loss/counts, and optional route/expert
 weights. The sources obey `h_top = seed + sum(completed cell deltas)`.
@@ -25,7 +31,8 @@ expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
 Outputs from `multipass` also expose `fused_input`: the shared projected tensor
 supplied to MTP and the following feedback pass. `forward_mtp_fused`
 runs the independent auxiliary block directly on that tensor; `forward_mtp`
-accepts payloads and next-token IDs and computes their fusion first. The
+accepts payloads and next-token IDs, normalizes their embedding lookup, and
+computes their fusion first. The
 auxiliary block's last row has no second token and carries no training weight.
 
 ## Tools
@@ -64,7 +71,8 @@ diverge and measure that additional feedback as part of the outcome.
 MTP predicts a second token using the same concat-linear fusion of payload
 and normalized ground-truth next-token embedding that feedback consumes.
 The payload is normalized once at its writer, before training jitter; fusion
-uses that jittered payload directly. Training shares the fused tensor between
+uses that jittered payload and the prepared token features directly.
+Training shares the fused tensor between
 both consumers; diagnostics and evaluation disable jitter. The auxiliary
 block retains its own PKDA memory, so its
 accuracy measures that auxiliary predictor. Sharing the fusion aligns the

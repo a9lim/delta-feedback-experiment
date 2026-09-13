@@ -5,10 +5,12 @@ grown for interpretability and monitoring experiments.
 
 The model uses four-layer `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, Multi-Head
 Delta Block (MHDB) routing over the seed and cell deltas, and shared plus
-selected routed SwiGLU experts. Each column's payload is normalized when
-written, receives training jitter, then joins the normalized next-token
-embedding in a shared concat-linear projection. This DeepSeek-style fusion
-feeds an independent auxiliary PKDA/expert block and, under feedback, the
+selected routed SwiGLU experts. A shared input RMSNorm normalizes every token
+embedding before either plain column entry or feedback/MTP fusion. Each
+column's payload is normalized when written, receives training jitter, then
+joins the next token's normalized features in a shared concat-linear
+projection. This DeepSeek-style fusion feeds an independent auxiliary
+PKDA/expert block and, under feedback, the
 next column. The auxiliary block trains the payload to
 predict a second token.
 

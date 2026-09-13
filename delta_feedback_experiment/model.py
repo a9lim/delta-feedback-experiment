@@ -290,6 +290,15 @@ class RMSNorm(nn.Module):
         return (x * self.weight.float()).to(dtype)
 
 
+def _normalized_embedding(norm: RMSNorm, embedding: Tensor) -> Tensor:
+    return norm(embedding)
+
+
+_compiled_normalized_embedding = torch.compile(
+    _normalized_embedding, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+
 class _EmbeddingSink(torch.autograd.Function):
     """Token lookup whose backward scatters into a persistent FP32 gradient.
 
@@ -316,12 +325,13 @@ class _EmbeddingSink(torch.autograd.Function):
 
 
 class ResidualEmbedding(nn.Embedding):
-    """FP32 tied weights, BF16 CUDA activations inside the training autocast.
+    """One learned RMSNorm on every token input, with raw FP32 tied weights.
 
     ``nn.Embedding`` is not autocast-aware.  Without this explicit boundary its
     FP32 output silently promotes every residual, payload, and routed source.
-    Outside CUDA autocast (CPU tests and explicit FP32 analysis) it remains an
-    ordinary embedding.
+    CUDA autocast casts lookup activations to BF16 before the shared RMSNorm.
+    Plain seeds, feedback, and MTP all consume this normalized lookup; the
+    tied classifier uses ``weight`` directly without input normalization.
 
     ``grad_sink`` is the trainer-owned persistent FP32 gradient buffer of the
     tied weight.  When it is set, both the lookup and the tied classifier
@@ -332,6 +342,10 @@ class ResidualEmbedding(nn.Embedding):
 
     grad_sink: Tensor | None = None
 
+    def __init__(self, num_embeddings: int, embedding_dim: int, norm_eps: float):
+        super().__init__(num_embeddings, embedding_dim)
+        self.norm = RMSNorm(embedding_dim, norm_eps)
+
     def forward(self, tokens: Tensor) -> Tensor:
         sink = self.grad_sink
         if sink is not None and self.weight.is_cuda and torch.is_grad_enabled():
@@ -339,8 +353,11 @@ class ResidualEmbedding(nn.Embedding):
         else:
             out = super().forward(tokens)
         if out.is_cuda and torch.is_autocast_enabled("cuda"):
-            return out.to(torch.bfloat16)
-        return out
+            out = out.to(torch.bfloat16)
+        normalize = (
+            _compiled_normalized_embedding if out.is_cuda else _normalized_embedding
+        )
+        return normalize(self.norm, out)
 
 
 # -- kv cache ------------------------------------------------------------------
@@ -950,7 +967,7 @@ class DeltaModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         factor_seed = torch.initial_seed()
-        self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
+        self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim, cfg.norm_eps)
         self.register_buffer("_classifier_shadow", None, persistent=False)
         self.register_buffer("_classifier_accum", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
@@ -970,7 +987,6 @@ class DeltaModel(nn.Module):
         self.fuse_proj_shadow: Tensor | None = None
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
         self.fuse_proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
-        self.fuse_token_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.checkpoint_blocks = 0
         """Runtime switch: how many PKDA and auxiliary block invocations of
         each logical forward, in execution order, recompute in backward
@@ -1047,15 +1063,12 @@ class DeltaModel(nn.Module):
 
     # -- pieces ----------------------------------------------------------------
 
-    def fuse(self, payload: Tensor, e: Tensor) -> Tensor:
-        """Shared entry: W [rmsnorm_token(e); p], with p normalized on write."""
-        return self.fuse_normalized_token(payload, self.fuse_token_norm(e))
+    def fuse(self, payload: Tensor, normalized_token: Tensor) -> Tensor:
+        """Shared entry W [normalized_token; payload], with no further norm.
 
-    def fuse_normalized_token(self, payload: Tensor, normalized_token: Tensor) -> Tensor:
-        """Fuse the written payload plus optional jitter without renormalizing.
-
-        Token features are normalized once across all passes. Keeping the
-        payload branch linear preserves its learned write gain and jitter.
+        ``embed_tokens`` normalizes token features once at lookup. The
+        payload is normalized at its writer, then receives optional jitter.
+        Both branches keep their learned gains through the linear fusion.
         """
         return sink_linear(
             torch.cat((normalized_token, payload), dim=-1),
@@ -1527,7 +1540,7 @@ class DeltaModel(nn.Module):
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
-        ``x`` is the actual column input: plain embeddings on pass 1 and
+        ``x`` is the actual column input: normalized embeddings on pass 1 and
         Standard decoding, or the concat-fused input on feedback passes. With a
         cache, positions start at ``cache.pos`` and every mixer cache advances
         by ``T`` exactly once. ``iterations`` is the core iteration count
@@ -1763,16 +1776,12 @@ def shift_right(x: Tensor) -> Tensor:
     return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
 
 
-def _normalized_fusion_token(model, embedding):
-    return model.fuse_token_norm(embedding)
-
-
 def _fused_input(model, payload, normalized_token):
-    return model.fuse_normalized_token(payload, normalized_token)
+    return model.fuse(payload, normalized_token)
 
 
 def _jittered_fused_input(model, payload, jitter, normalized_token):
-    return model.fuse_normalized_token(payload + jitter, normalized_token)
+    return model.fuse(payload + jitter, normalized_token)
 
 
 def _feedback_entry(fused_input, e, positions, prefix):
@@ -1780,10 +1789,6 @@ def _feedback_entry(fused_input, e, positions, prefix):
     plain = positions[None, :] < prefix[:, None]
     return torch.where(plain[..., None], e, shift_right(fused_input))
 
-
-_compiled_normalized_fusion_token = torch.compile(
-    _normalized_fusion_token, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
-)
 
 _compiled_fused_input = torch.compile(
     _fused_input, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
@@ -1836,26 +1841,23 @@ def multipass(
     # One logical forward: its trunk passes here and the auxiliary blocks in
     # ``multipass_loss`` share this recomputation budget in execution order.
     model._checkpoint_left = model.checkpoint_blocks
-    # One lookup of the whole stored row feeds both heads: the column seed is
-    # positions 0..T-1 and the auxiliary head's next-token input is 1..T, so
-    # the second lookup and its scatter into the embedding gradient are gone.
+    # One normalized lookup of the whole stored row feeds both heads: the
+    # column seed is positions 0..T-1 and the auxiliary head's next-token
+    # input is 1..T, so the second lookup and its gradient scatter are gone.
     # The seed is copied into a fresh tensor with the standard strides. The
     # routing bank allocates its gradient accumulator with ``zeros_like`` and
     # the routing and FLA kernels read packed rows, and Dynamo guards on
     # strides: a seed left as a view of the T+1 row (which ``contiguous`` is,
     # a size-one batch never breaking contiguity) gives pass 1 its own compiled
     # copy of every block, rounding differently from the passes whose entry is
-    # a fresh tensor. Fusion normalizes the shifted embedding view once;
-    # each pass produces one fresh fusion shared by its two consumers.
+    # a fresh tensor. The lookup normalizes the whole stored row once;
+    # plain seeds and fusion reuse its slices across all passes.
     e_all = model.embed_tokens(tokens)
     e = e_all[:, :-1].clone(memory_format=torch.contiguous_format)
     length = e.shape[1]
     positions = torch.arange(length, device=tokens.device)
     compiled = e.is_cuda
-    token_norm_fn = (
-        _compiled_normalized_fusion_token if compiled else _normalized_fusion_token
-    )
-    normalized_token = token_norm_fn(model, e_all[:, 1:])
+    normalized_token = e_all[:, 1:]
     entry = _compiled_feedback_entry if compiled else _feedback_entry
     outs = []
     x = e
