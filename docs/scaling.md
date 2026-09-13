@@ -25,8 +25,8 @@ Preset availability does not establish GPU fit or throughput.
 | MHDB groups | 4 | 6 | 8 | 12 |
 | PKDA heads, width 128 | 10 | 15 | 20 | 30 |
 | PKDA projection width | 1,280 | 1,920 | 2,560 | 3,840 |
-| Total parameters, every condition | 638,862,984 | 1,403,106,572 | 2,463,892,624 | 5,475,092,120 |
-| Training-active non-embedding parameters | 209,176,200 | 465,286,412 | 822,412,432 | 1,839,711,896 |
+| Total parameters, every condition | 638,862,216 | 1,403,105,420 | 2,463,891,088 | 5,475,089,816 |
+| Training-active non-embedding parameters | 209,175,432 | 465,285,260 | 822,410,896 | 1,839,709,592 |
 | Included auxiliary MTP total parameters | 35,181,480 | 78,750,908 | 139,639,504 | 313,374,200 |
 | Included auxiliary MTP active parameters | 12,178,344 | 26,993,852 | 47,626,960 | 106,345,976 |
 
@@ -55,13 +55,14 @@ Its active count replaces `(n+1)` with `(k+1)` in the expert term. It runs
 once per training pass over `seq_len` positions, of
 which `seq_len-1` are supervised, and shares the embedding/final norm/readout
 with the main head, including that pass's single vocabulary-loss call.
-It does not execute in generation. MTP and feedback share a normalized
-concat-linear entry: one `2D -> D` matrix and two width-`D` RMSNorm scales.
-Its `2D^2 + 2D` parameters are counted once outside the auxiliary
+It does not execute in generation. MTP and feedback share a concat-linear
+entry: one `2D -> D` matrix and one width-`D` token RMSNorm scale. The payload
+is normalized at its writer, before training jitter, and enters fusion directly.
+The shared entry's `2D^2 + D` parameters are counted once outside the auxiliary
 block. Every condition retains the payload writer and shared entry, so `f`,
 `l`, and `fl` have identical parameter counts. MTP trains the shared entry
 even on single-pass batches; `f` selects its consumption by the trunk.
-The entire fusion matrix uses ordinary NorMuonH; both norms use base NAdam.
+The entire fusion matrix uses ordinary NorMuonH; its token norm uses base NAdam.
 
 ## Expert learning rates
 
@@ -109,9 +110,9 @@ ratio is 25; larger ratios are supported arithmetic scenarios.
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|
 | Screen | 9,975 | 5,229,772,800 | 159,589 | 83,670,597,632 |
-| Bridge | 22,187 | 11,632,377,856 | 354,986 | 186,114,899,968 |
-| Flagship | 39,216 | 20,560,478,208 | 627,451 | 328,965,029,888 |
-| Extension | 87,725 | 45,993,164,800 | 1,403,589 | 735,884,869,632 |
+| Bridge | 22,187 | 11,632,377,856 | 354,985 | 186,114,375,680 |
+| Flagship | 39,216 | 20,560,478,208 | 627,450 | 328,964,505,600 |
+| Extension | 87,725 | 45,993,164,800 | 1,403,588 | 735,884,345,344 |
 
 Warmup is 2% of the shorter of the run and its 25x length: 200, 444, 784,
 and 1,754 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
@@ -143,7 +144,7 @@ every scale executes its 16 unique layers once per pass.
 Resumes and continuations inherit saved depths unless explicitly pinned.
 An explicit `--scale` pins its depth defaults along with its geometry, so
 resuming a different saved depth requires omitting `--scale` or supplying
-matching loop overrides. These settings are part of the checkpoint v36 contract.
+matching loop overrides. These settings are part of the checkpoint v37 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its

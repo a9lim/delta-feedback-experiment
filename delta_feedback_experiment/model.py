@@ -69,7 +69,7 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "f": (
         "feedback",
         "full-bandwidth feedback: fuse the preceding column's payload "
-        "with the token by normalized concatenation",
+        "with the normalized token by concatenation",
     ),
     "l": (
         "loop",
@@ -971,7 +971,6 @@ class DeltaModel(nn.Module):
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
         self.fuse_proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
         self.fuse_token_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.fuse_payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.checkpoint_blocks = 0
         """Runtime switch: how many PKDA and auxiliary block invocations of
         each logical forward, in execution order, recompute in backward
@@ -1049,13 +1048,17 @@ class DeltaModel(nn.Module):
     # -- pieces ----------------------------------------------------------------
 
     def fuse(self, payload: Tensor, e: Tensor) -> Tensor:
-        """Shared DeepSeek-style entry: W [rmsnorm_token(e); rmsnorm_payload(p)]."""
+        """Shared entry: W [rmsnorm_token(e); p], with p normalized on write."""
         return self.fuse_normalized_token(payload, self.fuse_token_norm(e))
 
     def fuse_normalized_token(self, payload: Tensor, normalized_token: Tensor) -> Tensor:
-        """Fuse a payload with token features normalized once across all passes."""
+        """Fuse the written payload plus optional jitter without renormalizing.
+
+        Token features are normalized once across all passes. Keeping the
+        payload branch linear preserves its learned write gain and jitter.
+        """
         return sink_linear(
-            torch.cat((normalized_token, self.fuse_payload_norm(payload)), dim=-1),
+            torch.cat((normalized_token, payload), dim=-1),
             (self.fuse_proj.weight,),
             (self.fuse_proj_sink,),
             self.fuse_proj_shadow,

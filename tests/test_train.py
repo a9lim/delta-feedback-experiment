@@ -144,8 +144,8 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         768,
         3,
         15,
-        638862984,
-        209176200,
+        638862216,
+        209175432,
     )
     from delta_feedback_experiment.cli import stream_target
     from delta_feedback_experiment.data import (

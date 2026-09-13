@@ -67,9 +67,9 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     states = [tiny(condition, layers=16).state_dict() for condition in ("f", "l", "fl")]
     common = states[0].keys() & states[1].keys() & states[2].keys()
     assert "payload_router.query" in common and "payload_norm.weight" in common
-    assert {
-        "fuse_proj.weight", "fuse_token_norm.weight", "fuse_payload_norm.weight"
-    } <= common
+    assert {name for name in common if name.startswith("fuse_")} == {
+        "fuse_proj.weight", "fuse_token_norm.weight"
+    }
     projection = states[0]["fuse_proj.weight"]
     assert projection.shape == (TINY["dim"], 2 * TINY["dim"])
     torch.testing.assert_close(
@@ -217,7 +217,7 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
         for name in (
             "fuse_proj.weight",
             "fuse_token_norm.weight",
-            "fuse_payload_norm.weight",
+            "payload_norm.weight",
             "payload_router.query",
             "embed_tokens.weight",
             "attention_gates.0.weight",

@@ -5,10 +5,22 @@ Block (MHDB) routing, shared and routed SwiGLU experts, and auxiliary two-token
 prediction. Conditions select cross-column feedback (`f`), tied depth (`l`),
 or both (`fl`); the default is `f`. Feedback retains the Full-Bandwidth
 Transformer (FBT) recurrence and Jacobi training, with DeepSeek-style
-normalized concat-linear fusion. There is no empty condition.
+concat-linear fusion of the normalized token embedding and the payload,
+normalized once at its writer. There is no empty condition.
 
 [Scaling](scaling.md) owns geometry and accounting, [design](design.md) owns
 data and training, and [references](../references/refs.yaml) records sources.
+
+The [TikZ figure](architecture.tex) shows `fl` as one vertical diagram, with
+shared MTP/feedback fusion, a cell-delta source bank, and one layer cutaway.
+Build its vector PDF from the repository root with Tectonic:
+
+```bash
+mkdir -p figures/architecture
+tectonic --outdir figures/architecture docs/architecture.tex
+```
+
+The editable source is tracked; generated files in `figures/` are not.
 
 ## The column
 
@@ -243,21 +255,24 @@ Residuals with cell-level addresses.
 
 ## Payload and letter f: feedback
 
-At a feedback position, token embedding `e_t` and incoming payload `p_(t-1)`
-are separately normalized, concatenated in that order, and projected back to
-width `D`. The same fusion is the MTP entry in every condition:
+At a feedback position, fusion normalizes token embedding `e_t`, concatenates
+it with incoming payload `p_(t-1)`, and projects back to width `D`.
+The payload was normalized once at its writer. With jitter disabled,
+the same fusion used by MTP gives the column seed:
 
 ```text
-seed_t = fuse_proj(concat(fuse_token_norm(e_t), fuse_payload_norm(p_(t-1))))
+seed_t = fuse_proj(concat(fuse_token_norm(e_t), p_(t-1)))
 ```
 
-The bias-free `fuse_proj: 2D -> D` and the two learned RMSNorms belong to the
-model and are shared by MTP and feedback. There is no activation or output
-normalization inside this fusion. Splitting its matrix into two width-`D`
-blocks gives `W_e norm_e(e_t) + W_p norm_p(p_(t-1))`, so both inputs contribute
-directly to the seed. This follows [DeepSeek-V3's MTP entry, Equation 21](https://arxiv.org/html/2412.19437v2#S2.SS2),
-using the routed payload in place of its preceding hidden state and sharing
-the result with cross-column feedback. Plain-prefix, pass-1, and
+The bias-free `fuse_proj: 2D -> D` and learned token RMSNorm belong to the
+model and are shared by MTP and feedback. Fusion applies no activation,
+payload normalization or payload gain, or output normalization. Splitting its
+matrix into two width-`D` blocks gives `W_e norm_e(e_t) + W_p p_(t-1)`, so both
+inputs contribute directly to the seed. This adapts
+[DeepSeek-V3's MTP entry, Equation 21](https://arxiv.org/html/2412.19437v2#S2.SS2):
+the routed payload replaces its preceding hidden state, payload normalization
+occurs at the writer before training jitter, and the result is shared with
+cross-column feedback. Plain-prefix, pass-1, and
 Standard-decoding positions use `e_t`. The actual seed is both residual origin
 and MHDB source. Every condition has a dedicated payload router that reads its
 null, seed, and every completed cell delta:
@@ -267,8 +282,9 @@ r_payload = route(null, seed, Delta_0 .. Delta_(C-1))
 p_t = payload_norm(h_top + r_payload)
 ```
 
-The direct `h_top` term remains alongside routed enrichment. Initially the
-uniform enrichment is `h_top/(C+2)`, making the normalized payload equal to a
+The writer's `payload_norm` is a learned RMSNorm. The direct `h_top` term
+remains alongside routed enrichment. Initially the uniform enrichment is
+`h_top/(C+2)`, making the normalized payload equal to a
 normalized top state up to epsilon. Payload routing is not conditioned on
 the next token; that token enters through the shared fusion at the next column.
 Every supervised pass constructs this payload for MTP, including single-pass
@@ -276,10 +292,12 @@ batches, `l` without `f`, and the final feedback pass. The `f` letter controls
 consumption by the next column. Generation can skip payload construction when
 no feedback or auxiliary read needs it.
 
-Every training pass adds its keyed jitter to the undetached payload and fuses
-it with the next-token embedding once. MTP consumes the resulting tensor
-directly. If another Jacobi pass follows, it shifts that same tensor right
-and restores the per-row plain prefix. Mixer states restart inside each pass.
+Every training pass adds its keyed jitter to the undetached, normalized
+payload and fuses it directly with the normalized next-token embedding once.
+There is no second payload normalization after jitter. MTP consumes the
+resulting tensor directly. If another Jacobi pass follows, it shifts that
+same tensor right and restores the per-row plain prefix. Mixer states restart
+inside each pass.
 Sequential generation instead retains the preceding payload and advances all
 mixer caches once per new token, computing one fusion with that token's
 embedding and no jitter.
@@ -360,24 +378,26 @@ data; compute comparisons need cell-tokens and auxiliary work or device time.
 ## Two-token prediction
 
 One independent auxiliary prediction block runs after each column pass.
-Its input is computed by the model's shared normalized concat-linear fusion:
+Its input is computed by the model's shared concat-linear fusion:
 
 ```text
 e_bar_(t+1) = fuse_token_norm(Emb(x_(t+1)))
-p_bar_t = fuse_payload_norm(p_t + jitter_t)
-u_t = fuse_proj(concat(e_bar_(t+1), p_bar_t))
+p_t = payload_norm(h_top,t + r_payload,t)
+u_t = fuse_proj(concat(e_bar_(t+1), p_t + jitter_t))
 v = PKDAExpertBlock(u)
 logits_mtp,t = (final_norm(v_t) * 1536 / D) @ Emb.weight.T
 ```
 
-`fuse_proj`, `fuse_token_norm`, and `fuse_payload_norm` are the exact parameters
-used by feedback, present in every condition. The two inputs each have width
-`D`, and the concatenation places the token first and payload second. One
-token normalization serves all passes; each pass adds jitter before payload
-normalization and computes `u` once for both consumers. The auxiliary block has
-its own PKDA mixer and one shared plus top-`k`-of-`n` routed
-SwiGLU experts, using the trunk's residual width, expert intermediate width,
-expert counts, output normalization, and `1/sqrt(2L)` branch scale. It shares the final norm and embedding/readout.
+`fuse_proj` and `fuse_token_norm` are the exact fusion parameters used by
+feedback, present in every condition. The two inputs each have width `D`,
+and the concatenation places the token first and payload second. One token
+normalization serves the whole stored row across all passes; each pass adds
+jitter after the writer's payload normalization and computes `u` once for both
+consumers. Fusion applies no further payload norm or gain before projection.
+The auxiliary block has its own PKDA mixer and one shared plus top-`k`-of-`n`
+routed SwiGLU experts, using the trunk's residual width, expert intermediate
+width, expert counts, output normalization, and `1/sqrt(2L)` branch scale.
+It shares the final norm and embedding/readout.
 It has no MHDB read or tied loop. Its independent matrix, diagonal, and
 convolution states start from zero for each row and pass.
 
@@ -556,8 +576,9 @@ The width-scaled group owns matrices with fan-in `D`: GGQA gates,
 expert routers, and PKDA packed controls. It uses `lr_nadam * 1536/D`; the
 base group uses `lr_nadam`, default `3e-4`. The base group owns the tied
 embedding/readout, fixed-head-width PKDA expansions, and every non-matrix
-parameter, including both fusion RMSNorm scales. The readout also multiplies
-by `1536/D`, while embedding lookup keeps its base rate.
+parameter, including the payload-writer and fusion-token RMSNorm scales.
+The readout also multiplies by `1536/D`, while embedding lookup keeps its
+base rate.
 
 NAdam uses betas `(.9,.95)`, momentum decay `psi=.004`, epsilon `1e-8`:
 

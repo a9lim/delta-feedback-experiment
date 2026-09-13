@@ -114,7 +114,7 @@ def cuda_probe() -> None:
                 "embed_tokens.weight",
                 "fuse_proj.weight",
                 "fuse_token_norm.weight",
-                "fuse_payload_norm.weight",
+                "payload_norm.weight",
                 "payload_router.query",
                 "mtp.block.attn.q_proj.weight",
                 "blocks.3.attn.qkv_proj.weight",

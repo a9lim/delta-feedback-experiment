@@ -57,7 +57,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=36, resumable=frozenset({36}), surface_version=36
+    version=37, resumable=frozenset({37}), surface_version=37
 )
 
 
@@ -371,7 +371,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     recipe.add_argument(
         "--jitter", type=float, default=0.02,
-        help="payload jitter shared by MTP and feedback on every training pass",
+        help=(
+            "uniform +/- amplitude added after payload normalization, shared "
+            "by MTP and feedback without renormalizing (default: 0.02)"
+        ),
     )
     recipe.add_argument("--zloss", type=float, default=1e-5)
     recipe.add_argument(

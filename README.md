@@ -5,10 +5,11 @@ grown for interpretability and monitoring experiments.
 
 The model uses four-layer `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, Multi-Head
 Delta Block (MHDB) routing over the seed and cell deltas, and shared plus
-selected routed SwiGLU experts. Each column's payload and next-token embedding
-are separately normalized, concatenated, and linearly projected; this shared
-DeepSeek-style fusion feeds an independent auxiliary PKDA/expert block and,
-under feedback, the next column. The auxiliary block trains the payload to
+selected routed SwiGLU experts. Each column's payload is normalized when
+written, receives training jitter, then joins the normalized next-token
+embedding in a shared concat-linear projection. This DeepSeek-style fusion
+feeds an independent auxiliary PKDA/expert block and, under feedback, the
+next column. The auxiliary block trains the payload to
 predict a second token.
 
 | Condition | Computation |

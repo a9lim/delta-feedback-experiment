@@ -61,10 +61,12 @@ specific effect from generic damage. Donors must contain no future information
 relative to the patched position. Autoregressive comparisons allow text to
 diverge and measure that additional feedback as part of the outcome.
 
-MTP predicts a second token using the same normalized concat-linear fusion of
-payload and ground-truth next-token embedding that feedback consumes. Training shares
-the jittered fused tensor between both consumers; diagnostics and evaluation
-disable jitter. The auxiliary block retains its own PKDA memory, so its
+MTP predicts a second token using the same concat-linear fusion of payload
+and normalized ground-truth next-token embedding that feedback consumes.
+The payload is normalized once at its writer, before training jitter; fusion
+uses that jittered payload directly. Training shares the fused tensor between
+both consumers; diagnostics and evaluation disable jitter. The auxiliary
+block retains its own PKDA memory, so its
 accuracy measures that auxiliary predictor. Sharing the fusion aligns the
 input interface but does not establish useful feedback. Compare ordinary
 next-token behavior and payload interventions to assess usefulness for
