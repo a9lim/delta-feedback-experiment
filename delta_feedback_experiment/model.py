@@ -803,8 +803,30 @@ class MultiTokenPrediction(nn.Module):
         return h, aux, counts, weights
 
 
+ACTIVATION_MEMORY_BUDGET = 0.9
+"""Inductor's activation memory budget for the compiled blocks.
+
+The partitioner has coarse tiers. At 0.9 it recomputes only cheap fused
+tensors in backward (the shared expert's SwiGLU output, flattened residual
+views) and keeps every custom-operator result, which frees 437 MiB per pass
+at one 4,096-token row for half a percent of block time; at 0.85 and below it
+re-executes the routed expert forward, which costs 8.6%. The trainer's
+whole-block recompute remains the stage past this one.
+"""
+
+
+def _activation_budget():
+    """The budget annotation while a block compiles; nothing when it runs eagerly."""
+    if torch.compiler.is_compiling():
+        return torch.autograd.graph.region_activation_memory_budget(
+            ACTIVATION_MEMORY_BUDGET
+        )
+    return contextlib.nullcontext()
+
+
 def _mtp_forward(module, payload, next_embedding, want_weights):
-    return module(payload, next_embedding, want_weights)
+    with _activation_budget():
+        return module(payload, next_embedding, want_weights)
 
 
 _compiled_mtp = torch.compile(
@@ -847,11 +869,13 @@ def _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors):
 # entry's guards against the current call to log the reason; one family's
 # guards name attributes the other family's mixer does not have.
 def _attention_block(block, h, block_start, gate_weight, banked, *tensors):
-    return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
+    with _activation_budget():
+        return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
 
 
 def _pkda_block(block, h, block_start, gate_weight, banked, *tensors):
-    return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
+    with _activation_budget():
+        return _block_for_checkpoint(block, h, block_start, gate_weight, banked, *tensors)
 
 
 _compiled_block = torch.compile(
@@ -1833,12 +1857,16 @@ def multipass(
     # One lookup of the whole stored row feeds both heads: the column seed is
     # positions 0..T-1 and the auxiliary head's next-token input is 1..T, so
     # the second lookup and its scatter into the embedding gradient are gone.
-    # The seed is copied dense because the routing bank allocates its gradient
-    # accumulator with ``zeros_like`` and the routing and FLA kernels read
-    # packed rows; the auxiliary input stays a view, normalized and
+    # The seed is copied into a fresh tensor with the standard strides. The
+    # routing bank allocates its gradient accumulator with ``zeros_like`` and
+    # the routing and FLA kernels read packed rows, and Dynamo guards on
+    # strides: a seed left as a view of the T+1 row (which ``contiguous`` is,
+    # a size-one batch never breaking contiguity) gives pass 1 its own compiled
+    # copy of every block, rounding differently from the passes whose entry is
+    # a fresh tensor. The auxiliary input stays a view, normalized and
     # concatenated inside the compiled auxiliary block.
     e_all = model.embed_tokens(tokens)
-    e = e_all[:, :-1].contiguous()
+    e = e_all[:, :-1].clone(memory_format=torch.contiguous_format)
     next_embedding = e_all[:, 1:]
     out = model.forward_column(
         e,

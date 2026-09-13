@@ -12,6 +12,11 @@ import os
 import tempfile
 from pathlib import Path
 
+# The CUDA graphs, the optimizer step, and the periodic monitors share one
+# private memory pool (``CudaGraphTrainer.pool_scope``); that reuse needs the
+# allocator's expandable segments, configured before its first allocation.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # Inductor's generated code is PyTorch-, CUDA-, and GPU-specific. Keep this
 # training autotuning cache durable across subprocesses. PyTorch sets
 # its own default under /tmp as soon as an earlier torch.compile user imports;

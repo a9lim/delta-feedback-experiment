@@ -416,8 +416,8 @@ class PreconditionedKDA(nn.Module):
             )
         if state is None and a_state is None and not output_final_state:
             # Dense training and prefill: the wrapped operator keeps Dynamo in
-            # one graph and hands its backward the same intermediates FLA's
-            # ``disable_recompute`` path keeps.
+            # one graph; its backward rebuilds the recurrence's WY, chunk-state
+            # and gate intermediates from the saved products and inputs.
             output, _saved = pkda_recurrence(
                 q,
                 k,
@@ -450,10 +450,9 @@ class PreconditionedKDA(nn.Module):
             "use_gate_in_kernel": True,
             # ``_project`` already normalized q and k.
             "use_qk_l2norm_in_kernel": False,
-            # Training keeps the WY and chunk-state intermediates for backward
-            # instead of recomputing them; measured on Jobe as a small,
-            # memory-cheap win at the screen geometry.
-            "disable_recompute": torch.is_grad_enabled(),
+            # Cached prefill and decode never train; the recompute path keeps
+            # the operator's footprint small.
+            "disable_recompute": False,
             "x": self.squash_x,
             "eps": self.squash_eps,
             "log_atk_scale": self.log_precond_center,

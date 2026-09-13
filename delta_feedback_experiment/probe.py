@@ -132,10 +132,11 @@ def cuda_probe() -> None:
             for gradient in routed
         )
         assert sum(gradient.abs().sum() for gradient in routed) > 0
-        for optimizer in optimizers:
-            optimizer.step()
-        model.update_expert_bias(state.expert_counts)
-        model.refresh_shadows()
+        with runner.pool_scope():
+            for optimizer in optimizers:
+                optimizer.step()
+            model.update_expert_bias(state.expert_counts)
+            model.refresh_shadows()
     assert not torch.equal(initial, model.embed_tokens.weight)
     runner.zero_grad()
 

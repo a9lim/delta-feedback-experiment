@@ -102,7 +102,10 @@ normalization, a rank-128 sigmoid output gate, and a bias-free output
 projection. The output-gate expansion bias initializes to zero.
 
 CUDA training/prefill uses the workspace FLA chunk operator at chunk size 64;
-decode uses its recurrent operator. CPU/MPS use the literal recurrence.
+decode uses its recurrent operator. Training's backward rebuilds the
+recurrence's WY representation, chunk states, and gate cumsum from the
+retained intra-chunk products and preconditioner scan, bitwise identically to
+keeping them. CPU/MPS use the literal recurrence.
 Convolution, SiLU, and Q/K normalization stay FP32 until the final activation
 cast. Decode retains the FP32 matrix and diagonal states plus three BF16
 projected convolution histories of length 3. Each Jacobi pass restarts those
@@ -312,8 +315,14 @@ All passes and iterations remain differentiable. Readout occurs after the
 coda, and auxiliary prediction runs once per pass. On CUDA the per-pass
 epilogues around the compiled blocks (the payload's routed add and norm, the
 feedback entry's jitter/shift/fuse/select, and both heads' readout) compile
-as their own small regions. CUDA captures one training graph per reachable
-`(pass count,r)` pair and no-grad evaluation graphs at the fixed depth. At
+as their own small regions. The compiled blocks carry an Inductor activation memory budget of 0.9, the
+partitioner tier that recomputes cheap fused tensors in backward and never a
+custom operator. CUDA captures one training graph per reachable
+`(pass count,r)` pair and no-grad evaluation graphs at the fixed depth. Every
+graph, the optimizer step, and the periodic monitors share one private memory
+pool: the eager work runs on the capture stream inside it, so nothing between
+replays grows memory outside the pool, which needs the allocator's expandable
+segments. At
 start-up the trainer measures the activation bytes one block invocation
 retains, subtracts the static footprint and a margin from device memory, and
 plans each graph: a one-pass graph replays the largest row multiple whose raw
@@ -402,7 +411,9 @@ Experts are constructed directly as part of the common model initialization.
 Attention gates, feedback matrices, and the auxiliary module use separate
 deterministic streams. The FBT stream does not advance shared draws. Feedback/depth recipe draws are separately keyed.
 
-Parameters, optimizer state, and accumulated gradients are FP32. CUDA residuals,
+Parameters, accumulated gradients, and optimizer state are FP32, except
+NorMuonH's momentum, which CUDA stores in BF16 rounded to nearest with its
+update computed in FP32. CUDA residuals,
 routed values, payloads, and mixer caches use BF16, except PKDA matrix/diagonal
 boundaries. CCE reads an address-stable BF16 classifier shadow refreshed after
 each optimizer step; it is runtime state, excluded from snapshots.
@@ -480,7 +491,13 @@ the finite displacement, so this is not a strict final-step bound. Full-model tr
 [Scaling](scaling.md#expert-learning-rates) lists the preset rates.
 CUDA compiles the update arithmetic by shape bucket within each group and
 runs the five Newton-Schulz iterations on a BF16 copy of the normalized
-direction, as reference Muon implementations do. The result returns to FP32
+direction, as reference Muon implementations do. CUDA also stores each
+bucket's momentum in BF16: the EMA and the Nesterov direction are computed in
+FP32 and only the writeback rounds to nearest, so a snapshot carries a BF16
+momentum and resumes exactly. Replaying 120 identical recorded gradients into
+FP32- and BF16-stored optimizers keeps their accumulated updates within cosine
+0.9999, with the momentum itself 1e-2 relative from FP32 and still drifting
+at that horizon. The result returns to FP32
 before row adaptation, the spectral/tangent step, and the retraction; CPU and
 MPS stay FP32 throughout. Paired steps on the screen model from one starting
 state keep every one of the 606 matrices within cosine similarity .99985 of

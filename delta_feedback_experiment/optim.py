@@ -24,7 +24,11 @@ No optimizer group uses weight decay.
 
 On CUDA the Newton-Schulz iterations run in BF16, as reference Muon
 implementations do; the direction returns to FP32 before row adaptation, the
-spectral/tangent step, and the retraction. CPU and MPS keep FP32 throughout.
+spectral/tangent step, and the retraction. CUDA also stores the momentum in
+BF16, rounded to nearest, with its EMA and the Nesterov direction computed in
+FP32 every step: that halves the largest optimizer state and its step
+traffic, and replaying 120 identical recorded gradients keeps the accumulated
+update within cosine 0.9999 of FP32 storage. CPU and MPS keep FP32 throughout.
 Each shape bucket holds its momenta, row moments, radii, and right vectors in
 one packed tensor per state kind, with every parameter's state entries as
 views into them, so a step packs only parameters and gradients.
@@ -50,6 +54,13 @@ NS_COEFFS = (3.4445, -4.7750, 2.0315)
 
 NS_CUDA_DTYPE = torch.bfloat16
 """Newton-Schulz working precision on CUDA; every other device keeps FP32."""
+
+MOMENTUM_CUDA_DTYPE = torch.bfloat16
+"""Momentum storage on CUDA; its EMA is computed in FP32 and rounded to nearest."""
+
+
+def _momentum_dtype(sample: Tensor) -> torch.dtype:
+    return MOMENTUM_CUDA_DTYPE if sample.is_cuda else sample.dtype
 
 DEFAULT_NORMUONH_LR = 6e-3
 """Stable estimated RMS-to-RMS trial-step budget for fresh runs."""
@@ -162,11 +173,13 @@ def _normuonh_batch(
     """Batched NorMuon direction and spectral tangent update on a fixed sphere.
 
     The Newton-Schulz iterations run in ``ns_dtype``; everything from the row
-    second moment onward is back in the parameter dtype.
+    second moment onward is back in the parameter dtype. The momentum EMA and
+    the Nesterov direction are computed in FP32 whatever the momentum's storage
+    dtype, and the returned momentum carries that dtype.
     """
     a, b, c = NS_COEFFS
-    momentum = torch.lerp(momentum, gradient, 1 - momentum_beta)
-    direction = torch.lerp(gradient, momentum, momentum_beta)
+    updated = torch.lerp(momentum.float(), gradient, 1 - momentum_beta)
+    direction = torch.lerp(gradient, updated, momentum_beta)
     transposed = direction.shape[-2] > direction.shape[-1]
     x = direction.mT if transposed else direction
     x = x / (x.norm(dim=(-2, -1), keepdim=True) + 1e-7)
@@ -183,7 +196,7 @@ def _normuonh_batch(
     projected, spectral_vectors = _spectral_tangent_step(
         parameters, update, radii, spectral_vectors, lr, eps
     )
-    return momentum, row_moment, projected, spectral_vectors
+    return updated.to(momentum.dtype), row_moment, projected, spectral_vectors
 
 
 def _normuonh_bucket_values(
@@ -341,7 +354,9 @@ class NorMuonH(torch.optim.Optimizer):
         count = len(bucket.params)
         rows, cols = sample.shape
         kwargs = {"device": sample.device, "dtype": sample.dtype}
-        bucket.momentum = torch.zeros(count, rows, cols, **kwargs)
+        bucket.momentum = torch.zeros(
+            count, rows, cols, device=sample.device, dtype=_momentum_dtype(sample)
+        )
         bucket.row_moment = torch.zeros(count, rows, 1, **kwargs)
         bucket.spectral_vector = torch.zeros(count, cols, **kwargs)
         bucket.radius = torch.stack(
@@ -366,6 +381,24 @@ class NorMuonH(torch.optim.Optimizer):
             )
             bucket.indices[key] = index
         return index
+
+    @torch.no_grad()
+    def prepare(self) -> None:
+        """Cache the row indices this gradient pattern will need.
+
+        ``step`` caches them on first use and keeps them for the run, so a
+        first step inside a CUDA graph's private memory pool would place them
+        in memory the graphs overwrite on the next replay. Callers that enter
+        such a pool call this beforehand, outside it.
+        """
+        for bucket in self._buckets:
+            present = [
+                row
+                for row, parameter in enumerate(bucket.params)
+                if parameter.grad is not None
+            ]
+            if present:
+                self._rows(bucket, present)
 
     @torch.no_grad()
     def warmup(self, active: set[torch.nn.Parameter] | None = None) -> None:
@@ -397,7 +430,9 @@ class NorMuonH(torch.optim.Optimizer):
         _normuonh_bucket_step(
             matrices,
             [torch.zeros_like(matrix) for matrix in matrices],
-            torch.zeros(count, rows, cols, **kwargs),
+            torch.zeros(
+                count, rows, cols, device=sample.device, dtype=_momentum_dtype(sample)
+            ),
             torch.zeros(count, rows, 1, **kwargs),
             torch.ones(count, **kwargs),
             torch.zeros(count, cols, **kwargs),

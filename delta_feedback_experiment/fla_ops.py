@@ -35,22 +35,20 @@ CHUNK_SIZE = 64
 PKDA_INTERMEDIATES = (
     "Aqk",
     "Akk",
-    "w",
-    "kg",
-    "v_new",
-    "h",
     "k_precond",
     "ac_atk",
     "a_atk",
     "sa_atk",
-    "qg",
-    "g_cum",
 )
 """What the recurrence hands its own backward, in the order it is carried.
 
-The fork's forward stores the gated query ``qg`` from its output kernel and
-keeps ``g_cum``, the FP32 chunk-local gate cumsum, so the backward relaunches
-neither; ``u`` is never read by a backward that keeps these and is dropped.
+The intra-chunk products and the preconditioner scan are kept. The WY
+representation (``w``, ``u``, ``kg``, the gated query ``qg``), the chunk
+states ``h`` and ``v_new``, and the FP32 gate cumsum are rebuilt in backward
+from them and the inputs, through the fork's own recompute path and the same
+kernels the forward ran: the gradients are bitwise those of a backward that
+had kept everything, and each invocation retains 80 MiB less at one
+4,096-token row.
 """
 
 
@@ -62,23 +60,17 @@ def _intermediate_meta(
     q: Tensor, v: Tensor
 ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
     """Shape and dtype of every saved intermediate, from the input geometry."""
+    del v
     batch, length, heads, key_dim = q.shape
-    value_dim = v.shape[-1]
     chunks = -(-length // CHUNK_SIZE)
     activation = q.dtype
     return (
         ((batch, length, heads, CHUNK_SIZE), activation),  # Aqk
         ((batch, length, heads, CHUNK_SIZE), activation),  # Akk
-        ((batch, length, heads, key_dim), activation),  # w
-        ((batch, length, heads, key_dim), activation),  # kg
-        ((batch, length, heads, value_dim), activation),  # v_new
-        ((batch, chunks, heads, key_dim, value_dim), activation),  # h
         ((batch, length, heads, key_dim), activation),  # k_precond
         ((batch, chunks, heads, key_dim), torch.float32),  # ac_atk
         ((batch, chunks, heads, key_dim), torch.float32),  # a_atk
         ((batch, chunks, heads), torch.float32),  # sa_atk
-        ((batch, length, heads, key_dim), activation),  # qg
-        ((batch, length, heads, key_dim), torch.float32),  # g_cum
     )
 
 
@@ -256,7 +248,8 @@ def pkda_recurrence(
     ``g`` is the raw decay projection: the log-space gate and its chunk-local
     cumulative sum happen inside the kernel, exactly as ``use_gate_in_kernel``
     does, and the backward recomputes them the same way.  The returned
-    intermediates are the ones FLA's own ``disable_recompute`` path keeps.
+    intermediates are the intra-chunk products and the preconditioner scan;
+    the backward rebuilds everything else.
 
     Every tensor input is made contiguous here and again in the backward, which
     is what FLA's ``input_guard`` does for its own entry point and what keeps
@@ -316,12 +309,12 @@ def pkda_recurrence(
         eps=squash_eps,
         log_atk_scale=log_atk_scale,
         transpose_state_layout=False,
-        output_qg=True,
+        output_qg=False,
     )
     if final_state is not None or at is not None:
         raise RuntimeError("the stateless PKDA recurrence returned a final state")
-    del u
-    saved = [Aqk, Akk, w, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg, cumulative]
+    del w, u, kg, v_new, h, qg, cumulative
+    saved = [Aqk, Akk, k_precond, ac_atk, a_atk, sa_atk]
     _check_intermediates(saved, q, v)
     return o.to(q.dtype), saved
 
@@ -375,18 +368,31 @@ def _pkda_recurrence_backward(
     squash_eps: float,
     autocast_dtype: torch.dtype | None,
 ) -> list[Tensor]:
-    """FLA's preconditioned-KDA backward over the saved intermediates.
+    """FLA's preconditioned-KDA backward over the saved products.
 
-    ``autocast_dtype`` reproduces FLA's ``custom_bwd``: its backward runs under
-    the autocast state its forward saw, which the surrounding training loop
-    leaves disabled by the time ``backward`` is called.
+    The gate cumsum is relaunched exactly as the forward launched it, and the
+    fork's recompute path rebuilds the WY representation and the chunk states
+    from the saved products and the inputs. ``autocast_dtype`` reproduces
+    FLA's ``custom_bwd``: its backward runs under the autocast state its
+    forward saw, which the surrounding training loop leaves disabled by the
+    time ``backward`` is called.
     """
-    Aqk, Akk, w, kg, v_new, h, k_precond, ac_atk, a_atk, sa_atk, qg, cumulative = saved
+    Aqk, Akk, k_precond, ac_atk, a_atk, sa_atk = saved
     q, k, v, g = q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous()
     g_atk, beta_atk, beta = (
         g_atk.contiguous(),
         beta_atk.contiguous(),
         beta.contiguous(),
+    )
+    cumulative = kda_gate_chunk_cumsum(
+        g=g,
+        A_log=A_log,
+        chunk_size=CHUNK_SIZE,
+        scale=RCP_LN2,
+        dt_bias=dt_bias,
+        cu_seqlens=None,
+        chunk_indices=None,
+        lower_bound=None,
     )
     with torch.autocast(
         "cuda",
@@ -421,18 +427,18 @@ def _pkda_recurrence_backward(
                 log_atk_scale=log_atk_scale,
                 transpose_state_layout=False,
                 safe_gate=False,
-                disable_recompute=True,
+                disable_recompute=False,
                 defer_dg_cumsum=defer_dg_cumsum,
-                w=w,
-                kg=kg,
-                v_new=v_new,
-                h=h,
+                w=None,
+                kg=None,
+                v_new=None,
+                h=None,
                 dat=None,
                 k_precond=k_precond,
                 ac_atk=ac_atk,
                 a_atk=a_atk,
                 sa_atk=sa_atk,
-                qg=qg,
+                qg=None,
             )
         )
         dg, dA_log, ddt_bias = kda_gate_bwd(

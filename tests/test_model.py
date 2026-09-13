@@ -40,6 +40,18 @@ def tokens():
     return torch.randint(0, 31, (1, 6), generator=torch.Generator().manual_seed(11))
 
 
+def test_multipass_seed_has_standard_strides():
+    """Pass 1 and the feedback passes must reach the compiled blocks through
+    one stride pattern, or Dynamo compiles pass 1 its own copy of every block
+    and the plain prefix of a later pass stops being bitwise pass 1."""
+    model = tiny()
+    outs = multipass(model, tokens(), 2, prefix_lens=torch.tensor([[2]]))
+    seed = outs[0].sources[0]
+    _, length, dim = seed.shape
+    assert seed.stride() == (length * dim, dim, 1)
+    assert outs[1].sources[0].stride() == seed.stride()
+
+
 @torch.no_grad()
 def separate_expert_selection(model):
     """Keep causal/cache comparisons away from discrete selection boundaries.

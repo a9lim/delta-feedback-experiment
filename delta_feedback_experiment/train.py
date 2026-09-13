@@ -450,7 +450,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CHECKPOINT_MARGIN_GIB,
         help="device memory kept free of retained activations when the trainer "
         "plans rows per replay and recomputed blocks for each graph "
-        "(default: 3.5); raise it if capture or the optimizer step runs out of memory",
+        "(default: 1.0); raise it if warm-up or capture runs out of memory",
     )
     return parser
 
@@ -610,11 +610,12 @@ class CapturedMicro:
     active: frozenset[torch.nn.Parameter] = frozenset()
 
 
-DEFAULT_CHECKPOINT_MARGIN_GIB = 3.5
-"""Device memory the activation budget leaves free: graph-pool rounding, the
-no-grad evaluation graphs, and the optimizer's packing temporaries. On the
-24 GiB card the retained activations can reach about 20 GiB allocated before
-the optimizer step runs out of memory."""
+DEFAULT_CHECKPOINT_MARGIN_GIB = 1.0
+"""Device memory the activation budget leaves free: the planned graphs'
+allocator rounding and the pre-capture warm-up. The optimizer step and the
+periodic monitors run inside the graphs' pool (``pool_scope``) and need none
+of it; below about 1 GiB the largest planned graph no longer fits during
+warm-up on the 24 GiB card."""
 
 PER_ROW_PASS_EXTRA_BYTES = 64 << 20
 """Per-row, per-pass activations outside the blocks: the fused entry, jitter,
@@ -809,12 +810,54 @@ class CudaGraphTrainer:
         self.zero_grad()
         torch.cuda.empty_cache()
 
-        self.pool = torch.cuda.graph_pool_handle()
+        # A MemPool object, not a bare handle: ``pool_scope`` needs the
+        # object to route eager allocations into this same private pool.
+        self.mempool = torch.cuda.MemPool()
+        self.pool = self.mempool.id
         for spec, state in self.states.items():
             state.active = frozenset(active_by_spec[spec])
             self._capture(state, self.pool)
         self.zero_grad()
         torch.cuda.synchronize()
+        if not any(
+            segment["is_expandable"] for segment in torch.cuda.memory_snapshot()
+        ):
+            raise RuntimeError(
+                "the graph pool needs the allocator's expandable segments: set "
+                "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True before the first "
+                "CUDA allocation (the package sets it on import unless overridden)"
+            )
+
+    @contextlib.contextmanager
+    def pool_scope(self):
+        """Run eager work inside the graphs' private pool.
+
+        Only work that allocates nothing the scope outlives belongs here: the
+        allocator hands out blocks the graph bodies freed, and a replay writes
+        its captured addresses without allocating, so a tensor from this scope
+        that is still alive at the next replay aliases what that replay
+        writes. No ``graph.replay()`` may run inside the scope for the same
+        reason.
+
+        The graph bodies free every activation they allocate, but a private
+        pool never returns its segments, so eager work between replays would
+        otherwise be paid for twice: once in the pool and once in the margin
+        the activation budget leaves free. The allocator keeps its free lists
+        per stream, so only allocations on the capture stream can reuse the
+        bodies' blocks, and only with expandable segments, which coalesce the
+        pool into a few segments instead of hundreds the size of one body
+        tensor; the two waits keep the eager work ordered against the replay
+        stream on both sides.
+        """
+        stream = torch.cuda.graph.default_capture_stream
+        assert stream is not None, "pool_scope runs after the first capture"
+        current = torch.cuda.current_stream()
+        stream.wait_stream(current)
+        try:
+            with torch.cuda.stream(stream), torch.cuda.use_mem_pool(self.mempool):
+                yield
+        finally:
+            current.wait_stream(stream)
 
     def _reachable_specs(self, schedule: Schedule) -> list[GraphSpec]:
         specs = set()
@@ -1100,6 +1143,13 @@ class CudaGraphTrainer:
             parameter.grad = (
                 self.grad_buffers.get(parameter) if parameter in state.active else None
             )
+        # Any per-pattern optimizer tensor must be allocated here, outside
+        # ``pool_scope``: one allocated inside would sit in memory the next
+        # replay overwrites.
+        for optimizer in self.optimizers:
+            prepare = getattr(optimizer, "prepare", None)
+            if prepare is not None:
+                prepare()
 
     def zero_grad(self) -> None:
         if self.head_accum is not None:
@@ -1788,9 +1838,11 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
     model.train()
     graph_runner = None
     eval_graph_runner = None
+    eager_scope = contextlib.nullcontext
     if device.type == "cuda":
         graph_runner = CudaGraphTrainer(model, optimizers, args, schedule)
         eval_graph_runner = CudaEvalRunner(model, args, graph_runner.pool)
+        eager_scope = graph_runner.pool_scope
         torch.cuda.reset_peak_memory_stats()
         telemetry.log(
             "execution",
@@ -1884,15 +1936,16 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     expert_counts.add_(loss_result.expert_counts)
                     expert_balance += loss_result.expert_aux_loss.item() / micros
 
-            grad_norm = clip_gradients(model.parameters())
-            for optimizer in optimizers:
-                optimizer.step()
-            model.update_expert_bias(expert_counts)
-            model.refresh_shadows()
-            if graph_runner is not None:
-                graph_runner.zero_grad()
-            else:
-                model.zero_grad(set_to_none=True)
+            with eager_scope():
+                grad_norm = clip_gradients(model.parameters())
+                for optimizer in optimizers:
+                    optimizer.step()
+                model.update_expert_bias(expert_counts)
+                model.refresh_shadows()
+                if graph_runner is not None:
+                    graph_runner.zero_grad()
+                else:
+                    model.zero_grad(set_to_none=True)
             # A pass executes ``executed_layers / cell`` cell-equivalents, so
             # cell-tokens beside pass-tokens keep matched data apart from
             # matched compute when the loop makes the column deeper.
@@ -1972,38 +2025,44 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     },
                 )
                 summary.update(scores)
-                for record in route_summary(model, data_val, args, device):
-                    telemetry.log("route", step=address, **record)
-                for record in expert_summary(model, data_val, args, device):
-                    telemetry.log("expert", step=address, **record)
-                if model.cfg.feedback:
-                    trace = iterate_fused(
-                        model, data_val.batch(0, 2, device), n_iters=8
-                    )
-                    model.train()
-                    telemetry.log(
-                        "contract",
-                        step=address,
-                        loss0=telemetry.format_metric(trace[0]["loss"]),
-                        loss8=telemetry.format_metric(trace[-1]["loss"]),
-                        upd8=telemetry.format_metric(trace[-1]["update_norm"]),
-                    )
-                if model.cfg.loop:
-                    sweep = depth_trace(model, data_val.batch(0, 2, device))
-                    model.train()
-                    by_depth = {record["iterations"]: record for record in sweep}
-                    telemetry.log(
-                        "depth",
-                        step=address,
-                        r_mean=model.cfg.loop_iterations,
-                        r_max=model.cfg.loop_max_iterations,
-                        loss_one=telemetry.format_metric(by_depth[1]["loss"]),
-                        loss_mean=telemetry.format_metric(
-                            by_depth[model.cfg.loop_iterations]["loss"]
-                        ),
-                        loss_max=telemetry.format_metric(sweep[-1]["loss"]),
-                        upd_max=telemetry.format_metric(sweep[-1]["update_norm"]),
-                    )
+                # The monitors run eagerly and allocate only transients, so
+                # they take the pool too; ``evaluate`` replays graphs and
+                # therefore stays outside.
+                with eager_scope():
+                    for record in route_summary(model, data_val, args, device):
+                        telemetry.log("route", step=address, **record)
+                    for record in expert_summary(model, data_val, args, device):
+                        telemetry.log("expert", step=address, **record)
+                    if model.cfg.feedback:
+                        trace = iterate_fused(
+                            model, data_val.batch(0, 2, device), n_iters=8
+                        )
+                        model.train()
+                        telemetry.log(
+                            "contract",
+                            step=address,
+                            loss0=telemetry.format_metric(trace[0]["loss"]),
+                            loss8=telemetry.format_metric(trace[-1]["loss"]),
+                            upd8=telemetry.format_metric(trace[-1]["update_norm"]),
+                        )
+                    if model.cfg.loop:
+                        sweep = depth_trace(model, data_val.batch(0, 2, device))
+                        model.train()
+                        by_depth = {record["iterations"]: record for record in sweep}
+                        telemetry.log(
+                            "depth",
+                            step=address,
+                            r_mean=model.cfg.loop_iterations,
+                            r_max=model.cfg.loop_max_iterations,
+                            loss_one=telemetry.format_metric(by_depth[1]["loss"]),
+                            loss_mean=telemetry.format_metric(
+                                by_depth[model.cfg.loop_iterations]["loss"]
+                            ),
+                            loss_max=telemetry.format_metric(sweep[-1]["loss"]),
+                            upd_max=telemetry.format_metric(
+                                sweep[-1]["update_norm"]
+                            ),
+                        )
 
             if step % args.snapshot_every == 0 or step in protected:
                 snapshot_writer.submit(step)

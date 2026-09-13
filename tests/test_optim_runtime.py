@@ -213,6 +213,56 @@ def test_bf16_newton_schulz_returns_fp32_and_tracks_the_fp32_direction():
     assert torch.all((ratio - 1).abs() < 0.02)
 
 
+def test_bf16_momentum_storage_keeps_the_fp32_direction():
+    """CUDA stores the momentum in BF16; the EMA is computed in FP32 and only
+    the writeback rounds, so the update follows the FP32-stored one."""
+    generator = torch.Generator().manual_seed(53)
+    shape = (3, 24, 16)
+    parameters = torch.randn(shape, generator=generator)
+    radii = parameters.norm(dim=(-2, -1))
+    momentum = torch.randn(shape, generator=generator) * 0.1
+    rest = (
+        torch.rand(3, 24, 1, generator=generator) * 0.01,
+        parameters,
+        radii,
+        torch.zeros(3, 16),
+        torch.randn(shape, generator=generator),
+        torch.tensor(0.006),
+        0.95,
+        0.95,
+        1e-8,
+        5,
+        torch.float32,
+    )
+    stored, _, exact, _ = _normuonh_batch(momentum, *rest)
+    reduced_momentum, _, reduced, _ = _normuonh_batch(momentum.to(torch.bfloat16), *rest)
+
+    assert stored.dtype == torch.float32
+    assert reduced_momentum.dtype == torch.bfloat16
+    torch.testing.assert_close(reduced_momentum.float(), stored, rtol=1e-2, atol=1e-3)
+    exact_step = (exact - parameters).flatten(1)
+    reduced_step = (reduced - parameters).flatten(1)
+    cosine = torch.nn.functional.cosine_similarity(exact_step, reduced_step, dim=-1)
+    assert torch.all(cosine > 0.99)
+
+
+def test_prepare_caches_the_row_indices_a_step_will_gather():
+    """A partially reached bucket's index tensor must exist before the step so
+    that a step run inside a CUDA graph pool never allocates it there."""
+    model = tiny_optimizer_model()
+    normuonh, _ = build_optimizers(model)
+    for parameter in model.parameters():
+        parameter.grad = torch.zeros_like(parameter)
+    bucket = next(bucket for bucket in normuonh._buckets if len(bucket.params) > 1)
+    bucket.params[0].grad = None
+    normuonh.prepare()
+    present = tuple(
+        row for row, parameter in enumerate(bucket.params) if parameter.grad is not None
+    )
+    assert present in bucket.indices
+    assert bucket.indices[present].tolist() == list(present)
+
+
 def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
     model = tiny_optimizer_model()
     frozen = {
