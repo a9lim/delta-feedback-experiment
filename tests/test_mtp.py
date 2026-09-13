@@ -1,5 +1,6 @@
 """Numerical and causal contracts for the teacher-forced second-token head."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -41,9 +42,32 @@ def tokens(length=8):
     return torch.randint(0, GEOMETRY["vocab_size"], (2, length), generator=generator)
 
 
-def passes(model, toks, count):
+def passes(model, toks, count, *, jitter=None):
     prefixes = torch.full((count - 1, toks.shape[0]), 2, dtype=torch.long)
-    return multipass(model, toks, count, prefix_lens=prefixes)
+    return multipass(model, toks, count, prefix_lens=prefixes, jitter=jitter)
+
+
+def jitter_for(model, toks, count):
+    generator = torch.Generator().manual_seed(37)
+    return torch.empty(count, *toks.shape, model.cfg.dim).uniform_(
+        -0.2, 0.2, generator=generator
+    )
+
+
+def explicit_fusion(model, payload, embedding):
+    """Independent FBT equation, without the prepared gate or fusion helpers."""
+    normalized = embedding * torch.rsqrt(
+        embedding.square().mean(-1, keepdim=True) + model.cfg.norm_eps
+    )
+    gate = F.linear(
+        normalized * model.gate_norm.weight, model.fuse_gate.weight
+    ).sigmoid()
+    product = F.linear(payload, model.fuse_value.weight) * gate
+    return (
+        product
+        * torch.rsqrt(product.square().mean(-1, keepdim=True) + model.cfg.norm_eps)
+        * model.entry_norm.weight
+    )
 
 
 def explicit_head_rows(model, hidden, targets):
@@ -96,12 +120,13 @@ def test_second_token_prediction_cannot_see_its_target():
         changed[:, edited_position] + 7
     ) % model.cfg.vocab_size
     count = 2
-    original_out = passes(model, original, count)
-    changed_out = passes(model, changed, count)
+    jitter = jitter_for(model, original, count)
+    original_out = passes(model, original, count, jitter=jitter)
+    changed_out = passes(model, changed, count, jitter=jitter)
 
     for before, after in zip(original_out, changed_out, strict=True):
-        original_hidden = model.forward_mtp(before.payload, original[:, 1:]).hidden
-        changed_hidden = model.forward_mtp(after.payload, changed[:, 1:]).hidden
+        original_hidden = model.forward_mtp_fused(before.fused_input).hidden
+        changed_hidden = model.forward_mtp_fused(after.fused_input).hidden
         # Auxiliary index t-2 predicts x[t]; neither x[t] nor later tokens may
         # influence it, even through an earlier feedback pass.
         torch.testing.assert_close(
@@ -132,6 +157,7 @@ def test_next_token_conditioning_and_payload_are_differentiable():
     assert not any(
         isinstance(module, torch.nn.Embedding) for module in model.mtp.modules()
     )
+    assert set(model.mtp._modules) == {"block"}
 
 
 @torch.no_grad()
@@ -145,14 +171,14 @@ def test_the_padded_auxiliary_row_leaves_the_supervised_rows_unchanged():
     torch.testing.assert_close(full[:, :-1], cropped, atol=2e-6, rtol=1e-5)
 
 
-def test_mtp_trains_the_payload_writer_on_every_supervised_pass():
-    count = 2
-    model = tiny("fl")
+@pytest.mark.parametrize("condition, count", [("f", 1), ("l", 1), ("fl", 2)])
+def test_mtp_trains_shared_fusion_and_payload_on_every_pass(condition, count):
+    model = tiny(condition)
     toks = tokens(length=5)
-    outs = passes(model, toks, count)
+    outs = passes(model, toks, count, jitter=jitter_for(model, toks, count))
     for out in outs:
         assert out.payload is not None
-        auxiliary = model.forward_mtp(out.payload, toks[:, 1:])
+        auxiliary = model.forward_mtp_fused(out.fused_input)
         loss, _ = explicit_mtp_losses(model, auxiliary.hidden, toks)
         gradients = torch.autograd.grad(
             loss,
@@ -161,6 +187,10 @@ def test_mtp_trains_the_payload_writer_on_every_supervised_pass():
                 model.payload_router.query,
                 model.payload_norm.weight,
                 model.blocks[0].attn.q_proj.weight,
+                model.fuse_value.weight,
+                model.fuse_gate.weight,
+                model.gate_norm.weight,
+                model.entry_norm.weight,
             ),
             retain_graph=True,
         )
@@ -189,33 +219,65 @@ def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
         )
 
 
-def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
+def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
+    """Independent consumers recompute the jittered FBT equation; sharing that
+    input and the token-only gate must preserve both objectives' derivatives."""
     count, z_coef, coefficient = 3, 0.017, 0.23
-    model = tiny("fl")
+    model, reference = tiny("fl"), tiny("fl")
+    for candidate in (model, reference):
+        for bank in candidate.expert_banks:
+            bank.expert_bias[-bank.experts_per_token :] = 2
     toks = tokens(length=6)
-    outs = passes(model, toks, count)
+    jitter = jitter_for(model, toks, count)
+    prefixes = torch.tensor([[1, 3], [4, 2]])
+    outs = multipass(model, toks, count, prefix_lens=prefixes, jitter=jitter)
     actual = multipass_loss(model, toks, outs, mtp_weight=coefficient, z_coef=z_coef)
     assert len(actual.ntp) == count and len(actual.mtp) == count
+
+    # Feedback and MTP deliberately perform their own embedding lookups and
+    # fusion. They share parameters, but have no shared prepared tensor.
+    e = reference.embed_tokens(toks[:, :-1])
+    reference_outs = [reference.forward_column(e)]
+    length = e.shape[1]
+    for index in range(count - 1):
+        payload = reference_outs[-1].payload + jitter[index, :, :length]
+        shifted = torch.cat((torch.zeros_like(payload[:, :1]), payload[:, :-1]), 1)
+        fused = explicit_fusion(reference, shifted, e)
+        plain = torch.arange(length)[None, :] < prefixes[index, :, None]
+        reference_outs.append(
+            reference.forward_column(torch.where(plain[..., None], e, fused))
+        )
+
     ntp, mtp, ntp_z, mtp_z = [], [], [], []
     expert_aux, expert_counts = [], []
-    for index, out in enumerate(outs):
-        ce, z = explicit_head_losses(model, out.h_top, toks[:, 1:])
-        auxiliary = model.forward_mtp(out.payload, toks[:, 1:], want_weights=True)
-        second_ce, second_z = explicit_mtp_losses(model, auxiliary.hidden, toks)
-        invocations = model.cfg.executed_layers(out.iterations)
+    for index, (out, expected_out) in enumerate(zip(outs, reference_outs, strict=True)):
+        torch.testing.assert_close(out.h_top, expected_out.h_top)
+        torch.testing.assert_close(out.payload, expected_out.payload)
+        ce, z = explicit_head_losses(reference, expected_out.h_top, toks[:, 1:])
+        fused = explicit_fusion(
+            reference,
+            expected_out.payload + jitter[index, :, :length],
+            reference.embed_tokens(toks[:, 1:]),
+        )
+        torch.testing.assert_close(out.fused_input, fused)
+        hidden, _, _, _, aux, weights, counts = reference.mtp.block(
+            fused, None, None, None, True
+        )
+        second_ce, second_z = explicit_mtp_losses(reference, hidden, toks)
+        invocations = reference.cfg.executed_layers(expected_out.iterations)
         expert_aux.append(
-            (out.expert_aux_loss * invocations + auxiliary.expert_aux_loss)
+            (expected_out.expert_aux_loss * invocations + aux)
             / (invocations + 1)
         )
         # Check dispatch accounting against actual selected expert weights,
         # independently of the loss implementation's count aggregation.
-        selected_counts = auxiliary.expert_weights.count_nonzero(dim=(0, 1))
-        torch.testing.assert_close(auxiliary.expert_counts, selected_counts)
-        assert auxiliary.expert_counts.sum() == (
+        selected_counts = weights.count_nonzero(dim=(0, 1))
+        torch.testing.assert_close(counts, selected_counts)
+        assert counts.sum() == (
             toks.shape[0] * (toks.shape[1] - 1) * model.cfg.experts_per_token
         )
         expert_counts.append(
-            torch.cat((out.expert_counts, selected_counts.unsqueeze(0)))
+            torch.cat((expected_out.expert_counts, selected_counts.unsqueeze(0)))
         )
         ntp.append(ce)
         ntp_z.append(z)
@@ -236,3 +298,55 @@ def test_mtp_loss_matches_materialized_logits_and_feedback_weighting():
         model.cfg.num_routed_experts,
     )
     torch.testing.assert_close(actual.expert_counts, torch.stack(expert_counts).sum(0))
+    actual.total.backward()
+    expected.backward()
+    for (name, parameter), (_, expected_parameter) in zip(
+        model.named_parameters(), reference.named_parameters(), strict=True
+    ):
+        assert (parameter.grad is None) == (expected_parameter.grad is None), name
+        if parameter.grad is not None:
+            # Reusing the gate and fusion changes FP32 gradient summation
+            # order. Bound both aggregate drift and individual coordinates
+            # against the tensor's scale, including near-zero coordinates.
+            error = parameter.grad - expected_parameter.grad
+            scale = expected_parameter.grad.square().mean().sqrt()
+            assert error.square().mean().sqrt() < 1e-6 + 1e-5 * scale, name
+            assert error.abs().max() < 1e-6 + 5e-5 * scale, name
+
+
+def test_training_reuses_one_lookup_one_token_gate_and_one_fusion_per_pass(monkeypatch):
+    import delta_feedback_experiment.model as implementation
+
+    model = tiny()
+    toks, count = tokens(length=5), 3
+    calls = {"embedding": 0, "gate": 0, "value": 0}
+    auxiliary_inputs = []
+    sink_linear = implementation.sink_linear
+
+    def count_linear(x, weights, *args, **kwargs):
+        if weights[0] is model.fuse_gate.weight:
+            calls["gate"] += 1
+        if weights[0] is model.fuse_value.weight:
+            calls["value"] += 1
+        return sink_linear(x, weights, *args, **kwargs)
+
+    def count_embedding(module, args, result):
+        calls["embedding"] += 1
+
+    monkeypatch.setattr(implementation, "sink_linear", count_linear)
+    embedding_hook = model.embed_tokens.register_forward_hook(count_embedding)
+    mtp_hook = model.mtp.register_forward_pre_hook(
+        lambda module, args: auxiliary_inputs.append(args[0])
+    )
+    try:
+        outs = passes(model, toks, count, jitter=jitter_for(model, toks, count))
+        multipass_loss(model, toks, outs)
+    finally:
+        embedding_hook.remove()
+        mtp_hook.remove()
+    assert calls == {"embedding": 1, "gate": 1, "value": count}
+    assert len(auxiliary_inputs) == count
+    assert all(
+        auxiliary is out.fused_input
+        for auxiliary, out in zip(auxiliary_inputs, outs, strict=True)
+    )

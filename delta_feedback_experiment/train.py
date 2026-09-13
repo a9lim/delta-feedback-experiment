@@ -57,7 +57,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=34, resumable=frozenset({34}), surface_version=34
+    version=35, resumable=frozenset({35}), surface_version=35
 )
 
 
@@ -369,7 +369,10 @@ def build_parser() -> argparse.ArgumentParser:
             "NAdam matrices run at this times 1536/dim (default: 0.0003)"
         ),
     )
-    recipe.add_argument("--jitter", type=float, default=0.02)
+    recipe.add_argument(
+        "--jitter", type=float, default=0.02,
+        help="payload jitter shared by MTP and feedback on every training pass",
+    )
     recipe.add_argument("--zloss", type=float, default=1e-5)
     recipe.add_argument(
         "--mtp-weight", type=nonnegative_finite, default=MTP_LOSS_WEIGHT,
@@ -554,7 +557,7 @@ def micro_draws(
     jitter_out: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """(prefix_lens [k-1, n], jitter [k-1, n, seq_len+1, dim]) for one
+    """(prefix_lens [k-1, n], jitter [k, n, seq_len+1, dim]) for one
     microbatch, keyed by (data seed, step, first global row) — identical
     across conditions for any run sharing the batch geometry."""
     if generator is None:
@@ -567,7 +570,7 @@ def micro_draws(
     # Plain-prefix lengths in 1..seq_len-1: position 0 is always plain and
     # every row keeps at least one fused position.
     torch.randint(1, args.seq_len, shape, generator=generator, out=prefix_out)
-    jitter_shape = (n_passes - 1, n_rows, columns, dim)
+    jitter_shape = (n_passes, n_rows, columns, dim)
     if jitter_out is None:
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         jitter_out = torch.empty(jitter_shape, dtype=dtype, device=device)
@@ -598,8 +601,8 @@ class CapturedMicro:
     spec: GraphSpec
     plan: ReplayPlan
     rows: torch.Tensor
-    prefix: torch.Tensor | None
-    jitter: torch.Tensor | None
+    prefix: torch.Tensor
+    jitter: torch.Tensor
     z_coef: torch.Tensor
     loss_sum: torch.Tensor
     pass1_sum: torch.Tensor
@@ -921,23 +924,21 @@ class CudaGraphTrainer:
 
     def _inputs(
         self, spec: GraphSpec, rows: int
-    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         tokens = torch.zeros(
             rows, self.args.seq_len + 1, dtype=torch.long, device=self.device
         )
-        prefix = jitter = None
-        if spec.n_passes > 1:
-            prefix = torch.ones(
-                spec.n_passes - 1, rows, dtype=torch.long, device=self.device
-            )
-            jitter = torch.zeros(
-                spec.n_passes - 1,
-                rows,
-                self.args.seq_len + 1,
-                self.args.dim,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
+        prefix = torch.ones(
+            spec.n_passes - 1, rows, dtype=torch.long, device=self.device
+        )
+        jitter = torch.zeros(
+            spec.n_passes,
+            rows,
+            self.args.seq_len + 1,
+            self.args.dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
         return tokens, prefix, jitter
 
     def _retained(self, spec: GraphSpec, checkpoint_blocks: int) -> int:
@@ -1155,19 +1156,18 @@ class CudaGraphTrainer:
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
         state.rows.copy_(rows, non_blocking=rows.is_cuda)
-        if state.spec.n_passes > 1:
-            micro_draws(
-                self.args,
-                step,
-                first,
-                state.spec.n_passes,
-                self.args.micro_rows,
-                self.args.dim,
-                self.device,
-                prefix_out=state.prefix,
-                jitter_out=state.jitter,
-                generator=self.generator,
-            )
+        micro_draws(
+            self.args,
+            step,
+            first,
+            state.spec.n_passes,
+            state.plan.rows_per_replay,
+            self.args.dim,
+            self.device,
+            prefix_out=state.prefix,
+            jitter_out=state.jitter,
+            generator=self.generator,
+        )
         state.graph.replay()
         calls = self._head_calls(state)
         if self.head_accum is not None and calls <= self.head_flush_every:
@@ -1451,7 +1451,7 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
         ):
             outs = multipass(model, rows, 1, want_weights=True)
             # The training geometry: every payload row, next tokens 1..T.
-            mtp = model.forward_mtp(outs[0].payload, rows[:, 1:], want_weights=True)
+            mtp = model.forward_mtp_fused(outs[0].fused_input, want_weights=True)
         records = []
         weights_by_site = outs[0].expert_weights | {"mtp.experts": mtp.expert_weights}
         for site, weights in weights_by_site.items():
@@ -1950,17 +1950,15 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
                     rows = data_train.batch(first_row, args.micro_rows, device)
-                    prefix = jitter = None
-                    if n_passes > 1:
-                        prefix, jitter = micro_draws(
-                            args,
-                            step,
-                            first_row,
-                            n_passes,
-                            rows.shape[0],
-                            args.dim,
-                            device,
-                        )
+                    prefix, jitter = micro_draws(
+                        args,
+                        step,
+                        first_row,
+                        n_passes,
+                        rows.shape[0],
+                        args.dim,
+                        device,
+                    )
                     with autocast:
                         outs = multipass(
                             model,

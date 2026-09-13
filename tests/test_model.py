@@ -67,6 +67,9 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     states = [tiny(condition, layers=16).state_dict() for condition in ("f", "l", "fl")]
     common = states[0].keys() & states[1].keys() & states[2].keys()
     assert "payload_router.query" in common and "payload_norm.weight" in common
+    assert {
+        "fuse_value.weight", "fuse_gate.weight", "gate_norm.weight", "entry_norm.weight"
+    } <= common
     assert any(name.startswith("mtp.block.attn.") for name in common)
     assert any(name.startswith("mtp.block.mlp.experts.") for name in common)
     for name in common:

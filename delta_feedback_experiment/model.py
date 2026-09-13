@@ -769,7 +769,7 @@ class MTPOutput:
 
 
 class MultiTokenPrediction(nn.Module):
-    """One sequential prediction depth; embedding and readout belong to the model.
+    """One auxiliary layer over the model's shared FBT-fused inputs.
 
     Position t consumes the payload at t and the embedding of token t+1.
     Its own causal PKDA recurrence over those pairs cannot see target t+2.
@@ -780,25 +780,13 @@ class MultiTokenPrediction(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.embedding_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.projection = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
-        self.projection_sink: Tensor | None = None
-        self.projection_shadow: Tensor | None = None
         self.block = Block(cfg, 0, auxiliary=True)
 
     def forward(
-        self, payload: Tensor, next_embedding: Tensor, want_weights: bool = False
+        self, fused_input: Tensor, want_weights: bool = False
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
-        joined = torch.cat(
-            (self.payload_norm(payload), self.embedding_norm(next_embedding)), dim=-1
-        )
-        x = sink_linear(
-            joined, (self.projection.weight,), (self.projection_sink,),
-            self.projection_shadow,
-        )
         h, _, _, _, aux, weights, counts = self.block(
-            x, None, None, None, want_weights
+            fused_input, None, None, None, want_weights
         )
         return h, aux, counts, weights
 
@@ -824,9 +812,9 @@ def _activation_budget():
     return contextlib.nullcontext()
 
 
-def _mtp_forward(module, payload, next_embedding, want_weights):
+def _mtp_forward(module, fused_input, want_weights):
     with _activation_budget():
-        return module(payload, next_embedding, want_weights)
+        return module(fused_input, want_weights)
 
 
 _compiled_mtp = torch.compile(
@@ -948,10 +936,10 @@ class ColumnOutput:
     expert_counts: Tensor
     """Assignment counts [physical layers, routed experts], summed over core uses."""
 
-    next_embedding: Tensor | None = None
-    """[B, T, D] embeddings of the stored row's positions 1..T: the auxiliary
-    head's next-token input, taken from the same lookup as the column seed.
-    ``multipass`` attaches it to every pass; a bare column leaves it None."""
+    fused_input: Tensor | None = None
+    """[B,T,D] shared fusion of this pass's jittered payload and next tokens.
+    MTP reads it directly; the next feedback pass shifts it right and restores
+    its plain prefix. ``multipass`` attaches it; a bare column leaves it None."""
 
 
 class DeltaModel(nn.Module):
@@ -969,7 +957,7 @@ class DeltaModel(nn.Module):
         self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_router = Router(cfg)
         # Capture the exact common-trunk initialization boundary before
-        # constructing the attention gates and the letter-private matrices,
+        # constructing the attention and shared fusion matrices,
         # which draw from their own streams. Restoring it below keeps every
         # shared parameter byte-identical across conditions.
         common_init_state = torch.random.get_rng_state()
@@ -982,11 +970,10 @@ class DeltaModel(nn.Module):
         self.fuse_value_shadow: Tensor | None = None
         self.fuse_gate_shadow: Tensor | None = None
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
-        if cfg.feedback:
-            self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
-            self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
-            self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-            self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.fuse_value = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.fuse_gate = nn.Linear(cfg.dim, cfg.dim, bias=False)
+        self.gate_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.entry_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.checkpoint_blocks = 0
         """Runtime switch: how many PKDA and auxiliary block invocations of
         each logical forward, in execution order, recompute in backward
@@ -1008,11 +995,10 @@ class DeltaModel(nn.Module):
         self._init_factor_linears(
             self.attention_gates, factor_seed ^ 0x4152434849544543
         )
-        if cfg.feedback:
-            self._init_factor_linears(
-                (self.fuse_value, self.fuse_gate),
-                factor_seed ^ 0x524543555252454E,
-            )
+        self._init_factor_linears(
+            (self.fuse_value, self.fuse_gate),
+            factor_seed ^ 0x524543555252454E,
+        )
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(
                 (factor_seed ^ 0x4D54505F44455054) % ((1 << 63) - 1)
@@ -1034,7 +1020,7 @@ class DeltaModel(nn.Module):
     def _init_factor_linears(linears: Iterable[nn.Linear], seed: int) -> None:
         """Initialize one module family from its own seed-stable random stream.
 
-        The attention gates and the letter-private FBT matrices never advance
+        The attention gates and the shared FBT matrices never advance
         the common trunk stream, so a module initializes identically in every
         condition that has it. Models are constructed on CPU (or meta for
         accounting) before moving to an execution device, so one local CPU
@@ -1066,7 +1052,11 @@ class DeltaModel(nn.Module):
 
     def fuse(self, payload: Tensor, e: Tensor) -> Tensor:
         """FBT entry: u = rmsnorm(W_U p ⊙ σ(W_G rmsnorm(e))) (Appendix C)."""
-        gate = torch.sigmoid(
+        return self.fuse_gated(payload, self.token_gate(e))
+
+    def token_gate(self, e: Tensor) -> Tensor:
+        """Token-only fusion component, shared across all supervised passes."""
+        return torch.sigmoid(
             sink_linear(
                 self.gate_norm(e),
                 (self.fuse_gate.weight,),
@@ -1074,6 +1064,9 @@ class DeltaModel(nn.Module):
                 self.fuse_gate_shadow,
             )
         )
+
+    def fuse_gated(self, payload: Tensor, gate: Tensor) -> Tensor:
+        """Fuse a payload with an already computed token gate."""
         value = sink_linear(
             payload,
             (self.fuse_value.weight,),
@@ -1088,34 +1081,29 @@ class DeltaModel(nn.Module):
         """Predict from payloads and supplied next tokens, returning expert stats."""
         if next_tokens.shape != payload.shape[:2]:
             raise ValueError("MTP needs next tokens aligned with the payloads")
-        return self.forward_mtp_embedded(
-            payload, self.embed_tokens(next_tokens), want_weights=want_weights
+        return self.forward_mtp_fused(
+            self.fuse(payload, self.embed_tokens(next_tokens)), want_weights=want_weights
         )
 
-    def forward_mtp_embedded(
-        self, payload: Tensor, embedding: Tensor, *, want_weights: bool = False
+    def forward_mtp_fused(
+        self, fused_input: Tensor, *, want_weights: bool = False
     ) -> MTPOutput:
-        """The same prediction from already-looked-up next-token embeddings.
-
-        The training objective embeds the whole stored row once and hands both
-        heads their slice of it, so the auxiliary head costs no second lookup
-        and no second scatter into the embedding gradient.
-        """
+        """Run the independent auxiliary layer on the shared fused input."""
         if (
-            payload.ndim != 3
-            or embedding.shape[:2] != payload.shape[:2]
-            or not payload.shape[1]
+            fused_input.ndim != 3
+            or fused_input.shape[-1] != self.cfg.dim
+            or not fused_input.shape[1]
         ):
-            raise ValueError("MTP needs aligned nonempty payloads and embeddings")
-        fn = _compiled_mtp if payload.is_cuda else _mtp_forward
+            raise ValueError("MTP needs nonempty fused inputs of shape [B,T,D]")
+        fn = _compiled_mtp if fused_input.is_cuda else _mtp_forward
         if self._checkpoint_left > 0 and self.training and torch.is_grad_enabled():
             self._checkpoint_left -= 1
             result = torch.utils.checkpoint.checkpoint(
-                fn, self.mtp, payload, embedding, want_weights,
+                fn, self.mtp, fused_input, want_weights,
                 use_reentrant=False, preserve_rng_state=False,
             )
         else:
-            result = fn(self.mtp, payload, embedding, want_weights)
+            result = fn(self.mtp, fused_input, want_weights)
         return MTPOutput(*result)
 
     @property
@@ -1334,17 +1322,12 @@ class DeltaModel(nn.Module):
                 attn.o_sink = sink(attn.o_proj.weight)
                 attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight, gate)
                 attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-        if self.cfg.feedback:
-            self.fuse_value_sink = sink(self.fuse_value.weight)
-            self.fuse_gate_sink = sink(self.fuse_gate.weight)
-            self.fuse_value_shadow = shadow(
-                self.fuse_value_shadow, self.fuse_value.weight
-            )
-            self.fuse_gate_shadow = shadow(self.fuse_gate_shadow, self.fuse_gate.weight)
-        self.mtp.projection_sink = sink(self.mtp.projection.weight)
-        self.mtp.projection_shadow = shadow(
-            self.mtp.projection_shadow, self.mtp.projection.weight
+        self.fuse_value_sink = sink(self.fuse_value.weight)
+        self.fuse_gate_sink = sink(self.fuse_gate.weight)
+        self.fuse_value_shadow = shadow(
+            self.fuse_value_shadow, self.fuse_value.weight
         )
+        self.fuse_gate_shadow = shadow(self.fuse_gate_shadow, self.fuse_gate.weight)
         self._shadow_refresh = refresh
         return bound
 
@@ -1795,33 +1778,40 @@ def shift_right(x: Tensor) -> Tensor:
     return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
 
 
-def _entry_body(model, payload, e, positions, prefix):
-    plain = positions[None, :] < prefix[:, None]  # [B, T]
-    fused = model.fuse(shift_right(payload), e)
-    return torch.where(plain[..., None], e, fused)
+def _token_gate(model, embedding):
+    return model.token_gate(embedding)
 
 
-# The jittered and plain entries compile through their own code objects: the
-# draw is present on training passes and absent on evaluation and monitor
-# passes, and one code object per call shape keeps Dynamo from re-guarding.
-def _feedback_entry(model, payload, e, positions, prefix):
-    """The next pass's column input: plain prefix, FBT-fused suffix."""
-    return _entry_body(model, payload, e, positions, prefix)
+def _fused_input(model, payload, gate):
+    return model.fuse_gated(payload, gate)
 
 
-def _jittered_feedback_entry(model, payload, jitter, e, positions, prefix):
-    """The same entry with this pass's keyed payload jitter added first."""
-    return _entry_body(model, payload + jitter, e, positions, prefix)
+def _jittered_fused_input(model, payload, jitter, gate):
+    return model.fuse_gated(payload + jitter, gate)
+
+
+def _feedback_entry(fused_input, e, positions, prefix):
+    """Reuse the preceding pass's fused input, restoring this pass's prefix."""
+    plain = positions[None, :] < prefix[:, None]
+    return torch.where(plain[..., None], e, shift_right(fused_input))
+
+
+_compiled_token_gate = torch.compile(
+    _token_gate, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+_compiled_fused_input = torch.compile(
+    _fused_input, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
+
+_compiled_jittered_fused_input = torch.compile(
+    _jittered_fused_input, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
 
 
 _compiled_feedback_entry = torch.compile(
     _feedback_entry, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
 )
-
-_compiled_jittered_entry = torch.compile(
-    _jittered_feedback_entry, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
-)
-
 
 def multipass(
     model: DeltaModel,
@@ -1837,20 +1827,27 @@ def multipass(
 
     tokens [B, T+1] is one stored row: the model executes its first T
     positions, which are exactly the positions that predict tokens 1..T.
-    The final stored token is only ever a target; computing a column for
-    it would be causally dead work.  prefix_lens [n_passes-1, B] holds
+    The final stored token is a main-head target and MTP input, but needs no
+    trunk column.  prefix_lens [n_passes-1, B] holds
     values in 1..T-1 (the plain-embedding prefix per feedback pass; position
-    0 is always plain and position T-1 is always fused); jitter [n_passes-1, B, T+1, D] is drawn at the
+    0 is always plain and position T-1 is always fused); jitter [n_passes, B, T+1, D] is drawn at the
     stored-row width and its first T columns are added to the carried
-    payload before shifting, so the keyed draw is independent of how many
-    positions execute.  Both are pre-drawn by the caller — the shared
+    payload before fusion, including the final/single pass's MTP input.
+    The next trunk pass reuses that fusion after shifting and prefix selection.
+    Both are pre-drawn by the caller — the shared
     randomness contract lives in the trainer, not here.  Conditions
     without ``f`` simply take n_passes=1.  ``iterations`` is the step's core
     iteration count under ``l``, shared by every pass.
     """
     cfg = model.cfg
+    if n_passes < 1:
+        raise ValueError("multipass needs at least one pass")
     if n_passes > 1 and not cfg.feedback:
         raise ValueError("multi-pass batches require a condition with f")
+    if jitter is not None and jitter.shape != (
+        n_passes, *tokens.shape, cfg.dim
+    ):
+        raise ValueError("jitter must have shape [passes,B,T+1,D]")
     # One logical forward: its trunk passes here and the auxiliary blocks in
     # ``multipass_loss`` share this recomputation budget in execution order.
     model._checkpoint_left = model.checkpoint_blocks
@@ -1863,38 +1860,22 @@ def multipass(
     # strides: a seed left as a view of the T+1 row (which ``contiguous`` is,
     # a size-one batch never breaking contiguity) gives pass 1 its own compiled
     # copy of every block, rounding differently from the passes whose entry is
-    # a fresh tensor. The auxiliary input stays a view, normalized and
-    # concatenated inside the compiled auxiliary block.
+    # a fresh tensor. The token gate reads the shifted embedding view once;
+    # each pass produces one fresh fusion shared by its two consumers.
     e_all = model.embed_tokens(tokens)
     e = e_all[:, :-1].clone(memory_format=torch.contiguous_format)
-    next_embedding = e_all[:, 1:]
-    out = model.forward_column(
-        e,
-        want_weights=want_weights,
-        need_payload=True,
-        iterations=iterations,
-    )
-    out.next_embedding = next_embedding
-    outs = [out]
-    if n_passes == 1:
-        return outs
-
     length = e.shape[1]
     positions = torch.arange(length, device=tokens.device)
     compiled = e.is_cuda
-    for i in range(n_passes - 1):
-        if jitter is None:
-            entry = _compiled_feedback_entry if compiled else _feedback_entry
-            x = entry(model, outs[-1].payload, e, positions, prefix_lens[i])
-        else:
-            entry = _compiled_jittered_entry if compiled else _jittered_feedback_entry
+    gate_fn = _compiled_token_gate if compiled else _token_gate
+    gate = gate_fn(model, e_all[:, 1:])
+    entry = _compiled_feedback_entry if compiled else _feedback_entry
+    outs = []
+    x = e
+    for i in range(n_passes):
+        if i:
             x = entry(
-                model,
-                outs[-1].payload,
-                jitter[i][:, :length],
-                e,
-                positions,
-                prefix_lens[i],
+                outs[-1].fused_input, e, positions, prefix_lens[i - 1]
             )
         out = model.forward_column(
             x,
@@ -1902,7 +1883,12 @@ def multipass(
             need_payload=True,
             iterations=iterations,
         )
-        out.next_embedding = next_embedding
+        if jitter is None:
+            fusion = _compiled_fused_input if compiled else _fused_input
+            out.fused_input = fusion(model, out.payload, gate)
+        else:
+            fusion = _compiled_jittered_fused_input if compiled else _jittered_fused_input
+            out.fused_input = fusion(model, out.payload, jitter[i][:, :length], gate)
         outs.append(out)
     return outs
 
@@ -2171,9 +2157,9 @@ def multipass_loss(
     for out in outs:
         if out.payload is None:
             raise ValueError("MTP loss needs a payload from every model pass")
-        if out.next_embedding is None:
-            raise ValueError("MTP loss needs the row's next-token embeddings")
-        mtp = model.forward_mtp_embedded(out.payload, out.next_embedding)
+        if out.fused_input is None:
+            raise ValueError("MTP loss needs the pass's shared fused input")
+        mtp = model.forward_mtp_fused(out.fused_input)
         nll, lse = head_row_losses(
             model, (out.h_top, mtp.hidden), (targets, mtp_targets)
         )

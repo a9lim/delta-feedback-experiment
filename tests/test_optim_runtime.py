@@ -276,7 +276,7 @@ def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
         parameter.requires_grad_(False)
 
     # Derive ownership from physical modules, independently of name predicates.
-    ordinary = {model.fuse_value.weight, model.mtp.projection.weight}
+    ordinary = {model.fuse_value.weight}
     width = {model.fuse_gate.weight}
     width.update(gate.weight for gate in model.attention_gates)
     expert_in, expert_out = set(), set()

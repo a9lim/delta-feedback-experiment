@@ -5,8 +5,10 @@ grown for interpretability and monitoring experiments.
 
 The model uses four-layer `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, Multi-Head
 Delta Block (MHDB) routing over the seed and cell deltas, and shared plus
-selected routed SwiGLU experts. An auxiliary PKDA/expert block trains each
-column's payload to predict a second token.
+selected routed SwiGLU experts. Each column's payload and next-token embedding
+pass through one shared FBT gate; its output feeds an independent auxiliary
+PKDA/expert block and, under feedback, the next column. The auxiliary block
+trains the payload to predict a second token.
 
 | Condition | Computation |
 |---|---|

@@ -22,6 +22,7 @@ from delta_feedback_experiment.train import (
     clip_gradients,
     draw_iterations,
     draw_passes,
+    micro_draws,
     mix,
     model_fields,
     parse_run_args,
@@ -143,8 +144,8 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         768,
         3,
         15,
-        640044168,
-        210357384,
+        638862984,
+        209176200,
     )
     from delta_feedback_experiment.cli import stream_target
     from delta_feedback_experiment.data import (
@@ -186,7 +187,9 @@ def test_preset_accounting_counts_shared_and_selected_experts():
     assert reference_active(args) == active
     assert args.steps * BATCH_TOKENS >= 25 * active
     assert (args.steps - 1) * BATCH_TOKENS < 25 * active
-    assert CANONICAL_TARGET_TOKENS == stream_target(scale, 400, CANONICAL_VAL_TOKENS)
+    # The canonical corpus identity stays fixed when parameter accounting
+    # shrinks; it still covers the current 400-token-per-parameter schedule.
+    assert CANONICAL_TARGET_TOKENS >= stream_target(scale, 400, CANONICAL_VAL_TOKENS)
 
 
 def test_keyed_schedule_draws_are_reproducible():
@@ -204,6 +207,31 @@ def test_keyed_schedule_draws_are_reproducible():
         passes = draw_passes(args, step, args.steps)
         assert passes == draw_passes(args, step, args.steps)
         assert 1 <= passes <= 3
+
+
+def test_keyed_jitter_covers_single_and_final_passes_and_replay_buffers():
+    args = parse_run_args(["draws", "--steps", "3", "--seq-len", "4"])
+    device = torch.device("cpu")
+    for count in (1, 3):
+        prefix, jitter = micro_draws(args, 2, 0, count, 2, 16, device)
+        assert prefix.shape == (count - 1, 2)
+        assert jitter.shape == (count, 2, args.seq_len + 1, 16)
+        assert torch.all((prefix >= 1) & (prefix < args.seq_len))
+        assert torch.all(jitter.abs() <= args.jitter)
+        assert all(draw.count_nonzero() for draw in jitter)
+        destination_prefix, destination_jitter = (
+            torch.empty_like(prefix), torch.empty_like(jitter)
+        )
+        repeated = micro_draws(
+            args, 2, 0, count, 2, 16, device,
+            prefix_out=destination_prefix, jitter_out=destination_jitter,
+            generator=torch.Generator(),
+        )
+        assert repeated[0] is destination_prefix and repeated[1] is destination_jitter
+        torch.testing.assert_close(repeated[0], prefix, atol=0, rtol=0)
+        torch.testing.assert_close(repeated[1], jitter, atol=0, rtol=0)
+        _, changed = micro_draws(args, 2, 2, count, 2, 16, device)
+        assert not torch.equal(jitter, changed)
 
 
 def assert_identical(left, right):

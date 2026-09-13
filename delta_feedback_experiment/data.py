@@ -69,8 +69,8 @@ DOC_DTYPE = np.dtype([("start", "<i8"), ("source", "<i8")])
 """One sidecar record: split-local start offset and universe address."""
 
 CANONICAL_TARGET_TOKENS = 85_000_000_000
-"""Stored tokens, held-out slice included, for the screen's 400x schedule;
-the bridge's 400x schedule needs 188B (``docs/scaling.md``)."""
+"""Default stored tokens, held-out slice included; covers screen's 400x schedule.
+Explicit scale/ratio requests derive their target from current parameter counts."""
 CANONICAL_VAL_TOKENS = 30_000_000
 CANONICAL_SHUFFLE_SEED = 0
 CANONICAL_TOKENS_PER_DOC = 900

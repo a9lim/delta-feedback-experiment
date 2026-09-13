@@ -38,7 +38,7 @@ def cuda_probe() -> None:
             "--three-pass",
             "0",
             "--batch-rows",
-            "1",
+            "2",
             "--micro-rows",
             "1",
             "--eval-rows",
@@ -74,7 +74,7 @@ def cuda_probe() -> None:
 
     class ProbeTrainer(CudaGraphTrainer):
         def _reachable_specs(self, schedule):
-            return [GraphSpec(2, 2)]
+            return [GraphSpec(1, 1), GraphSpec(2, 2)]
 
         def _plan(self, spec, bytes_per_block, bytes_per_checkpoint, budget_bytes):
             # The tiny model fits raw; recompute a few blocks anyway so the
@@ -84,7 +84,7 @@ def cuda_probe() -> None:
 
     class Rows:
         def __init__(self):
-            self.rows = torch.randint(0, args.vocab_size, (1, args.seq_len + 1))
+            self.rows = torch.randint(0, args.vocab_size, (args.batch_rows, args.seq_len + 1))
 
         def batch(self, first, count, device=None):
             return self.rows[first : first + count].to(device=device)
@@ -98,45 +98,46 @@ def cuda_probe() -> None:
     print("cuda probe | train graph", flush=True)
     runner = ProbeTrainer(model, optimizers, args, schedule)
     data = Rows()
-    spec = next(iter(runner.states))
     initial = model.embed_tokens.weight.detach().clone()
-    for step in (1, 2):
-        apply_schedule(optimizers, schedule, step)
-        runner.zero_grad()
-        state = runner.begin(spec, args.zloss)
-        runner.replay_batch(state, data, step, 0)
-        runner.prepare_optimizer(state)
-        assert math.isfinite(state.loss_sum.item())
-        assert math.isfinite(clip_gradients(model.parameters()))
-        assert runner.head_accum is not None and not runner.head_accum.any()
-        parameters = dict(model.named_parameters())
-        for name in (
-            "embed_tokens.weight",
-            "fuse_value.weight",
-            "payload_router.query",
-            "mtp.projection.weight",
-            "blocks.3.attn.qkv_proj.weight",
-            "blocks.3.attn.o_proj.weight",
-            "attention_gates.0.weight",
-            "blocks.4.attn.control_proj.weight",
-            "blocks.0.mlp.shared.down_proj.weight",
-        ):
-            gradient = parameters[name].grad
-            assert gradient is not None and gradient.dtype == torch.float32, name
-            assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0, name
-        routed = [
-            expert.down_proj.weight.grad for expert in model.blocks[0].mlp.experts
-        ]
-        assert all(
-            gradient is not None and gradient.dtype == torch.float32
-            for gradient in routed
-        )
-        assert sum(gradient.abs().sum() for gradient in routed) > 0
-        with runner.pool_scope():
-            for optimizer in optimizers:
-                optimizer.step()
-            model.update_expert_bias(state.expert_counts)
-            model.refresh_shadows()
+    for spec in runner.states:
+        for step in (1, 2):
+            apply_schedule(optimizers, schedule, step)
+            runner.zero_grad()
+            state = runner.begin(spec, args.zloss)
+            runner.replay_batch(state, data, step, 0)
+            runner.prepare_optimizer(state)
+            assert math.isfinite(state.loss_sum.item())
+            assert math.isfinite(clip_gradients(model.parameters()))
+            assert runner.head_accum is not None and not runner.head_accum.any()
+            parameters = dict(model.named_parameters())
+            for name in (
+                "embed_tokens.weight",
+                "fuse_value.weight",
+                "payload_router.query",
+                "fuse_gate.weight",
+                "mtp.block.attn.q_proj.weight",
+                "blocks.3.attn.qkv_proj.weight",
+                "blocks.3.attn.o_proj.weight",
+                "attention_gates.0.weight",
+                "blocks.4.attn.control_proj.weight",
+                "blocks.0.mlp.shared.down_proj.weight",
+            ):
+                gradient = parameters[name].grad
+                assert gradient is not None and gradient.dtype == torch.float32, name
+                assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0, name
+            routed = [
+                expert.down_proj.weight.grad for expert in model.blocks[0].mlp.experts
+            ]
+            assert all(
+                gradient is not None and gradient.dtype == torch.float32
+                for gradient in routed
+            )
+            assert sum(gradient.abs().sum() for gradient in routed) > 0
+            with runner.pool_scope():
+                for optimizer in optimizers:
+                    optimizer.step()
+                model.update_expert_bias(state.expert_counts)
+                model.refresh_shadows()
     assert not torch.equal(initial, model.embed_tokens.weight)
     runner.zero_grad()
 
@@ -145,7 +146,7 @@ def cuda_probe() -> None:
     assert all(math.isfinite(value) for value in evaluator.run(data).values())
     model.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        tokens = data.rows[:, :4].cuda()
+        tokens = data.rows[:1, :4].cuda()
         cache = KVCache(model.cfg, batch=1, device="cuda", dtype=torch.bfloat16)
         prefill = model.forward_column(model.embed_tokens(tokens[:, :3]), cache=cache)
         decoded = model.step(tokens[:, 3:], prefill.payload[:, -1:], cache)

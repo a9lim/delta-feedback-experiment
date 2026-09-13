@@ -13,8 +13,9 @@ Conditions, token streams, and schedules for the current model.
 | `fl` | Yes | Sampled during training |
 
 Every condition includes PKDA/GQA cells, MHDB routing, shared and routed
-experts, and auxiliary second-token prediction (MTP). Shared parameters pair
-identically for a given initialization seed. Data rows and feedback draws use
+experts, and auxiliary second-token prediction (MTP). MTP and feedback share
+the same FBT fusion, including its parameters and per-pass jitter. Shared
+parameters pair identically for a given initialization seed. Data rows and feedback draws use
 keyed streams; tied depth uses a separate stream. At one core iteration,
 `fl` and `f` have identical values and gradients.
 
@@ -58,8 +59,8 @@ attention can cross document boundaries. Step `n` starts at row
 prefix/jitter draws also depend on the first global row of the microbatch.
 
 `delta tokenize --scale S --tokens-per-param R` includes validation and
-extra row targets, then rounds storage up to a billion tokens. The default
-screen 400x store is 85B tokens. Allow roughly twice the final store size
+extra row targets, then rounds storage up to a billion tokens. A new screen
+400x store requires 84B tokens under the current geometry. Allow roughly twice the final store size
 while parts and output coexist. `--scratch` moves downloads only.
 `--workers` controls encoding processes; `--readers` controls assembly
 concurrency; `RAYON_NUM_THREADS` controls tokenizer threads per process.
@@ -93,11 +94,21 @@ and balancing equations.
 
 ### Feedback passes
 
-A feedback step starts with plain teacher forcing. Each later Jacobi pass
-adds keyed uniform jitter in `[-0.02,0.02]` to the preceding undetached
-payload, shifts it right, and fuses the suffix after a per-row prefix drawn
-uniformly from `1..seq_len-1`. Position zero stays plain. Mixer states
-restart each pass; gradients cross every feedback transition.
+A feedback step starts with plain teacher forcing. Every supervised pass
+adds keyed uniform jitter in `[-0.02,0.02]` to its undetached payload, then
+fuses it with the next-token embedding through the shared FBT gate. This
+includes single-pass batches, the final pass, and `l` without `f`. The
+independent MTP block consumes that fused tensor. When another feedback pass
+follows, it right-shifts the same tensor and restores plain embeddings before
+a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
+plain. Mixer states restart each pass; both consumers backpropagate through
+the shared fusion.
+
+One embedding lookup serves the whole stored row, and the token-only gate
+is computed once for all passes. Jitter has shape
+`[n_passes, B, seq_len+1, dim]`, where `B` is the number of rows in the
+microbatch or replay; the first `seq_len` positions of each pass's draw
+perturb its payload. Evaluation and diagnostics use no jitter.
 
 ### Core iterations
 
@@ -136,7 +147,8 @@ ordinary predicted-token budget.
 | `--tokens-per-param`, `--steps` | Schedule length |
 | `--lr-normuonh`, `--lr-nadam` | Peak optimizer rates; defaults `0.006`, `0.0003` |
 | `--warmup-frac`, `--cooldown-frac` | Schedule shape |
-| `--feedback-start`, `--three-pass`, `--jitter` | Feedback mixture |
+| `--feedback-start`, `--three-pass` | Feedback mixture |
+| `--jitter` | Payload jitter shared by MTP and feedback |
 | `--loop-iterations`, `--loop-max-iterations` | Mean/fixed depth and training cap |
 | `--mtp-weight` | Auxiliary prediction weight |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | Batch geometry |
@@ -144,11 +156,13 @@ ordinary predicted-token budget.
 
 ### Checkpoints and queue
 
-Checkpoint v34 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v35 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
+Only v35 snapshots are accepted: the shared fusion changes parameter and
+optimizer ownership and the per-pass jitter recipe.
 
 The trainer keeps the latest two snapshots and protected feedback, cooldown,
 and final boundaries. `--continue TAG` extends a finished run under a new tag
@@ -166,8 +180,8 @@ changes do not stop an active child. Operational commands are in
 with plain-prefix length 1. `val_mtp` and `val_mtp_fused` measure the separate
 second-token predictor over its supervised positions, before weights and
 z-loss. All four come from the same per-row head results the training
-objective uses. Evaluation reads the first `--eval-rows` validation rows, 128
-by default.
+objective uses, with jitter disabled for both heads. Evaluation reads the
+first `--eval-rows` validation rows, 128 by default.
 
 Generation uses three modes: **Standard** prefills and decodes without
 feedback; **Soft** prefills plainly and feeds payloads back during decode;

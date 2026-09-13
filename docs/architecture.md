@@ -24,9 +24,11 @@ token embedding + incoming payload (f)
   -> coda cell
   -> top state -> tied readout -> next-token logits
        + routed block deltas -> payload
-                                  -> next column (f)
-                                  -> auxiliary PKDA/expert block + next-token embedding
-                                     -> tied readout -> second-token logits
+                                  + next-token embedding
+                                  -> shared FBT fusion (shared jitter in training)
+                                     -> next column seed (f)
+                                     -> independent auxiliary PKDA/expert block
+                                        -> tied readout -> second-token logits
 ```
 
 Each cell has four residual layers, each with its own token mixer and expert
@@ -240,15 +242,16 @@ Residuals with cell-level addresses.
 ## Payload and letter f: feedback
 
 At a feedback position, token embedding `e_t` controls the gate on incoming
-payload `p_(t-1)`:
+payload `p_(t-1)`. The same fusion is the MTP entry in every condition:
 
 ```text
 seed_t = entry_norm(W_U p_(t-1) * sigmoid(W_G gate_norm(e_t)))
 ```
 
-There is no additive embedding bypass at that position. Plain-prefix, pass-1,
-and Standard-decoding positions use `e_t`. The actual seed is both residual
-origin and MHDB source. Every condition has a dedicated payload router that
+The value and gate projections and the two norms belong to the model and are
+shared by MTP and feedback. There is no additive embedding bypass at that
+position. Plain-prefix, pass-1, and Standard-decoding positions use `e_t`.
+The actual seed is both residual origin and MHDB source. Every condition has a dedicated payload router that
 reads its null, seed, and every completed cell delta:
 
 ```text
@@ -265,10 +268,13 @@ batches, `l` without `f`, and the final feedback pass. The `f` letter controls
 consumption by the next column. Generation can skip payload construction when
 no feedback or auxiliary read needs it.
 
-Jacobi training adds keyed jitter to the previous pass's undetached payload,
-shifts it right, and fuses a suffix after a per-row plain prefix. Mixer states
-restart inside each pass. Sequential generation instead retains the preceding
-payload and advances all mixer caches once per new token.
+Every training pass adds its keyed jitter to the undetached payload and fuses
+it with the next-token embedding once. MTP consumes the resulting tensor
+directly. If another Jacobi pass follows, it shifts that same tensor right
+and restores the per-row plain prefix. Mixer states restart inside each pass.
+Sequential generation instead retains the preceding payload and advances all
+mixer caches once per new token, computing one fusion with that token's
+embedding and no jitter.
 
 ## Letter l: the tied-depth loop
 
@@ -313,9 +319,11 @@ shared across tracks. A pass executes `2+c*r` cells.
 
 All passes and iterations remain differentiable. Readout occurs after the
 coda, and auxiliary prediction runs once per pass. On CUDA the per-pass
-epilogues around the compiled blocks (the payload's routed add and norm, the
-feedback entry's jitter/shift/fuse/select, and both heads' readout) compile
-as their own small regions. The compiled blocks carry an Inductor activation memory budget of 0.9, the
+epilogues around the compiled blocks (the payload's routed add and norm,
+shared jittered fusion, feedback shift/prefix selection, and both heads'
+readout) compile as their own small regions. The token-only gate has its own
+compiled region and runs once per logical multipass forward. The compiled
+blocks carry an Inductor activation memory budget of 0.9, the
 partitioner tier that recomputes cheap fused tensors in backward and never a
 custom operator. CUDA captures one training graph per reachable
 `(pass count,r)` pair and no-grad evaluation graphs at the fixed depth. Every
@@ -343,36 +351,52 @@ data; compute comparisons need cell-tokens and auxiliary work or device time.
 
 ## Two-token prediction
 
-One auxiliary prediction depth runs after each column pass:
+One independent auxiliary prediction block runs after each column pass.
+Its input is computed by the model's shared FBT fusion:
 
 ```text
-u_t = M concat(RMSNorm_p(p_t), RMSNorm_e(Emb(x_(t+1))))
+g_(t+1) = sigmoid(W_G gate_norm(Emb(x_(t+1))))
+u_t = entry_norm(W_U (p_t + jitter_t) * g_(t+1))
 v = PKDAExpertBlock(u)
 logits_mtp,t = (final_norm(v_t) * 1536 / D) @ Emb.weight.T
 ```
 
-`M` is bias-free `2D -> D`. The two entry norms are independent. The auxiliary
-block has its own PKDA mixer and one shared plus top-`k`-of-`n` routed
+`W_U`, `W_G`, `gate_norm`, and `entry_norm` are the exact parameters used by
+feedback, present in every condition. There is no auxiliary fusion projection
+or pair of input norms. One token-only gate computation serves all passes;
+each pass computes `u` once for both consumers. The auxiliary block has its
+own PKDA mixer and one shared plus top-`k`-of-`n` routed
 SwiGLU experts, using the trunk's residual width, expert intermediate width,
 expert counts, output normalization, and `1/sqrt(2L)` branch scale. It shares the final norm and embedding/readout.
 It has no MHDB read or tied loop. Its independent matrix, diagonal, and
 convolution states start from zero for each row and pass.
 
+Training draws uniform payload jitter in `[-0.02,0.02]` by default for every
+supervised pass, including the final or only pass and `l` without `f`. MTP and
+the next feedback pass use the same realization. For the latter, `u_t` becomes
+the seed at position `t+1`, with positions inside the selected plain prefix
+restored to their embeddings. The auxiliary block's output `v` is used only
+for MTP; it is not an early trunk readout or an extra feedback layer.
+Evaluation and diagnostics set jitter to zero.
+
 For a stored row of `T+1` tokens, ordinary inputs/targets are
-`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs are the whole `payload`
+`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs fuse the whole `payload`
 and `Emb(tokens[:,1:])`, with targets `tokens[:,2:]` plus one dummy target:
 `T-1` supervised positions and a padded last one, whose second token lies past
 the end of the stored row and which therefore carries no loss weight. That row
 is causally last in the auxiliary recurrence, so the supervised rows are the
 same ones the cropped geometry produced. One lookup of the whole stored row
-serves both heads, the column seed taking positions `0..T-1` and the auxiliary
-head `1..T`. Both inputs remain differentiable, so the auxiliary objective
-trains the payload router, payload normalization, and trunk as well as the
-shared token embedding. The causal PKDA recurrence never sees the second-token
-target, and auxiliary activations never feed into the column or payload.
-`DeltaModel.forward_mtp` exposes the block output from supplied tokens and
-`forward_mtp_embedded` from supplied embeddings, both with balancing loss,
-assignment counts, and optional expert weights.
+serves both heads, the column seed taking positions `0..T-1` and the shared
+gate taking next-token embeddings at `1..T`. Both inputs and the reused fused
+tensor remain differentiable, so the auxiliary objective trains the payload
+router, payload normalization, trunk, shared fusion, and token embedding.
+The causal PKDA recurrence never sees the second-token target. The auxiliary
+block's output never feeds into the column or payload.
+`multipass` exposes each pass's shared tensor as `ColumnOutput.fused_input`.
+`DeltaModel.forward_mtp_fused` runs the block on this tensor;
+`forward_mtp(payload, next_tokens)` embeds and fuses supplied next-token IDs
+as a convenience. Both return balancing loss, assignment counts, and optional
+expert weights.
 
 Each head averages over its own valid positions, and both heads' rows go
 through one unreduced vocabulary pass per model pass: their readout rows are
@@ -459,7 +483,7 @@ input factor is applied.
 ### NorMuonH matrices
 
 NorMuonH owns ordinary 2D hidden matrices: token-mixer projections, expert and
-auxiliary FFNs, the FBT value projection, and MTP concatenation. Every matrix
+auxiliary FFNs, and the shared FBT value projection. Every matrix
 keeps its initial FP32 Frobenius radius `R`, stored in the checkpoint:
 
 ```text
@@ -497,17 +521,9 @@ runs the five Newton-Schulz iterations on a BF16 copy of the normalized
 direction, as reference Muon implementations do. CUDA also stores each
 bucket's momentum in BF16: the EMA and the Nesterov direction are computed in
 FP32 and only the writeback rounds to nearest, so a snapshot carries a BF16
-momentum and resumes exactly. Replaying 120 identical recorded gradients into
-FP32- and BF16-stored optimizers keeps their accumulated updates within cosine
-0.9999, with the momentum itself 1e-2 relative from FP32 and still drifting
-at that horizon. The result returns to FP32
+momentum and resumes exactly. The result returns to FP32
 before row adaptation, the spectral/tangent step, and the retraction; CPU and
-MPS stay FP32 throughout. Paired steps on the screen model from one starting
-state keep every one of the 606 matrices within cosine similarity .99985 of
-the FP32 result and on its radius to 1.2e-7 relative. Delta norms land within
-.3% of the FP32 delta in every shape bucket except the expert down matrices,
-which spread from .98 to 1.05 as the power-iteration estimate follows the
-slightly rotated tangent.
+MPS stay FP32 throughout.
 
 Bucket membership is fixed at construction from device, dtype, shape, and a
 packing bound of 33,554,432 matrix elements (128 MiB per FP32 tensor), except

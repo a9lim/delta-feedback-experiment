@@ -25,10 +25,10 @@ Preset availability does not establish GPU fit or throughput.
 | MHDB groups | 4 | 6 | 8 | 12 |
 | PKDA heads, width 128 | 10 | 15 | 20 | 30 |
 | PKDA projection width | 1,280 | 1,920 | 2,560 | 3,840 |
-| `f` / `fl` total parameters | 640,044,168 | 1,405,763,084 | 2,468,614,288 | 5,485,713,560 |
-| `f` training-active non-embedding parameters | 210,357,384 | 467,942,924 | 827,134,096 | 1,850,333,336 |
-| Included auxiliary MTP total parameters | 36,362,664 | 81,407,420 | 144,361,168 | 323,995,640 |
-| Included auxiliary MTP active parameters | 13,359,528 | 29,650,364 | 52,348,624 | 116,967,416 |
+| Total parameters, every condition | 638,862,984 | 1,403,106,572 | 2,463,892,624 | 5,475,092,120 |
+| Training-active non-embedding parameters | 209,176,200 | 465,286,412 | 822,412,432 | 1,839,711,896 |
+| Included auxiliary MTP total parameters | 35,181,480 | 78,750,908 | 139,639,504 | 313,374,200 |
+| Included auxiliary MTP active parameters | 12,178,344 | 26,993,852 | 47,626,960 | 106,345,976 |
 
 Every scale has a 50,304-row tied embedding/readout, 4,096 predictions per
 row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
@@ -43,20 +43,23 @@ routed experts selected per token. `expert_intermediate` is the actual
 per-expert width `h`; the active dense-equivalent width `H = (k+1)h` is derived.
 The presets keep `(k+1)/(n+1) = 1/4`, so a quarter of the stored expert
 matrices run per token. Active counts include those experts and the full router
-in every bank, plus all mixer and payload-writer parameters.
+in every bank, plus all mixer, payload-writer, and shared fusion parameters.
 A microbatch can touch all experts; all parameters, gradients, and optimizer
 state occupy memory. Per-bank selection biases are buffers, excluded from
 parameter counts. Training's transient assignment counts have shape
 `[layers+1,n]`, with MTP last; column-only counts are `[layers,n]`.
 
-The auxiliary module adds `P_PKDA + 3D(n+1)h + 2D^2 + (n+4)D` parameters:
-its PKDA mixer, expert matrices, concatenation projection, expert router, and
-four RMSNorm scales. Its active count replaces `(n+1)` with `(k+1)` in the
-expert term. It runs once per training pass over `seq_len` positions, of
+The auxiliary block adds `P_PKDA + 3D(n+1)h + (n+2)D` parameters:
+its PKDA mixer, expert matrices, expert router, and two RMSNorm scales.
+Its active count replaces `(n+1)` with `(k+1)` in the expert term. It runs
+once per training pass over `seq_len` positions, of
 which `seq_len-1` are supervised, and shares the embedding/final norm/readout
 with the main head, including that pass's single vocabulary-loss call.
-It does not execute in generation. Condition `l` retains the payload writer
-and omits the FBT entry; shared token budgets still use `f`.
+It does not execute in generation. MTP and feedback share the model's FBT
+entry, whose `2D^2 + 2D` parameters are counted once outside the auxiliary
+block. Every condition retains the payload writer and shared entry, so `f`,
+`l`, and `fl` have identical parameter counts. MTP trains the shared entry
+even on single-pass batches; `f` selects its consumption by the trunk.
 
 ## Expert learning rates
 
@@ -103,13 +106,13 @@ ratio is 25; larger ratios are supported arithmetic scenarios.
 
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|
-| Screen | 10,031 | 5,259,132,928 | 160,490 | 84,142,981,120 |
-| Bridge | 22,314 | 11,698,962,432 | 357,013 | 187,177,631,744 |
-| Flagship | 39,441 | 20,678,443,008 | 631,054 | 330,854,039,552 |
-| Extension | 88,231 | 46,258,454,528 | 1,411,693 | 740,133,699,584 |
+| Screen | 9,975 | 5,229,772,800 | 159,589 | 83,670,597,632 |
+| Bridge | 22,187 | 11,632,377,856 | 354,986 | 186,114,899,968 |
+| Flagship | 39,216 | 20,560,478,208 | 627,451 | 328,965,029,888 |
+| Extension | 87,725 | 45,993,164,800 | 1,403,589 | 735,884,869,632 |
 
-Warmup is 2% of the shorter of the run and its 25x length: 201, 446, 789,
-and 1,765 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
+Warmup is 2% of the shorter of the run and its 25x length: 200, 444, 784,
+and 1,754 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
 the default mixture costs about 1.28 pass-tokens per prediction. See
 [design.md](design.md#schedule).
 
@@ -117,9 +120,9 @@ the default mixture costs about 1.28 pass-tokens per prediction. See
 longer schedule reproduces.
 Token stores include validation and each row's extra target.
 `delta tokenize --scale S --tokens-per-param R` computes that requirement and
-rounds up to the next billion stored tokens. Screen 100x needs 22B, screen
-400x needs 85B, bridge 400x needs 188B, flagship 400x needs 331B, and extension
-400x needs 741B.
+rounds up to the next billion stored tokens. Screen 100x needs 21B, screen
+400x needs 84B, bridge 400x needs 187B, flagship 400x needs 330B, and extension
+400x needs 737B.
 Full DCLM supports larger stores. Its stream and held-out slice differ from
 the publisher's DCLM-100B subset, preventing paired per-token comparisons.
 
@@ -138,7 +141,7 @@ every scale executes its 16 unique layers once per pass.
 Resumes and continuations inherit saved depths unless explicitly pinned.
 An explicit `--scale` pins its depth defaults along with its geometry, so
 resuming a different saved depth requires omitting `--scale` or supplying
-matching loop overrides. The checkpoint v34 contract is unchanged.
+matching loop overrides. These settings are part of the checkpoint v35 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its

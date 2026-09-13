@@ -22,8 +22,11 @@ source bank and labels, expert balance loss/counts, and optional route/expert
 weights. The sources obey `h_top = seed + sum(completed cell deltas)`.
 `want_weights=True` exposes MHDB source weights separately from sparse routed
 expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
-`forward_mtp` exposes the auxiliary block over the column's own rows; its
-last row has no second token and carries no training weight.
+Outputs from `multipass` also expose `fused_input`: the shared gated tensor
+supplied to MTP and the following feedback pass. `forward_mtp_fused`
+runs the independent auxiliary block directly on that tensor; `forward_mtp`
+accepts payloads and next-token IDs and computes their fusion first. The
+auxiliary block's last row has no second token and carries no training weight.
 
 ## Tools
 
@@ -58,8 +61,12 @@ specific effect from generic damage. Donors must contain no future information
 relative to the patched position. Autoregressive comparisons allow text to
 diverge and measure that additional feedback as part of the outcome.
 
-MTP predicts a second token using the payload and the ground-truth next-token
-embedding, with its own PKDA memory. Its accuracy measures that auxiliary
-predictor. Compare ordinary next-token behavior and payload interventions to
-assess usefulness for generation; recoverability from the payload alone does
-not show how the main column uses it.
+MTP predicts a second token using the same gated fusion of payload and
+ground-truth next-token embedding that feedback consumes. Training shares
+the jittered fused tensor between both consumers; diagnostics and evaluation
+disable jitter. The auxiliary block retains its own PKDA memory, so its
+accuracy measures that auxiliary predictor. Sharing the fusion aligns the
+input interface but does not establish useful feedback. Compare ordinary
+next-token behavior and payload interventions to assess usefulness for
+generation; recoverability from the payload alone does not show how the main
+column uses it.

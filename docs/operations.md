@@ -26,8 +26,9 @@ delta probe
 ```
 
 The default tests cover small portable model, training, and lifecycle cases.
-`delta probe` requires CUDA and runs one small train/eval/decode smoke,
-exercising kernels and graph replay. First-use kernel JIT adds startup
+`delta probe` requires CUDA and runs small one-pass and two-pass training
+graphs plus evaluation and decode, exercising kernels, shared fusion, and
+graph replay. First-use kernel JIT adds startup
 time. Neither command measures production throughput or memory fit. The
 queue starts training directly without running tests or a probe.
 
@@ -74,7 +75,7 @@ both tags must have no active or queued references and the destination must
 be free. Use `--out-dir` for snapshots outside `runs/`; custom outputs are
 not renamed. Existing figures retain their labels until regenerated.
 
-Resume and continuation use [current snapshots](design.md#checkpoints-and-queue).
+Resume and continuation accept only [v35 snapshots](design.md#checkpoints-and-queue).
 The queue stores arguments and refreshes the checkout before each job.
 Use `delta train --help` for recipe and runtime overrides.
 
@@ -112,7 +113,8 @@ heatmaps show each executed site's share per expert; hovering or focusing a cell
 also reports expert coverage and gate entropy. Bias heatmaps show each parameter
 bank once because core iterations share its parameters. Both diagnostics use up
 to two validation rows: routing uses the fused pass with feedback, while expert
-loads use pass-1 and the teacher-forced MTP block. These are sample diagnostics.
+loads use pass-1 and the teacher-forced MTP block. Both diagnostics disable
+payload jitter. These are sample diagnostics.
 
 Portable monitor data/lifecycle checks run with `node --test tests/monitor.test.cjs`
 from this checkout in the parent workspace. Browser checks cover slider input,
