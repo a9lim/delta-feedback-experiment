@@ -95,24 +95,27 @@ and balancing equations.
 
 ### Feedback passes
 
-A feedback step starts with plain teacher forcing, using normalized token
-embeddings as column seeds. Every supervised pass normalizes its payload once
-at the writer, then adds keyed uniform jitter in
-`[-0.02,0.02]` without detaching it. It concatenates the normalized next-token
-embedding and jittered payload, then applies the shared bias-free `2D -> D`
-projection. Fusion applies no further normalization or gain to either input.
+A feedback step starts with plain teacher forcing, using raw token embeddings
+as column seeds. Every supervised pass applies the writer's learned RMSNorm
+with its fixed output scale `BASE_NORMAL_INIT_STD=0.02`, then adds keyed
+uniform jitter without detaching it. `--jitter` sets the relative half-width,
+default `0.02`; the actual draw is uniform in
+`[-BASE_NORMAL_INIT_STD * jitter, BASE_NORMAL_INIT_STD * jitter]`, or
+`[-0.0004,0.0004]` by default. It concatenates the raw next-token embedding and jittered payload,
+then applies the shared bias-free `2D -> D` projection. Fusion applies no
+normalization or second scaling to either input.
 This includes single-pass batches, the final pass, and `l` without `f`. The
 independent MTP block consumes that fused tensor. When another feedback pass
-follows, it right-shifts the same tensor and restores normalized embeddings
+follows, it right-shifts the same tensor and restores raw embeddings
 before a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
 plain. Mixer states restart each pass; both consumers backpropagate through
 the shared fusion.
 
-One `embed_tokens` call looks up and normalizes the whole stored row before
-slicing. Its shared `embed_tokens.norm` serves plain seeds and both fusion
-consumers across all passes; the tied classifier retains the raw embedding
-weight. The writer's learned payload normalization precedes each pass's
-jitter. Jitter has shape
+One `embed_tokens` call looks up the whole stored row before slicing, serving
+plain seeds and both fusion consumers across all passes. The tied classifier
+uses the same raw embedding weight. The jitter generator writes the draw
+directly in scaled payload units, so the fusion path adds the buffer without
+another scale factor. Jitter has shape
 `[n_passes, B, seq_len+1, dim]`, where `B` is the number of rows in the
 microbatch or replay; the first `seq_len` positions of each pass's draw
 perturb its payload. Evaluation and diagnostics use no jitter.
@@ -155,7 +158,7 @@ ordinary predicted-token budget.
 | `--lr-normuonh`, `--lr-nadam` | Peak optimizer rates; defaults `0.006`, `0.0003` |
 | `--warmup-frac`, `--cooldown-frac` | Schedule shape |
 | `--feedback-start`, `--three-pass` | Feedback mixture |
-| `--jitter` | Payload jitter shared by MTP and feedback |
+| `--jitter` | Relative payload-jitter half-width, default `0.02`; actual amplitude is `0.02 * jitter` |
 | `--loop-iterations`, `--loop-max-iterations` | Mean/fixed depth and training cap |
 | `--mtp-weight` | Auxiliary prediction weight |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | Batch geometry |
@@ -163,17 +166,18 @@ ordinary predicted-token budget.
 
 ### Checkpoints and queue
 
-Checkpoint v38 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v39 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v38 snapshots are accepted: every input token lookup uses the shared
-`embed_tokens.norm`, while the payload is normalized at its writer before
-jitter. Fusion concatenates these prepared inputs and projects them. This
-defines the current parameter names and optimizer ownership. The fusion
-projection belongs to ordinary NorMuonH; the writer's payload norm and shared
-input norm belong to base NAdam.
+Only v39 snapshots are accepted: token lookups are raw, payloads use the
+writer's learned RMSNorm with fixed output scale `BASE_NORMAL_INIT_STD=0.02`,
+and jitter buffers are sampled in those scaled payload units. The same
+constant sets token embedding initialization. Fusion concatenates its
+inputs and projects them without further scaling. This defines the current
+parameter names and optimizer ownership. The fusion projection belongs to
+ordinary NorMuonH; the writer's payload norm belongs to base NAdam.
 
 The trainer keeps the latest two snapshots and protected feedback, cooldown,
 and final boundaries. `--continue TAG` extends a finished run under a new tag

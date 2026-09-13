@@ -17,11 +17,12 @@ shifted payload. Sequential feedback decode advances mixer caches and carries
 the previous token's payload. Core iterations have separate mixer-cache
 tracks. Label token, pass, and depth coordinates when comparing states.
 
-Every token input passes through the shared `embed_tokens.norm`, including
+`embed_tokens(tokens)` returns raw token features in the residual dtype for
 pass 1, plain-prefix positions, Standard decoding, and fusion inputs.
-`embed_tokens(tokens)` exposes these normalized features; `embed_tokens.weight`
-is the raw tied embedding/classifier matrix. Patches to plain column seeds
-therefore act on normalized token features.
+`embed_tokens.weight` is the tied embedding/classifier matrix. Patches to
+plain column seeds therefore act on raw embedding features. Payloads are in
+the writer's scaled units: `payload_norm(h_top + routed)`, with fixed output
+multiplier `BASE_NORMAL_INIT_STD=0.02` and a learned gain initialized to one.
 
 `DeltaModel.forward_column` returns `ColumnOutput`: top residual, payload,
 source bank and labels, expert balance loss/counts, and optional route/expert
@@ -31,8 +32,8 @@ expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
 Outputs from `multipass` also expose `fused_input`: the shared projected tensor
 supplied to MTP and the following feedback pass. `forward_mtp_fused`
 runs the independent auxiliary block directly on that tensor; `forward_mtp`
-accepts payloads and next-token IDs, normalizes their embedding lookup, and
-computes their fusion first. The
+accepts payloads and next-token IDs and computes their fusion with raw token
+embeddings first. The
 auxiliary block's last row has no second token and carries no training weight.
 
 ## Tools
@@ -69,9 +70,10 @@ relative to the patched position. Autoregressive comparisons allow text to
 diverge and measure that additional feedback as part of the outcome.
 
 MTP predicts a second token using the same concat-linear fusion of payload
-and normalized ground-truth next-token embedding that feedback consumes.
-The payload is normalized once at its writer, before training jitter; fusion
-uses that jittered payload and the prepared token features directly.
+and raw ground-truth next-token embedding that feedback consumes.
+The payload receives its learned RMSNorm and fixed `0.02` scale at the writer.
+Training jitter is sampled directly in these payload units, with default
+range `[-0.0004,0.0004]`; fusion adds it without another scale factor.
 Training shares the fused tensor between
 both consumers; diagnostics and evaluation disable jitter. The auxiliary
 block retains its own PKDA memory, so its

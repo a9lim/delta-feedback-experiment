@@ -34,6 +34,7 @@ from transformer_experiments.schedule import Schedule
 
 from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
+    BASE_NORMAL_INIT_STD,
     CONDITION_LETTERS,
     EXPERT_BALANCE_COEF,
     EXPERT_BIAS_RATE,
@@ -57,7 +58,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=38, resumable=frozenset({38}), surface_version=38
+    version=39, resumable=frozenset({39}), surface_version=39
 )
 
 
@@ -372,8 +373,10 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--jitter", type=float, default=0.02,
         help=(
-            "uniform +/- amplitude added after payload normalization, shared "
-            "by MTP and feedback without renormalizing (default: 0.02)"
+            "relative uniform +/- payload jitter amplitude; multiplied by the "
+            f"fixed payload scale {BASE_NORMAL_INIT_STD:g} when drawn, shared "
+            "by MTP and feedback "
+            f"(default: 0.02, actual amplitude: {BASE_NORMAL_INIT_STD * 0.02:g})"
         ),
     )
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -562,7 +565,8 @@ def micro_draws(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """(prefix_lens [k-1, n], jitter [k, n, seq_len+1, dim]) for one
     microbatch, keyed by (data seed, step, first global row) — identical
-    across conditions for any run sharing the batch geometry."""
+    across conditions for any run sharing the batch geometry. Jitter is drawn
+    directly in scaled payload units: BASE_NORMAL_INIT_STD * args.jitter."""
     if generator is None:
         generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
     generator.manual_seed(mix(args.data_seed, step, first_row))
@@ -577,7 +581,8 @@ def micro_draws(
     if jitter_out is None:
         dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         jitter_out = torch.empty(jitter_shape, dtype=dtype, device=device)
-    jitter_out.uniform_(-args.jitter, args.jitter, generator=generator)
+    amplitude = BASE_NORMAL_INIT_STD * args.jitter
+    jitter_out.uniform_(-amplitude, amplitude, generator=generator)
     return prefix_out, jitter_out
 
 

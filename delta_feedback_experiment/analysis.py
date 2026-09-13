@@ -98,7 +98,7 @@ def fused_inputs(
 ) -> Tensor:
     """The next pass's column input: plain prefix, concat-fused suffix.
 
-    ``e`` is the normalized lookup returned by ``model.embed_tokens``.
+    ``e`` is the raw lookup returned by ``model.embed_tokens``.
     ``payload`` is the preceding pass's payload at the same positions; it is
     shifted one column right (position 0 receives zero) before fusion. This
     has the same causal alignment as ``multipass``, which shifts the shared

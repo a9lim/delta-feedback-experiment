@@ -1,5 +1,6 @@
 """One tiny model per distinct causal, recurrence, and numerical contract."""
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -53,16 +54,15 @@ def test_multipass_seed_has_standard_strides():
     assert outs[1].sources[0].stride() == seed.stride()
 
 
-def test_plain_and_standard_inputs_share_lookup_norm_without_normalizing_classifier():
+def test_plain_and_standard_inputs_preserve_raw_embedding_magnitudes():
     model = tiny()
     toks = tokens()
     with torch.no_grad():
-        model.embed_tokens.norm.weight.uniform_(0.5, 1.5)
-    raw = F.embedding(toks, model.embed_tokens.weight)
-    expected = raw * torch.rsqrt(
-        raw.square().mean(-1, keepdim=True) + model.cfg.norm_eps
-    ) * model.embed_tokens.norm.weight
-    torch.testing.assert_close(model.embed_tokens(toks), expected)
+        model.embed_tokens.weight.mul_(
+            torch.linspace(0.5, 2, model.cfg.vocab_size)[:, None]
+        )
+    expected = F.embedding(toks, model.embed_tokens.weight)
+    torch.testing.assert_close(model.embed_tokens(toks), expected, atol=0, rtol=0)
     outs = multipass(model, toks, 2, prefix_lens=torch.tensor([[2]]))
     torch.testing.assert_close(outs[0].sources[0], expected[:, :-1])
     torch.testing.assert_close(outs[1].sources[0][:, :2], expected[:, :2])
@@ -70,19 +70,41 @@ def test_plain_and_standard_inputs_share_lookup_norm_without_normalizing_classif
     standard = model.step(toks[:, :1], None, cache)
     torch.testing.assert_close(standard.sources[0], expected[:, :1])
 
-    # Plain next-token training reaches the shared input gain without MTP.
-    loss = model.logits(outs[0].h_top).square().mean()
-    loss.backward()
-    gradient = model.embed_tokens.norm.weight.grad
-    assert gradient is not None and torch.isfinite(gradient).all()
-    assert gradient.abs().sum() > 0
-    # The readout consumes the original tied weights, independently of the
-    # input gain. Changing that gain must not change logits of a fixed state.
+    # The plain input path contributes directly to the shared embedding table.
+    gradient = torch.autograd.grad(
+        outs[0].h_top.square().mean(), model.embed_tokens.weight
+    )[0]
+    assert torch.isfinite(gradient).all()
+    assert gradient[toks[:, :-1].unique()].abs().sum() > 0
+    # The classifier independently reads the same raw table.
     hidden = outs[0].h_top.detach()
     expected_logits = F.linear(model.readout_input(hidden), model.embed_tokens.weight)
-    with torch.no_grad():
-        model.embed_tokens.norm.weight.mul_(2)
     torch.testing.assert_close(model.logits(hidden), expected_logits, atol=0, rtol=0)
+    with torch.no_grad():
+        model.embed_tokens.weight.mul_(2)
+    torch.testing.assert_close(model.embed_tokens(toks), 2 * expected, atol=0, rtol=0)
+    torch.testing.assert_close(model.logits(hidden), 2 * expected_logits, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_payload_scale_precedes_output_cast_and_preserves_learned_gain_gradients(dtype):
+    model = tiny()
+    with torch.no_grad():
+        model.payload_norm.weight.uniform_(0.5, 1.5)
+    hidden = torch.randn(2, 5, model.cfg.dim).to(dtype).requires_grad_()
+    reference = hidden.detach().clone().requires_grad_()
+    gain = model.payload_norm.weight.detach().clone().requires_grad_()
+    actual = model.payload_norm(hidden)
+    normalized = reference.float() * torch.rsqrt(
+        reference.float().square().mean(-1, keepdim=True) + model.cfg.norm_eps
+    )
+    expected = (normalized * (0.02 * gain)).to(dtype)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    cotangent = torch.randn_like(actual)
+    actual.backward(cotangent)
+    expected.backward(cotangent)
+    torch.testing.assert_close(hidden.grad, reference.grad)
+    torch.testing.assert_close(model.payload_norm.weight.grad, gain.grad)
 
 
 @torch.no_grad()
@@ -100,7 +122,9 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     states = [tiny(condition, layers=16).state_dict() for condition in ("f", "l", "fl")]
     common = states[0].keys() & states[1].keys() & states[2].keys()
     assert "payload_router.query" in common and "payload_norm.weight" in common
-    assert "embed_tokens.norm.weight" in common
+    assert {name for name in common if name.startswith("embed_tokens.")} == {
+        "embed_tokens.weight"
+    }
     assert {name for name in common if name.startswith("fuse_")} == {"fuse_proj.weight"}
     projection = states[0]["fuse_proj.weight"]
     assert projection.shape == (TINY["dim"], 2 * TINY["dim"])
@@ -248,7 +272,6 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
         )
         for name in (
             "fuse_proj.weight",
-            "embed_tokens.norm.weight",
             "payload_norm.weight",
             "payload_router.query",
             "embed_tokens.weight",

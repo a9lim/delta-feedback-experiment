@@ -68,8 +68,10 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "f": (
         "feedback",
-        "full-bandwidth feedback: fuse the preceding column's payload "
-        "with the normalized token by concatenation",
+        (
+            "full-bandwidth feedback: fuse the preceding column's scaled payload "
+            "with the raw token embedding by concatenation"
+        ),
     ),
     "l": (
         "loop",
@@ -95,11 +97,13 @@ def parse_condition(text: str) -> str:
 
 
 BASE_NORMAL_INIT_STD = 0.02
-"""Base Gaussian standard deviation for NAdam-owned matrices.
+"""Base Gaussian standard deviation and fixed payload/jitter scale.
 
 Embeddings and fixed-head-width expansions use this directly. Gate and control
 matrices with fan-in ``D`` multiply it by ``sqrt(MUP_BASE_DIM / D)``. Adjust
 this constant to tune both families; NorMuonH's fan-in scale is independent.
+The payload's learned RMSNorm and relative training jitter also use this
+fixed multiplier, matching the initial raw embedding RMS at the fusion input.
 """
 
 MUP_BASE_DIM = 1536
@@ -276,27 +280,22 @@ def condition_config(condition: str, **overrides) -> ModelConfig:
 
 
 class RMSNorm(nn.Module):
-    """Learnable RMSNorm computed in fp32, returned in the input dtype."""
+    """Learned RMSNorm with a fixed optional scale, applied in FP32 before cast."""
 
-    def __init__(self, dim: int, eps: float):
+    def __init__(self, dim: int, eps: float, *, scale: float = 1.0):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.scale = scale
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x * self.weight.float()).to(dtype)
-
-
-def _normalized_embedding(norm: RMSNorm, embedding: Tensor) -> Tensor:
-    return norm(embedding)
-
-
-_compiled_normalized_embedding = torch.compile(
-    _normalized_embedding, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
-)
+        gain = self.weight.float()
+        if self.scale != 1.0:
+            gain = gain * self.scale
+        return (x * gain).to(dtype)
 
 
 class _EmbeddingSink(torch.autograd.Function):
@@ -325,13 +324,12 @@ class _EmbeddingSink(torch.autograd.Function):
 
 
 class ResidualEmbedding(nn.Embedding):
-    """One learned RMSNorm on every token input, with raw FP32 tied weights.
+    """Raw token inputs with FP32 tied weights and accumulated gradients.
 
     ``nn.Embedding`` is not autocast-aware.  Without this explicit boundary its
     FP32 output silently promotes every residual, payload, and routed source.
-    CUDA autocast casts lookup activations to BF16 before the shared RMSNorm.
-    Plain seeds, feedback, and MTP all consume this normalized lookup; the
-    tied classifier uses ``weight`` directly without input normalization.
+    CUDA autocast casts lookup activations to BF16. Plain seeds, feedback,
+    and MTP all consume this raw lookup; the classifier uses ``weight`` too.
 
     ``grad_sink`` is the trainer-owned persistent FP32 gradient buffer of the
     tied weight.  When it is set, both the lookup and the tied classifier
@@ -342,10 +340,6 @@ class ResidualEmbedding(nn.Embedding):
 
     grad_sink: Tensor | None = None
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, norm_eps: float):
-        super().__init__(num_embeddings, embedding_dim)
-        self.norm = RMSNorm(embedding_dim, norm_eps)
-
     def forward(self, tokens: Tensor) -> Tensor:
         sink = self.grad_sink
         if sink is not None and self.weight.is_cuda and torch.is_grad_enabled():
@@ -354,10 +348,7 @@ class ResidualEmbedding(nn.Embedding):
             out = super().forward(tokens)
         if out.is_cuda and torch.is_autocast_enabled("cuda"):
             out = out.to(torch.bfloat16)
-        normalize = (
-            _compiled_normalized_embedding if out.is_cuda else _normalized_embedding
-        )
-        return normalize(self.norm, out)
+        return out
 
 
 # -- kv cache ------------------------------------------------------------------
@@ -841,7 +832,7 @@ _compiled_mtp = torch.compile(
 
 
 def _payload_epilogue(norm, h, routed):
-    """The column's payload: the routed read added to the top state, normalized."""
+    """Write the routed read plus top state through the scaled payload norm."""
     return norm(h + routed)
 
 
@@ -967,12 +958,12 @@ class DeltaModel(nn.Module):
         super().__init__()
         self.cfg = cfg
         factor_seed = torch.initial_seed()
-        self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim, cfg.norm_eps)
+        self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.register_buffer("_classifier_shadow", None, persistent=False)
         self.register_buffer("_classifier_accum", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
+        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps, scale=BASE_NORMAL_INIT_STD)
         self.payload_router = Router(cfg)
         # Capture the exact common-trunk initialization boundary before
         # constructing the attention gates and shared fusion projection,
@@ -1063,15 +1054,15 @@ class DeltaModel(nn.Module):
 
     # -- pieces ----------------------------------------------------------------
 
-    def fuse(self, payload: Tensor, normalized_token: Tensor) -> Tensor:
-        """Shared entry W [normalized_token; payload], with no further norm.
+    def fuse(self, payload: Tensor, token_embedding: Tensor) -> Tensor:
+        """Shared entry W [raw token; scaled payload], with no further norm.
 
-        ``embed_tokens`` normalizes token features once at lookup. The
-        payload is normalized at its writer, then receives optional jitter.
-        Both branches keep their learned gains through the linear fusion.
+        The writer scales its learned norm by BASE_NORMAL_INIT_STD. Any
+        jitter is already in those scaled units. Raw token magnitudes and
+        learned payload gains survive the linear fusion.
         """
         return sink_linear(
-            torch.cat((normalized_token, payload), dim=-1),
+            torch.cat((token_embedding, payload), dim=-1),
             (self.fuse_proj.weight,),
             (self.fuse_proj_sink,),
             self.fuse_proj_shadow,
@@ -1540,8 +1531,8 @@ class DeltaModel(nn.Module):
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
-        ``x`` is the actual column input: normalized embeddings on pass 1 and
-        Standard decoding, or the concat-fused input on feedback passes. With a
+        ``x`` is the actual column input: raw embeddings on pass 1 and
+        standard decoding, or the concat-fused input on feedback passes. With a
         cache, positions start at ``cache.pos`` and every mixer cache advances
         by ``T`` exactly once. ``iterations`` is the core iteration count
         under ``l``; the default is the configured mean, or the count the
@@ -1776,12 +1767,12 @@ def shift_right(x: Tensor) -> Tensor:
     return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
 
 
-def _fused_input(model, payload, normalized_token):
-    return model.fuse(payload, normalized_token)
+def _fused_input(model, payload, token_embedding):
+    return model.fuse(payload, token_embedding)
 
 
-def _jittered_fused_input(model, payload, jitter, normalized_token):
-    return model.fuse(payload + jitter, normalized_token)
+def _jittered_fused_input(model, payload, jitter, token_embedding):
+    return model.fuse(payload + jitter, token_embedding)
 
 
 def _feedback_entry(fused_input, e, positions, prefix):
@@ -1821,8 +1812,8 @@ def multipass(
     trunk column.  prefix_lens [n_passes-1, B] holds
     values in 1..T-1 (the plain-embedding prefix per feedback pass; position
     0 is always plain and position T-1 is always fused); jitter [n_passes, B, T+1, D] is drawn at the
-    stored-row width and its first T columns are added to the carried
-    payload before fusion, including the final/single pass's MTP input.
+    stored-row width in scaled payload units. Its first T columns are added
+    to the payload before fusion, including the final/single pass's MTP input.
     The next trunk pass reuses that fusion after shifting and prefix selection.
     Both are pre-drawn by the caller — the shared
     randomness contract lives in the trainer, not here.  Conditions
@@ -1841,7 +1832,7 @@ def multipass(
     # One logical forward: its trunk passes here and the auxiliary blocks in
     # ``multipass_loss`` share this recomputation budget in execution order.
     model._checkpoint_left = model.checkpoint_blocks
-    # One normalized lookup of the whole stored row feeds both heads: the
+    # One raw lookup of the whole stored row feeds both heads: the
     # column seed is positions 0..T-1 and the auxiliary head's next-token
     # input is 1..T, so the second lookup and its gradient scatter are gone.
     # The seed is copied into a fresh tensor with the standard strides. The
@@ -1850,14 +1841,14 @@ def multipass(
     # strides: a seed left as a view of the T+1 row (which ``contiguous`` is,
     # a size-one batch never breaking contiguity) gives pass 1 its own compiled
     # copy of every block, rounding differently from the passes whose entry is
-    # a fresh tensor. The lookup normalizes the whole stored row once;
+    # a fresh tensor. The lookup reads the whole stored row once;
     # plain seeds and fusion reuse its slices across all passes.
     e_all = model.embed_tokens(tokens)
     e = e_all[:, :-1].clone(memory_format=torch.contiguous_format)
     length = e.shape[1]
     positions = torch.arange(length, device=tokens.device)
     compiled = e.is_cuda
-    normalized_token = e_all[:, 1:]
+    token_embedding = e_all[:, 1:]
     entry = _compiled_feedback_entry if compiled else _feedback_entry
     outs = []
     x = e
@@ -1874,11 +1865,11 @@ def multipass(
         )
         if jitter is None:
             fusion = _compiled_fused_input if compiled else _fused_input
-            out.fused_input = fusion(model, out.payload, normalized_token)
+            out.fused_input = fusion(model, out.payload, token_embedding)
         else:
             fusion = _compiled_jittered_fused_input if compiled else _jittered_fused_input
             out.fused_input = fusion(
-                model, out.payload, jitter[i][:, :length], normalized_token
+                model, out.payload, jitter[i][:, :length], token_embedding
             )
         outs.append(out)
     return outs

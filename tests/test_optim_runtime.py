@@ -306,9 +306,7 @@ def test_rate_groups_partition_trunk_mtp_and_frozen_parameters():
     }
     partition = split_parameters(model)
     assert {name: set(parameters) for name, parameters in partition.items()} == expected
-    assert {model.embed_tokens.norm.weight, model.payload_norm.weight} <= expected[
-        "nadam"
-    ]
+    assert {model.embed_tokens.weight, model.payload_norm.weight} <= expected["nadam"]
     flattened = [
         parameter for parameters in partition.values() for parameter in parameters
     ]

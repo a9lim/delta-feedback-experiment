@@ -50,22 +50,19 @@ def passes(model, toks, count, *, jitter=None):
 def jitter_for(model, toks, count):
     generator = torch.Generator().manual_seed(37)
     return torch.empty(count, *toks.shape, model.cfg.dim).uniform_(
-        -0.2, 0.2, generator=generator
+        -0.0004, 0.0004, generator=generator
     )
 
 
 def explicit_embedding(model, toks):
-    """Independent normalized lookup, leaving the tied classifier untouched."""
-    raw = F.embedding(toks, model.embed_tokens.weight)
-    return raw * torch.rsqrt(
-        raw.square().mean(-1, keepdim=True) + model.cfg.norm_eps
-    ) * model.embed_tokens.norm.weight
+    """Independent raw lookup from the tied embedding table."""
+    return F.embedding(toks, model.embed_tokens.weight)
 
 
-def explicit_fusion(model, payload, normalized_token):
-    """Independent concat equation; both inputs have already been normalized."""
+def explicit_fusion(model, payload, token_embedding):
+    """Independent concat equation: raw token and prepared scaled payload."""
     return F.linear(
-        torch.cat((normalized_token, payload), dim=-1), model.fuse_proj.weight
+        torch.cat((token_embedding, payload), dim=-1), model.fuse_proj.weight
     )
 
 
@@ -111,8 +108,6 @@ def test_fusion_preserves_independent_token_and_payload_contributions():
     payload, embedding = torch.randn(2, 4, model.cfg.dim), torch.randn(
         2, 4, model.cfg.dim
     )
-    model.embed_tokens.norm.weight.uniform_(0.5, 1.5)
-    embedding = model.embed_tokens.norm(embedding)
     fused = model.fuse(payload, embedding)
     token_only = model.fuse(torch.zeros_like(payload), embedding)
     payload_only = model.fuse(payload, torch.zeros_like(embedding))
@@ -217,7 +212,7 @@ def test_mtp_trains_shared_fusion_and_payload_on_every_pass(condition, count):
                 model.payload_norm.weight,
                 model.blocks[0].attn.q_proj.weight,
                 model.fuse_proj.weight,
-                model.embed_tokens.norm.weight,
+                model.embed_tokens.weight,
             ),
             retain_graph=True,
         )
@@ -252,7 +247,7 @@ def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
 
 def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     """Independent consumers recompute the jittered concat equation; sharing that
-    input and normalized token must preserve both objectives' derivatives."""
+    input and raw token lookup must preserve both objectives' derivatives."""
     count, z_coef, coefficient = 3, 0.017, 0.23
     model, reference = tiny("fl"), tiny("fl")
     for candidate in (model, reference):
@@ -341,25 +336,25 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     ):
         assert (parameter.grad is None) == (expected_parameter.grad is None), name
         if parameter.grad is not None:
-            # Reusing normalization and fusion changes FP32 gradient summation
-            # order through the repeated feedback and core iterations. Bound
-            # aggregate drift and individual coordinates against the tensor's
-            # scale, including near-zero coordinates.
+            # Reusing the lookup and fusion changes FP32 gradient summation
+            # order through the repeated feedback and core iterations. The
+            # small raw seeds amplify that drift in early PKDA decay gradients
+            # even with identical forward states. Bound aggregate drift and
+            # individual coordinates relative to the tensor's RMS.
             error = parameter.grad - expected_parameter.grad
             scale = expected_parameter.grad.square().mean().sqrt()
-            assert error.square().mean().sqrt() < 2e-6 + 2e-5 * scale, name
-            assert error.abs().max() < 2e-6 + 1e-4 * scale, name
+            assert error.square().mean().sqrt() < 2e-6 + 5e-5 * scale, name
+            assert error.abs().max() < 2e-6 + 2e-4 * scale, name
 
 
-def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monkeypatch):
+def test_training_reuses_one_lookup_and_one_scaled_payload_and_fusion_per_pass(monkeypatch):
     import delta_feedback_experiment.model as implementation
 
     model = tiny()
     toks, count = tokens(length=5), 3
-    with torch.no_grad():
-        model.embed_tokens.norm.weight.uniform_(0.5, 1.5)
-    calls = {"embedding": 0, "token_norm": 0, "payload_norm": 0, "fusion": 0}
+    calls = {"embedding": 0, "payload_norm": 0, "fusion": 0}
     auxiliary_inputs = []
+    written_payloads = []
     sink_linear = implementation.sink_linear
 
     def count_linear(x, weights, *args, **kwargs):
@@ -368,18 +363,15 @@ def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monke
         return sink_linear(x, weights, *args, **kwargs)
 
     def count_embedding(module, args, result):
+        assert result.shape == (*toks.shape, model.cfg.dim)
         calls["embedding"] += 1
-
-    def count_token_norm(module, args, result):
-        assert args[0].shape == (*toks.shape, model.cfg.dim)
-        calls["token_norm"] += 1
 
     def count_payload_norm(module, args, result):
         calls["payload_norm"] += 1
+        written_payloads.append(result)
 
     monkeypatch.setattr(implementation, "sink_linear", count_linear)
     embedding_hook = model.embed_tokens.register_forward_hook(count_embedding)
-    token_norm_hook = model.embed_tokens.norm.register_forward_hook(count_token_norm)
     payload_norm_hook = model.payload_norm.register_forward_hook(count_payload_norm)
     mtp_hook = model.mtp.register_forward_pre_hook(
         lambda module, args: auxiliary_inputs.append(args[0])
@@ -389,12 +381,15 @@ def test_training_reuses_one_lookup_one_token_norm_and_one_fusion_per_pass(monke
         multipass_loss(model, toks, outs)
     finally:
         embedding_hook.remove()
-        token_norm_hook.remove()
         payload_norm_hook.remove()
         mtp_hook.remove()
     assert calls == {
-        "embedding": 1, "token_norm": 1, "payload_norm": count, "fusion": count
+        "embedding": 1, "payload_norm": count, "fusion": count
     }
+    assert all(
+        payload is out.payload
+        for payload, out in zip(written_payloads, outs, strict=True)
+    )
     assert len(auxiliary_inputs) == count
     assert all(
         auxiliary is out.fused_input

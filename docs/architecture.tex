@@ -80,13 +80,10 @@
 \node[font=\smalltext] (tokens) at (8.2,3.7) {Input token $x_t$};
 \node[box,fill=pink,text width=4.6cm] (embedding) at (8.2,5.05)
   {\textbf{Token embedding $E$}\\$e_t=E(x_t)$};
-\node[box,fill=yellow,text width=4.6cm] (tokennorm) at (8.2,6.6)
-  {\textbf{Shared token RMSNorm $N_e$}\\$\bar e_t=N_e(e_t)$};
 \node[box,fill=purple!50,text width=4.6cm] (seed) at (8.2,9.7)
-  {\textbf{Column seed $s_t$}\\plain $\bar e_t$ or incoming fusion};
+  {\textbf{Column seed $s_t$}\\plain $e_t$ or incoming fusion};
 \draw[flow] (tokens) -- (embedding);
-\draw[flow] (embedding) -- (tokennorm);
-\draw[flow] (tokennorm) -- (seed);
+\draw[flow] (embedding) -- (seed);
 \node[note,anchor=east,text width=2.8cm] at (7.95,8.02)
   {Plain token entry:\\pass 1 / prefix\\Standard decode};
 \draw[flow] (seed) -- (prelude);
@@ -132,6 +129,7 @@
   {site-local null + available live partial};
 
 % Payload write retains the direct top-state path, before final readout norm.
+% Its learned RMSNorm includes fixed output scale BASE_NORMAL_INIT_STD=0.02.
 \node[box,fill=mint,text width=2.7cm] (payloadroute) at (2.5,24.0)
   {\textbf{Payload MHDB}\\route seed + all deltas\\+ its learned null};
 \draw[bankread] (4.25,24.0) -- (payloadroute.east);
@@ -145,10 +143,10 @@
 \node[circle,draw=purpleink!50,fill=purple,minimum size=.68cm,inner sep=0pt]
   (payload) at (2.5,28.75) {$p_t$};
 \draw[flow] (payloadadd) -- (payloadnorm);
-\draw[flow] (payloadnorm) -- (payload);
+\draw[flow] (payloadnorm) -- node[right,edgeword] {$\times\,0.02$} (payload);
 
-% The outer feedback path carries p_t to fusion with N_e(E(x_{t+1})).
-% Both token paths share E and N_e; the whole row is normalized once.
+% The outer feedback path carries p_t to fusion with raw E(x_{t+1}).
+% Both token paths share E; one lookup serves the whole row.
 % Fusion is computed once and reused by MTP and shifted feedback.
 \node[box,fill=purple!65,text width=3.3cm] (jitter) at (20.2,3.1)
   {\textbf{Payload + jitter}\\$p_t+\xi_t$};
@@ -158,14 +156,11 @@
   at (.3,15.6) {Full-bandwidth payload feedback};
 \node[box,fill=pink,text width=3.3cm] (nextembedding) at (15.2,3.1)
   {\textbf{Token embedding $E$}\\$e_{t+1}=E(x_{t+1})$};
-\node[box,fill=yellow,text width=3.3cm] (nexttokennorm) at (15.2,4.62)
-  {\textbf{Shared RMSNorm}\\$\bar e_{t+1}=N_e(e_{t+1})$};
-\draw[flow] (nextembedding) -- (nexttokennorm);
 \node[box,fill=purple,text width=7.5cm,minimum height=1.12cm]
   (fusion) at (17.7,6.35)
   {\textbf{Shared concat-linear fusion}\quad $2D\to D$\\
-   $u_t=W_f\,[\bar e_{t+1};\,p_t+\xi_t]$};
-\draw[flow,rounded corners=3pt] (nexttokennorm.north) -- (15.2,5.5)
+   $u_t=W_f\,[e_{t+1};\,p_t+\xi_t]$};
+\draw[flow,rounded corners=3pt] (nextembedding.north) -- (15.2,5.5)
   -| ($(fusion.south)+(-1.5,0)$);
 \draw[flow,rounded corners=3pt] (jitter.north) -- (20.2,5.5)
   -| ($(fusion.south)+(1.5,0)$);
@@ -176,8 +171,8 @@
 \draw[feedback] (fused) -- (11.8,7.6) -- (11.8,9.7) -- (seed.east);
 \node[note,text=purpleink,text width=2.3cm,anchor=west] at (12.03,8.77)
   {Shift one token:\\seed at $t+1$\\in the next column/pass};
-\node[note,text width=5.8cm] at (16.9,2.05)
-  {One payload RMSNorm, then shared jitter.\\Evaluation: $\xi_t=0$.};
+\node[note,text width=6.6cm] at (16.9,2.05)
+  {Default jitter: $\xi_t\sim U(-0.0004,0.0004)$.\\Evaluation: $\xi_t=0$.};
 
 % MTP is a connected side branch of the very same fusion tensor.
 \node[box,fill=gold,text width=5.0cm,minimum height=1.2cm]

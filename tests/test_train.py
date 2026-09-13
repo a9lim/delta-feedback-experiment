@@ -144,8 +144,8 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         768,
         3,
         15,
-        638862216,
-        209175432,
+        638861448,
+        209174664,
     )
     from delta_feedback_experiment.cli import stream_target
     from delta_feedback_experiment.data import (
@@ -217,7 +217,8 @@ def test_keyed_jitter_covers_single_and_final_passes_and_replay_buffers():
         assert prefix.shape == (count - 1, 2)
         assert jitter.shape == (count, 2, args.seq_len + 1, 16)
         assert torch.all((prefix >= 1) & (prefix < args.seq_len))
-        assert torch.all(jitter.abs() <= args.jitter)
+        assert torch.all(jitter.abs() <= 0.02 * args.jitter)
+        assert jitter.abs().max() > 0.9 * 0.02 * args.jitter
         assert all(draw.count_nonzero() for draw in jitter)
         destination_prefix, destination_jitter = (
             torch.empty_like(prefix), torch.empty_like(jitter)
@@ -297,6 +298,10 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     full = trainer.train(["full", *flags])
     half = trainer.train(["half", *flags, "--max-steps", "1"])
     assert half["step"] == 1
+    # Resume must restore a nonzero auxiliary controller state. Later updates
+    # can legitimately bring these signed count corrections back to zero.
+    halfway = trainer.read_checkpoint(tmp_path / "runs/half.pt.1")
+    assert halfway["state"]["mtp.block.mlp.expert_bias"].count_nonzero()
     Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE).move("half", "renamed")
     with pytest.raises(ValueError, match="conflicts"):
         trainer.train(["renamed", *flags, "--resume", "--experts-per-token", "1"])
@@ -323,7 +328,6 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
         if name.endswith("expert_bias")
     ]
     assert any(value.count_nonzero() for value in biases)
-    assert restored["state"]["mtp.block.mlp.expert_bias"].count_nonzero()
 
 
 def test_replay_plan_fits_rows_then_recomputes_blocks():
