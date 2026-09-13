@@ -91,9 +91,32 @@ Use `delta train --help` for recipe and runtime overrides.
 | `expert_max_violation` | Worst bank's whole-update `max(load)/mean(load)-1` |
 | `expert_bias_max` | Maximum absolute post-update selection bias |
 
-`delta watch` streams run milestones. The browser monitor plots training
-health, validation, routing, and recurrence.
-Expert route summaries use up to two validation rows and describe that sample.
+`delta watch` streams run milestones. The browser monitor groups raw learning
+curves, layer anatomy, optimization, and recurrence. The overview holds progress,
+pace, cumulative token counts, and the host's current GPU reading; configuration
+and non-step logs expand on demand. Token totals require the complete addressed
+step history, including inherited fork steps, and exclude the MTP branch.
+
+The **Eval step** slider moves all layer profiles and expert heatmaps together.
+Arrow buttons and keyboard arrows select recorded evals. A selection stays pinned
+while the log refreshes; **Follow latest** resumes tracking new evals. Switching
+runs resets to the latest eval. A resume that removes a selected eval clamps the
+selection to the nearest surviving earlier eval (or the first remaining eval).
+Routing overlays use the exact selected step; absent sites or evals remain blank.
+The heatmaps show the selected run. Assignment colors use multiples of uniform
+load; bias colors and null-RMS axes keep a fixed range across recorded evals.
+
+Routing profiles expose null, seed and previous-cell mass, maximum weight with
+its `1/n` reference, head divergence, and learned-null RMS. Expert assignment
+heatmaps show each executed site's share per expert; hovering or focusing a cell
+also reports expert coverage and gate entropy. Bias heatmaps show each parameter
+bank once because core iterations share its parameters. Both diagnostics use up
+to two validation rows: routing uses the fused pass with feedback, while expert
+loads use pass-1 and the teacher-forced MTP block. These are sample diagnostics.
+
+Portable monitor data/lifecycle checks run with `node --test tests/monitor.test.cjs`
+from this checkout in the parent workspace. Browser checks cover slider input,
+overlays, refresh, heatmap inspection, and responsive layout.
 
 ## Conversation formatting
 

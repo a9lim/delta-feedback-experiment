@@ -5,140 +5,199 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>delta runs</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="/vendor/uPlot.min.css">
 <link rel="stylesheet" href="/monitor.css">
 <style>
-  /* Feedback and core-loop sections follow the displayed conditions. */
-  section.mech[hidden] { display: none; }
-  section.mech > h3 { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
-  section.mech > h3 small { margin-left: 0; }
-  section.mech .note { font-size: 12.5px; color: var(--ink-2); margin: 0 0 8px; max-width: 78ch; }
+  .wrap { max-width: 1680px; padding: 20px clamp(14px, 2.5vw, 40px) 40px; }
+  header { justify-content: space-between; gap: 10px 20px; }
+  h1 .brand { color: var(--s1); font-size: 13px; }
+  .controls { gap: 8px 14px; font-size: 12px; }
+  #meta:empty { display: none; }
+  .run-tools { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px 20px; margin: 10px 0; }
+  .run-tools details { min-width: 0; }
+  summary { cursor: pointer; color: var(--ink-2); font-size: 12px; }
+  summary:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid var(--s1); outline-offset: 3px; }
+  #overlay { padding: 8px 0; font-size: 12px; }
+  #run-key { margin: 8px 0; font-size: 11px; }
+  #run-key span { overflow-wrap: anywhere; }
+  #status { margin-left: auto; font-size: 12px; color: var(--ink-2); }
+  #status[data-live=true]::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--good); }
+  #status[data-failed=true] { color: var(--critical); }
+  .tiles { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px 22px; margin: 16px 0; padding: 16px 0; border-top: 1px solid var(--grid); border-bottom: 1px solid var(--grid); }
+  .tile { min-width: 0; }
+  .tile .v { font-size: 24px; }
+  .tile .k { font-size: 10px; letter-spacing: .08em; }
+  .tile .s { font-size: 11px; }
+  .config { margin: 0 0 14px; }
+  .config-grid { margin-top: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); }
+  .config-group { border-radius: 6px; }
+  nav { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 18px 0 0; font-size: 12px; }
+  nav button { color: var(--ink-2); background: transparent; width: auto; height: auto; padding: 0; border-radius: 0; font-size: 12px; }
+  nav button:hover { color: var(--s1); }
+  section { scroll-margin-top: 14px; margin-top: 24px; }
+  [hidden] { display: none !important; }
+  .section-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 6px 14px; margin: 0 0 12px; }
+  .section-head h3 { font-size: 11px; color: var(--ink); margin: 0; }
+  .section-head p, .section-note { margin: 0; color: var(--muted); font-size: 11px; }
+  .section-note { margin: 10px 0; }
+  .grid { gap: 12px; margin: 0; align-items: stretch; }
+  .grid.two, .grid.three { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .chart { background: var(--surface); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 12px 7px; position: relative; }
+  .chart h2 { margin: 0; font-size: 12px; gap: 4px 10px; }
+  .chart h2 small { font-size: 11px; }
+  .chart .caption { margin: 3px 0 10px; color: var(--muted); font-size: 11px; min-height: 16px; }
+  .plot { min-height: 238px; }
+  .chart[data-empty=true] .plot::after { content: 'No observations yet'; position: absolute; left: 0; right: 0; top: 46%; text-align: center; color: var(--muted); font-size: 12px; pointer-events: none; }
+  .u-legend { font-size: 10.5px; line-height: 1.65; }
+  .u-legend .u-series { padding-right: 10px; }
+  .u-legend .u-marker { width: 7px; height: 7px; margin-right: 4px; }
+  .snapshot-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 11px 14px; background: var(--fill-2); border: 1px solid var(--grid); border-radius: 8px; margin-bottom: 10px; }
+  .snapshot-bar label { font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .snapshot-bar output { color: var(--s1); font-variant-numeric: tabular-nums; min-width: 8ch; font-size: 13px; }
+  input[type=range] { accent-color: var(--s1); flex: 1 1 160px; min-width: 80px; margin: 0; cursor: pointer; }
+  button.text { width: auto; padding: 5px 10px; height: 28px; font-size: 11px; border-radius: 5px; }
+  button[aria-pressed=true] { color: var(--s1); background: color-mix(in srgb, var(--s1) 12%, transparent); }
+  button:disabled, input:disabled { opacity: .4; cursor: default; }
+  #snapshot-context { font-size: 11px; color: var(--muted); flex-basis: 100%; }
+  .heatmaps { margin-top: 12px; }
+  .heatmap-scroll { overflow-x: auto; }
+  .heatmap { width: 100%; border-collapse: separate; border-spacing: 2px; table-layout: fixed; font-size: 10px; }
+  .heatmap th { color: var(--muted); font-weight: 400; text-align: center; }
+  .heatmap th:first-child { width: 28px; text-align: left; }
+  .heatmap td { height: 15px; padding: 0; border-radius: 2px; cursor: crosshair; }
+  .heatmap td.missing { background: repeating-linear-gradient(135deg, var(--fill), var(--fill) 2px, transparent 2px, transparent 4px); }
+  .heatmap td:focus { outline: 2px solid var(--ink); outline-offset: 1px; }
+  .heatmap tfoot th { height: 64px; vertical-align: top; padding-top: 6px; overflow: visible; }
+  .heatmap tfoot span { display: block; writing-mode: vertical-rl; font-size: 9px; white-space: nowrap; margin: auto; }
+  .heatmap-key { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 10px; margin-top: 7px; }
+  .heatmap-key i { width: 100px; height: 6px; border-radius: 2px; }
+  .heatmap-readout { min-height: 32px; margin-top: 7px; font: 10.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ink-2); }
+  .heatmap-empty { padding: 42px 12px; text-align: center; color: var(--muted); font-size: 12px; }
+  .log { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--grid); }
+  .log pre { margin-top: 10px !important; }
+  @media (min-width: 1180px) { .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+  @media (max-width: 850px) { .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } .tile .v { font-size: 22px; } }
+  @media (max-width: 640px) {
+    .wrap { padding-top: 14px; } .grid.two, .grid.three { grid-template-columns: minmax(0, 1fr); }
+    .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .tile:last-child { grid-column: 1 / -1; } .tile:last-child .v { display: inline-block; margin-right: 12px; }
+    .tile:last-child .s { display: inline; } #run { max-width: calc(100vw - 105px); }
+    #status { margin-left: 0; } .chart { padding: 11px 8px 6px; } nav { gap: 8px 16px; }
+    .snapshot-bar { display: grid; grid-template-columns: 28px auto minmax(0, 1fr) auto 28px; }
+    .snapshot-bar label { grid-column: 1 / 3; grid-row: 1; }
+    #eval-value { grid-column: 3; grid-row: 1; min-width: 0; }
+    #eval-latest { grid-column: 4 / 6; grid-row: 1; }
+    #eval-prev { grid-column: 1; grid-row: 2; }
+    #eval-step { grid-column: 2 / 5; grid-row: 2; width: 100%; }
+    #eval-next { grid-column: 5; grid-row: 2; }
+    #snapshot-context { grid-column: 1 / -1; grid-row: 3; }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
 <header>
-  <h1><span class="brand">delta</span><select id="run" title="run"></select></h1>
+  <h1><span class="brand">delta</span><select id="run" aria-label="Run"></select></h1>
   <div class="controls">
-    <label><input type="checkbox" id="logy" checked> log y <span class="hint">positive quantities</span></label>
-    <label>every <output id="every">–</output></label>
-    <button id="refresh" title="refresh now">↻</button>
-    <span class="hint zoom">drag to zoom · double-click resets</span>
+    <label title="Logarithmic scale for positive quantities; masses, counts and signed differences stay linear"><input type="checkbox" id="logy" checked> log scale</label>
+    <span>refresh <output id="every">–</output></span>
+    <button id="refresh" aria-label="Refresh now" title="Refresh now">↻</button>
   </div>
-  <div class="controls"><span>overlay</span><span id="overlay"></span></div>
 </header>
 <div id="meta"></div>
-<div id="banner">Fetch failed — the Access session may have expired. Tap to reload.</div>
-<div class="tiles" id="tiles"></div>
-<section class="config">
-  <h3>run configuration <small>selected run · geometry and training settings</small></h3>
-  <div class="config-grid" id="config"></div>
-</section>
-
-<section class="mech" id="sec-train">
-  <h3>training <small id="sum-train"></small></h3>
-  <div class="grid two">
-    <div class="chart"><h2>training objective <small>per step · solid loss · dashed pass-1 · dotted combined NTP CE · ▲ snapshots</small></h2><div class="plot" id="p-nll"></div></div>
-    <div class="chart"><h2>held-out NLL <small>nats at eval cadence · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-val"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>learning rates <small>NorMuonH base, expert input/output · NAdam width/base · one shared schedule</small></h2><div class="plot" id="p-lr"></div></div>
-    <div class="chart"><h2>gradient norm <small>global FP32 L2 before clipping</small></h2><div class="plot" id="p-gnorm"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>throughput <small>per second · solid predicted tokens · dashed pass-tokens · dotted cell-tokens</small></h2><div class="plot" id="p-tput"></div></div>
-    <div class="chart"><h2>cumulative tokens <small>solid predicted (matched data) · dashed pass-tokens · dotted trunk cell-tokens · from k, r, and the geometry</small></h2><div class="plot" id="p-cum"></div></div>
-  </div>
-</section>
-
-<section class="mech">
-  <h3>attention <small id="sum-attention"></small></h3>
-  <p class="note">PKDA occupies three of every four attention layers; the fourth is gated global GQA.</p>
-</section>
-
-<section class="mech">
-  <h3>mixture of experts <small id="sum-experts"></small></h3>
-  <p class="note">Each token uses one shared expert and a selected subset of routed experts. Counts and widths follow the run configuration. Selection biases balance actual assignments across each optimizer step. The tiny sequence penalty uses unbiased choices and is averaged over executed layers and passes. Pass-1 and validation remain cross-entropy.</p>
-  <div class="chart"><h2>expert sequence penalty <small>unweighted · coefficient in run configuration</small></h2><div class="plot" id="p-expert-balance"></div></div>
-  <div class="chart"><h2>expert load imbalance <small>worst bank · max load / mean load − 1</small></h2><div class="plot" id="p-expert-violation"></div></div>
-  <div class="chart"><h2>expert selection bias <small>largest absolute bias after each step</small></h2><div class="plot" id="p-expert-bias"></div></div>
-</section>
-
-<section class="mech">
-  <h3>residual routing <small id="sum-routing"></small></h3>
-  <div class="grid two">
-    <div class="chart"><h2>source mass by site <small>latest eval · head-averaged · solid null · dashed seed · left to right: prelude, core by iteration, coda, payload router</small></h2><div class="plot" id="p-site-mass"></div></div>
-    <div class="chart"><h2>sharpness by site <small>latest eval · solid max weight (uniform is 1/n) · dashed head divergence (normalized Jensen–Shannon, 0 means identical head routes)</small></h2><div class="plot" id="p-site-sharp"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>seed mass <small>head-averaged · solid payload router · dashed deepest attn · dotted deepest MLP</small></h2><div class="plot" id="p-seed"></div></div>
-    <div class="chart"><h2>null mass <small>learned opt-out source · same sites</small></h2><div class="plot" id="p-null"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>max weight <small>uniform is 1/n · same sites</small></h2><div class="plot" id="p-route"></div></div>
-    <div class="chart"><h2>head specialization <small>normalized Jensen–Shannon divergence · same sites</small></h2><div class="plot" id="p-headjs"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>null RMS <small>source value scale · mass alone is not a no-op once this grows · same sites</small></h2><div class="plot" id="p-nullrms"></div></div>
-    <div class="chart"><h2>null RMS by site <small>latest eval</small></h2><div class="plot" id="p-site-nullrms"></div></div>
-  </div>
-</section>
-
-<section class="mech" data-letter="f" hidden>
-  <h3>f · feedback <small id="sum-f"></small></h3>
-  <div class="grid two">
-    <div class="chart"><h2>fused gap <small>fused − pass-1 · ● held-out at eval cadence · dashed train on multi-pass steps · signed, linear</small></h2><div class="plot" id="p-gap"></div></div>
-    <div class="chart"><h2>passes per step <small>k · rolling mean over 200 steps · one before the boundary, two or three after</small></h2><div class="plot" id="p-k"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>self-composition · loss drift <small>iterated fused prefill on 2 rows · loss(8) − loss(0) · signed, linear</small></h2><div class="plot" id="p-drift"></div></div>
-    <div class="chart"><h2>self-composition · update norm <small>‖h(8) − h(7)‖ · shrinks if the payload map contracts</small></h2><div class="plot" id="p-upd"></div></div>
-  </div>
-</section>
-
-<section class="mech" data-letter="l" hidden>
-  <h3>l · loop <small id="sum-l"></small></h3>
-  <div class="grid two">
-    <div class="chart"><h2>loss by iteration count <small>fixed-r sweep on 2 rows · solid r = 1 · dashed r_mean · dotted r_max</small></h2><div class="plot" id="p-depth"></div></div>
-    <div class="chart"><h2>gain from iterating <small>loss(r) − loss(1) · dashed r_mean · dotted r_max · signed, linear</small></h2><div class="plot" id="p-depthgain"></div></div>
-  </div>
-  <div class="grid two">
-    <div class="chart"><h2>core update at r_max <small>mean ‖core(r_max) − core(r_max − 1)‖ · shrinks if the core contracts</small></h2><div class="plot" id="p-depthupd"></div></div>
-    <div class="chart"><h2>iterations per step <small>r drawn once per step · rolling mean over 200 steps · reference r_mean · linear</small></h2><div class="plot" id="p-r"></div></div>
-  </div>
-</section>
-
-<section class="mech">
-  <h3>two-token prediction <small id="sum-mtp"></small></h3>
-  <p class="note">The auxiliary block predicts the second token from the payload and the supplied next token. Training CE is pass-1 plus mean fused CE, before its weight and z-loss. Held-out CE uses the same teacher forcing. Token and cell counters above count trunk work; they exclude the auxiliary block and vocabulary loss.</p>
-  <div class="grid two">
-    <div class="chart"><h2>auxiliary training CE <small>unweighted · pass-1 plus mean feedback passes</small></h2><div class="plot" id="p-mtp-train"></div></div>
-    <div class="chart"><h2>auxiliary held-out CE <small>nats · solid pass-1 · dashed fused pass</small></h2><div class="plot" id="p-mtp-val"></div></div>
-  </div>
-</section>
-
-<h3>log tail <small>non-step records</small></h3>
-<pre id="tail"></pre>
+<div class="run-tools">
+  <details id="compare"><summary>Compare runs</summary><div id="overlay"></div></details>
+  <span class="hint zoom">drag to zoom · double-click to reset · click legend to toggle series</span>
+  <span id="status" role="status"></span>
 </div>
-
+<div class="controls" id="run-key" hidden></div>
+<div id="banner">Fetch failed — tap to reload the session.</div>
+<div class="tiles" id="tiles"></div>
+<details class="config"><summary>Run configuration <span class="hint">· geometry, optimizer &amp; schedule</span></summary><div class="config-grid" id="config"></div></details>
+<nav aria-label="Monitor sections">
+  <button data-section="learning">Learning</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letter="f">Feedback</button><button data-section="loop" data-letter="l">Core loop</button>
+</nav>
+<section id="learning">
+  <div class="section-head"><h3>Learning</h3><p>Raw observations · nats · ▲ checkpoint snapshots</p></div>
+  <div class="grid three">
+    <div class="chart"><h2>Training objective</h2><p class="caption">Total loss and its main / auxiliary cross-entropies</p><div class="plot" id="p-nll"></div></div>
+    <div class="chart"><h2>Held-out next token</h2><p class="caption">Pass-1 and feedback on the validation set</p><div class="plot" id="p-val"></div></div>
+    <div class="chart"><h2>Held-out second token</h2><p class="caption">Teacher-forced auxiliary prediction · unweighted CE</p><div class="plot" id="p-mtp-val"></div></div>
+  </div>
+</section>
+<section id="anatomy">
+  <div class="section-head"><h3>Layer anatomy</h3><p>Eval snapshots · up to two validation rows</p></div>
+  <div class="snapshot-bar">
+    <label for="eval-step">Eval step</label><output id="eval-value" for="eval-step">–</output>
+    <button id="eval-prev" class="text" aria-label="Previous eval">←</button>
+    <input type="range" id="eval-step" min="0" max="0" value="0" step="1" disabled aria-describedby="snapshot-context">
+    <button id="eval-next" class="text" aria-label="Next eval">→</button>
+    <button id="eval-latest" class="text" aria-pressed="true">Follow latest</button>
+    <span id="snapshot-context">Waiting for the first eval.</span>
+  </div>
+  <div class="grid three">
+    <div class="chart"><h2>Residual source mass</h2><p class="caption">Head-averaged · remaining mass goes to block deltas</p><div class="plot" id="p-site-mass"></div></div>
+    <div class="chart"><h2>Route concentration &amp; specialization</h2><p class="caption">Max weight vs. uniform 1/n · normalized head JS</p><div class="plot" id="p-site-sharp"></div></div>
+    <div class="chart"><h2>Null source scale</h2><p class="caption">Learned null RMS · fixed scale across recorded evals</p><div class="plot" id="p-site-nullrms"></div></div>
+  </div>
+  <div class="grid two heatmaps">
+    <div class="chart"><h2>Expert assignments <small>selected run · pass-1 + MTP</small></h2><p class="caption">Share of routed assignments · 1× is uniform within each bank</p><div id="expert-load"></div></div>
+    <div class="chart"><h2>Expert selection biases <small>selected run · signed</small></h2><p class="caption">One column per bank · core iterations share the same parameters</p><div id="expert-bias"></div></div>
+  </div>
+  <p class="section-note">Sites follow execution: prelude → core by iteration → coda → payload / MTP. Routing uses the fused pass when feedback is enabled; expert loads use pass-1. Missing observations remain blank.</p>
+</section>
+<section id="optimization">
+  <div class="section-head"><h3>Optimization &amp; work</h3><p id="work-summary"></p></div>
+  <div class="grid three">
+    <div class="chart"><h2>Learning rates</h2><p class="caption">Five parameter groups · shared schedule</p><div class="plot" id="p-lr"></div></div>
+    <div class="chart"><h2>Gradient norm</h2><p class="caption">Global FP32 L2 before clipping · dashed clipping threshold</p><div class="plot" id="p-gnorm"></div></div>
+    <div class="chart"><h2>Throughput</h2><p class="caption">Predicted / pass / trunk cell tokens per second</p><div class="plot" id="p-tput"></div></div>
+    <div class="chart"><h2>Expert sequence penalty</h2><p class="caption">Unweighted · unbiased choices, averaged over layers and passes</p><div class="plot" id="p-expert-balance"></div></div>
+    <div class="chart"><h2>Expert load imbalance</h2><p class="caption">Worst bank across the whole update · max / mean − 1</p><div class="plot" id="p-expert-violation"></div></div>
+    <div class="chart"><h2>Expert bias magnitude</h2><p class="caption">Largest absolute selection bias after each update</p><div class="plot" id="p-expert-bias"></div></div>
+  </div>
+</section>
+<section id="feedback" data-letter="f" hidden>
+  <div class="section-head"><h3>Feedback</h3><p>Self-composition: eight repeated fused prefills on two rows</p></div>
+  <div class="grid three">
+    <div class="chart"><h2>Feedback gain</h2><p class="caption">Fused − pass-1 CE · negative means improvement</p><div class="plot" id="p-gap"></div></div>
+    <div class="chart"><h2>Self-composition loss drift</h2><p class="caption">Loss(8) − loss(0) · negative means improvement</p><div class="plot" id="p-drift"></div></div>
+    <div class="chart"><h2>Self-composition update</h2><p class="caption">‖h(8) − h(7)‖ · smaller means less movement</p><div class="plot" id="p-upd"></div></div>
+  </div>
+</section>
+<section id="loop" data-letter="l" hidden>
+  <div class="section-head"><h3>Core loop</h3><p>Fixed-depth sweep on two validation rows</p></div>
+  <div class="grid three">
+    <div class="chart"><h2>Loss by iteration count</h2><p class="caption">The same rows at r = 1, r mean and r max</p><div class="plot" id="p-depth"></div></div>
+    <div class="chart"><h2>Final core update</h2><p class="caption">‖core(r max) − core(r max − 1)‖</p><div class="plot" id="p-depthupd"></div></div>
+    <div class="chart"><h2>Executed recurrence</h2><p class="caption">Raw passes k and core iterations r per optimizer step</p><div class="plot" id="p-recurrence"></div></div>
+  </div>
+</section>
+<details class="log"><summary>Log tail <span class="hint">· non-step records</span></summary><pre id="tail"></pre></details>
+</div>
 <script src="/vendor/uPlot.iife.min.js"></script>
 <script src="/chassis.js"></script>
 <script>
 'use strict';
-// Current Delta telemetry. Parsing, polling, and plotting come from the chassis.
-const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtWhen,
-        fmtAge, esc, tile, pace, gpuTile, configGroup, scheduleFields,
-        makeChart, setData, bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs,
-        state, runFor } = M;
+// Shared chassis owns ingestion, resume/fork folding and polling. Every eval
+// observable stays in run.evals so rewinds apply to snapshots and trajectories.
+const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtAge, esc,
+        tile, pace, gpuTile, configGroup, scheduleFields, makeChart, setData,
+        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state, runFor } = M;
+const finite = (v) => Number.isFinite(v) ? v : null;
+const signed = (v, digits = 3) => v == null || !Number.isFinite(v) ? '–' : (v > 0 ? '+' : '') + v.toFixed(digits);
+const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).toLocaleString();
+const compact = (v) => v == null || !Number.isFinite(v) ? '–' : v >= 1e9 ? `${fmt(v / 1e9, 3)}B` : v >= 1e6 ? `${fmt(v / 1e6, 3)}M` : count(v);
+const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
+const has = (view, letter) => conditionOf(view).includes(letter);
+const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
+function eventLines(view) {
+  if (!view || !has(view, 'f')) return [];
+  const b = num(view.run.meta.schedule?.feedback_boundary);
+  return b > 0 && b < view.total ? [{ label: 'feedback →', step: b }] : [];
+}
 
-const ROLL = 200;
-
-// ---------------------------------------------------------------- records
-// step: loss/ntp/mtp/pass1/k/r, learning rates, gradients, throughput, memory.
-// eval: val/val_mtp and fused losses with f. route: per-site weights at eval
-// cadence.  contract: the standing self-composition diagnostic (f).  depth:
-// the loop's fixed-r sweep (l).  Non-step series live in run.evals so the
-// chassis's resume-fold rewinds them with everything else.
 function onStep(run, rec) {
   return {
     loss: num(rec.loss), ntp: num(rec.ntp), mtp: num(rec.mtp), pass1: num(rec.pass1), k: num(rec.k), r: num(rec.r),
@@ -166,7 +225,17 @@ function onEval(run, rec, step) {
 function onRecord(run, rec) {
   if (rec.event === 'route') {
     Object.assign(entryAt(run, `route|${rec.site}`, address(rec.step)[0]),
-      { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), nul: num(rec.null), nulrms: num(rec.null_rms) });
+      { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), prev: num(rec.prev), nul: num(rec.null), nulrms: num(rec.null_rms) });
+  } else if (rec.event === 'expert') {
+    const vector = (prefix) => {
+      const entries = Object.entries(rec).filter(([key]) => new RegExp(`^${prefix}\\d+$`).test(key));
+      const out = [];
+      for (const [key, value] of entries) out[+key.slice(prefix.length)] = num(value);
+      return Array.from(out, (value) => value ?? null);
+    };
+    Object.assign(entryAt(run, `expert|${rec.site}`, address(rec.step)[0]), {
+      loads: vector('expert'), biases: vector('bias'), used: num(rec.used), entropy: num(rec.entropy),
+    });
   } else if (rec.event === 'contract') {
     Object.assign(entryAt(run, 'contract', address(rec.step)[0]),
       { loss0: num(rec.loss0), loss8: num(rec.loss8), upd8: num(rec.upd8) });
@@ -177,121 +246,214 @@ function onRecord(run, rec) {
   }
 }
 
-// ---------------------------------------------------------------- conditions
-const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
-const has = (view, letter) => conditionOf(view).includes(letter);
-const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
-// The feedback boundary is a schedule event worth a line on every step chart.
-function eventLines(view) {
-  if (!view || !has(view, 'f')) return [];
-  const b = num(view.run.meta.schedule?.feedback_boundary);
-  return b > 0 && b < view.total ? [{ label: 'feedback →', step: b }] : [];
-}
 
-// ---------------------------------------------------------------- sites
-// A routing site is `payload` or `L<layer>[i<iteration>].<attn|mlp>`; the
-// iteration tag marks a core site under l.
-const SITE = /^route\|(payload|L(\d+)(?:i(\d+))?\.(attn|mlp))$/;
-function parseSite(key) {
-  const m = SITE.exec(key);
-  if (!m) return null;
-  return { key, name: m[1], layer: m[2] != null ? +m[2] : null, iter: m[3] != null ? +m[3] : null, kind: m[4] ?? null };
+// ---------------------------------------------------------------- snapshots
+// A null selection follows the newest eval. Explicit step addresses stay pinned
+// across polling, theme/scale changes and overlay rebuilds. Never nearest-match
+// another run: an overlay without this exact eval contributes gaps.
+const snapshot = { tag: null, step: null, steps: [], current: null };
+function evalSteps(view) {
+  return [...new Set([...view.evals].filter(([key]) => key === 'val' || /^(route|expert)\|/.test(key))
+    .flatMap(([, list]) => list.map((e) => e.step)).filter(Number.isFinite))].sort((a, b) => a - b);
 }
-// Column order over every displayed run: the prelude's sites, the core's by
-// iteration, the coda's, then the payload router.
-function orderedSites(views) {
+function reconcileSnapshot(view) {
+  if (snapshot.tag !== view.run.tag) { snapshot.tag = view.run.tag; snapshot.step = null; }
+  snapshot.steps = evalSteps(view);
+  if (snapshot.step != null && !snapshot.steps.includes(snapshot.step)) {
+    snapshot.step = snapshot.steps.filter((step) => step <= snapshot.step).at(-1) ?? snapshot.steps[0] ?? null;
+  }
+  snapshot.current = snapshot.step ?? snapshot.steps.at(-1) ?? null;
+}
+function atStep(view, key, step = snapshot.current) {
+  return (view.evals.get(key) || []).find((entry) => entry.step === step);
+}
+const SITE = /^(?:route|expert)\|(payload|mtp\.experts|L(\d+)(?:i(\d+))?\.(attn|mlp|experts))$/;
+function parseSite(key) {
+  const match = SITE.exec(key);
+  return match ? { key, name: match[1], layer: match[2] == null ? null : +match[2], iter: match[3] == null ? null : +match[3], kind: match[4] } : null;
+}
+function orderedSites(views, prefix, step = snapshot.current) {
   const sites = new Map();
-  for (const v of views) for (const key of v.evals.keys()) { const s = parseSite(key); if (s && !sites.has(s.name)) sites.set(s.name, s); }
+  for (const view of views) for (const [key, entries] of view.evals) {
+    if (!key.startsWith(prefix + '|') || !entries.some((entry) => entry.step === step)) continue;
+    const site = parseSite(key);
+    if (site) sites.set(site.name, site);
+  }
   const core = [...sites.values()].filter((s) => s.iter != null).map((s) => s.layer);
   const firstCore = core.length ? Math.min(...core) : Infinity;
-  const rank = (s) => (s.name === 'payload' ? [3, 0, 0, 0]
+  const rank = (s) => s.layer == null ? [3, 0, 0, 0]
     : s.iter != null ? [1, s.iter, s.layer, s.kind === 'mlp' ? 1 : 0]
-    : [s.layer < firstCore ? 0 : 2, 0, s.layer, s.kind === 'mlp' ? 1 : 0]);
-  return [...sites.values()].sort((a, b) => { const ra = rank(a), rb = rank(b); for (let i = 0; i < 4; i++) if (ra[i] !== rb[i]) return ra[i] - rb[i]; return 0; });
+    : [s.layer < firstCore ? 0 : 2, 0, s.layer, s.kind === 'mlp' ? 1 : 0];
+  return [...sites.values()].sort((a, b) => { const x = rank(a), y = rank(b); for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; });
 }
-const SITES = [];   // the current ordered union; the by-site charts index into it
-// The headline sites for trajectories: the payload router and the deepest
-// column attn/MLP sites in the log (the deepest see every source).
-function routeSites(view) {
-  const of = (kind) => {
-    let best = null, layer = -1;
-    for (const key of view.evals.keys()) {
-      const s = parseSite(key);
-      if (s && s.kind === kind && s.iter == null && s.layer > layer) { layer = s.layer; best = key; }
-    }
-    return best;
-  };
-  return { payload: view.evals.has('route|payload') ? 'route|payload' : null, attn: of('attn'), mlp: of('mlp') };
-}
-function latestRouteStep(view) {
-  let last = null;
-  for (const [key, list] of view.evals) {
-    if (!parseSite(key) || !list.length) continue;
-    const s = list[list.length - 1].step;
-    if (last == null || s > last) last = s;
-  }
-  return last;
-}
-// Site labels along x, thinned to what fits; the grid follows the labels.
+const SITES = [];
+const heatmapMarkup = new Map();
 function siteAxis() {
-  const stride = (u) => Math.max(1, Math.ceil(SITES.length * 46 / Math.max(1, u.bbox.width / (devicePixelRatio || 1))));
-  const thin = (u, splits) => { const k = stride(u); return splits.map((s) => (s % k === 0 ? s : null)); };
+  const stride = (u) => Math.max(1, Math.ceil(SITES.length * 64 / Math.max(1, u.bbox.width / (devicePixelRatio || 1))));
+  const thin = (u, splits) => { const k = stride(u); return splits.map((s) => s % k === 0 ? s : null); };
   return {
-    splits: (u, ax, min, max) => { const out = []; for (let i = Math.max(0, Math.ceil(min)); i <= Math.min(SITES.length - 1, Math.floor(max)); i++) out.push(i); return out; },
-    filter: thin,
-    values: (u, splits) => splits.map((s) => (s == null ? null : SITES[s]?.name ?? '')),
+    splits: (u, ax, min, max) => Array.from({ length: SITES.length }, (_, i) => i).filter((i) => i >= min && i <= max),
+    filter: thin, values: (u, splits) => splits.map((s) => SITES[s]?.name ?? ''),
     grid: { stroke: P.grid, width: 1, filter: thin },
   };
 }
-
-// ---------------------------------------------------------------- derived values
-// Trailing mean over the last `window` non-null entries.
-function rolling(values, window) {
-  const out = new Array(values.length).fill(null), buf = [];
-  let sum = 0;
-  for (let i = 0; i < values.length; i++) {
-    const v = values[i];
-    if (v == null) continue;
-    buf.push(v); sum += v;
-    if (buf.length > window) sum -= buf.shift();
-    out[i] = sum / buf.length;
-  }
-  return out;
+function profileOf(view) {
+  const records = SITES.map((s) => atStep(view, `route|${s.name}`));
+  const profile = (...fields) => [SITES.map((_, i) => i), ...fields.map((f) => records.map((r) => finite(typeof f === 'function' ? f(r) : r?.[f])))];
+  return {
+    'p-site-mass': profile('nul', 'seed', 'prev'),
+    'p-site-sharp': profile('max', 'headjs', (r) => r?.n > 0 ? 1 / r.n : null),
+    'p-site-nullrms': profile('nulrms'),
+  };
 }
-const finite = (v) => (Number.isFinite(v) ? v : null);
-// Signed differences are small numbers near zero: fixed decimals, never exponent form.
-const signed = (v, digits = 3) => (v == null || !Number.isFinite(v) ? '–' : (v > 0 ? '+' : '') + v.toFixed(digits));
-const count = (v) => (v == null ? '–' : Math.round(v).toLocaleString());
+function expertBanks(sites) {
+  const banks = new Map();
+  for (const site of sites) {
+    const name = site.layer == null ? site.name : `L${site.layer}.experts`;
+    if (!banks.has(name)) banks.set(name, { ...site, name });
+  }
+  return [...banks.values()];
+}
+function biasBound(view) {
+  let max = 0;
+  for (const [key, entries] of view.evals) if (key.startsWith('expert|')) {
+    for (const entry of entries) for (const value of entry.biases || []) if (Number.isFinite(value)) max = Math.max(max, Math.abs(value));
+  }
+  return max;
+}
+function nullRange() {
+  let max = 0;
+  for (const view of shownViews()) for (const [key, entries] of view.evals) if (key.startsWith('route|')) {
+    for (const entry of entries) if (Number.isFinite(entry.nulrms)) max = Math.max(max, entry.nulrms);
+  }
+  return [0, max > 0 ? max * 1.08 : 1];
+}
+function plotData(id, data, idle = null) {
+  setData(id, data, idle);
+  document.getElementById(id).closest('.chart').dataset.empty = !data.slice(1).some((col) => col.some(Number.isFinite));
+}
+function heatmapHTML(view, sites, field) {
+  const entries = sites.map((s) => atStep(view, s.key));
+  const width = Math.max(0, ...entries.map((entry) => entry?.[field]?.length ?? 0));
+  if (!width || !entries.some((entry) => entry?.[field]?.some(Number.isFinite))) return '<div class="heatmap-empty">No expert observations at this eval.</div>';
+  const bias = field === 'biases';
+  const bound = bias ? biasBound(view) : 3;
+  const color = (value, n) => {
+    const scaled = bias ? (bound > 0 ? Math.abs(value) / bound : 0) : value * n / bound;
+    return `color-mix(in srgb, var(${bias && value < 0 ? '--s2' : '--s1'}) ${Math.min(100, Math.max(0, scaled * 100))}%, var(--surface))`;
+  };
+  let firstCell = true;
+  const rows = Array.from({ length: width }, (_, expert) => `<tr><th scope="row">E${expert}</th>${entries.map((entry, i) => {
+    const value = entry?.[field]?.[expert], n = entry?.loads?.length;
+    if (!Number.isFinite(value)) return '<td class="missing" aria-label="No observation"></td>';
+    const description = `${sites[i].name} · E${expert} · ${bias ? 'bias ' + signed(value, 6) : (100 * value).toFixed(2) + '% of assignments · ' + fmt(value * n, 3) + '× uniform · ' + count(entry.used) + '/' + n + ' experts used · gate entropy ' + fmt(entry.entropy, 4) + ' nats'}`;
+    const tabIndex = firstCell ? 0 : -1; firstCell = false;
+    return `<td tabindex="${tabIndex}" style="background:${color(value, n)}" aria-label="${esc(description)}" title="${esc(description)}"></td>`;
+  }).join('')}</tr>`).join('');
+  const labels = sites.map((s) => `<th scope="col"><span>${esc(s.name.replace('.experts', ''))}</span></th>`).join('');
+  const key = bias ? `${signed(-bound, 5)} <i style="background:linear-gradient(to right,var(--s2),var(--surface),var(--s1))"></i> ${signed(bound, 5)} · fixed across recorded evals` : '0× <i style="background:linear-gradient(to right,var(--surface),var(--s1))"></i> ≥3× uniform';
+  return `<div class="heatmap-scroll"><table class="heatmap" aria-label="Expert ${bias ? 'selection biases' : 'assignment shares'} at step ${snapshot.current}" style="min-width:${Math.max(240, sites.length * 17 + 30)}px"><tbody>${rows}</tbody><tfoot><tr><th>site</th>${labels}</tr></tfoot></table></div><div class="heatmap-key">${key}</div><div class="heatmap-readout">Hover or focus a cell for its value, expert coverage and gate entropy.</div>`;
+}
+function renderSnapshots(view) {
+  reconcileSnapshot(view);
+  const views = shownViews(), current = snapshot.current;
+  const slider = document.getElementById('eval-step');
+  const index = snapshot.steps.indexOf(current);
+  slider.max = Math.max(0, snapshot.steps.length - 1);
+  slider.value = Math.max(0, index);
+  slider.disabled = snapshot.steps.length < 2;
+  slider.setAttribute('aria-valuetext', current == null ? 'No evaluations yet' : `Step ${current.toLocaleString()}`);
+  document.getElementById('eval-value').textContent = current == null ? '–' : current.toLocaleString();
+  document.getElementById('eval-prev').disabled = index <= 0;
+  document.getElementById('eval-next').disabled = index < 0 || index >= snapshot.steps.length - 1;
+  document.getElementById('eval-latest').disabled = !snapshot.steps.length;
+  document.getElementById('eval-latest').setAttribute('aria-pressed', snapshot.step == null);
+  const oldOrder = SITES.map((s) => s.name).join('|');
+  SITES.splice(0, SITES.length, ...orderedSites(views, 'route'));
+  if (oldOrder !== SITES.map((s) => s.name).join('|')) {
+    for (const [id, chart] of M.charts) if (id.startsWith('p-site-')) chart.u.zoomed = false;
+  }
+  const mine = orderedSites([view], 'route').length, experts = orderedSites([view], 'expert');
+  const context = current == null ? ['Waiting for the first eval.'] : [
+    `${snapshot.step == null ? 'Following latest' : 'Pinned'} · eval ${index + 1}/${snapshot.steps.length}`,
+    `${mine} routing sites · ${experts.length} expert sites`,
+    ...views.slice(1).map((v) => `${v.run.tag}: ${orderedSites([v], 'route').length ? 'exact-step routing' : 'no routing at this step'}`),
+  ];
+  document.getElementById('snapshot-context').textContent = context.join(' · ');
+  const profiles = views.map(profileOf);
+  for (const id of ['p-site-mass', 'p-site-sharp', 'p-site-nullrms']) plotData(id, join(profiles.map((profile) => profile[id])));
+  for (const [id, field] of [['expert-load', 'loads'], ['expert-bias', 'biases']]) {
+    const el = document.getElementById(id), html = heatmapHTML(view, field === 'biases' ? expertBanks(experts) : experts, field);
+    // Preserve keyboard focus and hover readouts while an unchanged log polls.
+    if (heatmapMarkup.get(id) !== html) { el.innerHTML = html; heatmapMarkup.set(id, html); }
+  }
+}
+function setupSnapshotControls() {
+  // The fragment belongs to the shareable run/overlay selection, not navigation.
+  for (const button of document.querySelectorAll('nav [data-section]')) button.onclick = () => document.getElementById(button.dataset.section).scrollIntoView();
+  const select = (index) => {
+    snapshot.step = snapshot.steps[index] ?? snapshot.step;
+    const view = viewOf(state.selected); if (view) renderSnapshots(view);
+  };
+  document.getElementById('eval-step').oninput = (event) => select(+event.target.value);
+  document.getElementById('eval-prev').onclick = () => select(snapshot.steps.indexOf(snapshot.current) - 1);
+  document.getElementById('eval-next').onclick = () => select(snapshot.steps.indexOf(snapshot.current) + 1);
+  document.getElementById('eval-latest').onclick = () => { snapshot.step = null; const view = viewOf(state.selected); if (view) renderSnapshots(view); };
+  for (const id of ['expert-load', 'expert-bias']) {
+    const el = document.getElementById(id);
+    const inspect = (event) => {
+      const cell = event.target.closest('td[aria-label]');
+      if (cell) el.querySelector('.heatmap-readout').textContent = cell.getAttribute('aria-label');
+    };
+    el.addEventListener('pointerover', inspect);
+    el.addEventListener('focusin', (event) => {
+      inspect(event);
+      if (event.target.matches('td[tabindex]')) {
+        for (const cell of el.querySelectorAll('td[tabindex="0"]')) cell.tabIndex = -1;
+        event.target.tabIndex = 0;
+      }
+    });
+    el.addEventListener('keydown', (event) => {
+      const cell = event.target.closest('td'); if (!cell) return;
+      const row = cell.parentElement;
+      const next = event.key === 'ArrowRight' ? cell.nextElementSibling : event.key === 'ArrowLeft' ? cell.previousElementSibling
+        : event.key === 'ArrowDown' ? row.nextElementSibling?.children[cell.cellIndex] : event.key === 'ArrowUp' ? row.previousElementSibling?.children[cell.cellIndex] : null;
+      if (next?.matches('td[tabindex]')) { event.preventDefault(); next.focus(); }
+    });
+  }
+}
 
-// ---------------------------------------------------------------- tiles
+// ---------------------------------------------------------------- overview
+function tokenTotals(view) {
+  const setup = view.run.meta.run || {}, per = num(setup.batch_rows) * num(setup.seq_len);
+  const layers = num(setup.layers), cell = num(setup.routing_block_size);
+  if (!(per > 0 && layers > 0 && cell > 0) || !view.steps.length) return null;
+  // Exact totals require the complete addressed history, including fork parents.
+  // A partial log cannot reconstruct the missing k/r draws.
+  if (view.steps.some((step, index) => step.step !== index + 1 || !(step.k > 0) || (has(view, 'l') && !(step.r > 0)))) return null;
+  const passes = view.steps.reduce((total, s) => total + s.k * per, 0);
+  const cells = view.steps.reduce((total, s) => total + s.k * per * (has(view, 'l') ? 2 + s.r * (layers - 2 * cell) / cell : layers / cell), 0);
+  return { predicted: view.steps.length * per, passes, cells };
+}
 function renderTiles(view) {
-  const el = document.getElementById('tiles');
-  const run = view.run, p = pace(view);
-  if (!p) { el.innerHTML = tile('run', esc(run.tag), run.missing ? 'no log yet' : 'no steps yet'); return; }
-  const { last, total, remaining, age, status, live, began, elapsed, etaS, rateRecent } = p;
-  const activeHere = state.active && state.active.tag === run.tag;
-  const vals = view.evals.get('val') || [];
-  const lastVal = vals[vals.length - 1];
-  const feedback = has(view, 'f');
-  const rates = [`${count(last.tok_s)} tok/s`];
-  if (last.pass_tok_s != null && last.k > 1) rates.push(`${count(last.pass_tok_s)} pass`);
-  if (last.cell_tok_s != null) rates.push(`${count(last.cell_tok_s)} cell`);
+  const p = pace(view), el = document.getElementById('tiles'), status = document.getElementById('status');
+  if (!p) { el.innerHTML = tile('run', 'Waiting', view.run.missing ? 'no log yet' : 'no steps yet'); status.textContent = ''; status.dataset.live = false; status.dataset.failed = false; return; }
+  const { last, total, remaining, age, live, elapsed, etaS, rateRecent } = p;
+  const totals = tokenTotals(view);
+  const percent = total > 0 ? (100 * last.step / total).toFixed(1) : '–';
+  status.textContent = `${p.status === '–' ? (live ? 'running' : 'idle') : p.status} · updated ${fmtAge(age)}`;
+  status.dataset.live = live;
+  status.dataset.failed = /KILLED|FAILED/.test(p.status);
   el.innerHTML = [
-    tile('step', `${last.step.toLocaleString()} <small>/ ${total.toLocaleString()}</small>`, `${esc(last.phase || '')} · ${(100 * last.step / total).toFixed(1)}% of run`),
-    tile('pace', `${fmt(1 / rateRecent, 3)} <small>s/step</small>`, Number.isFinite(etaS) ? `ETA ${fmtDuration(etaS)} · ${fmtWhen(run.serverDate + etaS * 1000)}` : remaining > 0 ? `stopped · ${remaining.toLocaleString()} steps left` : 'complete'),
-    tile('elapsed', fmtDuration(elapsed), began != null ? `began ${fmtWhen(began)}` : ''),
-    tile('loss', fmt(last.loss), `pass-1 ${fmt(last.pass1)} · k ${last.k ?? '–'}${last.r != null ? ` · r ${last.r}` : ''}`),
-    tile('val', lastVal ? fmt(lastVal.val) : '–', lastVal ? `${feedback && lastVal.val_fused != null ? `fused ${fmt(lastVal.val_fused)} · ` : ''}@ ${lastVal.step.toLocaleString()}` : feedback ? '' : 'no feedback'),
-    tile('lr NorMuonH', fmt(last.lr_normuonh, 3), `NAdam ${fmt(last.lr_nadam, 3)} · width ${fmt(last.lr_nadam_width, 3)} · gnorm ${fmt(last.gnorm, 3)}`),
-    tile('lr expert input', fmt(last.lr_normuonh_expert_in, 3), `output ${fmt(last.lr_normuonh_expert_out, 3)}`),
-    tile('memory', `${fmt(last.mem, 3)} <small>GiB</small>`, rates.join(' · ')),
-    gpuTile(live),
-    tile('updated', fmtAge(age), `${esc(status)}${activeHere && state.active.phase ? ' · ' + esc(state.active.phase) : ''}`, live ? 'ok' : (/KILLED|FAILED/.test(status) ? 'bad' : '')),
+    tile('progress', `${count(last.step)} <small>/ ${count(total)}</small>`, `${esc(last.phase || '')} · ${percent}%`),
+    tile('remaining', remaining <= 0 ? 'Complete' : Number.isFinite(etaS) ? fmtDuration(etaS) : '–', remaining > 0 ? `${count(remaining)} steps${live ? '' : ' · not advancing'}` : 'all steps recorded'),
+    tile('elapsed', fmtDuration(elapsed), rateRecent > 0 ? `${fmt(1 / rateRecent, 3)} s/step · recent 200-step pace` : 'pace unavailable'),
+    tile('predicted tokens', totals ? compact(totals.predicted) : '–', totals ? `${compact(totals.passes)} pass · ${compact(totals.cells)} trunk cell` : 'complete step history required'),
+    gpuTile(live).replace('>gpu<', '>GPU · live host<'),
   ].join('');
 }
 
-// ---------------------------------------------------------------- config
-// Permanent geometry plus the active feedback/loop settings.
+// ---------------------------------------------------------------- configuration
 const CONFIG_GROUPS = [
   ['run', null, ['condition', 'seed', 'data_seed', 'params', 'device']],
   ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'vocab_size', 'seq_len']],
@@ -308,7 +470,7 @@ function renderConfig(view) {
   const run = view.run, setup = run.meta.run, condition = conditionOf(view);
   const cards = [];
   if (setup) {
-    const used = new Set(['event', 'tag']);
+    const used = new Set(['event', 'tag', 'expert_intermediate', 'num_routed_experts', 'experts_per_token']);
     // Once the resolved schedule is present, its address and phase lengths
     // supersede the raw step/warmup/cooldown inputs.
     if (run.meta.schedule) for (const key of ['steps', 'warmup_frac', 'cooldown_frac']) used.add(key);
@@ -326,254 +488,125 @@ function renderConfig(view) {
   document.getElementById('config').innerHTML = html || '<div class="config-empty">Structured configuration is unavailable for this log.</div>';
 }
 
-// ---------------------------------------------------------------- summaries
-// Each section header carries the selected run's latest headline numbers for
-// that mechanism, so the state of every letter reads without scrolling.
-function summaries(view) {
-  const setup = view.run.meta.run || {};
-  const out = { train: 'every condition · pass-1 is the common number · loss adds fused CE, weighted MTP, z-loss and expert balance where enabled' };
-  if (setup.layers != null) {
-    const layers = +setup.layers, pkda = layers - Math.floor(layers / 4);
-    out.attention = `PKDA in ${pkda} of ${layers} attention layers · ${setup.pkda_heads} heads × ${setup.pkda_head_dim} · conv ${setup.pkda_conv_size} · configuration only`;
-  }
-  out.experts = `1 shared + ${setup.expert_top_k}/${setup.expert_routed} routed · width ${setup.expert_width} · balance ${fmt(view.steps.at(-1)?.expert_balance, 4)}`;
-  const step = latestRouteStep(view);
-  if (step != null) {
-    const sites = orderedSites([view]);
-    const pay = (view.evals.get('route|payload') || []).find((e) => e.step === step);
-    out.routing = `${sites.length} sites @ ${step.toLocaleString()}`
-      + (pay ? ` · payload router: seed ${fmt(pay.seed, 3)} · null ${fmt(pay.nul, 3)} · head divergence ${fmt(pay.headjs, 3)}` : '')
-      + ' · zero-initialized routers, no knobs';
-  }
-  const vals = view.evals.get('val') || [], lastVal = vals[vals.length - 1];
-  const contract = view.evals.get('contract') || [], lastC = contract[contract.length - 1];
-  const boundary = num(view.run.meta.schedule?.feedback_boundary);
-  const f = [];
-  if (has(view, 'f') && lastVal && lastVal.val_fused != null) f.push(`fused gap ${signed(lastVal.val_fused - lastVal.val, 4)} @ ${lastVal.step.toLocaleString()}`);
-  if (has(view, 'f') && lastC) f.push(`drift ${signed(lastC.loss8 - lastC.loss0, 3)}`, `‖Δh‖ ${fmt(lastC.upd8, 3)}`);
-  if (has(view, 'f') && boundary != null) f.push(`feedback from step ${boundary.toLocaleString()}`);
-  out.f = f.join(' · ');
-  const depth = view.evals.get('depth') || [], lastD = depth[depth.length - 1];
-  const l = [];
-  if (has(view, 'l') && setup.loop_iterations != null) l.push(`r drawn per step · mean ${setup.loop_iterations} · cap ${setup.loop_max_iterations}`);
-  if (has(view, 'l') && lastD) l.push(`gain at r_mean ${signed(lastD.loss_mean - lastD.loss_one, 3)}`, `at r_max ${signed(lastD.loss_max - lastD.loss_one, 3)}`, `‖Δcore‖ ${fmt(lastD.upd_max, 3)} @ ${lastD.step.toLocaleString()}`);
-  out.l = l.join(' · ');
-  out.mtp = `weight ${fmt(num(setup.mtp_weight), 3)} · train CE ${fmt(view.steps.at(-1)?.mtp, 4)}`;
-  if (lastVal?.val_mtp != null) out.mtp += ` · held-out ${fmt(lastVal.val_mtp, 4)}${lastVal.val_mtp_fused != null ? ` · fused ${fmt(lastVal.val_mtp_fused, 4)}` : ''} @ ${lastVal.step.toLocaleString()}`;
-  return out;
-}
 
-// ---------------------------------------------------------------- charts
+// ---------------------------------------------------------------- trajectories
 function tightLogRange(u, lo, hi) {
   if (!Number.isFinite(lo) || !Number.isFinite(hi) || !(lo > 0) || hi < lo) return [1, 10];
-  const paddedLo = lo / 1.15, paddedHi = hi * 1.15;
-  // uPlot's log splits must begin on the current magnitude's tick grid. An
-  // arbitrary lower bound can make its increment stop advancing and exhaust
-  // the array. Keep the tight upper bound, but let uPlot snap the lower one.
-  const [safeLo] = uPlot.rangeLog(paddedLo, paddedHi, 10, false);
-  return [safeLo, paddedHi];
+  const [safeLo] = uPlot.rangeLog(lo / 1.15, hi * 1.15, 10, false);
+  return [safeLo, hi * 1.15];
 }
 function rebuild() {
-  // One toggle for every strictly positive quantity.  Masses and normalized
-  // divergences live on [0, 1]; signed differences and counts stay linear.
-  const logY = document.getElementById('logy').checked;
-  const yLog = logY ? { distr: 3, log: 10, range: tightLogRange } : {};
-  const unit = { range: [0, 1] };
-  const ovs = overlayTags();
+  const yLog = document.getElementById('logy').checked ? { distr: 3, log: 10, range: tightLogRange } : {};
+  const ovs = overlayTags(), unit = { range: [0, 1] };
   const bands = () => bandsOf(runFor(state.selected));
-  const marks = () => viewOf(state.selected)?.snapshots ?? [];
-  const lines = () => { const v = viewOf(state.selected); return [...(v?.forks ?? []), ...eventLines(v)]; };
-  // Within a run, line style encodes the metric; hue is the run: the selected
-  // run in s1, each overlay in its own slot, its tag suffixed to the label.
-  const perRun = (build) => [...build(P.s1, ''), ...ovs.flatMap((t, i) => build(hue(i), ` · ${t}`))];
-  const v3 = { value: (u, v) => fmt(v, 3) };
-  const v0 = { value: (u, v) => count(v) };
-  const vs = { value: (u, v) => signed(v, 4), ...PTS };   // signed differences, fixed decimals
-  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks: lines, ...extra });
+  const forks = () => { const view = viewOf(state.selected); return [...(view?.forks ?? []), ...eventLines(view)]; };
+  const perRun = (build) => [...build(P.s1, ovs.length ? ' [1]' : ''), ...ovs.flatMap((tag, i) => build(hue(i), ` [${i + 2}]`))];
+  const v3 = { value: (u, v) => fmt(v, 3) }, v0 = { value: (u, v) => count(v) };
+  const vs = { value: (u, v) => signed(v, 4), ...PTS };
+  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks, height: 230, ...extra });
   const site = (id, series, extra = {}) => makeChart(id, {
-    series, sync: 'site',
+    series, sync: 'site', height: 240,
     x: { label: 'site', value: (u, v) => SITES[v]?.name ?? '–' },
-    xScale: { range: (u, min, max) => [min - 0.5, max + 0.5] },
+    xScale: { range: (u, min, max) => min == null ? [-0.5, 0.5] : [min - 0.5, max + 0.5] },
     xAxis: siteAxis(), ...extra,
   });
-  const SPTS = { points: { size: 6 }, spanGaps: false };
-
-  // training
-  step('p-nll', perRun((c, t) => [
-    line(`loss${t}`, c), dashed(`pass-1${t}`, c), dotted(`NTP CE${t}`, c)]), { yScale: yLog, marks });
-  step('p-val', perRun((c, t) => [line(`val${t}`, c, PTS), dashed(`val fused${t}`, c, PTS)]), { yScale: yLog });
-  step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dashed(`Expert input${t}`, c, v3), dotted(`Expert output${t}`, c, v3), { ...line(`NAdam width${t}`, c, v3), dash: [8, 3, 2, 3] }, { ...line(`NAdam${t}`, c, v3), dash: [2, 5] }]), { yScale: yLog });
-  step('p-gnorm', perRun((c, t) => [line(`gnorm${t}`, c, v3)]), { yScale: yLog });
-  step('p-tput', perRun((c, t) => [line(`tok/s${t}`, c, v0), dashed(`pass tok/s${t}`, c, v0), dotted(`cell tok/s${t}`, c, v0)]), { yScale: yLog });
-  step('p-cum', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
-
-  step('p-expert-balance', perRun((c, t) => [line(`balance${t}`, c, v3)]));
+  const points = { points: { size: 4 }, spanGaps: false };
+  step('p-nll', perRun((c, t) => [line(`total${t}`, c), dashed(`pass-1${t}`, c), dotted(`NTP${t}`, c), { ...line(`MTP${t}`, c), dash: [8, 3, 2, 3] }]), { yScale: yLog, marks: () => viewOf(state.selected)?.snapshots ?? [] });
+  step('p-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS)]), { yScale: yLog });
+  step('p-mtp-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS)]), { yScale: yLog });
+  site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, points), dashed(`seed${t}`, c, points), dotted(`prev${t}`, c, points)]), { yScale: unit });
+  site('p-site-sharp', perRun((c, t) => [line(`max${t}`, c, points), dashed(`head JS${t}`, c, points), dotted(`1/n${t}`, c, points)]), { yScale: unit });
+  // Zero-initialized null vectors must remain visible even with log scale on.
+  site('p-site-nullrms', perRun((c, t) => [line(`RMS${t}`, c, points)]), { yScale: { range: nullRange } });
+  step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dashed(`expert in${t}`, c, v3), dotted(`expert out${t}`, c, v3), { ...line(`NAdam width${t}`, c, v3), dash: [8, 3, 2, 3] }, { ...line(`NAdam${t}`, c, v3), dash: [2, 5] }]), { yScale: yLog });
+  step('p-gnorm', [...perRun((c, t) => [line(`L2${t}`, c, v3)]), ref('clip')], { yScale: yLog });
+  step('p-tput', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
+  step('p-expert-balance', perRun((c, t) => [line(`penalty${t}`, c, v3)]));
   step('p-expert-violation', perRun((c, t) => [line(`imbalance${t}`, c, v3)]));
-  step('p-expert-bias', perRun((c, t) => [line(`bias${t}`, c, v3)]));
-
-  // r · residual routing
-  site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, SPTS), dashed(`seed${t}`, c, SPTS)]), { yScale: unit });
-  site('p-site-sharp', perRun((c, t) => [line(`max${t}`, c, SPTS), dashed(`head JS${t}`, c, SPTS)]), { yScale: unit });
-  site('p-site-nullrms', perRun((c, t) => [line(`null RMS${t}`, c, SPTS)]), { yScale: yLog });
-  const headline = (id, extra) => step(id, perRun((c, t) => [line(`payload${t}`, c, PTS), dashed(`attn${t}`, c, PTS), dotted(`mlp${t}`, c, PTS)]), extra);
-  headline('p-seed', { yScale: unit });
-  headline('p-null', { yScale: unit });
-  headline('p-route', { yScale: unit });
-  headline('p-headjs', { yScale: unit });
-  headline('p-nullrms', { yScale: yLog });
-
-  // f · feedback
-  step('p-gap', [...perRun((c, t) => [line(`val gap${t}`, c, vs), dashed(`train gap${t}`, c, { value: vs.value })]), ref('0')]);
-  step('p-k', perRun((c, t) => [line(`k mean${t}`, c, v3)]));
+  step('p-expert-bias', perRun((c, t) => [line(`max |bias|${t}`, c, v3)]));
+  step('p-gap', [...perRun((c, t) => [line(`held-out${t}`, c, vs), dashed(`train${t}`, c, { value: vs.value })]), ref('0')]);
   step('p-drift', [...perRun((c, t) => [line(`drift${t}`, c, vs)]), ref('0')]);
   step('p-upd', perRun((c, t) => [line(`‖Δh‖${t}`, c, PTS)]), { yScale: yLog });
-
-  // l · loop
-  step('p-depth', perRun((c, t) => [line(`r = 1${t}`, c, PTS), dashed(`r_mean${t}`, c, PTS), dotted(`r_max${t}`, c, PTS)]), { yScale: yLog });
-  step('p-depthgain', [...perRun((c, t) => [dashed(`r_mean${t}`, c, vs), dotted(`r_max${t}`, c, vs)]), ref('0')]);
+  step('p-depth', perRun((c, t) => [line(`r = 1${t}`, c, PTS), dashed(`r mean${t}`, c, PTS), dotted(`r max${t}`, c, PTS)]), { yScale: yLog });
   step('p-depthupd', perRun((c, t) => [line(`‖Δcore‖${t}`, c, PTS)]), { yScale: yLog });
-  step('p-r', [...perRun((c, t) => [line(`r mean${t}`, c, v3)]), ref('r_mean')]);
-
-  // m · sequential second-token prediction
-  step('p-mtp-train', perRun((c, t) => [line(`MTP CE${t}`, c)]), { yScale: yLog });
-  step('p-mtp-val', perRun((c, t) => [line(`MTP val${t}`, c, PTS), dashed(`MTP val fused${t}`, c, PTS)]), { yScale: yLog });
+  step('p-recurrence', perRun((c, t) => [line(`k${t}`, c, v0), dashed(`r${t}`, c, v0)]));
 }
-
-// One run's tables per chart, in the series order `rebuild` declared.
 function seriesOf(view) {
   const steps = view.steps, xs = steps.map((s) => s.step);
-  const col = (f) => steps.map((s) => s[f] ?? null);
-  const loss = col('loss'), pass1 = col('pass1');
-  const ntp = col('ntp');
-  const trainGap = steps.map((s, i) => (s.k > 1 && ntp[i] != null && s.pass1 != null ? ntp[i] - 2 * s.pass1 : null));
-  // Cumulative tokens from the step records and the geometry: a pass executes
-  // layers / cell cell-equivalents on a flat column and 2 + r · core / cell
-  // under l. These counters measure trunk work and exclude the MTP branch.
-  const setup = view.run.meta.run || {};
-  const batch = num(setup.batch_rows), length = num(setup.seq_len);
-  const per = batch > 0 && length > 0 ? batch * length : null;
-  const layers = num(setup.layers), cell = num(setup.routing_block_size);
-  const geometry = layers > 0 && cell > 0;
-  const core = geometry ? layers - 2 * cell : null;
-  const looped = has(view, 'l');
-  const add = (total, amount) => total == null || amount == null ? null : total + amount;
-  let cumPred = 0, cumPass = 0, cumCell = 0;
-  const cum = steps.map((s) => {
-    const cells = geometry && (!looped || s.r > 0) ? (looped ? 2 + s.r * core / cell : layers / cell) : null;
-    const pass = per != null && s.k > 0 ? s.k * per : null;
-    cumPred = add(cumPred, per);
-    cumPass = add(cumPass, pass);
-    cumCell = add(cumCell, pass != null && cells != null ? pass * cells : null);
-    return [cumPred, cumPass, cumCell];
-  });
-  const sites = routeSites(view);
-  const at = (key, field) => {
-    const list = key ? view.evals.get(key) || [] : [];
-    return [list.map((e) => e.step), list.map((e) => e[field] ?? null)];
+  const col = (field) => steps.map((s) => s[field] ?? null);
+  const ev = (key, ...fields) => {
+    const list = view.evals.get(key) || [];
+    return [list.map((e) => e.step), ...fields.map((f) => list.map((e) => finite(typeof f === 'function' ? f(e) : e[f])))];
   };
-  const headline = (field) => [at(sites.payload, field), at(sites.attn, field), at(sites.mlp, field)];
-  const ev = (list, ...fields) => [[list.map((e) => e.step), ...fields.map((f) => list.map((e) => finite(typeof f === 'function' ? f(e) : e[f])))]];
-  const vals = view.evals.get('val') || [], contract = view.evals.get('contract') || [], depth = view.evals.get('depth') || [];
-  const last = latestRouteStep(view);
-  const profile = (...fields) => [[SITES.map((_, i) => i),
-    ...fields.map((f) => SITES.map((s) => finite((view.evals.get(`route|${s.name}`) || []).find((e) => e.step === last)?.[f]))),
-  ]];
   return {
-    nll: [[xs, loss, pass1, col('ntp')]],
-    val: ev(vals, 'val', 'val_fused'),
-    lr: [[xs, col('lr_normuonh'), col('lr_normuonh_expert_in'), col('lr_normuonh_expert_out'), col('lr_nadam_width'), col('lr_nadam')]],
-    gnorm: [[xs, col('gnorm')]],
-    expertBalance: [[xs, col('expert_balance')]],
-    expertViolation: [[xs, col('expert_max_violation')]],
-    expertBias: [[xs, col('expert_bias_max')]],
-    tput: [[xs, col('tok_s'), col('pass_tok_s'), col('cell_tok_s')]],
-    cum: [[xs, cum.map((c) => c[0]), cum.map((c) => c[1]), cum.map((c) => c[2])]],
-    siteMass: profile('nul', 'seed'),
-    siteSharp: profile('max', 'headjs'),
-    siteNullrms: profile('nulrms'),
-    seed: headline('seed'), null: headline('nul'), route: headline('max'), headjs: headline('headjs'), nullrms: headline('nulrms'),
-    gap: [...ev(vals, (e) => e.val_fused != null && e.val != null ? e.val_fused - e.val : null), [xs, trainGap]],
-    k: [[xs, rolling(col('k'), ROLL)]],
-    drift: ev(contract, (e) => e.loss8 - e.loss0),
-    upd: ev(contract, 'upd8'),
-    depth: ev(depth, 'loss_one', 'loss_mean', 'loss_max'),
-    depthgain: ev(depth, (e) => e.loss_mean - e.loss_one, (e) => e.loss_max - e.loss_one),
-    depthupd: ev(depth, 'upd_max'),
-    r: [[xs, rolling(col('r'), ROLL)]],
-    mtpTrain: [[xs, col('mtp')]],
-    mtpVal: ev(vals, 'val_mtp', 'val_mtp_fused'),
+    'p-nll': [xs, col('loss'), col('pass1'), col('ntp'), col('mtp')],
+    'p-val': ev('val', 'val', 'val_fused'),
+    'p-mtp-val': ev('val', 'val_mtp', 'val_mtp_fused'),
+    'p-lr': [xs, col('lr_normuonh'), col('lr_normuonh_expert_in'), col('lr_normuonh_expert_out'), col('lr_nadam_width'), col('lr_nadam')],
+    'p-gnorm': [xs, col('gnorm')],
+    'p-tput': [xs, col('tok_s'), col('pass_tok_s'), col('cell_tok_s')],
+    'p-expert-balance': [xs, col('expert_balance')],
+    'p-expert-violation': [xs, col('expert_max_violation')],
+    'p-expert-bias': [xs, col('expert_bias_max')],
+    'p-gap': join([ev('val', (e) => e.val_fused != null && e.val != null ? e.val_fused - e.val : null), [xs, steps.map((s) => s.k > 1 && s.ntp != null && s.pass1 != null ? s.ntp - 2 * s.pass1 : null)]]),
+    'p-drift': ev('contract', (e) => e.loss8 != null && e.loss0 != null ? e.loss8 - e.loss0 : null),
+    'p-upd': ev('contract', 'upd8'),
+    'p-depth': ev('depth', 'loss_one', 'loss_mean', 'loss_max'),
+    'p-depthupd': ev('depth', 'upd_max'),
+    'p-recurrence': [xs, col('k'), col('r')],
   };
 }
 function render(view) {
   renderTiles(view);
   renderConfig(view);
-  SITES.splice(0, SITES.length, ...orderedSites(shownViews()));
-  for (const sec of document.querySelectorAll('section.mech[data-letter]')) {
-    sec.hidden = !shownViews().some((v) => has(v, sec.dataset.letter));
+  const views = shownViews();
+  const key = document.getElementById('run-key');
+  key.hidden = views.length < 2;
+  key.innerHTML = views.length < 2 ? '' : views.map((v, i) => `<span style="color:${i === 0 ? P.s1 : hue(i - 1)}">[${i + 1}] ${esc(v.run.tag)}</span>`).join('');
+  for (const el of document.querySelectorAll('[data-letter]')) el.hidden = !views.some((v) => has(v, el.dataset.letter));
+  const looped = views.some((v) => has(v, 'l'));
+  const recurrence = document.getElementById('p-recurrence').closest('.chart');
+  const recurrenceGrid = document.querySelector(looped ? '#loop .grid' : '#feedback .grid');
+  if (recurrence.parentElement !== recurrenceGrid) recurrenceGrid.appendChild(recurrence);
+  document.querySelector('#feedback .grid').classList.toggle('three', looped);
+  document.querySelector('#feedback .grid').classList.toggle('two', !looped);
+  const last = view.steps.at(-1), setup = view.run.meta.run || {};
+  document.getElementById('work-summary').textContent = last ? `${fmt(last.mem, 3)} GiB allocated at step ${count(last.step)} · trunk counters exclude MTP` : '';
+  const series = views.map(seriesOf);
+  for (const id of Object.keys(series[0])) {
+    const data = join(series.map((s) => s[id]));
+    const reference = id === 'p-gnorm' ? num(setup.grad_clip) : ['p-gap', 'p-drift'].includes(id) ? 0 : undefined;
+    // Only recorded measurements drive the empty state; references are decoration.
+    const observed = data.slice(1).some((col) => col.some(Number.isFinite));
+    if (reference !== undefined) spanRefs(data, { [data.length]: reference });
+    const ownX = series[0][id][0];
+    plotData(id, data, ownX.at(-1));
+    document.getElementById(id).closest('.chart').dataset.empty = !observed;
   }
-  const sums = summaries(view);
-  for (const el of document.querySelectorAll('[id^="sum-"]')) el.textContent = sums[el.id.slice(4)] ?? '';
-  const mine = seriesOf(view);
-  const others = overlayTags().map((t) => seriesOf(viewOf(t)));
-  const merged = {};
-  for (const key of Object.keys(mine)) merged[key] = [...mine[key], ...others.flatMap((o) => o[key])];
-  const lastX = view.steps.length ? view.steps[view.steps.length - 1].step : null;
-  const vals = view.evals.get('val') || [];
-  const lastEval = vals.length ? vals[vals.length - 1].step : null;
-  // A reference line spans the joined x range as one more column after every run's series.
-  const withRef = (data, value) => spanRefs(data, { [data.length]: value });
-  setData('p-nll', join(merged.nll), lastX);
-  setData('p-val', join(merged.val), lastEval);
-  setData('p-lr', join(merged.lr), lastX);
-  setData('p-gnorm', join(merged.gnorm), lastX);
-  setData('p-expert-balance', join(merged.expertBalance), lastX);
-  setData('p-expert-violation', join(merged.expertViolation), lastX);
-  setData('p-expert-bias', join(merged.expertBias), lastX);
-  setData('p-tput', join(merged.tput), lastX);
-  setData('p-cum', join(merged.cum), lastX);
-  setData('p-site-mass', join(merged.siteMass));
-  setData('p-site-sharp', join(merged.siteSharp));
-  setData('p-site-nullrms', join(merged.siteNullrms));
-  setData('p-seed', join(merged.seed), lastX);
-  setData('p-null', join(merged.null), lastX);
-  setData('p-route', join(merged.route), lastX);
-  setData('p-headjs', join(merged.headjs), lastX);
-  setData('p-nullrms', join(merged.nullrms), lastX);
-  setData('p-gap', withRef(join(merged.gap), 0), lastX);
-  setData('p-k', join(merged.k), lastX);
-  setData('p-drift', withRef(join(merged.drift), 0), lastX);
-  setData('p-upd', join(merged.upd), lastX);
-  setData('p-depth', join(merged.depth), lastX);
-  setData('p-depthgain', withRef(join(merged.depthgain), 0), lastX);
-  setData('p-depthupd', join(merged.depthupd), lastX);
-  setData('p-r', withRef(join(merged.r), num(view.run.meta.run?.loop_iterations)), lastX);
-  setData('p-mtp-train', join(merged.mtpTrain), lastX);
-  setData('p-mtp-val', join(merged.mtpVal), lastEval);
+  renderSnapshots(view);
 }
-
 M.configure({
   primaryKind: 'train',
   pollSeconds: (view) => {
-    const p = pace(view);
-    const stepSeconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
-    return Number.isFinite(stepSeconds) ? Math.ceil(stepSeconds + 1) : 5;
+    const p = pace(view), seconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
+    return Number.isFinite(seconds) ? Math.ceil(seconds + 1) : 5;
   },
   metaEvents: ['run', 'schedule', 'execution', 'resume', 'continue'],
   title: (run) => `delta · ${run.tag}`,
   meta: (view) => {
-    const setup = view.run.meta.run;
-    if (!setup) return '';
-    const params = num(setup.params);
+    const s = view.run.meta.run; if (!s) return '';
     return esc([
-      `condition ${setup.condition}`,
-      setup.dim != null ? `d ${setup.dim} × L ${setup.layers}` : null,
-      params ? `${(params / 1e6).toFixed(1)}M params` : null,
-      setup.seq_len != null ? `batch ${setup.batch_rows}×${setup.seq_len}` : `batch ${setup.batch_rows}`,
-      `seed ${setup.seed}`,
+      s.condition, s.params ? `${compact(num(s.params))} params` : null,
+      s.layers ? `${s.layers} layers × ${s.dim}d` : null,
+      s.layers ? `${+s.layers - Math.floor(+s.layers / 4)} PKDA / ${Math.floor(+s.layers / 4)} GQA` : null,
+      s.expert_routed ? `${s.expert_shared} shared + ${s.expert_top_k}/${s.expert_routed} routed experts` : null,
+      s.batch_rows ? `batch ${s.batch_rows} × ${s.seq_len}` : null,
+      s.seed != null ? `seed ${s.seed}` : null,
     ].filter(Boolean).join(' · '));
   },
   onRecord, onStep, onEval, rebuild, render,
 });
+setupSnapshotControls();
 M.start();
 </script>
 </body>
