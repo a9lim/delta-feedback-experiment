@@ -621,8 +621,10 @@ PER_ROW_PASS_EXTRA_BYTES = 64 << 20
 """Per-row, per-pass activations outside the blocks: the fused entry, jitter,
 payload chain, and head inputs."""
 
-ROW_MULTIPLES = (4, 2, 1)
-"""Rows-per-replay multiples of ``micro_rows`` a one-pass graph may use."""
+ROW_MULTIPLES = (2, 1)
+"""Rows-per-replay multiples of ``micro_rows`` a one-pass graph may use. Two
+rows per replay run 4% faster per row than one on the 4090; four run 1%
+slower per row than two, so the budget is not spent on them."""
 
 
 def block_invocations(cfg, spec: GraphSpec) -> tuple[int, int]:
