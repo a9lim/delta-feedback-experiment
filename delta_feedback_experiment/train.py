@@ -611,15 +611,12 @@ class CapturedMicro:
 
 
 DEFAULT_CHECKPOINT_MARGIN_GIB = 1.0
-"""Device memory the activation budget leaves free: the planned graphs'
-allocator rounding and the pre-capture warm-up. The optimizer step and the
-periodic monitors run inside the graphs' pool (``pool_scope``) and need none
-of it; below about 1 GiB the largest planned graph no longer fits during
-warm-up on the 24 GiB card."""
-
-PER_ROW_PASS_EXTRA_BYTES = 64 << 20
-"""Per-row, per-pass activations outside the blocks: the fused entry, jitter,
-payload chain, and head inputs."""
+"""Free device memory, measured after the static footprint exists, that the
+activation budget leaves untouched: the planned graphs' allocator rounding
+and the pre-capture warm-up. The optimizer step and the periodic monitors run
+inside the graphs' pool (``pool_scope``) and need none of it; below about
+1 GiB the largest planned graph no longer fits during warm-up on the 24 GiB
+card."""
 
 ROW_MULTIPLES = (2, 1)
 """Rows-per-replay multiples of ``micro_rows`` a one-pass graph may use. Two
@@ -640,9 +637,22 @@ def block_invocations(cfg, spec: GraphSpec) -> tuple[int, int]:
 
 
 def plan_replay(
-    cfg, args, spec: GraphSpec, bytes_per_block: float, budget_bytes: float
+    cfg,
+    args,
+    spec: GraphSpec,
+    bytes_per_block: float,
+    bytes_per_checkpoint: float,
+    budget_bytes: float,
 ) -> ReplayPlan:
     """Fit one graph into the activation budget.
+
+    ``bytes_per_block`` is the calibrated average one block invocation of a
+    raw forward retains, everything outside the blocks included, so a graph
+    needs its block count times that: the per-pass extras scale with the
+    blocks and a two-pass forward retains exactly twice a one-pass one.
+    ``bytes_per_checkpoint`` is what recomputing one eligible block releases,
+    calibrated too, because the eligible blocks retain more than the average
+    (the global-attention blocks retain less and are never recomputed).
 
     A one-pass graph replays the largest row multiple whose raw activations
     fit; keyed feedback draws address single microbatches, so multi-pass
@@ -653,9 +663,7 @@ def plan_replay(
     blocks, eligible = block_invocations(cfg, spec)
 
     def needed(rows: int) -> float:
-        return (rows / args.micro_rows) * blocks * bytes_per_block + (
-            spec.n_passes * rows * PER_ROW_PASS_EXTRA_BYTES
-        )
+        return (rows / args.micro_rows) * blocks * bytes_per_block
 
     multiples = ROW_MULTIPLES if spec.n_passes == 1 else (1,)
     for multiple in multiples:
@@ -666,7 +674,7 @@ def plan_replay(
             return ReplayPlan(rows, 0, eligible, needed(rows) / 2**30)
     rows = args.micro_rows
     shortfall = needed(rows) - budget_bytes
-    count = min(eligible, math.ceil(shortfall / max(bytes_per_block, 1.0)))
+    count = min(eligible, math.ceil(shortfall / max(bytes_per_checkpoint, 1.0)))
     return ReplayPlan(rows, count, eligible, needed(rows) / 2**30)
 
 
@@ -766,23 +774,26 @@ class CudaGraphTrainer:
             model.bind_classifier_accum(self.head_accum)
 
         # Materialize the optimizer state before anything transient, so the
-        # static footprint the activation budget subtracts is complete.
+        # free memory the activation budget starts from already excludes the
+        # static footprint. Measuring what the device reports free, with the
+        # allocator's cache emptied, also excludes the CUDA context and any
+        # other process, which a total-minus-static estimate would count.
         for parameter in self.parameters:
             parameter.grad = self._buffers[parameter]
         self._initialize_optimizers()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         self.static_bytes = torch.cuda.memory_allocated()
-        total_bytes = torch.cuda.mem_get_info(self.device)[1]
-        self.budget_bytes = (
-            total_bytes - self.static_bytes - args.checkpoint_margin_gib * 2**30
-        )
+        free_bytes = torch.cuda.mem_get_info(self.device)[0]
+        self.budget_bytes = free_bytes - args.checkpoint_margin_gib * 2**30
         specs = self._reachable_specs(schedule)
         base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
-        self.bytes_per_block = self._calibrate(base)
+        self.bytes_per_block, self.bytes_per_checkpoint = self._calibrate(base)
         self.states: dict[GraphSpec, CapturedMicro] = {}
         for spec in specs:
-            plan = self._plan(spec, self.bytes_per_block, self.budget_bytes)
+            plan = self._plan(
+                spec, self.bytes_per_block, self.bytes_per_checkpoint, self.budget_bytes
+            )
             self.states[spec] = self._allocate(spec, plan)
 
         # The package sets Dynamo's recompile budget once for the process, so
@@ -874,9 +885,20 @@ class CudaGraphTrainer:
         return sorted(specs, key=lambda spec: (spec.n_passes, spec.iterations))
 
     def _plan(
-        self, spec: GraphSpec, bytes_per_block: float, budget_bytes: float
+        self,
+        spec: GraphSpec,
+        bytes_per_block: float,
+        bytes_per_checkpoint: float,
+        budget_bytes: float,
     ) -> ReplayPlan:
-        return plan_replay(self.model.cfg, self.args, spec, bytes_per_block, budget_bytes)
+        return plan_replay(
+            self.model.cfg,
+            self.args,
+            spec,
+            bytes_per_block,
+            bytes_per_checkpoint,
+            budget_bytes,
+        )
 
     def _inputs(
         self, spec: GraphSpec, rows: int
@@ -899,17 +921,11 @@ class CudaGraphTrainer:
             )
         return tokens, prefix, jitter
 
-    def _calibrate(self, spec: GraphSpec) -> float:
-        """Retained activation bytes per block invocation of one raw forward.
-
-        One eager forward of the cheapest graph at ``micro_rows`` rows, with
-        nothing recomputed: what stays allocated once the forward returns is
-        exactly what a raw backward would consume, and the graphs stack it
-        per pass and per block.
-        """
+    def _retained(self, spec: GraphSpec, checkpoint_blocks: int) -> int:
+        """Bytes one eager forward of ``spec`` at ``micro_rows`` rows leaves
+        allocated once it returns: exactly what its backward would consume."""
         tokens, prefix, jitter = self._inputs(spec, self.args.micro_rows)
-        blocks, _ = block_invocations(self.model.cfg, spec)
-        self.model.checkpoint_blocks = 0
+        self.model.checkpoint_blocks = checkpoint_blocks
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with self.autocast:
@@ -929,7 +945,25 @@ class CudaGraphTrainer:
         del outs, result
         self.model.zero_grad(set_to_none=True)
         torch.cuda.synchronize()
-        return alive / blocks
+        return alive
+
+    def _calibrate(self, spec: GraphSpec) -> tuple[float, float]:
+        """(retained bytes per block invocation, bytes one recomputed block
+        releases), from two eager forwards of the cheapest graph.
+
+        The raw forward divided by its block count is the average a graph
+        retains per block, extras included, which the graphs stack per pass
+        and per block. The same forward with its first eligible block
+        recomputed releases what every recomputed block releases: the PKDA
+        and auxiliary blocks retain more than the average, so the difference,
+        not the average, sizes a shortfall in recomputed blocks.
+        """
+        blocks, _ = block_invocations(self.model.cfg, spec)
+        raw = self._retained(spec, 0)
+        released = raw - self._retained(spec, 1)
+        self.model.checkpoint_blocks = 0
+        per_block = raw / blocks
+        return per_block, released if released > 0 else per_block
 
     def _allocate(self, spec: GraphSpec, plan: ReplayPlan) -> CapturedMicro:
         tokens, prefix, jitter = self._inputs(spec, plan.rows_per_replay)
@@ -1295,6 +1329,7 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
         "static_gib": round(graph_runner.static_bytes / 2**30, 2),
         "activation_budget_gib": round(graph_runner.budget_bytes / 2**30, 2),
         "block_mib": round(graph_runner.bytes_per_block / 2**20, 1),
+        "checkpoint_mib": round(graph_runner.bytes_per_checkpoint / 2**20, 1),
     }
 
 

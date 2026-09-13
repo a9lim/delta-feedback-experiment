@@ -323,9 +323,10 @@ graph, the optimizer step, and the periodic monitors share one private memory
 pool: the eager work runs on the capture stream inside it, so nothing between
 replays grows memory outside the pool, which needs the allocator's expandable
 segments. At
-start-up the trainer measures the activation bytes one block invocation
-retains, subtracts the static footprint and a margin from device memory, and
-plans each graph: a one-pass graph replays the largest row multiple whose raw
+start-up the trainer measures, from two eager forwards, the activation bytes
+one block invocation retains and the bytes one recomputed block releases,
+takes the device memory still free once the static footprint exists less a
+margin, and plans each graph: a one-pass graph replays the largest row multiple whose raw
 activations fit, and otherwise the first PKDA and auxiliary block invocations
 of the logical forward, as many as the shortfall needs, recompute in
 backward. Global-attention blocks are always retained. Checkpoint wrappers

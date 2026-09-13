@@ -76,10 +76,10 @@ def cuda_probe() -> None:
         def _reachable_specs(self, schedule):
             return [GraphSpec(2, 2)]
 
-        def _plan(self, spec, bytes_per_block, budget_bytes):
+        def _plan(self, spec, bytes_per_block, bytes_per_checkpoint, budget_bytes):
             # The tiny model fits raw; recompute a few blocks anyway so the
             # checkpoint wrappers run under capture.
-            plan = super()._plan(spec, bytes_per_block, budget_bytes)
+            plan = super()._plan(spec, bytes_per_block, bytes_per_checkpoint, budget_bytes)
             return replace(plan, checkpoint_blocks=3)
 
     class Rows:

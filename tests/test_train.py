@@ -301,11 +301,10 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
 def test_replay_plan_fits_rows_then_recomputes_blocks():
     """One-pass graphs take the largest row multiple that fits raw, capped at
     two rows; multi-pass graphs keep the keyed microbatch width; a shortfall
-    recomputes exactly as many block invocations as it needs, never more than
-    are eligible."""
+    recomputes exactly as many block invocations as the calibrated release of
+    one recomputed block needs, never more than are eligible."""
     from delta_feedback_experiment.model import condition_config
     from delta_feedback_experiment.train import (
-        PER_ROW_PASS_EXTRA_BYTES,
         GraphSpec,
         block_invocations,
         plan_replay,
@@ -317,21 +316,28 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
     assert block_invocations(cfg, GraphSpec(2, 1)) == (34, 26)
     assert block_invocations(cfg, GraphSpec(1, 4)) == (41, 31)
     block = 300 * 2**20
-    extra = PER_ROW_PASS_EXTRA_BYTES
+    release = 320 * 2**20
 
     def budget(rows, spec):
         blocks, _ = block_invocations(cfg, spec)
-        return rows * blocks * block + spec.n_passes * rows * extra
+        return rows * blocks * block
+
+    def plan(spec, budget_bytes):
+        return plan_replay(cfg, args, spec, block, release, budget_bytes)
 
     flat = GraphSpec(1, 1)
-    assert plan_replay(cfg, args, flat, block, budget(8, flat)).rows_per_replay == 2
-    assert plan_replay(cfg, args, flat, block, budget(2, flat)).rows_per_replay == 2
-    assert plan_replay(cfg, args, flat, block, budget(2, flat) - 1).rows_per_replay == 1
-    assert plan_replay(cfg, args, flat, block, budget(1, flat)).rows_per_replay == 1
+    assert plan(flat, budget(8, flat)).rows_per_replay == 2
+    assert plan(flat, budget(2, flat)).rows_per_replay == 2
+    assert plan(flat, budget(2, flat) - 1).rows_per_replay == 1
+    assert plan(flat, budget(1, flat)).rows_per_replay == 1
     two = GraphSpec(2, 1)
-    generous = plan_replay(cfg, args, two, block, budget(8, two))
+    generous = plan(two, budget(8, two))
     assert (generous.rows_per_replay, generous.checkpoint_blocks) == (1, 0)
-    short = plan_replay(cfg, args, two, block, budget(1, two) - 5 * block)
+    # A shortfall is sized by what a recomputed block releases, not by the
+    # average block: five releases cover a five-average-block shortfall.
+    short = plan(two, budget(1, two) - 5 * block)
     assert (short.rows_per_replay, short.checkpoint_blocks) == (1, 5)
-    starved = plan_replay(cfg, args, GraphSpec(1, 4), block, 0)
+    assert plan(two, budget(1, two) - 5 * release).checkpoint_blocks == 5
+    assert plan(two, budget(1, two) - 5 * release - 1).checkpoint_blocks == 6
+    starved = plan(GraphSpec(1, 4), 0)
     assert starved.checkpoint_blocks == starved.eligible_blocks == 31

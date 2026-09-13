@@ -145,13 +145,15 @@ one two-pass microbatch.
 Training compiles blocks and captures fixed-address graphs for reachable
 pass/depth pairs. Inductor caches persist at
 `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
-them. Before capture the trainer measures the activation bytes one block
-invocation retains and plans each graph against device memory minus the
-static footprint and `--checkpoint-margin-gib` (default 1.0): rows per
-replay for one-pass graphs, otherwise how many leading PKDA and auxiliary
-block invocations recompute in backward. The `execution` record reports the
-static footprint, the budget, and the bytes per block; one `plan` record per
-graph reports its rows and recomputed block count. Raise the margin if
+them. Before capture the trainer measures, from two eager forwards, the
+activation bytes one block invocation retains and the bytes one recomputed
+block releases, and plans each graph against the device memory still free
+once the static footprint exists minus `--checkpoint-margin-gib` (default
+1.0): rows per replay for one-pass graphs, otherwise how many leading PKDA
+and auxiliary block invocations recompute in backward. The `execution`
+record reports the static footprint, the budget, the bytes per block, and
+the bytes per recomputed block; one `plan` record per graph reports its rows
+and recomputed block count. Raise the margin if
 warm-up or capture runs out of memory. The optimizer step and the periodic
 monitors run inside the graphs' memory pool on the capture stream, which
 requires the allocator's expandable segments: the package sets
