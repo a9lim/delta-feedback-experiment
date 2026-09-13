@@ -35,10 +35,10 @@
 \newcommand{\cell}[3]{%
   \node[cellbox] (#1) at (8.2,#2) {};
   \node[font=\bfseries\smalltext] at (8.2,#2+.88) {#3};
-  \node[strip,fill=coral] (#1gqa) at (8.2,#2+.08)
-    {NoPE-GGQA + MoE};
-  \node[strip,fill=teal] (#1pkda) at (8.2,#2-.65)
-    {PKDA + MoE\qquad $\times 3$};
+  \node[strip,gqaop] (#1gqa) at (8.2,#2+.08)
+    {\textbf{NoPE-GGQA + MoE}};
+  \node[strip,pkdaop] (#1pkda) at (8.2,#2-.65)
+    {\textbf{PKDA + MoE}\qquad $\times 3$};
   \draw[flow,thin] (#1pkda.north) -- (#1gqa.south);
 }
 
@@ -47,6 +47,21 @@
   x=1cm,y=1cm,text=ink,font=\smalltext,
   box/.style={draw=line,fill=white,rounded corners=3pt,line width=.65pt,
     minimum height=.85cm,inner sep=5pt,align=center},
+  % Semantic colors: use these styles for every occurrence of an operation.
+  tokenop/.style={fill=pink},
+  normop/.style={fill=yellow},
+  mhdbop/.style={fill=mint},
+  pkdaop/.style={fill=teal},
+  gqaop/.style={fill=coral},
+  moeop/.style={fill=gold},
+  fusionop/.style={fill=purple},
+  readoutop/.style={fill=blue},
+  mixertype/.style={path picture={
+    \fill[teal] (path picture bounding box.south west)
+      rectangle (path picture bounding box.north);
+    \fill[coral] (path picture bounding box.south)
+      rectangle (path picture bounding box.north east);
+  }},
   cellbox/.style={box,minimum width=5.3cm,minimum height=2.65cm},
   strip/.style={box,text width=4.4cm,minimum height=.53cm,
     inner sep=3pt,font=\smalltext},
@@ -60,7 +75,7 @@
   sum/.style={circle,draw=ink,fill=white,minimum size=.46cm,
     inner sep=0pt,font=\normalsize,line width=.85pt}
 ]
-\path[use as bounding box] (0,0) rectangle (23.75,32.2);
+\path[use as bounding box] (0,-.85) rectangle (23.75,32.2);
 
 \node[font=\bfseries\fontsize{23}{27}\selectfont] at (11.9,31.5)
   {Delta: feedback + tied depth};
@@ -78,14 +93,14 @@
 \cell{coda}{22.7}{Coda cell}
 
 \node[font=\smalltext] (tokens) at (8.2,3.7) {Input token $x_t$};
-\node[box,fill=pink,text width=4.6cm] (embedding) at (8.2,5.05)
+\node[box,tokenop,text width=4.6cm] (embedding) at (8.2,5.05)
   {\textbf{Token embedding $E$}\\$e_t=E(x_t)$};
-\node[box,fill=purple!50,text width=4.6cm] (seed) at (8.2,9.7)
+\node[box,fusionop,text width=4.6cm] (seed) at (8.2,9.7)
   {\textbf{Column seed $s_t$}\\plain $e_t$ or incoming fusion};
 \draw[flow] (tokens) -- (embedding);
 \draw[flow] (embedding) -- (seed);
 \node[note,anchor=east,text width=2.8cm] at (7.95,8.02)
-  {Plain token entry:\\pass 1 / prefix\\Standard decode};
+  {Plain token entry:\\pass 1 / prefix\\standard decode};
 \draw[flow] (seed) -- (prelude);
 \draw[flow] (prelude) -- (coreone);
 \draw[flow] (coreone) -- (coretwo);
@@ -99,9 +114,9 @@
   at (12.02,17.85) {$r$ core iterations; same weights};
 
 \coordinate (top) at (8.2,24.72);
-\node[box,fill=yellow,text width=4.6cm] (finalnorm) at (8.2,26.15)
-  {\textbf{Final RMSNorm}};
-\node[box,fill=blue,text width=4.6cm] (classifier) at (8.2,27.65)
+\node[box,normop,text width=4.6cm] (finalnorm) at (8.2,26.15)
+  {\textbf{RMSNorm}\\shared output norm $N_o$};
+\node[box,readoutop,text width=4.6cm] (classifier) at (8.2,27.65)
   {\textbf{Tied classifier $E^\top$}};
 \node[align=center,font=\bfseries\fontsize{11}{14}\selectfont]
   (mainoutput) at (8.2,29.15) {Next-token logits\\\normalfont\smalltext predict $x_{t+1}$};
@@ -114,7 +129,7 @@
 % One accumulated delta per physical cell; the trunk and cutaway read only
 % causally available contributions. Every MHDB site owns its own null.
 \draw[bankwire,rounded corners=3pt] (4.25,9.7) -- (4.25,30.08)
-  -- (23.3,30.08) -- (23.3,18.0);
+  -- (23.3,30.08) -- (23.3,17.22);
 \foreach \name/\y/\value in {seed/9.7/s_t,prelude/12.8/\Delta_{\mathrm P},coreone/16.1/\Delta_{\mathrm R_1},coretwo/19.4/\Delta_{\mathrm R_2},coda/22.7/\Delta_{\mathrm C}} {
   \draw[bankwire] (\name.west) -- (4.25,\y);
   \fill[greenink] (4.25,\y) circle (1.3pt);
@@ -130,17 +145,17 @@
 
 % Payload write retains the direct top-state path, before final readout norm.
 % Its learned RMSNorm includes fixed output scale BASE_NORMAL_INIT_STD=0.02.
-\node[box,fill=mint,text width=2.7cm] (payloadroute) at (2.5,24.0)
-  {\textbf{Payload MHDB}\\route seed + all deltas\\+ its learned null};
+\node[box,mhdbop,text width=2.7cm] (payloadroute) at (2.5,24.0)
+  {\textbf{MHDB read}\\payload: seed + all deltas\\+ learned null};
 \draw[bankread] (4.25,24.0) -- (payloadroute.east);
 \fill[greenink] (4.25,24.0) circle (1.3pt);
 \node[sum] (payloadadd) at (2.5,26.0) {$+$};
 \draw[flow] (payloadroute) -- (payloadadd);
 \draw[flow,rounded corners=3pt,preaction={draw=white,line width=3.8pt}]
   (top) -- (4.65,24.72) -- (4.65,26.0) -- (payloadadd.east);
-\node[box,fill=yellow,text width=2.7cm] (payloadnorm) at (2.5,27.42)
-  {\textbf{Payload RMSNorm}};
-\node[circle,draw=purpleink!50,fill=purple,minimum size=.68cm,inner sep=0pt]
+\node[box,normop,text width=2.7cm] (payloadnorm) at (2.5,27.42)
+  {\textbf{RMSNorm}\\payload norm $N_p$};
+\node[circle,draw=purpleink!50,fusionop,minimum size=.68cm,inner sep=0pt]
   (payload) at (2.5,28.75) {$p_t$};
 \draw[flow] (payloadadd) -- (payloadnorm);
 \draw[flow] (payloadnorm) -- node[right,edgeword] {$\times\,0.02$} (payload);
@@ -148,15 +163,15 @@
 % The outer feedback path carries p_t to fusion with raw E(x_{t+1}).
 % Both token paths share E; one lookup serves the whole row.
 % Fusion is computed once and reused by MTP and shifted feedback.
-\node[box,fill=purple!65,text width=3.3cm] (jitter) at (20.2,3.1)
+\node[box,fusionop,text width=3.3cm] (jitter) at (20.2,3.1)
   {\textbf{Payload + jitter}\\$p_t+\xi_t$};
 \draw[feedback] (payload.west) -- (.3,28.75) -- (.3,1.55)
   -- (20.2,1.55) -- (jitter.south);
 \node[rotate=90,text=purpleink,font=\smalltext,fill=white,inner sep=3pt]
   at (.3,15.6) {Full-bandwidth payload feedback};
-\node[box,fill=pink,text width=3.3cm] (nextembedding) at (15.2,3.1)
+\node[box,tokenop,text width=3.3cm] (nextembedding) at (15.2,3.1)
   {\textbf{Token embedding $E$}\\$e_{t+1}=E(x_{t+1})$};
-\node[box,fill=purple,text width=7.5cm,minimum height=1.12cm]
+\node[box,fusionop,text width=7.5cm,minimum height=1.12cm]
   (fusion) at (17.7,6.35)
   {\textbf{Shared concat-linear fusion}\quad $2D\to D$\\
    $u_t=W_f\,[e_{t+1};\,p_t+\xi_t]$};
@@ -175,13 +190,13 @@
   {Default jitter: $\xi_t\sim U(-0.0004,0.0004)$.\\Evaluation: $\xi_t=0$.};
 
 % MTP is a connected side branch of the very same fusion tensor.
-\node[box,fill=gold,text width=5.0cm,minimum height=1.2cm]
+\node[box,pkdaop,text width=4.6cm,minimum height=1.2cm]
   (mtp) at (17.7,9.43)
-  {\textbf{Auxiliary prediction block}\\independent PKDA + expert FFN\\\tinytext no MHDB read or tied-depth loop};
+  {\textbf{PKDA + MoE}\\independent auxiliary block\\\tinytext no MHDB read or tied-depth loop};
 \draw[flow] (fused) -- (mtp.south);
-\node[box,fill=yellow,text width=5.0cm] (mtpnorm) at (17.7,11.17)
-  {\textbf{Shared final RMSNorm}};
-\node[box,fill=blue,text width=5.0cm] (mtpclassifier) at (17.7,12.65)
+\node[box,normop,text width=4.6cm] (mtpnorm) at (17.7,11.17)
+  {\textbf{RMSNorm}\\shared output norm $N_o$};
+\node[box,readoutop,text width=4.6cm] (mtpclassifier) at (17.7,12.65)
   {\textbf{Tied classifier $E^\top$}};
 \node[align=center,font=\bfseries\fontsize{11}{14}\selectfont]
   (mtpoutput) at (17.7,14.1)
@@ -202,49 +217,78 @@
   {Inside one residual layer};
 \node[note] at (18.02,28.61)
   {Per cell: 3 PKDA + 1 NoPE-GGQA\qquad $\alpha=1/\sqrt{2L},\ L=16$};
-\node (layerout) at (17.7,27.96) {$h_{\mathrm{next}}=h+a+m$};
-\node[sum] (addm) at (17.7,27.05) {$+$};
-\node[box,fill=gold!55,text width=6.0cm,minimum height=.9cm]
-  (mixexperts) at (17.7,25.58)
-  {$\displaystyle\frac{S(x)+k\sum_{j\in J}w_jE_j(x)}{\sqrt{k+1}}$};
-\node[box,fill=gold,text width=2.65cm,minimum height=1.0cm]
-  (sharedexpert) at (15.9,23.97) {\textbf{Shared SwiGLU}\\$S(x)$};
-\node[box,fill=coral,text width=2.65cm,minimum height=1.0cm]
-  (routedexperts) at (20.0,23.97) {\textbf{Routed SwiGLUs}\\router: top-$k$ of $n$};
-\node[box,fill=mint,text width=5.4cm,minimum height=.92cm]
-  (readm) at (17.7,22.05)
-  {\textbf{MHDB read + RMSNorm}\\$x=\operatorname{RMSNorm}(h'+R_m(\mathcal B_m))$};
-\node[sum] (adda) at (17.7,20.65) {$+$};
-\node[box,fill=teal,text width=4.5cm,minimum height=1.0cm]
-  (tokenmixer) at (17.7,19.35)
-  {\textbf{PKDA / NoPE-GGQA}\\token mixer};
-\node[box,fill=mint,text width=5.4cm,minimum height=.92cm]
-  (reada) at (17.7,18.0)
-  {\textbf{MHDB read + RMSNorm}\\$\operatorname{RMSNorm}(h+R_a(\mathcal B_a))$};
-\node (layerin) at (17.7,17.0) {$h$};
-\draw[flow] (layerin) -- (reada);
-\draw[flow] (reada) -- (tokenmixer);
-\draw[flow] (tokenmixer) -- node[right,edgeword] {$a=\alpha\,\mathrm{mixer}(\cdot)$} (adda);
-\draw[flow] (adda) -- node[right,edgeword] {$h'=h+a$} (readm);
-\draw[flow,rounded corners=3pt] (readm.north) -- (17.7,22.83)
-  -- (15.9,22.83) -- (sharedexpert.south);
-\draw[flow,rounded corners=3pt] (17.7,22.83) -- (20.0,22.83) -- (routedexperts.south);
-\fill[ink] (17.7,22.83) circle (1.3pt);
+\node (layerout) at (17.7,28.0) {$h_{\mathrm{next}}=h+a+m$};
+\node[sum] (addm) at (17.7,27.27) {$+$};
+\node[box,moeop,text width=6.0cm,minimum height=.9cm]
+  (mixexperts) at (17.7,26.0)
+  {\textbf{MoE}\\$\displaystyle
+    \frac{S(x_m)+k\sum_{j\in J}w_jE_j(x_m)}{\sqrt{k+1}}$};
+\node[box,moeop,text width=2.65cm,minimum height=1.0cm]
+  (sharedexpert) at (15.9,24.6)
+  {\textbf{Shared SwiGLU}\\$S(x_m)$};
+\node[box,moeop,text width=2.65cm,minimum height=1.0cm]
+  (routedexperts) at (20.0,24.6)
+  {\textbf{Routed SwiGLUs}\\router: top-$k$ of $n$};
+
+% Every branch has the same explicit read -> add -> norm structure as the
+% payload writer. A learned MHDB query reads the bank, not the live residual;
+% h or h' joins that read at + and also follows its untouched residual bypass.
+\node[box,normop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
+  (normm) at (17.7,23.43)
+  {\textbf{RMSNorm}\quad $x_m=N_m(h'+r_m)$};
+\node[sum] (readaddm) at (17.7,22.65) {$+$};
+\node[box,mhdbop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
+  (readm) at (17.7,21.85)
+  {\textbf{MHDB read}\quad $r_m=R_m(\mathcal B_m)$};
+\node[sum] (adda) at (17.7,21.0) {$+$};
+\node[box,mixertype,text width=4.5cm,minimum height=1.0cm]
+  (tokenmixer) at (17.7,19.95)
+  {\textbf{PKDA or NoPE-GGQA}\\token mixer};
+\node[box,normop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
+  (norma) at (17.7,18.8)
+  {\textbf{RMSNorm}\quad $x_a=N_a(h+r_a)$};
+\node[sum] (readadda) at (17.7,18.02) {$+$};
+\node[box,mhdbop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
+  (reada) at (17.7,17.22)
+  {\textbf{MHDB read}\quad $r_a=R_a(\mathcal B_a)$};
+\node (layerin) at (14.02,17.0) {$h$};
+
+\draw[flow] (reada) -- (readadda);
+\draw[flow] (readadda) -- (norma);
+\draw[flow] (norma) -- (tokenmixer);
+\draw[flow] (tokenmixer) -- node[right,edgeword]
+  {$a=\alpha\,\mathrm{mixer}(x_a)$} (adda);
+\draw[flow] (readm) -- (readaddm);
+\draw[flow] (readaddm) -- (normm);
+\draw[flow,rounded corners=1pt] (normm.north) -- (17.7,23.88)
+  -- (15.9,23.88) -- (sharedexpert.south);
+\draw[flow,rounded corners=1pt] (17.7,23.88) -- (20.0,23.88)
+  -- (routedexperts.south);
+\fill[ink] (17.7,23.88) circle (1.3pt);
 \draw[flow] (sharedexpert.north) -- (mixexperts.south -| sharedexpert.north);
 \draw[flow] (routedexperts.north) -- (mixexperts.south -| routedexperts.north);
-\draw[flow] (mixexperts) -- node[right,edgeword] {$m=\alpha\,\mathrm{MoE}(x)$} (addm);
+\draw[flow] (mixexperts) -- node[right,edgeword]
+  {$m=\alpha\,\mathrm{MoE}(x_m)$} (addm);
 \draw[flow] (addm) -- (layerout);
-\draw[flow,rounded corners=3pt] (17.7,17.32) -- (14.02,17.32) |- (adda.west);
-\draw[flow,rounded corners=3pt] (17.7,21.14) -- (14.02,21.14) |- (addm.west);
-\fill[ink] (17.7,17.32) circle (1.3pt);
-\fill[ink] (17.7,21.14) circle (1.3pt);
-\draw[bankread] (23.3,18.0) -- (reada.east);
-\draw[bankread] (23.3,22.05) -- (readm.east);
-\fill[greenink] (23.3,22.05) circle (1.3pt);
-\node[box,fill=teal!40,draw=tealink!50,text width=1.35cm,font=\tinytext,inner sep=3pt]
-  (history) at (21.75,19.35) {Token\\history};
+
+% The lower and upper residual rails each feed both their pre-norm sum and
+% their post-sublayer sum. They never pass through the MHDB read itself.
+\draw[flow,rounded corners=3pt] (layerin.north) -- (14.02,21.0) -- (adda.west);
+\draw[flow] (14.02,18.02) -- (readadda.west);
+\fill[ink] (14.02,18.02) circle (1.3pt);
+\draw[flow,rounded corners=3pt] (adda.north) -- (17.7,21.4)
+  -- (14.02,21.4) |- (addm.west);
+\draw[flow] (14.02,22.65) -- (readaddm.west);
+\fill[ink] (14.02,22.65) circle (1.3pt);
+\node[edgeword,anchor=west] at (18.02,21.1) {$h'=h+a$};
+\draw[bankread] (23.3,17.22) -- (reada.east);
+\fill[greenink] (23.3,17.22) circle (1.3pt);
+\draw[bankread] (23.3,21.85) -- (readm.east);
+\fill[greenink] (23.3,21.85) circle (1.3pt);
+\node[box,fill=white,draw=tealink!60,text width=1.35cm,font=\tinytext,inner sep=3pt]
+  (history) at (21.75,19.95) {Token\\history};
 \draw[state] (tokenmixer.east) -- (history.west);
-\node[note,text width=8.8cm] at (18.0,16.43)
+\node[note,text width=8.8cm] at (18.0,16.36)
   {Read the live partial when present.\\
    Cache per core iteration; reset in Jacobi, retain in decode.};
 
@@ -259,5 +303,14 @@
 \node[anchor=west,note] at (13.2,.6) {MHDB sources};
 \draw[state] (18.3,.6) -- (19.15,.6);
 \node[anchor=west,note] at (19.3,.6) {token history};
+% Color and wire legends use the same styles as the diagram.
+\foreach \x/\kind/\label in {
+  1.0/tokenop/Embedding,3.95/normop/RMSNorm,6.9/mhdbop/MHDB,
+  9.45/pkdaop/PKDA,11.9/gqaop/NoPE-GGQA,15.15/moeop/MoE,
+  17.55/readoutop/Readout,20.25/fusionop/Entry + payload} {
+  \node[box,\kind,minimum width=.28cm,minimum height=.22cm,
+    inner sep=0pt,rounded corners=1pt] at (\x,-.35) {};
+  \node[note,anchor=west] at (\x+.24,-.35) {\label};
+}
 \end{tikzpicture}
 \end{document}
