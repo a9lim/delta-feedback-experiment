@@ -450,7 +450,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CHECKPOINT_MARGIN_GIB,
         help="device memory kept free of retained activations when the trainer "
         "plans rows per replay and recomputed blocks for each graph "
-        "(default: 1.0); raise it if warm-up or capture runs out of memory",
+        f"(default: {DEFAULT_CHECKPOINT_MARGIN_GIB}); raise it if warm-up or "
+        "capture runs out of memory",
     )
     return parser
 
@@ -610,13 +611,13 @@ class CapturedMicro:
     active: frozenset[torch.nn.Parameter] = frozenset()
 
 
-DEFAULT_CHECKPOINT_MARGIN_GIB = 1.0
+DEFAULT_CHECKPOINT_MARGIN_GIB = 3.5
 """Free device memory, measured after the static footprint exists, that the
-activation budget leaves untouched: the planned graphs' allocator rounding
-and the pre-capture warm-up. The optimizer step and the periodic monitors run
-inside the graphs' pool (``pool_scope``) and need none of it; below about
-1 GiB the largest planned graph no longer fits during warm-up on the 24 GiB
-card."""
+retained-forward activation budget leaves untouched. Backward workspaces,
+checkpoint recomputation, allocator rounding, and graph instantiation also
+need memory; a 1 GiB margin OOMs during screen fl capture on the 24 GiB card.
+The optimizer step and periodic monitors reuse the graphs' pool
+(``pool_scope``)."""
 
 ROW_MULTIPLES = (2, 1)
 """Rows-per-replay multiples of ``micro_rows`` a one-pass graph may use. Two
@@ -789,6 +790,14 @@ class CudaGraphTrainer:
         specs = self._reachable_specs(schedule)
         base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
         self.bytes_per_block, self.bytes_per_checkpoint = self._calibrate(base)
+        telemetry.log(
+            "memory_plan",
+            static_gib=round(self.static_bytes / 2**30, 2),
+            activation_budget_gib=round(self.budget_bytes / 2**30, 2),
+            checkpoint_margin_gib=args.checkpoint_margin_gib,
+            block_mib=round(self.bytes_per_block / 2**20, 1),
+            checkpoint_mib=round(self.bytes_per_checkpoint / 2**20, 1),
+        )
         self.states: dict[GraphSpec, CapturedMicro] = {}
         for spec in specs:
             plan = self._plan(
@@ -799,9 +808,18 @@ class CudaGraphTrainer:
         # The package sets Dynamo's recompile budget once for the process, so
         # every block and router specialization compiles here and in later
         # eager evaluation alike.
-        active_by_spec = {
-            spec: self._warm(state) for spec, state in self.states.items()
-        }
+        active_by_spec = {}
+        for spec, state in self.states.items():
+            telemetry.log(
+                "plan",
+                k=spec.n_passes,
+                r=spec.iterations,
+                rows=state.plan.rows_per_replay,
+                checkpoint_blocks=state.plan.checkpoint_blocks,
+                eligible_blocks=state.plan.eligible_blocks,
+                estimated_gib=round(state.plan.estimated_gib, 2),
+            )
+            active_by_spec[spec] = self._warm(state)
         model.zero_grad(set_to_none=True)
         union = set().union(*active_by_spec.values())
         self.grad_buffers = {p: self._buffers[p] for p in self.parameters if p in union}
@@ -829,6 +847,7 @@ class CudaGraphTrainer:
         self.pool = self.mempool.id
         for spec, state in self.states.items():
             state.active = frozenset(active_by_spec[spec])
+            telemetry.log("capture", k=spec.n_passes, r=spec.iterations)
             self._capture(state, self.pool)
         self.zero_grad()
         torch.cuda.synchronize()
@@ -1885,16 +1904,6 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             "execution",
             **execution_fields(model, graph_runner, eval_graph_runner),
         )
-        for spec, state in graph_runner.states.items():
-            telemetry.log(
-                "plan",
-                k=spec.n_passes,
-                r=spec.iterations,
-                rows=state.plan.rows_per_replay,
-                checkpoint_blocks=state.plan.checkpoint_blocks,
-                eligible_blocks=state.plan.eligible_blocks,
-                estimated_gib=round(state.plan.estimated_gib, 2),
-            )
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0
     window_cell_tokens = 0.0

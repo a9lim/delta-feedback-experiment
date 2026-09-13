@@ -326,7 +326,9 @@ segments. At
 start-up the trainer measures, from two eager forwards, the activation bytes
 one block invocation retains and the bytes one recomputed block releases,
 takes the device memory still free once the static footprint exists less a
-margin, and plans each graph: a one-pass graph replays the largest row multiple whose raw
+3.5 GiB default margin for backward workspaces, recomputation, allocator
+rounding, and graph instantiation, and plans each graph: a one-pass graph
+replays the largest row multiple whose raw
 activations fit, and otherwise the first PKDA and auxiliary block invocations
 of the logical forward, as many as the shortfall needs, recompute in
 backward. Global-attention blocks are always retained. Checkpoint wrappers
