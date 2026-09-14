@@ -1,7 +1,6 @@
 # Scale presets and accounting
 
-`--scale screen|bridge|flagship|extension` selects geometry, recurrent depth,
-and batch settings.
+`--scale screen|bridge|flagship|extension` selects geometry and batch settings.
 Explicit geometry or recipe flags override their preset fields. Conditions are `f`,
 `l`, and `fl`; tied depth adds no parameters. The trainer is single-process.
 Preset availability does not establish GPU fit or throughput.
@@ -13,8 +12,9 @@ Preset availability does not establish GPU fit or throughput.
 | Residual width `D` | 768 | 1,152 | 1,536 | 2,304 |
 | Layers / four-layer cells | 16 / 4 | 16 / 4 | 16 / 4 | 16 / 4 |
 | Prelude / core / coda cells | 1 / 2 / 1 | 1 / 2 / 1 | 1 / 2 / 1 | 1 / 2 / 1 |
-| Core iterations, uncapped mean / cap (`l`, `fl`) | 2 / 4 | 3 / 6 | 4 / 8 | 6 / 12 |
-| Executed trunk layers at mean / cap | 24 / 40 | 32 / 56 | 40 / 72 | 56 / 104 |
+| Core iterations, training mean / maximum (`l`, `fl`) | 2.4 / 5 | 2.4 / 5 | 2.4 / 5 | 2.4 / 5 |
+| Default evaluation / decode core iterations | 3 | 3 | 3 | 3 |
+| Executed trunk layers, training mean / evaluation / maximum | 27.2 / 32 / 48 | 27.2 / 32 / 48 | 27.2 / 32 / 48 | 27.2 / 32 / 48 |
 | Trunk and MTP per-expert width `h` | 832 | 832 | 832 | 832 |
 | Shared + selected / routed experts | 1 + 3 / 15 | 1 + 5 / 23 | 1 + 7 / 31 | 1 + 11 / 47 |
 | Active FFN width `H = (k+1)h` | 3,328 | 4,992 | 6,656 | 9,984 |
@@ -137,18 +137,25 @@ the publisher's DCLM-100B subset, preventing paired per-token comparisons.
 
 With `C` unique cells, the core contains `C-2` cells. At depth `r`, a pass
 executes `2+(C-2)r` cells. Every preset has `C=4`, so all scales execute
-`2+2r` cells, or `8+8r` transformer layers. The default uncapped means are
-`2,3,4,6`, with caps `4,6,8,12` for screen through extension. These preset
-means equal `D/384`; changing `--dim` alone does not change recurrent depth.
-Explicit `--loop-iterations` and `--loop-max-iterations` override their
-respective preset fields. Evaluation and decode hold the configured mean
-fixed; training's capped draw has a slightly lower actual mean. Without `l`,
-every scale executes its 16 unique layers once per pass.
+`2+2r` cells, or `8+8r` transformer layers. Every scale uses the same fixed
+training distribution:
 
-Resumes and continuations inherit saved depths unless explicitly pinned.
-An explicit `--scale` pins its depth defaults along with its geometry, so
-resuming a different saved depth requires omitting `--scale` or supplying
-matching loop overrides. These settings are part of the checkpoint v39 contract.
+| Core iterations `r` | 1 | 2 | 3 | 4 | 5 |
+|---|---:|---:|---:|---:|---:|
+| Probability | 30% | 30% | 20% | 10% | 10% |
+
+The actual training mean is 2.4 core visits, or 27.2 trunk layers per pass;
+the maximum is five visits, or 48 layers. Evaluation and decode default to
+three visits, or 32 layers. `--loop-iterations` overrides only their fixed
+depth within `1..5`; scale and geometry overrides do not change the training
+distribution. Without `l`, every scale executes its 16 unique layers once
+per pass.
+
+Resumes and continuations inherit the saved evaluation depth unless explicitly
+pinned; conflicting overrides are rejected. `--scale` pins geometry and batch
+settings, while core-depth defaults are common to every scale. The fixed
+sampling recipe and evaluation-depth argument are part of the checkpoint
+v39 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its
@@ -157,12 +164,12 @@ vocabulary loss. Measured device time includes routing and execution overhead.
 For 4,096 cached positions, BF16 GQA K/V and convolution histories plus FP32
 PKDA matrix/diagonal states cost:
 
-| Scale | One cell | Flat / `r=1` | Default `r_mean` | Default `r_max` |
+| Scale | One cell | Flat / `r=1` | Default evaluation `r=3` | Maximum `r=5` |
 |---|---:|---:|---:|---:|
-| Screen | 13.96 MiB | 55.82 MiB | 83.73 MiB | 139.56 MiB |
-| Bridge | 20.93 MiB | 83.73 MiB | 167.47 MiB | 293.07 MiB |
-| Flagship | 27.91 MiB | 111.64 MiB | 279.11 MiB | 502.40 MiB |
-| Extension | 41.87 MiB | 167.47 MiB | 586.13 MiB | 1,088.53 MiB |
+| Screen | 13.96 MiB | 55.82 MiB | 111.64 MiB | 167.47 MiB |
+| Bridge | 20.93 MiB | 83.73 MiB | 167.47 MiB | 251.20 MiB |
+| Flagship | 27.91 MiB | 111.64 MiB | 223.29 MiB | 334.93 MiB |
+| Extension | 41.87 MiB | 167.47 MiB | 334.93 MiB | 502.40 MiB |
 
 Each core iteration keeps its own mixer cache. These per-sequence state
 counts exclude payload, logits, allocator overhead, and serving metadata.

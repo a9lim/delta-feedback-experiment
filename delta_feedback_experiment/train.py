@@ -36,8 +36,12 @@ from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
     BASE_NORMAL_INIT_STD,
     CONDITION_LETTERS,
+    DEFAULT_LOOP_ITERATIONS,
     EXPERT_BALANCE_COEF,
     EXPERT_BIAS_RATE,
+    LOOP_ITERATION_WEIGHTS,
+    LOOP_MAX_ITERATIONS,
+    LOOP_MEAN_ITERATIONS,
     MTP_LOSS_WEIGHT,
     DeltaModel,
     combine_pass_losses,
@@ -92,8 +96,6 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 15,
         "experts_per_token": 3,
         "pkda_heads": 10,
-        "loop_iterations": 2,
-        "loop_max_iterations": 4,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -107,8 +109,6 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 23,
         "experts_per_token": 5,
         "pkda_heads": 15,
-        "loop_iterations": 3,
-        "loop_max_iterations": 6,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -122,8 +122,6 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 31,
         "experts_per_token": 7,
         "pkda_heads": 20,
-        "loop_iterations": 4,
-        "loop_max_iterations": 8,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -137,16 +135,14 @@ SCALES: dict[str, dict[str, int]] = {
         "num_routed_experts": 47,
         "experts_per_token": 11,
         "pkda_heads": 30,
-        "loop_iterations": 6,
-        "loop_max_iterations": 12,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
     },
 }
-"""Geometry, recurrent depth, and batch presets from ``docs/scaling.md``.
+"""Geometry and batch presets from ``docs/scaling.md``.
 Every scale shares 4,096-token rows in one-row microbatches with
-``BATCH_TOKENS`` predictions per step."""
+``BATCH_TOKENS`` predictions per step and the same recurrent-depth recipe."""
 
 DEFAULT_TOKENS_PER_PARAM = 25.0
 """The screen recipe's predicted tokens per reference active parameter."""
@@ -165,7 +161,6 @@ EXACT_FIELDS = (
     "feedback_start",
     "three_pass",
     "loop_iterations",
-    "loop_max_iterations",
     "lr_normuonh",
     "lr_nadam",
     "jitter",
@@ -287,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=tuple(SCALES),
         default="screen",
         help=(
-            "geometry, recurrent depth, and batch preset from docs/scaling.md; "
+            "geometry and batch preset from docs/scaling.md; "
             "a trunk or recipe flag typed alongside overrides its field "
             "(default: screen)"
         ),
@@ -387,20 +382,11 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--loop-iterations",
         type=int,
-        default=SCALES["screen"]["loop_iterations"],
+        choices=range(1, LOOP_MAX_ITERATIONS + 1),
+        default=DEFAULT_LOOP_ITERATIONS,
         help=(
-            "l: uncapped mean core iterations per column, drawn once per step; "
-            "also the fixed count evaluation and decoding use "
-            "(scale defaults: screen 2, bridge 3, flagship 4, extension 6)"
-        ),
-    )
-    recipe.add_argument(
-        "--loop-max-iterations",
-        type=int,
-        default=SCALES["screen"]["loop_max_iterations"],
-        help=(
-            "l: cap of the per-step iteration draw "
-            "(scale defaults: screen 4, bridge 6, flagship 8, extension 12)"
+            "l: fixed evaluation/decode core visits (default: 3 at every scale); "
+            "training always samples 1..5 visits with probabilities 30/30/20/10/10%%"
         ),
     )
 
@@ -517,37 +503,25 @@ def draw_passes(args, step: int, total: int) -> int:
     return 3 if draw < args.three_pass else 2
 
 
-LOOP_DRAW_SIGMA = 0.5
-"""Log-normal spread of the recurrent-depth iteration draw."""
-
-
 def draw_iterations(args, step: int, loop: bool) -> int:
     """The step's core iteration count under ``l``, shared by every pass and
     microbatch of the step.
 
-    The recurrent-depth log-normal Poisson draw with its rate shifted by one::
-
-        tau ~ Normal(log(r_mean - 1) - sigma^2 / 2, sigma)
-        r   = min(1 + Poisson(exp(tau)), r_max)
-
-    so the uncapped mean of ``r`` is ``r_mean``. The draw has its own keyed
-    sub-stream, so the pass, prefix, and jitter draws stay identical to the
-    condition without ``l``.
+    Every scale draws 1..5 visits with probabilities 30/30/20/10/10 percent,
+    independently of the evaluation/decode depth. Its keyed sub-stream keeps
+    pass, prefix, and jitter draws identical to the condition without ``l``.
     """
     if not loop:
         return 1
-    mean, cap = args.loop_iterations, args.loop_max_iterations
-    if mean <= 1:
-        return 1
     generator = torch.Generator().manual_seed(mix(args.data_seed, 0x6C6F6F70, step))
-    tau = torch.normal(
-        math.log(mean - 1) - LOOP_DRAW_SIGMA**2 / 2,
-        LOOP_DRAW_SIGMA,
-        size=(1,),
-        generator=generator,
-    )
-    count = torch.poisson(tau.exp(), generator=generator)
-    return min(1 + int(count.item()), cap)
+    draw = torch.rand((), generator=generator).item()
+    cumulative = 0
+    total = sum(LOOP_ITERATION_WEIGHTS)
+    for iterations, weight in enumerate(LOOP_ITERATION_WEIGHTS[:-1], start=1):
+        cumulative += weight
+        if draw < cumulative / total:
+            return iterations
+    return LOOP_MAX_ITERATIONS
 
 
 def micro_draws(
@@ -1577,7 +1551,6 @@ def model_fields(args) -> dict:
         "pkda_conv_size": args.pkda_conv_size,
         "max_seq_len": args.seq_len + 1,
         "loop_iterations": args.loop_iterations,
-        "loop_max_iterations": args.loop_max_iterations,
     }
 
 
@@ -1620,7 +1593,7 @@ def resolve_run_args(
 ) -> tuple[argparse.Namespace, frozenset[str]]:
     """Parse one command line and settle the recipe it names.
 
-    ``--scale`` fills geometry, recurrent depth, and batch fields left unset;
+    ``--scale`` fills geometry and batch fields left unset;
     a retyped ``--seq-len`` without ``--batch-rows`` keeps ``BATCH_TOKENS``
     predictions per step; and a fresh run's ``--steps`` is derived from
     ``--tokens-per-param`` unless typed. Returns the settled arguments and the
@@ -2104,10 +2077,11 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                         telemetry.log(
                             "depth",
                             step=address,
-                            r_mean=model.cfg.loop_iterations,
-                            r_max=model.cfg.loop_max_iterations,
+                            r_eval=model.cfg.loop_iterations,
+                            r_train_mean=LOOP_MEAN_ITERATIONS,
+                            r_max=LOOP_MAX_ITERATIONS,
                             loss_one=telemetry.format_metric(by_depth[1]["loss"]),
-                            loss_mean=telemetry.format_metric(
+                            loss_eval=telemetry.format_metric(
                                 by_depth[model.cfg.loop_iterations]["loss"]
                             ),
                             loss_max=telemetry.format_metric(sweep[-1]["loss"]),

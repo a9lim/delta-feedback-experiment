@@ -22,7 +22,10 @@ trains the payload to predict a second token.
 All presets have sixteen unique layers and expert intermediate width 832.
 Screen, bridge, flagship, and extension use residual widths 768, 1,152,
 1,536, and 2,304. Shared parameters initialize identically for a seed;
-data and recurrent recipe draws use keyed streams.
+data and recurrent recipe draws use keyed streams. Under `l` or `fl`, all
+four scales train on one through five total core visits with probabilities
+`30/30/20/10/10%` (mean 2.4). Evaluation and decode default to three visits;
+`--loop-iterations` overrides their fixed depth within `1..5`.
 
 The pinned GPT-NeoX/ChatML tokenizer supports arbitrary and repeated roles.
 Pretraining uses raw web documents. Ordinary generation uses the main

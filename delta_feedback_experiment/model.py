@@ -130,6 +130,17 @@ EXPERT_BALANCE_COEF = 0.0001
 MTP_LOSS_WEIGHT = 0.3
 """Default weight of the one-token-ahead auxiliary prediction objective."""
 
+LOOP_ITERATION_WEIGHTS = (3, 3, 2, 1, 1)
+"""Training weights for one through five core visits, shared by every scale."""
+
+LOOP_MAX_ITERATIONS = len(LOOP_ITERATION_WEIGHTS)
+LOOP_MEAN_ITERATIONS = sum(
+    iterations * weight
+    for iterations, weight in enumerate(LOOP_ITERATION_WEIGHTS, start=1)
+) / sum(LOOP_ITERATION_WEIGHTS)
+DEFAULT_LOOP_ITERATIONS = 3
+"""Fixed evaluation/decode depth; training samples independently of this value."""
+
 
 @dataclass(frozen=True)
 class ModelConfig:
@@ -164,12 +175,9 @@ class ModelConfig:
     runs ``iterations`` times per column, each core cell keeping its own block
     delta across iterations (``docs/architecture.md``)."""
 
-    loop_iterations: int = 2
-    """``l``: uncapped mean of the per-step iteration draw, and the fixed count
-    that evaluation and decoding use. Defaults match the screen preset."""
-
-    loop_max_iterations: int = 4
-    """``l``: cap of the per-step iteration draw."""
+    loop_iterations: int = DEFAULT_LOOP_ITERATIONS
+    """``l``: fixed evaluation/decode count in 1..5. Training draws from
+    ``LOOP_ITERATION_WEIGHTS`` at every scale, independently of this count."""
 
     def __post_init__(self) -> None:
         if not (self.feedback or self.loop):
@@ -181,8 +189,12 @@ class ModelConfig:
             raise ValueError("model needs at least one layer")
         if self.routing_block_size < 1:
             raise ValueError("routing block size must be positive")
-        if self.loop_iterations < 1 or self.loop_max_iterations < self.loop_iterations:
-            raise ValueError("loop iterations must satisfy 1 <= mean <= max")
+        if not isinstance(self.loop_iterations, int) or self.loop_iterations < 1:
+            raise ValueError("loop evaluation/decode iterations must be a positive integer")
+        if self.loop and self.loop_iterations > LOOP_MAX_ITERATIONS:
+            raise ValueError(
+                f"loop evaluation/decode iterations must be an integer in 1..{LOOP_MAX_ITERATIONS}"
+            )
         if self.loop and (
             self.layers % self.routing_block_size
             or self.layers < 3 * self.routing_block_size
@@ -255,9 +267,9 @@ class ModelConfig:
             return 1
         if iterations is None:
             return self.loop_iterations
-        if not 1 <= iterations <= self.loop_max_iterations:
+        if not isinstance(iterations, int) or not 1 <= iterations <= LOOP_MAX_ITERATIONS:
             raise ValueError(
-                f"iterations {iterations} outside 1..{self.loop_max_iterations}"
+                f"iterations {iterations} outside integer range 1..{LOOP_MAX_ITERATIONS}"
             )
         return iterations
 
@@ -2231,7 +2243,7 @@ def depth_trace(
     """The loop's fixed-``r`` sweep: loss and core update size per iteration.
 
     Runs the column at every iteration count from 1 to ``iterations``
-    (default: the configured cap) and reports the held-out loss with the coda
+    (default: all five training depths) and reports the held-out loss with the coda
     applied after that many iterations, plus ``mean_token ||core_state(r) -
     core_state(r-1)||_2``, the size of iteration ``r``'s update; at ``r = 1``
     the update is measured from the core entry.  Under same-depth mixing the
@@ -2246,7 +2258,8 @@ def depth_trace(
     if fused and not cfg.feedback:
         raise ValueError("a fused depth trace needs a condition with f")
     if iterations is None:
-        iterations = cfg.loop_max_iterations
+        iterations = LOOP_MAX_ITERATIONS
+    cfg.resolve_iterations(iterations)
     with _monitor_autocast(tokens):
         e = model.embed_tokens(tokens[:, :-1])
         targets = tokens[:, 1:]

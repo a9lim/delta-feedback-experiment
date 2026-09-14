@@ -122,12 +122,15 @@ perturb its payload. Evaluation and diagnostics use no jitter.
 
 ### Core iterations
 
-With `l`, one independent keyed log-normal Poisson draw sets the core depth
-for the whole step. Default uncapped mean/cap pairs are screen `2/4`, bridge
-`3/6`, flagship `4/8`, and extension `6/12`. Capping slightly lowers the actual
-training mean. Evaluation and decode use the configured uncapped mean as
-their fixed depth. For `C` cells, each pass executes `2+(C-2)r` cells. Every
-preset has four cells; see [scaling.md](scaling.md#loop-compute-and-decode-state).
+With `l`, one independent keyed categorical draw sets the core depth for the
+whole optimizer step, shared by every microbatch and feedback pass. All four
+scales use probabilities `30/30/20/10/10%` for one through five total core
+visits, giving an actual mean of 2.4. Evaluation and decode use three visits
+by default; `--loop-iterations` changes only that fixed depth within `1..5`.
+For `C` cells, each pass executes `2+(C-2)r` cells. Every preset has four
+cells, so expected training depth is 27.2 trunk layers, default evaluation
+depth is 32, and maximum depth is 48. See
+[scaling.md](scaling.md#loop-compute-and-decode-state).
 
 ### Schedule
 
@@ -159,7 +162,7 @@ ordinary predicted-token budget.
 | `--warmup-frac`, `--cooldown-frac` | Schedule shape |
 | `--feedback-start`, `--three-pass` | Feedback mixture |
 | `--jitter` | Relative payload-jitter half-width, default `0.02`; actual amplitude is `0.02 * jitter` |
-| `--loop-iterations`, `--loop-max-iterations` | Mean/fixed depth and training cap |
+| `--loop-iterations` | Fixed evaluation/decode core depth, default 3 within `1..5`; training distribution is fixed |
 | `--mtp-weight` | Auxiliary prediction weight |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | Batch geometry |
 | `--resume`, `--continue TAG`, `--max-steps` | Run lifecycle |
@@ -171,7 +174,9 @@ tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v39 snapshots are accepted: token lookups are raw, payloads use the
+Only v39 snapshots are accepted. The core-depth training recipe is the fixed
+`30/30/20/10/10%` distribution, independent of the saved evaluation-depth
+argument. Token lookups are raw, payloads use the
 writer's learned RMSNorm with fixed output scale `BASE_NORMAL_INIT_STD=0.02`,
 and jitter buffers are sampled in those scaled payload units. The same
 constant sets token embedding initialization. Fusion concatenates its

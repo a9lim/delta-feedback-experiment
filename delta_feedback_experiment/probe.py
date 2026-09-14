@@ -12,7 +12,7 @@ from dataclasses import replace
 def cuda_probe() -> None:
     import torch
 
-    from .model import DeltaModel, KVCache, condition_config
+    from .model import LOOP_MAX_ITERATIONS, DeltaModel, KVCache, condition_config
     from .optim import apply_schedule, build_optimizers
     from .train import (
         CudaEvalRunner,
@@ -65,16 +65,12 @@ def cuda_probe() -> None:
             "1",
             "--pkda-head-dim",
             "128",
-            "--loop-iterations",
-            "2",
-            "--loop-max-iterations",
-            "2",
         ]
     )
 
     class ProbeTrainer(CudaGraphTrainer):
         def _reachable_specs(self, schedule):
-            return [GraphSpec(1, 1), GraphSpec(2, 2)]
+            return [GraphSpec(1, 1), GraphSpec(2, LOOP_MAX_ITERATIONS)]
 
         def _plan(self, spec, bytes_per_block, bytes_per_checkpoint, budget_bytes):
             # The tiny model fits raw; recompute a few blocks anyway so the

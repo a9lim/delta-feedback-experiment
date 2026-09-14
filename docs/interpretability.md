@@ -42,7 +42,7 @@ auxiliary block's last row has no second token and carries no training weight.
 |---|---|
 | `scripts/route_report.py` | Plain/fused source mass and entropy by site/group, source/null scale, query geometry |
 | `scripts/payload_swap.py` | Trained, top-only, uniform, and forced-source payload enrichment; optional single-group intervention |
-| `scripts/depth_trace.py` | Held-out loss, core updates, and route mass over fixed depths `1..r_max` |
+| `scripts/depth_trace.py` | Held-out loss, core updates, and route mass over fixed depths, default `1..5` |
 | `scripts/downstream_eval.py` | Workspace zero-shot tasks in Standard, Soft, or Fused mode |
 | `scripts/training_curves.py` | Main/auxiliary training and validation CE, gradient norm, and throughput from current logs |
 

@@ -349,15 +349,20 @@ The keyed depth stream draws once per optimizer step, independently of the
 feedback draws, and every pass/microbatch shares the result:
 
 ```text
-tau ~ Normal(log(r_mean - 1) - sigma^2 / 2, sigma), sigma = 1/2
-r = min(1 + Poisson(exp(tau)), r_max)
+u ~ Uniform(0, 1)
+r = 1 if u < 0.30
+    2 if u < 0.60
+    3 if u < 0.80
+    4 if u < 0.90
+    5 otherwise
 ```
 
-The uncapped mean is `r_mean`. Scale defaults for mean/cap are screen `2/4`,
-bridge `3/6`, flagship `4/8`, and extension `6/12`; explicit loop flags override
-them. Capping slightly lowers the actual training mean. Evaluation/decode
-hold `r = r_mean` fixed for the request. Each iteration has its own mixer
-cache track and reads earlier token positions' writes at the same iteration.
+The weights `LOOP_ITERATION_WEIGHTS=(3,3,2,1,1)` are common to every scale:
+`r_train_mean=2.4` and `r_max=5`. Evaluation/decode hold `r = r_eval` fixed
+for the request, defaulting to three visits. `--loop-iterations` sets this
+fixed depth within `1..5` and does not change the training distribution.
+Each iteration has its own mixer cache track and reads earlier token
+positions' writes at the same iteration.
 Every current prefill pass starts those tracks from zero. Cache position is
 shared across tracks. A pass executes `2+c*r` cells.
 
@@ -386,8 +391,10 @@ backward. Global-attention blocks are always retained. Checkpoint wrappers
 remain outside compiled blocks.
 
 `ColumnOutput` exposes `iterations`, `core_entry`, and `core_state`; route
-keys include iteration, such as `L4i2.attn`. `depth_trace` sweeps `1..r_max`,
-reading out after the coda at each depth and reporting core-update norms.
+keys include iteration, such as `L4i2.attn`. `depth_trace` defaults to sweeping
+`1..5`, reading out after the coda at each depth and reporting core-update
+norms. The depth telemetry labels the fixed evaluation depth `r_eval` and
+its held-out loss `loss_eval`, separately from `r_train_mean` and `r_max`.
 The payload self-composition trace holds depth fixed. Paired `f`/`fl` runs
 share initialization, rows, schedule, and feedback draws. Equal steps match
 data; compute comparisons need cell-tokens and auxiliary work or device time.

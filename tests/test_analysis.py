@@ -16,7 +16,7 @@ from delta_feedback_experiment.model import (
 )
 from delta_feedback_experiment.optim import OptimizerPair, build_optimizers
 from delta_feedback_experiment.tokenizer import SYNTHETIC_TOKENIZER_ID
-from delta_feedback_experiment.train import CONTRACT
+from delta_feedback_experiment.train import CONTRACT, read_checkpoint
 
 TINY = {
     "vocab_size": 97,
@@ -32,7 +32,6 @@ TINY = {
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
     "loop_iterations": 4,
-    "loop_max_iterations": 8,
 }
 
 
@@ -69,6 +68,20 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
         want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
         got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
     assert torch.equal(want, got)
+
+
+def test_v39_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
+    model, path = snapshot(tmp_path, "f")
+    payload = read_checkpoint(path)
+    assert payload["version"] == CONTRACT.version == 39
+    # These retired depth settings were unused for f, including extension's
+    # six-visit default, and must not prevent reading its unchanged weights.
+    payload["args"].update(loop_iterations=6, loop_max_iterations=12)
+    checkpoints.write_payload(path, payload)
+    loaded, saved = analysis.load_checkpoint(path, "cpu")
+    assert saved["condition"] == "f" and not loaded.cfg.loop
+    for name, tensor in model.state_dict().items():
+        assert torch.equal(tensor, loaded.state_dict()[name])
 
 
 def test_token_ce_matches_sequence_ce(tmp_path):

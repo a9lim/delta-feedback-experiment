@@ -27,7 +27,6 @@ GEOMETRY = {
     "pkda_conv_size": 4,
     "max_seq_len": 16,
     "loop_iterations": 2,
-    "loop_max_iterations": 2,
 }
 
 

@@ -21,7 +21,7 @@ import torch
 
 from delta_feedback_experiment.analysis import autocast, load_checkpoint
 from delta_feedback_experiment.data import TokenData
-from delta_feedback_experiment.model import depth_trace
+from delta_feedback_experiment.model import LOOP_MAX_ITERATIONS, depth_trace
 
 
 @torch.no_grad()
@@ -55,7 +55,7 @@ def main() -> None:
         "--iterations",
         type=int,
         default=None,
-        help="sweep cap (default: the snapshot's r_max)",
+        help=f"sweep cap (default: {LOOP_MAX_ITERATIONS} core visits)",
     )
     parser.add_argument("--out-dir", default=None)
     args = parser.parse_args()
@@ -66,7 +66,7 @@ def main() -> None:
         raise SystemExit(f"{args.snapshot} is a {cfg.condition!r} snapshot, not a loop")
     device = next(model.parameters()).device
     data = TokenData.load(args.data_dir, "val", saved["seq_len"])
-    cap = args.iterations or cfg.loop_max_iterations
+    cap = LOOP_MAX_ITERATIONS if args.iterations is None else args.iterations
     tag = Path(args.snapshot).name.split(".pt.")[0]
     out_dir = Path(args.out_dir or f"figures/depth-{tag}")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -94,7 +94,7 @@ def main() -> None:
         "step": saved["step"],
         "rows": counted,
         "iterations": cap,
-        "r_mean": cfg.loop_iterations,
+        "r_eval": cfg.loop_iterations,
         "device": str(device),
         "sweep": sweep,
         "core_routes": routes,
@@ -139,7 +139,7 @@ def main() -> None:
     fig.suptitle(f"{tag} step {saved['step']}: depth trace on {counted} rows", fontsize=10)
     fs.save(fig, out_dir / "depth-trace.png")
 
-    print(f"{tag} step {saved['step']} ({cfg.condition}), {counted} rows, r_mean {cfg.loop_iterations}")
+    print(f"{tag} step {saved['step']} ({cfg.condition}), {counted} rows, r_eval {cfg.loop_iterations}")
     print(f"{'r':>3} " + " ".join(f"{mode + ' loss':>12} {mode + ' upd':>11}" for mode in modes))
     for index, r in enumerate(depth):
         cells = " ".join(

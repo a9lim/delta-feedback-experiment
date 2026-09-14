@@ -1,11 +1,20 @@
 """Training controls and one exact checkpoint-resume trajectory."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from delta_feedback_experiment.data import DEFAULT_SOURCE, write_synthetic
+from delta_feedback_experiment.model import (
+    DEFAULT_LOOP_ITERATIONS,
+    LOOP_ITERATION_WEIGHTS,
+    LOOP_MAX_ITERATIONS,
+    LOOP_MEAN_ITERATIONS,
+    ModelConfig,
+    condition_config,
+)
 from delta_feedback_experiment.optim import (
     DEFAULT_NADAM_BETAS,
     DEFAULT_NADAM_LR,
@@ -17,6 +26,7 @@ from delta_feedback_experiment.train import (
     CONTRACT,
     GRAD_CLIP_NORM,
     CudaGraphTrainer,
+    GraphSpec,
     build_parser,
     build_schedule,
     clip_gradients,
@@ -96,20 +106,17 @@ def test_optimizer_materialization_restores_fresh_nadam_state():
         assert torch.count_nonzero(state["exp_avg_sq"]) == 0
 
 
-@pytest.mark.parametrize(
-    "scale, mean, cap",
-    [("screen", 2, 4), ("bridge", 3, 6), ("flagship", 4, 8), ("extension", 6, 12)],
-)
-def test_resolved_arguments_pin_what_the_operator_fixed(scale, mean, cap):
+@pytest.mark.parametrize("scale", ["screen", "bridge", "flagship", "extension"])
+def test_resolved_arguments_pin_what_the_operator_fixed(scale):
     """A resume validates what the operator pinned and inherits the rest: an
     explicit --scale pins its fields, an explicit --tokens-per-param pins the
     derived steps, and an untyped schedule stays open for the checkpoint."""
     parser = build_parser()
     args, pinned = resolve_run_args(parser, ["x", "--resume"])
     assert pinned == frozenset({"resume"}) and args.steps is None
-    assert (args.loop_iterations, args.loop_max_iterations) == (2, 4)
+    assert args.loop_iterations == DEFAULT_LOOP_ITERATIONS == 3
     args, pinned = resolve_run_args(parser, ["x", "--resume", "--scale", scale])
-    assert (args.loop_iterations, args.loop_max_iterations) == (mean, cap)
+    assert args.loop_iterations == 3
     assert {
         "scale",
         "dim",
@@ -120,18 +127,13 @@ def test_resolved_arguments_pin_what_the_operator_fixed(scale, mean, cap):
         "expert_intermediate",
         "num_routed_experts",
         "experts_per_token",
-        "loop_iterations",
-        "loop_max_iterations",
     } <= pinned
+    assert "loop_iterations" not in pinned
     assert "steps" not in pinned
-    args, _ = resolve_run_args(
+    args, pinned = resolve_run_args(
         parser, ["x", "--steps", "1", "--loop-iterations", "1", "--scale", scale]
     )
-    assert (args.loop_iterations, args.loop_max_iterations) == (1, cap)
-    args, _ = resolve_run_args(
-        parser, ["x", "--steps", "1", "--scale", scale, "--loop-max-iterations", "16"]
-    )
-    assert (args.loop_iterations, args.loop_max_iterations) == (mean, 16)
+    assert args.loop_iterations == 1 and "loop_iterations" in pinned
     _, pinned = resolve_run_args(parser, ["x", "--tokens-per-param", "400"])
     assert {"tokens_per_param", "steps"} <= pinned and "dim" not in pinned
     _, pinned = resolve_run_args(parser, ["x", "--seq-len", "2048"])
@@ -160,8 +162,7 @@ def test_preset_accounting_counts_shared_and_selected_experts():
 
     args = parse_run_args(["geometry", "--scale", scale])
     cfg = condition_config("fl", **model_fields(args))
-    assert cfg.loop_iterations == ModelConfig().loop_iterations == 2
-    assert cfg.loop_max_iterations == ModelConfig().loop_max_iterations == 4
+    assert cfg.loop_iterations == ModelConfig().loop_iterations == 3
     assert cfg.layers == 16 and cfg.core_layers == range(4, 12)
     assert cfg.executed_layers(4) == 40 and cfg.routing_blocks == 4
     assert cfg.dim == dim and cfg.expert_intermediate == 832
@@ -202,11 +203,102 @@ def test_keyed_schedule_draws_are_reproducible():
         assert mix(0, step, 1) != mix(0, step, 2)
         iterations = draw_iterations(args, step, True)
         assert iterations == draw_iterations(args, step, True)
-        assert 1 <= iterations <= args.loop_max_iterations
+        assert 1 <= iterations <= LOOP_MAX_ITERATIONS == 5
         assert draw_iterations(args, step, False) == 1
         passes = draw_passes(args, step, args.steps)
         assert passes == draw_passes(args, step, args.steps)
         assert 1 <= passes <= 3
+
+
+def test_iteration_distribution_assigns_exact_probability_intervals(monkeypatch):
+    args = parse_run_args(["draws", "--steps", "100"])
+    draws = iter((index + 0.5) / 100 for index in range(100))
+    monkeypatch.setattr(
+        torch,
+        "rand",
+        lambda *args, **kwargs: torch.tensor(next(draws), dtype=torch.float64),
+    )
+    depths = [draw_iterations(args, step, True) for step in range(100)]
+    assert [depths.count(depth) for depth in range(1, 6)] == [30, 30, 20, 10, 10]
+    assert sum(depths) / len(depths) == LOOP_MEAN_ITERATIONS == 2.4
+    assert LOOP_ITERATION_WEIGHTS == (3, 3, 2, 1, 1)
+
+    for draw, expected in (
+        (0.0, 1), (0.3 - 1e-9, 1), (0.3, 2),
+        (0.6 - 1e-9, 2), (0.6, 3), (0.8 - 1e-9, 3),
+        (0.8, 4), (0.9 - 1e-9, 4), (0.9, 5), (1.0 - 1e-9, 5),
+    ):
+        monkeypatch.setattr(
+            torch,
+            "rand",
+            lambda *args, **kwargs: torch.tensor(draw, dtype=torch.float64),
+        )
+        assert draw_iterations(args, 1, True) == expected
+        assert draw_iterations(args, 1, False) == 1
+
+
+def test_iteration_draws_are_shared_across_scales_and_independent_of_eval_depth():
+    steps = range(1, 129)
+    expected = None
+    for scale in ("screen", "bridge", "flagship", "extension"):
+        args = parse_run_args(["draws", "--steps", "128", "--scale", scale])
+        assert args.loop_iterations == 3
+        for eval_depth in (1, 3, 5):
+            args.loop_iterations = eval_depth
+            cfg = condition_config("fl", **model_fields(args))
+            assert cfg.loop_iterations == eval_depth
+            depths = [draw_iterations(args, step, True) for step in steps]
+            if expected is None:
+                expected = depths
+            assert depths == expected
+    assert set(expected) == {1, 2, 3, 4, 5}
+
+
+def test_iteration_rng_is_addressed_by_step_and_preserves_other_streams():
+    args = parse_run_args(["draws", "--steps", "128", "--seq-len", "4"])
+    expected = [draw_iterations(args, step, True) for step in range(1, 129)]
+    passes = [draw_passes(args, step, args.steps) for step in range(1, 129)]
+    micro = micro_draws(args, 17, 0, 3, 2, 16, torch.device("cpu"))
+    global_state = torch.get_rng_state().clone()
+    # Reordered calls model restarting at an arbitrary step without carrying
+    # sampler state, while unrelated feedback and microbatch draws intervene.
+    for step in reversed(range(1, 129)):
+        assert draw_passes(args, step, args.steps) == passes[step - 1]
+        assert draw_iterations(args, step, True) == expected[step - 1]
+        assert draw_iterations(args, step, False) == 1
+    repeated = micro_draws(args, 17, 0, 3, 2, 16, torch.device("cpu"))
+    assert torch.equal(global_state, torch.get_rng_state())
+    for left, right in zip(micro, repeated, strict=True):
+        assert torch.equal(left, right)
+    args.data_seed += 1
+    assert [draw_iterations(args, step, True) for step in range(1, 129)] != expected
+
+
+def test_reachable_graphs_cover_every_sampled_depth_without_cuda():
+    args = parse_run_args([
+        "graphs", "--condition", "fl", "--steps", "400",
+        "--feedback-start", "0.25", "--three-pass", "0.5",
+    ])
+    runner = object.__new__(CudaGraphTrainer)
+    runner.args = args
+    runner.model = SimpleNamespace(cfg=condition_config("fl", **model_fields(args)))
+    schedule = build_schedule(args)
+    specs = runner._reachable_specs(schedule)
+    assert specs == [
+        GraphSpec(passes, depth) for passes in (1, 2, 3) for depth in range(1, 6)
+    ]
+    runner.model.cfg = replace(runner.model.cfg, loop=False)
+    assert runner._reachable_specs(schedule) == [
+        GraphSpec(passes, 1) for passes in (1, 2, 3)
+    ]
+
+
+@pytest.mark.parametrize("depth", [0, 6])
+def test_eval_depth_stays_within_the_trained_range(depth):
+    with pytest.raises(ValueError, match="loop.*iterations"):
+        ModelConfig(loop=True, loop_iterations=depth)
+    with pytest.raises(SystemExit):
+        parse_run_args(["draws", "--steps", "1", "--loop-iterations", str(depth)])
 
 
 def test_keyed_jitter_covers_single_and_final_passes_and_replay_buffers():
@@ -278,7 +370,6 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
         "batch-rows": 2,
         "micro-rows": 1,
         "loop-iterations": 2,
-        "loop-max-iterations": 2,
         "steps": 2,
         "warmup-frac": 0,
         "cooldown-frac": 0,
@@ -292,9 +383,14 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     flags = [
         item for key, value in settings.items() for item in (f"--{key}", str(value))
     ]
-    monkeypatch.setattr(
-        trainer, "draw_iterations", lambda args, step, loop: 2 if loop else 1
-    )
+    sampled_depths = []
+
+    def record_depth(args, step, loop):
+        depth = draw_iterations(args, step, loop)
+        sampled_depths.append((step, depth))
+        return depth
+
+    monkeypatch.setattr(trainer, "draw_iterations", record_depth)
     full = trainer.train(["full", *flags])
     half = trainer.train(["half", *flags, "--max-steps", "1"])
     assert half["step"] == 1
@@ -305,11 +401,11 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE).move("half", "renamed")
     with pytest.raises(ValueError, match="conflicts"):
         trainer.train(["renamed", *flags, "--resume", "--experts-per-token", "1"])
-    # Saved geometry and recurrent depths override unpinned new-run defaults.
+    # Saved geometry and evaluation depth override unpinned new-run defaults.
     resume_flags = [
         item
         for key, value in settings.items()
-        if key not in {"head-dim", "loop-iterations", "loop-max-iterations"}
+        if key not in {"head-dim", "loop-iterations"}
         for item in (f"--{key}", str(value))
     ]
     resumed = trainer.train(["renamed", *resume_flags, "--resume"])
@@ -317,9 +413,12 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
         assert resumed[key] == full[key]
     complete = trainer.read_checkpoint(tmp_path / "runs/full.pt.2")
     restored = trainer.read_checkpoint(tmp_path / "runs/renamed.pt.2")
-    assert complete["version"] == CONTRACT.version
-    for field in ("loop_iterations", "loop_max_iterations"):
-        assert complete["args"][field] == restored["args"][field] == 2
+    assert complete["version"] == CONTRACT.version == 39
+    assert (
+        complete["args"]["loop_iterations"] == restored["args"]["loop_iterations"] == 2
+    )
+    assert sampled_depths == [(1, 2), (2, 1), (1, 2), (2, 1)]
+    assert "loop_max_iterations" not in restored["args"]
     assert_identical(complete["state"], restored["state"])
     assert_identical(complete["optimizer"], restored["optimizer"])
     biases = [
