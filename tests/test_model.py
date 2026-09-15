@@ -294,13 +294,19 @@ def test_looped_columns_reenter_through_the_shared_fusion():
     )
     single = multipass(model, toks, 1, iterations=1, jitter=jitter)
     torch.testing.assert_close(single[0][0].h_top, first.h_top, atol=0, rtol=0)
-    # The loss reads every column: the first at full weight, the rest as a mean.
+    # The loss reads every column through FBT's first-plus-mean rule on both
+    # axes: passes within each column, then columns.
     result = multipass_loss(model, toks, outs)
     assert [len(columns) for columns in result.ntp] == [2]
     assert [len(columns) for columns in result.mtp] == [2]
-    one, two, four = (torch.tensor(value) for value in (1.0, 2.0, 4.0))
-    assert combine_column_losses([[one, two], [four]]).item() == 1.0 + 3.0
+    one, two, four, eight = (torch.tensor(value) for value in (1.0, 2.0, 4.0, 8.0))
     assert combine_column_losses([[one]]).item() == 1.0
+    assert combine_column_losses([[one, two]]).item() == 3.0  # l alone
+    assert combine_column_losses([[one], [four]]).item() == 5.0  # f alone
+    assert combine_column_losses([[one, two], [four, eight]]).item() == 15.0
+    grid = [[torch.tensor(float(10 * p + c)) for c in (1, 2, 3)] for p in (1, 2, 3)]
+    expected = 11 + (12 + 13) / 2 + (21 + 31) / 2 + (22 + 23 + 32 + 33) / 4
+    assert combine_column_losses(grid).item() == pytest.approx(expected)
     with pytest.raises(ValueError, match="loop jitter"):
         multipass(model, toks, 1, iterations=2, jitter=jitter)
     with pytest.raises(ValueError, match="loop jitter"):

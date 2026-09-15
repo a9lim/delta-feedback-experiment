@@ -77,8 +77,10 @@ update. Expert-selection biases update once from the whole step's assignment
 counts.
 
 Every column trains ordinary next-token prediction and MTP. For each head,
-`combine(CE)` is the first column's CE plus the mean over every other column
-of the step, or just the first column's CE when only one runs. The
+`combine(CE)` applies FBT's first-plus-mean rule along passes within each
+column and then along columns, so a rolled `fl` step gives the plain
+column, the loop alone, feedback alone, and both together one unit of
+weight each; with one axis absent it is that axis's own rule. The
 objective is:
 
 ```text

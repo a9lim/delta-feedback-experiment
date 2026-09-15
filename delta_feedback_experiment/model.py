@@ -2076,18 +2076,30 @@ def sequence_ce(
     return nll.mean(), lse.square().mean()
 
 
-def combine_column_losses(values: list[list[Tensor]]) -> Tensor:
-    """The first column plus the mean over every other supervised column.
+def _first_plus_mean(values: list[Tensor]) -> Tensor:
+    """FBT Eq. 12 at lambda=1 along one axis: the first plus the mean of the rest."""
+    if len(values) == 1:
+        return values[0]
+    return values[0] + torch.stack(values[1:]).mean()
 
-    ``values`` is ``[pass][column]``. With one column this is FBT Eq. 12 at
-    lambda=1 over passes; under ``l`` every later column of every pass joins
-    the mean, so the plain first column keeps full weight and the recurrent
-    columns share unit weight.
+
+def combine_column_losses(values: list[list[Tensor]]) -> Tensor:
+    """FBT's first-plus-mean combine applied along both recurrence axes.
+
+    ``values`` is ``[pass][column]``. Each column's series is combined along
+    passes, the first pass plus the mean over later passes, and the resulting
+    per-column series is combined the same way along columns. The four
+    blocks of a rolled step therefore each carry unit weight, spread evenly
+    inside the block: the plain first column; the loop alone (pass 1, later
+    columns); feedback alone (later passes, column 1); and both together.
+    With one axis absent this is the other axis's own combine, so the ``f``
+    and ``l`` objectives are its marginals.
     """
-    flat = [value for columns in values for value in columns]
-    if len(flat) == 1:
-        return flat[0]
-    return flat[0] + torch.stack(flat[1:]).mean()
+    per_column = [
+        _first_plus_mean([pass_values[column] for pass_values in values])
+        for column in range(len(values[0]))
+    ]
+    return _first_plus_mean(per_column)
 
 
 @dataclass
@@ -2113,12 +2125,13 @@ def multipass_loss(
     z_coef: float | Tensor = 0.0,
     mtp_weight: float = MTP_LOSS_WEIGHT,
 ) -> LossOutput:
-    """The first column's NTP plus the mean over every other column, plus (in
-    cooldown) the z-loss under the same weighting: FBT Eq. 12 with λ=1 over
-    passes, extended to every looped column.
+    """FBT Eq. 12 with λ=1 along passes and again along columns, plus (in
+    cooldown) the z-loss under the same weighting: ``combine_column_losses``
+    gives the plain column, the loop alone, feedback alone, and both together
+    one unit each.
 
     Every column is supervised. MTP adds one sequential second-token
-    predictor per column. Its CE and z-loss have the same column weighting,
+    predictor per column. Its CE and z-loss have the same weighting,
     scaled by ``mtp_weight``. Each head is normalized over its own real
     targets; the auxiliary head runs over every executed position, and its
     last row, whose second token is past the end of the stored row, takes a

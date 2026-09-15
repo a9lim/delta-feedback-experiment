@@ -496,9 +496,14 @@ expert weights.
 Each head averages over its own valid positions, and both heads' rows go
 through one unreduced vocabulary pass per column: their readout rows are
 concatenated into a single cut cross-entropy request, and the column scalars
-are weighted sums of the returned rows. For either head, over the step's
-`K` columns in execution order, `combine(ell)=ell_1` with one column,
-otherwise `ell_1 + mean(ell_2,...,ell_K)`:
+are weighted sums of the returned rows. For either head, `combine` applies
+FBT's first-plus-mean rule along both recurrence axes: each column's series
+is combined along passes, `ell_1 + mean(ell_2,...,ell_k)`, or `ell_1` alone
+at one pass, and the per-column results are combined the same way along
+columns. At `k` passes and `r` columns the plain first column, pass 1's
+later columns, later passes' first columns, and the remaining block each
+carry unit weight, spread evenly inside the block, so with one axis absent
+the rule is the other axis's own combine:
 
 ```text
 loss = combine(CE_ntp) + z_coef * combine(z_ntp)

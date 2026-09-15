@@ -120,6 +120,16 @@ def feedback_sum(values):
     )
 
 
+def grid_sum(values, count, iterations):
+    """FBT's combine on both axes of a pass-major flat list: passes within
+    each column, then columns."""
+    per_column = [
+        feedback_sum([values[p * iterations + c] for p in range(count)])
+        for c in range(iterations)
+    ]
+    return feedback_sum(per_column)
+
+
 @torch.no_grad()
 def test_fusion_preserves_independent_token_and_payload_contributions():
     """Both inputs contribute; payload amplitude and additive jitter survive."""
@@ -375,12 +385,15 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         mtp_z.append(second_z)
         torch.testing.assert_close(actual.ntp[index][column], ce)
         torch.testing.assert_close(actual.mtp[index][column], second_ce)
-    # The first column at full weight plus the mean over every other column,
-    # for both heads and their z-losses.
+    # First-plus-mean along passes, then along columns, for both heads and
+    # their z-losses.
     expected = (
-        feedback_sum(ntp)
-        + z_coef * feedback_sum(ntp_z)
-        + coefficient * (feedback_sum(mtp) + z_coef * feedback_sum(mtp_z))
+        grid_sum(ntp, count, iterations)
+        + z_coef * grid_sum(ntp_z, count, iterations)
+        + coefficient * (
+            grid_sum(mtp, count, iterations)
+            + z_coef * grid_sum(mtp_z, count, iterations)
+        )
         + EXPERT_BALANCE_COEF * torch.stack(expert_aux).mean()
     )
     torch.testing.assert_close(actual.total, expected)
