@@ -22,7 +22,7 @@ function monitor() {
   vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, configure,'), context);
   vm.runInContext(inline.replace('\nsetupSnapshotControls();\nM.start();', ''), context);
   vm.runInContext("M.configure({onStep, onEval, onRecord, metaEvents: ['run', 'schedule']});", context);
-  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, expertBanks, heatmapHTML, biasBound, nullRange, seriesOf, tokenTotals})', context);
+  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, tokenTotals})', context);
   api.read = (tag, log) => {
     api.M.ingest(api.M.runFor(tag), log);
     api.M.rebuildAll();
@@ -106,12 +106,12 @@ test('profiles use exact step in every run; missing overlays stay empty', () => 
   assert.deepEqual(plain(a.profileOf(primary)['p-site-sharp'][3]), [0.25]);
 });
 
-test('execution order handles repeated core layers, coda, payload and changing sites', () => {
+test('execution order follows layers, then the payload, and tracks changing sites', () => {
   const a = monitor();
-  const names = ['payload', 'L12.attn', 'L4i2.mlp', 'L4i1.mlp', 'L0.mlp', 'L4i1.attn', 'L0.attn'];
+  const names = ['payload', 'L12.attn', 'L4.mlp', 'L0.mlp', 'L4.attn', 'L0.attn'];
   const view = a.read('a', setup('a') + names.map((name) => route(10, name, 0.2)).join('') + route(20, 'L0.attn', 0.3));
   a.reconcileSnapshot(view); a.snapshot.step = 10; a.reconcileSnapshot(view);
-  assert.deepEqual(plain(a.orderedSites([view], 'route').map((s) => s.name)), ['L0.attn', 'L0.mlp', 'L4i1.attn', 'L4i1.mlp', 'L4i2.mlp', 'L12.attn', 'payload']);
+  assert.deepEqual(plain(a.orderedSites([view], 'route').map((s) => s.name)), ['L0.attn', 'L0.mlp', 'L4.attn', 'L4.mlp', 'L12.attn', 'payload']);
   a.snapshot.step = 20; a.reconcileSnapshot(view);
   assert.deepEqual(plain(a.orderedSites([view], 'route').map((s) => s.name)), ['L0.attn']);
 });
@@ -127,13 +127,21 @@ test('expert vectors use numeric ids and preserve missing versus zero', () => {
   assert.equal(e.biases[10], 0);
 });
 
-test('biases collapse shared iteration banks; assignment sites remain separate', () => {
+test('expert sites order by layer with the auxiliary bank last', () => {
   const a = monitor();
-  const view = a.read('a', setup('a') + ['L4i1.experts', 'L4i2.experts', 'L12.experts', 'mtp.experts'].map((s) => expert(10, s)).join(''));
+  const view = a.read('a', setup('a') + ['mtp.experts', 'L12.experts', 'L4.experts'].map((s) => expert(10, s)).join(''));
   a.reconcileSnapshot(view);
-  const sites = a.orderedSites([view], 'expert');
-  assert.equal(sites.length, 4);
-  assert.deepEqual(plain(a.expertBanks(sites).map((s) => s.name)), ['L4.experts', 'L12.experts', 'mtp.experts']);
+  assert.deepEqual(plain(a.orderedSites([view], 'expert').map((s) => s.name)), ['L4.experts', 'L12.experts', 'mtp.experts']);
+});
+
+test('depth and eval records read out per column at the evaluation count', () => {
+  const a = monitor();
+  const view = a.read('a', setup('a') + line('eval', {step: '10/100', val: 6, val_fused: 5.5, val_one: 5.8, val_mtp: 7})
+    + line('depth', {step: '10/100', r_eval: 2, r_max: 3, loss_one: 5.8, loss_eval: 6, loss_max: 5.9, upd_max: 0.3}));
+  const series = a.seriesOf(view);
+  assert.deepEqual(plain(series['p-val']), [[10], [6], [5.5], [5.8]]);
+  assert.deepEqual(plain(series['p-depth']), [[10], [5.8], [6], [5.9]]);
+  assert.deepEqual(plain(series['p-depthupd']), [[10], [0.3]]);
 });
 
 test('heatmaps expose values and one keyboard entry, with stable scales across evals', () => {
@@ -164,17 +172,20 @@ test('unobserved heatmaps and zero biases do not invent measurements', () => {
 
 test('raw training traces and feedback gap use CE, not weighted total loss', () => {
   const a = monitor();
-  const view = a.read('a', setup('a') + step(1, {loss: 20, pass1: 5, ntp: 9.5, mtp: 7, k: 2, r: 3}) + step(2, {loss: 8, pass1: 4, ntp: 4, mtp: 6, k: 1, r: 1}));
+  const view = a.read('a', setup('a') + step(1, {loss: 20, pass1: 5, ntp: 9.5, mtp: 7, k: 2, r: 1}) + step(2, {loss: 8, pass1: 4, ntp: 4, mtp: 6, k: 1, r: 1})
+    + step(3, {loss: 30, pass1: 5, ntp: 19, mtp: 7, k: 2, r: 2}));
   const series = a.seriesOf(view);
-  assert.deepEqual(plain(series['p-nll']), [[1, 2], [20, 8], [5, 4], [9.5, 4], [7, 6]]);
-  assert.deepEqual(plain(series['p-gap'][2]), [-0.5, null]);
-  assert.deepEqual(plain(series['p-recurrence']), [[1, 2], [2, 1], [3, 1]]);
+  assert.deepEqual(plain(series['p-nll']), [[1, 2, 3], [20, 8, 30], [5, 4, 5], [9.5, 4, 19], [7, 6, 7]]);
+  // The train gain reads only single-column feedback steps; looped steps
+  // fold the loop blocks into the combined CE.
+  assert.deepEqual(plain(series['p-gap'][2]), [-0.5, null, null]);
+  assert.deepEqual(plain(series['p-recurrence']), [[1, 2, 3], [2, 1, 2], [1, 1, 2]]);
 });
 
-test('token totals account for actual recurrence and reject incomplete histories', () => {
+test('token totals account for every column of every pass and reject incomplete histories', () => {
   const a = monitor();
   let view = a.read('a', setup('a') + step(1, {k: 2, r: 1}) + step(2, {k: 3, r: 2}));
-  assert.deepEqual(plain(a.tokenTotals(view)), {predicted: 32, passes: 80, cells: 416});
+  assert.deepEqual(plain(a.tokenTotals(view)), {predicted: 32, passes: 80, cells: 512});
   view = a.read('a', step(4));
   assert.equal(a.tokenTotals(view), null);
 });

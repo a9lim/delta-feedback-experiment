@@ -112,11 +112,14 @@ load; bias colors and null-RMS axes keep a fixed range across recorded evals.
 Routing profiles expose null, seed and previous-cell mass, maximum weight with
 its `1/n` reference, head divergence, and learned-null RMS. Expert assignment
 heatmaps show each executed site's share per expert; hovering or focusing a cell
-also reports expert coverage and gate entropy. Bias heatmaps show each parameter
-bank once because every column shares its parameters. Both diagnostics use up
-to two validation rows: routing uses the fused pass with feedback, while expert
+also reports expert coverage and gate entropy. Bias heatmaps show each bank's
+signed selection biases. Both diagnostics use up to two validation rows:
+routing uses the fused pass at its last column with feedback, while expert
 loads use pass-1 and the teacher-forced MTP block. Both diagnostics disable
-payload jitter. These are sample diagnostics.
+payload jitter. These are sample diagnostics. The looped-column section
+plots the per-column depth readout, and the training feedback gain is shown
+only on single-column steps, since looped steps fold the loop blocks into
+the combined CE.
 
 Portable monitor data/lifecycle checks run with `node --test tests/monitor.test.cjs`
 from this checkout in the parent workspace. Browser checks cover slider input,

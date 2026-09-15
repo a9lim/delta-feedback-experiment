@@ -116,13 +116,13 @@
 <div class="tiles" id="tiles"></div>
 <details class="config"><summary>Run configuration <span class="hint">· geometry, optimizer &amp; schedule</span></summary><div class="config-grid" id="config"></div></details>
 <nav aria-label="Monitor sections">
-  <button data-section="learning">Learning</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letter="f">Feedback</button><button data-section="loop" data-letter="l">Core loop</button>
+  <button data-section="learning">Learning</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letter="f">Feedback</button><button data-section="loop" data-letter="l">Looped column</button>
 </nav>
 <section id="learning">
   <div class="section-head"><h3>Learning</h3><p>Raw observations · nats · ▲ checkpoint snapshots</p></div>
   <div class="grid three">
     <div class="chart"><h2>Training objective</h2><p class="caption">Total loss and its main / auxiliary cross-entropies</p><div class="plot" id="p-nll"></div></div>
-    <div class="chart"><h2>Held-out next token</h2><p class="caption">Pass-1 and feedback on the validation set</p><div class="plot" id="p-val"></div></div>
+    <div class="chart"><h2>Held-out next token</h2><p class="caption">Pass-1 and feedback at the evaluation column count · first column under l</p><div class="plot" id="p-val"></div></div>
     <div class="chart"><h2>Held-out second token</h2><p class="caption">Teacher-forced auxiliary prediction · unweighted CE</p><div class="plot" id="p-mtp-val"></div></div>
   </div>
 </section>
@@ -143,9 +143,9 @@
   </div>
   <div class="grid two heatmaps">
     <div class="chart"><h2>Expert assignments <small>selected run · pass-1 + MTP</small></h2><p class="caption">Share of routed assignments · 1× is uniform within each bank</p><div id="expert-load"></div></div>
-    <div class="chart"><h2>Expert selection biases <small>selected run · signed</small></h2><p class="caption">One column per bank · core iterations share the same parameters</p><div id="expert-bias"></div></div>
+    <div class="chart"><h2>Expert selection biases <small>selected run · signed</small></h2><p class="caption">One column per bank · every looped column shares the same parameters</p><div id="expert-bias"></div></div>
   </div>
-  <p class="section-note">Sites follow execution: prelude → core by iteration → coda → payload / MTP. Routing uses the fused pass when feedback is enabled; expert loads use pass-1. Missing observations remain blank.</p>
+  <p class="section-note">Sites follow execution: layers in order → payload / MTP, read at each pass's last column. Routing uses the fused pass when feedback is enabled; expert loads use pass-1. Missing observations remain blank.</p>
 </section>
 <section id="optimization">
   <div class="section-head"><h3>Optimization &amp; work</h3><p id="work-summary"></p></div>
@@ -167,11 +167,11 @@
   </div>
 </section>
 <section id="loop" data-letter="l" hidden>
-  <div class="section-head"><h3>Core loop</h3><p>Fixed-depth sweep on two validation rows</p></div>
+  <div class="section-head"><h3>Looped column</h3><p>Per-column readout on two validation rows</p></div>
   <div class="grid three">
-    <div class="chart"><h2>Loss by iteration count</h2><p class="caption">The same rows at r = 1, r mean and r max</p><div class="plot" id="p-depth"></div></div>
-    <div class="chart"><h2>Final core update</h2><p class="caption">‖core(r max) − core(r max − 1)‖</p><div class="plot" id="p-depthupd"></div></div>
-    <div class="chart"><h2>Executed recurrence</h2><p class="caption">Raw passes k and core iterations r per optimizer step</p><div class="plot" id="p-recurrence"></div></div>
+    <div class="chart"><h2>Loss by column</h2><p class="caption">The same rows after 1, r eval, and r max columns</p><div class="plot" id="p-depth"></div></div>
+    <div class="chart"><h2>Final column update</h2><p class="caption">‖h_top(r max) − h_top(r max − 1)‖</p><div class="plot" id="p-depthupd"></div></div>
+    <div class="chart"><h2>Executed recurrence</h2><p class="caption">Passes k and columns per pass r per optimizer step</p><div class="plot" id="p-recurrence"></div></div>
   </div>
 </section>
 <details class="log"><summary>Log tail <span class="hint">· non-step records</span></summary><pre id="tail"></pre></details>
@@ -193,9 +193,9 @@ const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
 const has = (view, letter) => conditionOf(view).includes(letter);
 const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
 function eventLines(view) {
-  if (!view || !has(view, 'f')) return [];
-  const b = num(view.run.meta.schedule?.feedback_boundary);
-  return b > 0 && b < view.total ? [{ label: 'feedback →', step: b }] : [];
+  if (!view) return [];
+  const b = num(view.run.meta.schedule?.recurrence_boundary);
+  return b > 0 && b < view.total ? [{ label: 'roll →', step: b }] : [];
 }
 
 function onStep(run, rec) {
@@ -218,7 +218,7 @@ function entryAt(run, key, step) {
 }
 function onEval(run, rec, step) {
   Object.assign(entryAt(run, 'val', step), {
-    val: num(rec.val), val_fused: num(rec.val_fused),
+    val: num(rec.val), val_fused: num(rec.val_fused), val_one: num(rec.val_one),
     val_mtp: num(rec.val_mtp), val_mtp_fused: num(rec.val_mtp_fused),
   });
 }
@@ -241,8 +241,8 @@ function onRecord(run, rec) {
       { loss0: num(rec.loss0), loss8: num(rec.loss8), upd8: num(rec.upd8) });
   } else if (rec.event === 'depth') {
     Object.assign(entryAt(run, 'depth', address(rec.step)[0]),
-      { loss_one: num(rec.loss_one), loss_mean: num(rec.loss_mean), loss_max: num(rec.loss_max),
-        upd_max: num(rec.upd_max), r_mean: num(rec.r_mean), r_max: num(rec.r_max) });
+      { loss_one: num(rec.loss_one), loss_eval: num(rec.loss_eval), loss_max: num(rec.loss_max),
+        upd_max: num(rec.upd_max), r_eval: num(rec.r_eval), r_max: num(rec.r_max) });
   }
 }
 
@@ -267,10 +267,10 @@ function reconcileSnapshot(view) {
 function atStep(view, key, step = snapshot.current) {
   return (view.evals.get(key) || []).find((entry) => entry.step === step);
 }
-const SITE = /^(?:route|expert)\|(payload|mtp\.experts|L(\d+)(?:i(\d+))?\.(attn|mlp|experts))$/;
+const SITE = /^(?:route|expert)\|(payload|mtp\.experts|L(\d+)\.(attn|mlp|experts))$/;
 function parseSite(key) {
   const match = SITE.exec(key);
-  return match ? { key, name: match[1], layer: match[2] == null ? null : +match[2], iter: match[3] == null ? null : +match[3], kind: match[4] } : null;
+  return match ? { key, name: match[1], layer: match[2] == null ? null : +match[2], kind: match[3] } : null;
 }
 function orderedSites(views, prefix, step = snapshot.current) {
   const sites = new Map();
@@ -279,12 +279,9 @@ function orderedSites(views, prefix, step = snapshot.current) {
     const site = parseSite(key);
     if (site) sites.set(site.name, site);
   }
-  const core = [...sites.values()].filter((s) => s.iter != null).map((s) => s.layer);
-  const firstCore = core.length ? Math.min(...core) : Infinity;
-  const rank = (s) => s.layer == null ? [3, 0, 0, 0]
-    : s.iter != null ? [1, s.iter, s.layer, s.kind === 'mlp' ? 1 : 0]
-    : [s.layer < firstCore ? 0 : 2, 0, s.layer, s.kind === 'mlp' ? 1 : 0];
-  return [...sites.values()].sort((a, b) => { const x = rank(a), y = rank(b); for (let i = 0; i < 4; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; });
+  // Every column runs the layers in order; the payload and auxiliary sites follow.
+  const rank = (s) => s.layer == null ? [1, 0, 0] : [0, s.layer, s.kind === 'mlp' ? 1 : 0];
+  return [...sites.values()].sort((a, b) => { const x = rank(a), y = rank(b); for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; });
 }
 const SITES = [];
 const heatmapMarkup = new Map();
@@ -305,14 +302,6 @@ function profileOf(view) {
     'p-site-sharp': profile('max', 'headjs', (r) => r?.n > 0 ? 1 / r.n : null),
     'p-site-nullrms': profile('nulrms'),
   };
-}
-function expertBanks(sites) {
-  const banks = new Map();
-  for (const site of sites) {
-    const name = site.layer == null ? site.name : `L${site.layer}.experts`;
-    if (!banks.has(name)) banks.set(name, { ...site, name });
-  }
-  return [...banks.values()];
 }
 function biasBound(view) {
   let max = 0;
@@ -383,7 +372,7 @@ function renderSnapshots(view) {
   const profiles = views.map(profileOf);
   for (const id of ['p-site-mass', 'p-site-sharp', 'p-site-nullrms']) plotData(id, join(profiles.map((profile) => profile[id])));
   for (const [id, field] of [['expert-load', 'loads'], ['expert-bias', 'biases']]) {
-    const el = document.getElementById(id), html = heatmapHTML(view, field === 'biases' ? expertBanks(experts) : experts, field);
+    const el = document.getElementById(id), html = heatmapHTML(view, experts, field);
     // Preserve keyboard focus and hover readouts while an unchanged log polls.
     if (heatmapMarkup.get(id) !== html) { el.innerHTML = html; heatmapMarkup.set(id, html); }
   }
@@ -432,7 +421,8 @@ function tokenTotals(view) {
   // A partial log cannot reconstruct the missing k/r draws.
   if (view.steps.some((step, index) => step.step !== index + 1 || !(step.k > 0) || (has(view, 'l') && !(step.r > 0)))) return null;
   const passes = view.steps.reduce((total, s) => total + s.k * per, 0);
-  const cells = view.steps.reduce((total, s) => total + s.k * per * (has(view, 'l') ? 2 + s.r * (layers - 2 * cell) / cell : layers / cell), 0);
+  // Every column of every pass runs the whole stack: k * r columns of layers / cell cells.
+  const cells = view.steps.reduce((total, s) => total + s.k * (has(view, 'l') ? s.r : 1) * per * layers / cell, 0);
   return { predicted: view.steps.length * per, passes, cells };
 }
 function renderTiles(view) {
@@ -459,13 +449,13 @@ const CONFIG_GROUPS = [
   ['geometry', null, ['dim', 'layers', 'routing_block_size', 'heads', 'kv_heads', 'head_dim', 'vocab_size', 'seq_len']],
   ['attention', null, ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
   ['experts', null, ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
-  ['f · feedback', 'f', ['feedback_start', 'three_pass', 'jitter']],
-  ['l · loop', 'l', ['loop_iterations', 'loop_max_iterations']],
+  ['recurrence roll', null, ['recurrence_start', 'three_rate', 'jitter']],
+  ['l · loop', 'l', ['loop_iterations']],
   ['prediction', null, ['mtp_weight']],
   ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_lr_scale', 'grad_clip', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
 ];
-const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', expert_lr_scale: 'expert LR multiplier', zloss: 'z-loss', loop_iterations: 'r mean', loop_max_iterations: 'r cap', mtp_weight: 'auxiliary weight' };
+const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', expert_lr_scale: 'expert LR multiplier', zloss: 'z-loss', recurrence_start: 'roll start', three_rate: 'three rate', loop_iterations: 'r eval', mtp_weight: 'auxiliary weight' };
 function renderConfig(view) {
   const run = view.run, setup = run.meta.run, condition = conditionOf(view);
   const cards = [];
@@ -512,7 +502,7 @@ function rebuild() {
   });
   const points = { points: { size: 4 }, spanGaps: false };
   step('p-nll', perRun((c, t) => [line(`total${t}`, c), dashed(`pass-1${t}`, c), dotted(`NTP${t}`, c), { ...line(`MTP${t}`, c), dash: [8, 3, 2, 3] }]), { yScale: yLog, marks: () => viewOf(state.selected)?.snapshots ?? [] });
-  step('p-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS)]), { yScale: yLog });
+  step('p-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS), dotted(`first column${t}`, c, PTS)]), { yScale: yLog });
   step('p-mtp-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS)]), { yScale: yLog });
   site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, points), dashed(`seed${t}`, c, points), dotted(`prev${t}`, c, points)]), { yScale: unit });
   site('p-site-sharp', perRun((c, t) => [line(`max${t}`, c, points), dashed(`head JS${t}`, c, points), dotted(`1/n${t}`, c, points)]), { yScale: unit });
@@ -527,8 +517,8 @@ function rebuild() {
   step('p-gap', [...perRun((c, t) => [line(`held-out${t}`, c, vs), dashed(`train${t}`, c, { value: vs.value })]), ref('0')]);
   step('p-drift', [...perRun((c, t) => [line(`drift${t}`, c, vs)]), ref('0')]);
   step('p-upd', perRun((c, t) => [line(`‖Δh‖${t}`, c, PTS)]), { yScale: yLog });
-  step('p-depth', perRun((c, t) => [line(`r = 1${t}`, c, PTS), dashed(`r mean${t}`, c, PTS), dotted(`r max${t}`, c, PTS)]), { yScale: yLog });
-  step('p-depthupd', perRun((c, t) => [line(`‖Δcore‖${t}`, c, PTS)]), { yScale: yLog });
+  step('p-depth', perRun((c, t) => [line(`r = 1${t}`, c, PTS), dashed(`r eval${t}`, c, PTS), dotted(`r max${t}`, c, PTS)]), { yScale: yLog });
+  step('p-depthupd', perRun((c, t) => [line(`‖Δh_top‖${t}`, c, PTS)]), { yScale: yLog });
   step('p-recurrence', perRun((c, t) => [line(`k${t}`, c, v0), dashed(`r${t}`, c, v0)]));
 }
 function seriesOf(view) {
@@ -540,7 +530,7 @@ function seriesOf(view) {
   };
   return {
     'p-nll': [xs, col('loss'), col('pass1'), col('ntp'), col('mtp')],
-    'p-val': ev('val', 'val', 'val_fused'),
+    'p-val': ev('val', 'val', 'val_fused', 'val_one'),
     'p-mtp-val': ev('val', 'val_mtp', 'val_mtp_fused'),
     'p-lr': [xs, col('lr_normuonh'), col('lr_normuonh_expert_in'), col('lr_normuonh_expert_out'), col('lr_nadam_width'), col('lr_nadam')],
     'p-gnorm': [xs, col('gnorm')],
@@ -548,10 +538,13 @@ function seriesOf(view) {
     'p-expert-balance': [xs, col('expert_balance')],
     'p-expert-violation': [xs, col('expert_max_violation')],
     'p-expert-bias': [xs, col('expert_bias_max')],
-    'p-gap': join([ev('val', (e) => e.val_fused != null && e.val != null ? e.val_fused - e.val : null), [xs, steps.map((s) => s.k > 1 && s.ntp != null && s.pass1 != null ? s.ntp - 2 * s.pass1 : null)]]),
+    // The train gain is the combined CE less twice the plain column, which is
+    // the mean feedback CE less pass-1 only on single-column steps; looped
+    // steps mix in the loop blocks, so only the held-out gain is shown there.
+    'p-gap': join([ev('val', (e) => e.val_fused != null && e.val != null ? e.val_fused - e.val : null), [xs, steps.map((s) => s.k > 1 && !(s.r > 1) && s.ntp != null && s.pass1 != null ? s.ntp - 2 * s.pass1 : null)]]),
     'p-drift': ev('contract', (e) => e.loss8 != null && e.loss0 != null ? e.loss8 - e.loss0 : null),
     'p-upd': ev('contract', 'upd8'),
-    'p-depth': ev('depth', 'loss_one', 'loss_mean', 'loss_max'),
+    'p-depth': ev('depth', 'loss_one', 'loss_eval', 'loss_max'),
     'p-depthupd': ev('depth', 'upd_max'),
     'p-recurrence': [xs, col('k'), col('r')],
   };
