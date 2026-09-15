@@ -1,10 +1,10 @@
-"""Fixed-r sweep of a loop snapshot: loss, update size, and router mass by iteration.
+"""Per-column readout of a loop snapshot: loss, update size, and router mass by iteration.
 
     python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 
 Runs ``depth_trace`` on held-out rows in both label assignments (all plain,
-and prefix-1 fused when the condition has ``f``), records the core routers'
-mean mass on each source by iteration at the cap, and writes
+and prefix-1 fused when the condition has ``f``), records every router's
+mean mass on each source at every column up to the cap, and writes
 ``depth_trace.json`` and ``depth-trace.png`` under ``figures/depth-TAG/``.
 """
 
@@ -25,23 +25,22 @@ from delta_feedback_experiment.model import LOOP_MAX_ITERATIONS, depth_trace
 
 
 @torch.no_grad()
-def core_route_mass(model, rows, iterations: int) -> dict[str, dict[int, dict[str, float]]]:
-    """Mean route mass per source at every core site, keyed by iteration."""
+def route_mass_by_column(model, rows, iterations: int) -> dict[str, dict[int, dict[str, float]]]:
+    """Mean route mass per source at every site, keyed by column index."""
     device = rows.device
     with autocast(device):
-        seed = model.plain_seed(model.embed_tokens(rows[:, :-1]))
-        out = model.forward_column(seed, want_weights=True, iterations=iterations)
-    routes: dict[str, dict[int, dict[str, float]]] = {}
-    for site, weights in out.route_weights.items():
-        layer_kind, _, sublayer = site.partition(".")
-        layer, tagged, iteration = layer_kind[1:].partition("i")
-        if not tagged:
-            continue
-        names = out.route_source_names[site]
-        mean = weights.float().mean(dim=(1, 2, 3))
-        routes.setdefault(f"L{layer}.{sublayer}", {})[int(iteration)] = dict(
-            zip(names, mean.tolist(), strict=True)
+        e = model.embed_tokens(rows[:, :-1])
+        columns = model.forward_iterations(
+            model.plain_seed(e), e, iterations=iterations, want_weights=True
         )
+    routes: dict[str, dict[int, dict[str, float]]] = {}
+    for iteration, out in enumerate(columns):
+        for site, weights in out.route_weights.items():
+            names = out.route_source_names[site]
+            mean = weights.float().mean(dim=(1, 2, 3))
+            routes.setdefault(site, {})[iteration] = dict(
+                zip(names, mean.tolist(), strict=True)
+            )
     return routes
 
 
@@ -55,7 +54,7 @@ def main() -> None:
         "--iterations",
         type=int,
         default=None,
-        help=f"sweep cap (default: {LOOP_MAX_ITERATIONS} core visits)",
+        help=f"column cap (default: {LOOP_MAX_ITERATIONS})",
     )
     parser.add_argument("--out-dir", default=None)
     args = parser.parse_args()
@@ -86,7 +85,7 @@ def main() -> None:
         mode: {key: [value / counted for value in values] for key, values in stats.items()}
         for mode, stats in sums.items()
     }
-    routes = core_route_mass(model, data.batch(0, min(args.micro, args.rows), device), cap)
+    routes = route_mass_by_column(model, data.batch(0, min(args.micro, args.rows), device), cap)
 
     record = {
         "snapshot": str(args.snapshot),
@@ -97,13 +96,12 @@ def main() -> None:
         "r_eval": cfg.loop_iterations,
         "device": str(device),
         "sweep": sweep,
-        "core_routes": routes,
+        "routes": routes,
     }
     (out_dir / "depth_trace.json").write_text(json.dumps(record, indent=2))
 
     depth = list(range(1, cap + 1))
-    panels = 3 if routes else 2
-    fig, axes = plt.subplots(1, panels, figsize=(4.2 * panels, 3.4))
+    fig, axes = plt.subplots(1, 3, figsize=(12.6, 3.4))
     colors = {"plain": fs.BLUE, "fused": fs.ORANGE}
     for mode in modes:
         axes[0].plot(depth, sweep[mode]["loss"], "o-", color=colors[mode], label=mode)
@@ -112,30 +110,29 @@ def main() -> None:
         )
     for ax in axes[:2]:
         ax.axvline(cfg.loop_iterations, color="0.6", ls=":", lw=1)
-        ax.set_xlabel("core iterations r")
+        ax.set_xlabel("columns r")
         ax.set_xticks(depth)
         ax.legend(frameon=False, fontsize=8)
-    axes[0].set_ylabel("held-out loss after r iterations")
-    axes[1].set_ylabel("mean ||core update|| at iteration r")
-    if routes:
-        labels: list[str] = []
-        for by_iteration in routes.values():
-            for masses in by_iteration.values():
-                labels += [label for label in masses if label not in labels]
-        for label, color in zip(labels, itertools.cycle(fs.SERIES)):
-            series = []
-            for iteration in range(cap):
-                masses = [
-                    by_iteration[iteration][label]
-                    for by_iteration in routes.values()
-                    if iteration in by_iteration and label in by_iteration[iteration]
-                ]
-                series.append(sum(masses) / len(masses) if masses else float("nan"))
-            axes[2].plot(depth, series, "o-", color=color, label=label)
-        axes[2].set_xlabel("core iteration")
-        axes[2].set_xticks(depth)
-        axes[2].set_ylabel("mean core route mass")
-        axes[2].legend(frameon=False, fontsize=8)
+    axes[0].set_ylabel("held-out loss after r columns")
+    axes[1].set_ylabel("mean ||top-state update|| at column r")
+    labels: list[str] = []
+    for by_iteration in routes.values():
+        for masses in by_iteration.values():
+            labels += [label for label in masses if label not in labels]
+    for label, color in zip(labels, itertools.cycle(fs.SERIES)):
+        series = []
+        for iteration in range(cap):
+            masses = [
+                by_iteration[iteration][label]
+                for by_iteration in routes.values()
+                if iteration in by_iteration and label in by_iteration[iteration]
+            ]
+            series.append(sum(masses) / len(masses) if masses else float("nan"))
+        axes[2].plot(depth, series, "o-", color=color, label=label)
+    axes[2].set_xlabel("column")
+    axes[2].set_xticks(depth)
+    axes[2].set_ylabel("mean route mass over sites")
+    axes[2].legend(frameon=False, fontsize=8)
     fig.suptitle(f"{tag} step {saved['step']}: depth trace on {counted} rows", fontsize=10)
     fs.save(fig, out_dir / "depth-trace.png")
 

@@ -10,22 +10,25 @@ and feedback/MTP fusion. Each column's payload passes through a learned
 RMSNorm and a fixed `0.02` scale, receives training jitter in those scaled
 units, then joins the next token's embedding in a shared concat-linear
 projection. This DeepSeek-style fusion feeds an independent auxiliary
-PKDA/expert block and, under feedback, the next column. The auxiliary block
-trains the payload to predict a second token.
+PKDA/expert block and, under feedback, the next position's column, and,
+under the loop, the same position's next column. The auxiliary block trains
+the payload to predict a second token.
 
 | Condition | Computation |
 |---|---|
-| `f` (default) | Latent feedback between columns |
-| `l` | Tied middle cells repeated within a column |
+| `f` (default) | Latent feedback between positions |
+| `l` | The whole column re-run from its own payload |
 | `fl` | Both |
 
 All presets have sixteen unique layers and expert intermediate width 832.
 Screen, bridge, flagship, and extension use residual widths 768, 1,152,
 1,536, and 2,304. Shared parameters initialize identically for a seed;
-data and recurrent recipe draws use keyed streams. Under `l` or `fl`, all
-four scales train on one through five total core visits with probabilities
-`30/30/20/10/10%` (mean 2.4). Evaluation and decode default to three visits;
-`--loop-iterations` overrides their fixed depth within `1..5`.
+data and recurrent recipe draws use keyed streams. One recurrence roll per
+step shapes every condition: after the boundary a step runs three passes of
+two columns or two passes of three columns with probability `0.12` each,
+otherwise two of two; `f` reads the passes, `l` the columns, and `fl` both.
+Evaluation and decode default to two columns; `--loop-iterations` overrides
+their fixed count within `1..3`.
 
 The pinned GPT-NeoX/ChatML tokenizer supports arbitrary and repeated roles.
 Pretraining uses raw web documents. Ordinary generation uses the main

@@ -3,8 +3,9 @@
 The architecture contract is ``docs/architecture.md``. PKDA occupies three
 layers of each four-layer cell, with NoPE gated GQA in the fourth, MHDB reads
 before every sublayer, MoE channel mixers, and sequential two-token prediction.
-``f`` adds FBT feedback; ``l`` ties the middle cells into a core iterated per
-column. At least one recurrence must be selected.
+``f`` adds FBT feedback; ``l`` re-enters the whole column through the same
+fusion with its own payload, iterated per column. At least one recurrence
+must be selected.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired conditions
 architecturally identical in everything but the flags.
@@ -75,7 +76,10 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     ),
     "l": (
         "loop",
-        "Huginn loop: the middle cells become one tied core iterated per column",
+        (
+            "looped depth: the whole column re-enters through the shared fusion "
+            "of its own payload with its raw token embedding, iterated per column"
+        ),
     ),
 }
 """Letter -> (``ModelConfig`` flag, one-line change), in canonical order."""
@@ -130,16 +134,12 @@ EXPERT_BALANCE_COEF = 0.0001
 MTP_LOSS_WEIGHT = 0.3
 """Default weight of the one-token-ahead auxiliary prediction objective."""
 
-LOOP_ITERATION_WEIGHTS = (3, 3, 2, 1, 1)
-"""Training weights for one through five core visits, shared by every scale."""
+LOOP_MAX_ITERATIONS = 3
+"""Most columns one pass runs at a position: the recurrence roll draws two or
+three, and the fixed evaluation/decode count stays within this range."""
 
-LOOP_MAX_ITERATIONS = len(LOOP_ITERATION_WEIGHTS)
-LOOP_MEAN_ITERATIONS = sum(
-    iterations * weight
-    for iterations, weight in enumerate(LOOP_ITERATION_WEIGHTS, start=1)
-) / sum(LOOP_ITERATION_WEIGHTS)
-DEFAULT_LOOP_ITERATIONS = 3
-"""Fixed evaluation/decode depth; training samples independently of this value."""
+DEFAULT_LOOP_ITERATIONS = 2
+"""Fixed evaluation/decode iteration count; training draws from the roll."""
 
 
 @dataclass(frozen=True)
@@ -171,13 +171,14 @@ class ModelConfig:
     """``f``: consume the preceding column's payload through shared concat fusion."""
 
     loop: bool = False
-    """``l``: the cells between the first and last become one tied core that
-    runs ``iterations`` times per column, each core cell keeping its own block
-    delta across iterations (``docs/architecture.md``)."""
+    """``l``: every column runs the whole stack ``iterations`` times, each
+    later column seeded by the shared fusion of the preceding column's payload
+    with the same raw token embedding; no parameters are added
+    (``docs/architecture.md``)."""
 
     loop_iterations: int = DEFAULT_LOOP_ITERATIONS
-    """``l``: fixed evaluation/decode count in 1..5. Training draws from
-    ``LOOP_ITERATION_WEIGHTS`` at every scale, independently of this count."""
+    """``l``: fixed evaluation/decode count in 1..3. Training draws from the
+    recurrence roll, independently of this count."""
 
     def __post_init__(self) -> None:
         if not (self.feedback or self.loop):
@@ -194,14 +195,6 @@ class ModelConfig:
         if self.loop and self.loop_iterations > LOOP_MAX_ITERATIONS:
             raise ValueError(
                 f"loop evaluation/decode iterations must be an integer in 1..{LOOP_MAX_ITERATIONS}"
-            )
-        if self.loop and (
-            self.layers % self.routing_block_size
-            or self.layers < 3 * self.routing_block_size
-        ):
-            raise ValueError(
-                "l needs whole cells and at least three of them: "
-                "a prelude, a core, and a coda"
             )
         if self.pkda_heads < 1 or self.pkda_head_dim < 1:
             raise ValueError("PKDA head count and dimension must be positive")
@@ -238,32 +231,16 @@ class ModelConfig:
         return (self.layers + self.routing_block_size - 1) // self.routing_block_size
 
     @property
-    def core_layers(self) -> range:
-        """``l``: the tied core, every layer between the first and last cells."""
-        return range(self.routing_block_size, self.layers - self.routing_block_size)
-
-    def is_core_layer(self, layer: int) -> bool:
-        return self.loop and layer in self.core_layers
-
-    def executed_layers(self, iterations: int) -> int:
-        """Layers one column pass evaluates at ``iterations`` core iterations."""
-        if not self.loop:
-            return self.layers
-        return 2 * self.routing_block_size + iterations * len(self.core_layers)
-
-    def executed_pkda_layers(self, iterations: int) -> int:
-        """PKDA layer invocations in one column pass; these blocks can
-        recompute in backward, the global-attention blocks stay retained."""
-        core = set(self.core_layers) if self.loop else set()
-        outer = sum(self.is_pkda_layer(layer) for layer in range(self.layers) if layer not in core)
-        inner = sum(self.is_pkda_layer(layer) for layer in core)
-        return outer + (iterations if self.loop else 0) * inner
+    def pkda_layers(self) -> int:
+        """PKDA layers per column: the blocks that can recompute in backward,
+        while the global-attention blocks stay retained."""
+        return sum(self.is_pkda_layer(layer) for layer in range(self.layers))
 
     def resolve_iterations(self, iterations: int | None) -> int:
-        """The core iteration count a column runs; ``None`` is the default."""
+        """The columns one pass runs at a position; ``None`` is the default."""
         if not self.loop:
             if iterations not in (None, 1):
-                raise ValueError("a condition without l runs the core once")
+                raise ValueError("a condition without l runs one column per pass")
             return 1
         if iterations is None:
             return self.loop_iterations
@@ -371,11 +348,11 @@ class KVCache:
 
     Only global-attention layers receive KV slots. PKDA layers retain their
     FP32 matrix/preconditioner states and three short-convolution histories.
-    The caller advances the shared position once per column. Under ``l`` a
-    core layer owns one track per iteration, because iteration ``i`` of a
-    column mixes over the earlier columns' iteration-``i`` writes;
-    ``forward_column`` selects the track through ``iteration`` before each
-    core iteration and every track shares the column position.
+    ``forward_iterations`` advances the shared position once per token
+    position. Under ``l`` every layer owns one track per iteration, because
+    column ``i`` at a position mixes over the earlier positions' column-``i``
+    writes; the driver selects the track through ``iteration`` before each
+    column and every track shares the position.
     """
 
     def __init__(
@@ -391,8 +368,7 @@ class KVCache:
         self.iteration = 0
         self.global_slots: dict[tuple[int, int], int] = {}
         for layer in cfg.global_attention_layers:
-            tracks = self.iterations if cfg.is_core_layer(layer) else 1
-            for track in range(tracks):
+            for track in range(self.iterations):
                 self.global_slots[layer, track] = len(self.global_slots)
         # Position-major storage keeps each incoming column's write contiguous.
         shape = (
@@ -415,7 +391,7 @@ class KVCache:
         self.pos = 0
 
     def _track(self, layer: int) -> tuple[int, int]:
-        return layer, (self.iteration if self.cfg.is_core_layer(layer) else 0)
+        return layer, self.iteration
 
     def update(self, layer: int, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:
         """Write k/v [B,T,Hkv,D]; return the full prefix in that layout."""
@@ -939,32 +915,24 @@ class ColumnOutput:
     n_seeds: int
     """How many leading entries of ``sources`` are seeds, not deltas."""
 
-    iterations: int
-    """Core iterations this column ran; 1 without ``l``."""
-
-    core_entry: Tensor | None
-    """``l``: the residual at core entry, the prelude output [B, T, D]."""
-
-    core_state: Tensor | None
-    """``l``: the residual at core exit after the last iteration [B, T, D]."""
-
     expert_aux_loss: Tensor
-    """Mean load-balance loss over executed layer invocations."""
+    """Mean load-balance loss over this column's layer invocations."""
 
     expert_weights: dict[str, Tensor]
     """Site -> sparse normalized top-k routing weights [B, T, routed experts]."""
 
     expert_counts: Tensor
-    """Assignment counts [physical layers, routed experts], summed over core uses."""
+    """Assignment counts [physical layers, routed experts] of this column."""
 
     fused_input: Tensor | None = None
-    """[B,T,D] shared fusion of this pass's jittered payload and next tokens.
-    MTP reads it directly; the next feedback pass shifts it right and restores
-    its plain prefix. ``multipass`` attaches it; a bare column leaves it None."""
+    """[B,T,D] shared fusion of this column's jittered payload and next tokens.
+    MTP reads it directly; after a pass's last column the next feedback pass
+    shifts it right and restores its plain prefix. ``multipass`` attaches it;
+    a bare column leaves it None."""
 
 
 class DeltaModel(nn.Module):
-    """The permanent trunk with feedback and/or tied-depth recurrence."""
+    """The permanent trunk with feedback and/or looped-depth recurrence."""
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
@@ -1498,9 +1466,6 @@ class DeltaModel(nn.Module):
         names: list[str],
         accumulators: list[Tensor],
         *,
-        entry: Tensor | None = None,
-        partial: Tensor | None = None,
-        label: str = "",
         weights_out: dict[str, Tensor],
         route_source_names: dict[str, tuple[str, ...]],
         expert_losses: list[Tensor],
@@ -1510,16 +1475,14 @@ class DeltaModel(nn.Module):
     ) -> tuple[Tensor, Tensor]:
         """Run ``blocks`` as routing cell ``cell``; return (h, cell delta).
 
-        Without ``entry`` the first block opens the cell and measures from its
-        own input. With it the blocks continue a cell already under way:
-        ``entry`` is that cell's entry residual and ``partial`` the progress
-        made so far, the first block's partial source. ``label`` tags the
-        recorded route sites so a tied core's iterations stay distinct.
+        The first block opens the cell and measures from its own input; the
+        later blocks read the cell's progress so far as their partial source.
         """
-        cell_start = h if entry is None else entry
+        cell_start = h
         banked = tuple(accumulators)
+        partial: Tensor | None = None
         for index, block in enumerate(blocks):
-            opens = entry is None and index == 0
+            opens = index == 0
             passed = list(sources)
             passed_names = list(names)
             if not opens:
@@ -1530,17 +1493,14 @@ class DeltaModel(nn.Module):
             )
             expert_losses.append(aux)
             if w_expert is not None:
-                expert_weights_out[f"L{block.layer}{label}.experts"] = w_expert
-            previous = expert_counts_out.get(block.layer)
-            expert_counts_out[block.layer] = (
-                counts if previous is None else previous + counts
-            )
+                expert_weights_out[f"L{block.layer}.experts"] = w_expert
+            expert_counts_out[block.layer] = counts
             if w_attn is not None:
-                site = f"L{block.layer}{label}.attn"
+                site = f"L{block.layer}.attn"
                 weights_out[site] = w_attn
                 route_source_names[site] = ("null", *passed_names)
             if w_mlp is not None:
-                site = f"L{block.layer}{label}.mlp"
+                site = f"L{block.layer}.mlp"
                 weights_out[site] = w_mlp
                 mlp_names = [*passed_names, f"partial{cell}"] if opens else passed_names
                 route_source_names[site] = ("null", *mlp_names)
@@ -1553,28 +1513,18 @@ class DeltaModel(nn.Module):
         cache: KVCache | None = None,
         want_weights: bool = False,
         need_payload: bool = True,
-        iterations: int | None = None,
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
         ``x`` is the actual column input: the shared fusion of raw embeddings
         with the blank payload (``plain_seed``) on pass 1, plain prefixes, and
-        Standard decoding, or with the preceding payload on feedback
-        positions. With a
-        cache, positions start at ``cache.pos`` and every mixer cache advances
-        by ``T`` exactly once. ``iterations`` is the core iteration count
-        under ``l``; the default is the configured mean, or the count the
-        cache was allocated for.
+        Standard decoding, with the preceding position's payload on feedback
+        positions, or with the preceding column's own payload on a looped
+        column. With a cache, positions start at ``cache.pos`` on the cache's
+        current iteration track; ``forward_iterations`` owns the track
+        selection and advances the position once per token position.
         """
         cfg = self.cfg
-        if cache is not None:
-            if iterations is not None and iterations != cache.iterations:
-                raise ValueError(
-                    f"the cache holds {cache.iterations} iteration tracks, "
-                    f"not {iterations}"
-                )
-            iterations = cache.iterations
-        iterations = cfg.resolve_iterations(iterations)
 
         # Bank source gradients during CUDA backward; portable execution
         # accumulates ordinary autograd gradients.
@@ -1639,92 +1589,12 @@ class DeltaModel(nn.Module):
             return carrier
 
         size = cfg.routing_block_size
-        core_entry = core_state = None
-        if cfg.loop:
-            # Prelude, tied core, coda. The core is every cell between them,
-            # run in order ``iterations`` times. Each core cell keeps its own
-            # block delta, accumulated across iterations, and every core site
-            # reads every core cell's delta so far, its own as the live
-            # partial. An iteration boundary is a boundary in weights, not in
-            # state, and at one iteration the column is the unlooped column.
-            prelude = self.blocks[:size]
-            coda = self.blocks[cfg.layers - size :]
-            core = [
-                self.blocks[start : start + size]
-                for start in range(size, cfg.layers - size, size)
-            ]
+        for cell in range(cfg.routing_blocks):
+            blocks = self.blocks[cell * size : (cell + 1) * size]
             h, delta = self._run_cell(
-                prelude, h, 0, sources, source_names, accumulators, **runtime
+                blocks, h, cell, sources, source_names, accumulators, **runtime
             )
-            h = complete(h, delta, 0)
-            core_entry = h
-            origins: list[Tensor | None] = [None] * len(core)
-            deltas: list[Tensor | None] = [None] * len(core)
-            exits: list[Tensor | None] = [None] * len(core)
-            last = iterations - 1
-            for iteration in range(iterations):
-                if cache is not None:
-                    cache.iteration = iteration
-                for index, blocks in enumerate(core):
-                    cell = 1 + index
-                    if iteration == 0:
-                        origin, entry, partial = h, None, None
-                    else:
-                        # The cell's delta is measured from an origin pinned at
-                        # its first entry and advanced by whatever the other
-                        # core cells added between its visits. With one core
-                        # cell nothing runs between visits and the origin stays
-                        # the prelude output.
-                        origin = origins[index]
-                        if h is not exits[index]:
-                            origin = origin + (h - exits[index])
-                        entry, partial = origin, deltas[index]
-                    passed, passed_names = sources, source_names
-                    # The other core cells' deltas so far: the cells before
-                    # this one from this iteration, the cells after it from
-                    # the previous one. A cell completed on the last
-                    # iteration is already in the bank.
-                    extra = [
-                        (f"block{1 + other}", deltas[other])
-                        for other in range(len(core))
-                        if other != index
-                        and deltas[other] is not None
-                        and not (iteration == last and other < index)
-                    ]
-                    passed = [*sources, *(tensor for _, tensor in extra)]
-                    passed_names = [*source_names, *(name for name, _ in extra)]
-                    h, delta = self._run_cell(
-                        blocks,
-                        h,
-                        cell,
-                        passed,
-                        passed_names,
-                        accumulators,
-                        entry=entry,
-                        partial=partial,
-                        label=f"i{iteration}",
-                        **runtime,
-                    )
-                    origins[index], deltas[index], exits[index] = origin, delta, h
-                    if iteration == last:
-                        if index == len(core) - 1:
-                            core_state = h
-                        h = complete(h, delta, cell)
-            if cache is not None:
-                cache.iteration = 0
-            h, delta = self._run_cell(
-                coda, h, 1 + len(core), sources, source_names, accumulators, **runtime
-            )
-            h = complete(h, delta, 1 + len(core))
-        else:
-            for cell in range(cfg.routing_blocks):
-                blocks = self.blocks[cell * size : (cell + 1) * size]
-                h, delta = self._run_cell(
-                    blocks, h, cell, sources, source_names, accumulators, **runtime
-                )
-                h = complete(h, delta, cell)
-        if cache is not None:
-            cache.advance(x.shape[1])
+            h = complete(h, delta, cell)
 
         payload = None
         if need_payload:
@@ -1757,9 +1627,6 @@ class DeltaModel(nn.Module):
             sources=sources,
             source_names=tuple(source_names),
             n_seeds=seeds,
-            iterations=iterations,
-            core_entry=core_entry,
-            core_state=core_state,
             expert_aux_loss=torch.stack(expert_losses).mean(),
             expert_weights=expert_weights_out,
             expert_counts=torch.stack([
@@ -1767,7 +1634,72 @@ class DeltaModel(nn.Module):
             ]),
         )
 
-    # -- sequential decoding ---------------------------------------------------
+    # -- looped depth and sequential decoding ----------------------------------
+
+    def forward_iterations(
+        self,
+        x: Tensor,
+        token_embedding: Tensor,
+        *,
+        iterations: int | None = None,
+        cache: KVCache | None = None,
+        loop_jitter: Tensor | None = None,
+        want_weights: bool = False,
+        need_payload: bool = True,
+    ) -> list[ColumnOutput]:
+        """Run every column of one position range and return them in order.
+
+        ``x`` [B, T, D] seeds the first column. Each later column is seeded by
+        the shared fusion of the preceding column's payload with
+        ``token_embedding``, the same raw embeddings ``x`` was fused from,
+        after adding that column's row of ``loop_jitter`` [iterations-1, B,
+        T, D] in scaled payload units when given. ``iterations`` is the
+        column count under ``l``: the configured evaluation/decode count, or
+        the count the cache was allocated for. Every column but possibly the
+        last writes a payload. With a cache, column ``i`` mixes on track
+        ``i`` and the shared position advances once, after the last column.
+        """
+        cfg = self.cfg
+        if cache is not None:
+            if iterations is not None and iterations != cache.iterations:
+                raise ValueError(
+                    f"the cache holds {cache.iterations} iteration tracks, "
+                    f"not {iterations}"
+                )
+            iterations = cache.iterations
+        iterations = cfg.resolve_iterations(iterations)
+        if token_embedding.shape != x.shape:
+            raise ValueError("the loop needs the raw token embedding of every seed")
+        if loop_jitter is not None and loop_jitter.shape != (iterations - 1, *x.shape):
+            raise ValueError("loop jitter must have shape [iterations-1,B,T,D]")
+        compiled = x.is_cuda
+        outs: list[ColumnOutput] = []
+        for i in range(iterations):
+            if cache is not None:
+                cache.iteration = i
+            last = i + 1 == iterations
+            out = self.forward_column(
+                x,
+                cache=cache,
+                want_weights=want_weights,
+                need_payload=need_payload or not last,
+            )
+            outs.append(out)
+            if not last:
+                if loop_jitter is None:
+                    fusion = _compiled_fused_input if compiled else _fused_input
+                    x = fusion(self, out.payload, token_embedding)
+                else:
+                    fusion = (
+                        _compiled_jittered_fused_input
+                        if compiled
+                        else _jittered_fused_input
+                    )
+                    x = fusion(self, out.payload, loop_jitter[i], token_embedding)
+        if cache is not None:
+            cache.iteration = 0
+            cache.advance(x.shape[1])
+        return outs
 
     def step(
         self,
@@ -1777,14 +1709,14 @@ class DeltaModel(nn.Module):
         *,
         want_weights: bool = False,
     ) -> ColumnOutput:
-        """Decode one column: tokens [B, 1], payload [B, 1, D] from the
-        previous column (None for Standard decoding and conditions without
-        ``f``)."""
+        """Decode one position: tokens [B, 1] and the preceding position's
+        payload [B, 1, D] (None for Standard decoding and conditions without
+        ``f``). Runs the cache's column count and returns the last column."""
         e = self.embed_tokens(tokens)
         if payload is not None and not self.cfg.feedback:
             raise ValueError("a condition without f cannot consume a payload")
         x = self.fuse(payload, e) if payload is not None else self.plain_seed(e)
-        return self.forward_column(x, cache=cache, want_weights=want_weights)
+        return self.forward_iterations(x, e, cache=cache, want_weights=want_weights)[-1]
 
 
 # -- multi-pass training forward ----------------------------------------------
@@ -1836,30 +1768,36 @@ def multipass(
     tokens: Tensor,
     n_passes: int,
     *,
+    iterations: int | None = None,
     prefix_lens: Tensor | None = None,
     jitter: Tensor | None = None,
+    loop_jitter: Tensor | None = None,
     want_weights: bool = False,
-    iterations: int | None = None,
-) -> list[ColumnOutput]:
-    """The condition-agnostic Jacobi multi-pass forward.
+) -> list[list[ColumnOutput]]:
+    """The condition-agnostic Jacobi multi-pass forward: ``[pass][column]``.
 
     tokens [B, T+1] is one stored row: the model executes its first T
     positions, which are exactly the positions that predict tokens 1..T.
     Pass 1 seeds every position through the shared fusion with the blank
     payload; feedback passes replace the suffix past each row's prefix.
     The final stored token is a main-head target and MTP input, but needs no
-    trunk column.  prefix_lens [n_passes-1, B] holds
-    values in 1..T-1 (the plain-embedding prefix per feedback pass; position
-    0 is always plain and position T-1 is always fused); jitter [n_passes, B, T+1, D] is drawn at the
-    stored-row width in scaled payload units. Its first T columns are added
-    to the payload before fusion, including the final/single pass's MTP input.
-    The next trunk pass reuses that fusion after shifting and prefix selection.
-    Both are pre-drawn by the caller — the shared
-    randomness contract lives in the trainer, not here.  Conditions
-    without ``f`` simply take n_passes=1.  ``iterations`` is the step's core
-    iteration count under ``l``, shared by every pass.
+    trunk column.  Under ``l`` every pass runs ``iterations`` columns at each
+    position, each later column seeded by the fusion of the preceding
+    column's jittered payload with the position's own raw embedding.
+    prefix_lens [n_passes-1, B] holds values in 1..T-1 (the plain-embedding
+    prefix per feedback pass; position 0 is always plain and position T-1 is
+    always fused). jitter [n_passes, B, T+1, D] is drawn at the stored-row
+    width in scaled payload units for each pass's last column, and
+    loop_jitter [n_passes, iterations-1, B, T+1, D] for the columns before
+    it. A column's first T jitter rows are added to its payload once, before
+    both fusions: the MTP input with the next tokens, and either the next
+    column's seed or, after a pass's last column, the next pass's entry after
+    shifting and prefix selection.  Both are pre-drawn by the caller — the
+    shared randomness contract lives in the trainer, not here.  Conditions
+    without ``f`` simply take n_passes=1.
     """
     cfg = model.cfg
+    iterations = cfg.resolve_iterations(iterations)
     if n_passes < 1:
         raise ValueError("multipass needs at least one pass")
     if n_passes > 1 and not cfg.feedback:
@@ -1868,7 +1806,16 @@ def multipass(
         n_passes, *tokens.shape, cfg.dim
     ):
         raise ValueError("jitter must have shape [passes,B,T+1,D]")
-    # One logical forward: its trunk passes here and the auxiliary blocks in
+    if (loop_jitter is not None) != (jitter is not None and iterations > 1):
+        raise ValueError(
+            "loop jitter accompanies pass jitter exactly when a pass runs more "
+            "than one column"
+        )
+    if loop_jitter is not None and loop_jitter.shape != (
+        n_passes, iterations - 1, *tokens.shape, cfg.dim
+    ):
+        raise ValueError("loop jitter must have shape [passes,iterations-1,B,T+1,D]")
+    # One logical forward: its trunk columns here and the auxiliary blocks in
     # ``multipass_loss`` share this recomputation budget in execution order.
     model._checkpoint_left = model.checkpoint_blocks
     # One raw lookup of the whole stored row feeds both heads: the plain
@@ -1882,33 +1829,39 @@ def multipass(
     e_all = model.embed_tokens(tokens)
     compiled = e_all.is_cuda
     plain = _compiled_plain_seed if compiled else _plain_seed
-    seed = plain(model, e_all[:, :-1])
+    own_embedding = e_all[:, :-1]
+    seed = plain(model, own_embedding)
     length = seed.shape[1]
     positions = torch.arange(length, device=tokens.device)
     token_embedding = e_all[:, 1:]
     entry = _compiled_feedback_entry if compiled else _feedback_entry
-    outs = []
+    outs: list[list[ColumnOutput]] = []
     x = seed
-    for i in range(n_passes):
-        if i:
+    for p in range(n_passes):
+        if p:
             x = entry(
-                outs[-1].fused_input, seed, positions, prefix_lens[i - 1]
+                outs[-1][-1].fused_input, seed, positions, prefix_lens[p - 1]
             )
-        out = model.forward_column(
+        columns = model.forward_iterations(
             x,
-            want_weights=want_weights,
-            need_payload=True,
+            own_embedding,
             iterations=iterations,
+            loop_jitter=(
+                None if loop_jitter is None else loop_jitter[p][:, :, :length]
+            ),
+            want_weights=want_weights,
         )
-        if jitter is None:
-            fusion = _compiled_fused_input if compiled else _fused_input
-            out.fused_input = fusion(model, out.payload, token_embedding)
-        else:
-            fusion = _compiled_jittered_fused_input if compiled else _jittered_fused_input
-            out.fused_input = fusion(
-                model, out.payload, jitter[i][:, :length], token_embedding
-            )
-        outs.append(out)
+        for i, out in enumerate(columns):
+            if jitter is None:
+                fusion = _compiled_fused_input if compiled else _fused_input
+                out.fused_input = fusion(model, out.payload, token_embedding)
+            else:
+                fusion = _compiled_jittered_fused_input if compiled else _jittered_fused_input
+                draw = jitter[p] if i + 1 == iterations else loop_jitter[p, i]
+                out.fused_input = fusion(
+                    model, out.payload, draw[:, :length], token_embedding
+                )
+        outs.append(columns)
     return outs
 
 
@@ -2123,82 +2076,99 @@ def sequence_ce(
     return nll.mean(), lse.square().mean()
 
 
-def combine_pass_losses(values: list[Tensor]) -> Tensor:
-    """Pass 1 plus the mean over feedback passes (FBT Eq. 12, lambda=1)."""
-    if len(values) == 1:
-        return values[0]
-    return values[0] + torch.stack(values[1:]).mean()
+def combine_column_losses(values: list[list[Tensor]]) -> Tensor:
+    """The first column plus the mean over every other supervised column.
+
+    ``values`` is ``[pass][column]``. With one column this is FBT Eq. 12 at
+    lambda=1 over passes; under ``l`` every later column of every pass joins
+    the mean, so the plain first column keeps full weight and the recurrent
+    columns share unit weight.
+    """
+    flat = [value for columns in values for value in columns]
+    if len(flat) == 1:
+        return flat[0]
+    return flat[0] + torch.stack(flat[1:]).mean()
 
 
 @dataclass
 class LossOutput:
-    """Training objective and unregularized CE for each pass and prediction depth."""
+    """Training objective and unregularized CE for each column and prediction depth."""
 
     total: Tensor
-    ntp: list[Tensor]
-    mtp: list[Tensor]
+    ntp: list[list[Tensor]]
+    """Main-head CE ``[pass][column]``; ``ntp[0][0]`` is the plain column."""
+    mtp: list[list[Tensor]]
+    """Auxiliary-head CE ``[pass][column]``."""
     expert_aux_loss: Tensor
-    """Mean over passes of the mean over trunk and auxiliary layer invocations."""
+    """Mean over columns of the mean over trunk and auxiliary layer invocations."""
     expert_counts: Tensor
-    """Assignments summed over passes, [trunk layers + MTP, routed experts]."""
+    """Assignments summed over columns, [trunk layers + MTP, routed experts]."""
 
 
 def multipass_loss(
     model: DeltaModel,
     tokens: Tensor,
-    outs: list[ColumnOutput],
+    outs: list[list[ColumnOutput]],
     *,
     z_coef: float | Tensor = 0.0,
     mtp_weight: float = MTP_LOSS_WEIGHT,
 ) -> LossOutput:
-    """FBT Eq. 12 with λ=1: pass-1 NTP plus the mean over feedback passes,
-    plus (in cooldown) the z-loss under the same per-pass weighting.
+    """The first column's NTP plus the mean over every other column, plus (in
+    cooldown) the z-loss under the same weighting: FBT Eq. 12 with λ=1 over
+    passes, extended to every looped column.
 
-    MTP adds one sequential second-token predictor per executed pass. Its CE
-    and z-loss have the same pass weighting, scaled by ``mtp_weight``. Each
-    head is normalized over its own real targets; the auxiliary head runs over
-    every executed position, and its last row, whose second token is past the
-    end of the stored row, takes a dummy target and no weight. Both heads'
-    rows go through one vocabulary pass per model pass. ``ntp[0]`` is the
-    Standard-mode tracking metric.
+    Every column is supervised. MTP adds one sequential second-token
+    predictor per column. Its CE and z-loss have the same column weighting,
+    scaled by ``mtp_weight``. Each head is normalized over its own real
+    targets; the auxiliary head runs over every executed position, and its
+    last row, whose second token is past the end of the stored row, takes a
+    dummy target and no weight. Both heads' rows go through one vocabulary
+    pass per column. ``ntp[0][0]`` is the Standard-mode tracking metric.
     """
-    if not outs:
-        raise ValueError("loss needs at least one model pass")
+    if not outs or not outs[0]:
+        raise ValueError("loss needs at least one model column")
     if not math.isfinite(mtp_weight) or mtp_weight < 0:
         raise ValueError("mtp_weight must be finite and nonnegative")
     if tokens.shape[1] < 3:
         raise ValueError("MTP needs at least three stored tokens")
     targets = tokens[:, 1:]
     mtp_targets = F.pad(tokens[:, 2:], (0, 1))
-    losses, z_terms = [], []
-    mtp_losses, mtp_z = [], []
+    losses: list[list[Tensor]] = []
+    z_terms: list[list[Tensor]] = []
+    mtp_losses: list[list[Tensor]] = []
+    mtp_z: list[list[Tensor]] = []
     expert_losses, expert_counts = [], []
-    for out in outs:
-        if out.payload is None:
-            raise ValueError("MTP loss needs a payload from every model pass")
-        if out.fused_input is None:
-            raise ValueError("MTP loss needs the pass's shared fused input")
-        mtp = model.forward_mtp_fused(out.fused_input)
-        nll, lse = head_row_losses(
-            model, (out.h_top, mtp.hidden), (targets, mtp_targets)
-        )
-        losses.append(nll[0].mean())
-        z_terms.append(lse[0].square().mean())
-        # The padded row is the auxiliary head's causally last one, so leaving
-        # it out of both means leaves every earlier row untouched.
-        mtp_losses.append(nll[1][:, :-1].mean())
-        mtp_z.append(lse[1][:, :-1].square().mean())
-        invocations = model.cfg.executed_layers(out.iterations)
-        expert_losses.append(
-            (out.expert_aux_loss * invocations + mtp.expert_aux_loss)
-            / (invocations + 1)
-        )
-        expert_counts.append(torch.cat((out.expert_counts, mtp.expert_counts[None])))
+    invocations = model.cfg.layers
+    for columns in outs:
+        for series in (losses, z_terms, mtp_losses, mtp_z):
+            series.append([])
+        for out in columns:
+            if out.payload is None:
+                raise ValueError("MTP loss needs a payload from every column")
+            if out.fused_input is None:
+                raise ValueError("MTP loss needs the column's shared fused input")
+            mtp = model.forward_mtp_fused(out.fused_input)
+            nll, lse = head_row_losses(
+                model, (out.h_top, mtp.hidden), (targets, mtp_targets)
+            )
+            losses[-1].append(nll[0].mean())
+            z_terms[-1].append(lse[0].square().mean())
+            # The padded row is the auxiliary head's causally last one, so
+            # leaving it out of both means leaves every earlier row untouched.
+            mtp_losses[-1].append(nll[1][:, :-1].mean())
+            mtp_z[-1].append(lse[1][:, :-1].square().mean())
+            expert_losses.append(
+                (out.expert_aux_loss * invocations + mtp.expert_aux_loss)
+                / (invocations + 1)
+            )
+            expert_counts.append(
+                torch.cat((out.expert_counts, mtp.expert_counts[None]))
+            )
 
-    total = combine_pass_losses(losses)
-    total = total + z_coef * combine_pass_losses(z_terms)
+    total = combine_column_losses(losses)
+    total = total + z_coef * combine_column_losses(z_terms)
     total = total + mtp_weight * (
-        combine_pass_losses(mtp_losses) + z_coef * combine_pass_losses(mtp_z)
+        combine_column_losses(mtp_losses) + z_coef * combine_column_losses(mtp_z)
     )
     expert_aux_loss = torch.stack(expert_losses).mean()
     total = total + EXPERT_BALANCE_COEF * expert_aux_loss
@@ -2231,7 +2201,8 @@ def iterate_fused(
     ||h(k) − h(k−1)|| (FBT Fig. 3).  Decaying update norms and flat loss
     are the contraction signature; oscillation or rising loss means the
     map diverges under self-composition.  Every pass runs ``iterations``
-    core iterations under ``l`` (default: the configured mean).
+    columns per position under ``l`` (default: the evaluation count), and
+    the map composes the last column's payload.
     """
     cfg = model.cfg
     if not cfg.feedback:
@@ -2243,15 +2214,15 @@ def iterate_fused(
         positions = torch.arange(length, device=tokens.device)
         plain = (positions[None, :] < 1).expand(batch, -1)
 
-        out = model.forward_column(seed, iterations=iterations)
+        out = model.forward_iterations(seed, e, iterations=iterations)[-1]
         records = []
         for _ in range(n_iters):
             previous = out.h_top
             p_shifted = shift_right(out.payload)
             fused = model.fuse(p_shifted, e)
-            out = model.forward_column(
-                torch.where(plain[..., None], seed, fused), iterations=iterations
-            )
+            out = model.forward_iterations(
+                torch.where(plain[..., None], seed, fused), e, iterations=iterations
+            )[-1]
             loss, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
             delta = (out.h_top - previous).float().norm(dim=-1).mean()
             records.append({"loss": loss.item(), "update_norm": delta.item()})
@@ -2266,17 +2237,15 @@ def depth_trace(
     *,
     fused: bool = False,
 ) -> list[dict[str, float]]:
-    """The loop's fixed-``r`` sweep: loss and core update size per iteration.
+    """The loop's per-column readout: loss and update size at every depth.
 
-    Runs the column at every iteration count from 1 to ``iterations``
-    (default: all five training depths) and reports the held-out loss with the coda
-    applied after that many iterations, plus ``mean_token ||core_state(r) -
-    core_state(r-1)||_2``, the size of iteration ``r``'s update; at ``r = 1``
-    the update is measured from the core entry.  Under same-depth mixing the
-    state after iteration ``i`` does not depend on how many iterations follow,
-    so on plain positions the sweep is one trajectory read out after every
-    iteration.  With ``fused`` the column is a second pass with plain-prefix
-    length 1 whose payload comes from a first pass at the same count.
+    Runs ``iterations`` columns (default: the maximum) and reads out after
+    each: the held-out loss of that column's top state, plus ``mean_token
+    ||h_top(r) - h_top(r-1)||_2``, the size of column ``r``'s update; at ``r
+    = 1`` the update is measured from the seed. A column's state does not
+    depend on the columns after it, so one run reports every depth up to the
+    count. With ``fused`` the run is a second pass with plain-prefix length 1
+    whose payload comes from a first pass at the same count.
     """
     cfg = model.cfg
     if not cfg.loop:
@@ -2293,20 +2262,21 @@ def depth_trace(
         batch, length = e.shape[:2]
         positions = torch.arange(length, device=tokens.device)
         plain = (positions[None, :] < 1).expand(batch, -1)
+        x = seed
+        if fused:
+            first = model.forward_iterations(seed, e, iterations=iterations)[-1]
+            x = torch.where(
+                plain[..., None], seed, model.fuse(shift_right(first.payload), e)
+            )
+        columns = model.forward_iterations(
+            x, e, iterations=iterations, need_payload=False
+        )
         records = []
-        previous = None
-        for depth in range(1, iterations + 1):
-            x = seed
-            if fused:
-                first = model.forward_column(seed, iterations=depth)
-                x = torch.where(
-                    plain[..., None], seed, model.fuse(shift_right(first.payload), e)
-                )
-            out = model.forward_column(x, need_payload=False, iterations=depth)
+        previous = x
+        for depth, out in enumerate(columns, start=1):
             loss, _ = sequence_ce(model, out.h_top, targets)
-            reference = out.core_entry if previous is None else previous
-            update = (out.core_state - reference).float().norm(dim=-1).mean()
-            previous = out.core_state
+            update = (out.h_top - previous).float().norm(dim=-1).mean()
+            previous = out.h_top
             records.append(
                 {
                     "iterations": depth,

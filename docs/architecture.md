@@ -2,18 +2,22 @@
 
 `DeltaModel` has one core architecture: PKDA/GQA token mixers, Multi-Head Delta
 Block (MHDB) routing, shared and routed SwiGLU experts, and auxiliary two-token
-prediction. Conditions select cross-column feedback (`f`), tied depth (`l`),
-or both (`fl`); the default is `f`. Feedback retains the Full-Bandwidth
-Transformer (FBT) recurrence and Jacobi training, with DeepSeek-style
-concat-linear fusion of the raw token embedding and the payload, normalized
-once and multiplied by a fixed `0.02` scale at its writer. There is no empty
-condition.
+prediction. Conditions select cross-column feedback (`f`), looped depth (`l`),
+or both (`fl`); the default is `f`. Both recurrences are one operator: a
+column writes a payload, and the shared DeepSeek-style concat-linear fusion
+seeds the next column from that payload and a raw token embedding. Feedback
+fuses the payload with the next position's token, the Full-Bandwidth
+Transformer (FBT) recurrence with Jacobi training; the loop fuses it with the
+same position's token and re-runs the whole column, in the Ouro style. The
+payload is normalized once and multiplied by a fixed `0.02` scale at its
+writer. There is no empty condition.
 
 [Scaling](scaling.md) owns geometry and accounting, [design](design.md) owns
 data and training, and [references](../references/refs.yaml) records sources.
 
 The [TikZ figure](architecture.tex) shows `fl` as one vertical diagram, with
-shared MTP/feedback fusion, a cell-delta source bank, and one layer cutaway.
+the shared fusion feeding MTP and both recurrences, a cell-delta source bank,
+and one layer cutaway.
 Build its vector PDF from the repository root with Tectonic:
 
 ```bash
@@ -39,19 +43,23 @@ there is no input token normalization.
 Layers form four-layer cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`.
 Each trunk FFN uses one shared expert
 and a configurable number of selected routed experts. All presets have four
-cells; the middle two form the tied core under `l`.
+cells. Under `l` the whole column runs `r` times per position, each run
+seeded by the preceding run's payload.
 
 ```text
-raw token embedding + incoming payload (f) or the learned blank payload
+raw token embedding + incoming payload (f), the preceding column's own
+payload (l), or the learned blank payload
   -> shared concat-linear fusion -> column seed
-  -> prelude cell
-  -> middle cells, repeated r times under l
-  -> coda cell
+  -> four cells
   -> top state -> tied readout -> next-token logits
        + routed block deltas -> learned RMSNorm -> x 0.02 -> payload
+                                  (+ shared jitter in training)
+                                  + raw same-token embedding
+                                  -> shared concat-linear fusion
+                                     -> next column seed at this position (l)
                                   + raw next-token embedding
-                                  -> shared concat-linear fusion (shared jitter in training)
-                                     -> next column seed (f)
+                                  -> shared concat-linear fusion
+                                     -> next column seed at the next position (f)
                                      -> independent auxiliary PKDA/expert block
                                         -> tied readout -> second-token logits
 ```
@@ -65,7 +73,8 @@ a payload. Pass 1, plain-prefix positions, and Standard decoding, which have
 no incoming payload, fuse the learned blank payload `p_0` instead. The readout applies
 `final_norm(h_top) * 1536 / D` before the tied classifier.
 PKDA and GQA caches carry additional state along tokens; the payload carries
-feedback between columns and between Jacobi passes.
+feedback between positions, between Jacobi passes, and between the looped
+columns of one position.
 
 ### Residual shell and sources
 
@@ -315,77 +324,86 @@ Initially the uniform enrichment is
 `h_top/(C+2)`, making the payload equal to `0.02` times a normalized top state
 up to epsilon. Payload routing is not conditioned on the next token; that
 token enters through the shared fusion at the next column.
-Every supervised pass constructs this payload for MTP, including single-pass
-batches, `l` without `f`, and the final feedback pass. The `f` letter controls
-consumption by the next column. Generation can skip payload construction when
-no feedback or auxiliary read needs it.
+Every supervised column constructs this payload for MTP, including
+single-pass batches, `l` without `f`, and the final feedback pass. The `f`
+letter controls consumption by the next position's column and the `l` letter
+by the same position's next column. Generation can skip payload construction
+when no feedback, loop, or auxiliary read needs it.
 
-Every training pass adds its keyed jitter, already in scaled payload units,
-to the undetached payload and fuses it directly with the raw next-token
-embedding once.
+Every training column adds its keyed jitter, already in scaled payload units,
+to the undetached payload and fuses it with the raw next-token embedding
+once.
 There is no second payload normalization after jitter. MTP consumes the
 resulting tensor directly. If another Jacobi pass follows, it shifts that
-same tensor right and restores the per-row plain prefix. Mixer states restart
+same tensor right and restores the per-row plain prefix. If another looped
+column follows at the same position, the same jittered payload is fused once
+more with the position's own raw embedding to seed it. Mixer states restart
 inside each pass.
 Sequential generation instead retains the preceding payload and advances all
 mixer caches once per new token, computing one fusion with that token's
-raw embedding and no jitter; Standard decoding fuses the blank payload.
+raw embedding and no jitter, and under `l` running the evaluation column
+count before the caches advance; Standard decoding fuses the blank payload.
 
-## Letter l: the tied-depth loop
+## Letter l: the looped column
 
-Whole cells and at least three cells are required. Of `C` unique cells, the
-first is the prelude, the last the coda, and the `c=C-2` middle cells run in
-order as one tied core, repeated `r` times. It adds no parameters. At `r=1`,
-`fl` equals `f` in values, routes, losses, and gradients.
-
-Every core cell keeps one delta accumulated across iterations. A visit reads
-the seed, prelude delta, every other core cell's contribution so far, and its
-own accumulated contribution as the partial. Its effective origin advances
-by whatever other cells add between visits. Contributions not yet produced
-on the first iteration are absent. The coda and payload read one final delta
-per core cell, retaining the flat column's source identities:
+Under `l`, every position runs the whole column `r` times per pass. The
+first column is seeded as in the flat model. Each later column is seeded by
+the same shared fusion feedback uses, with the preceding column's payload in
+the payload slot and the position's own raw embedding in the token slot:
 
 ```text
-h_top = seed + Delta_P + sum_j Delta_R_j + Delta_C
+seed_t^(1)   = fuse_proj(concat(e_t, p_(t-1)))            (or p_0)
+p_t^(i)      = payload_norm(h_top,t^(i) + r_payload,t^(i))
+seed_t^(i+1) = fuse_proj(concat(e_t, p_t^(i) + jitter_t^(i)))
 ```
 
-With one core cell, its origin remains the prelude output and its partial is
-`h - core_entry` across all iterations. No additional residual normalization
-or branch scaling is introduced. Fixed NorMuonH radii alone do not establish
-contraction because norms, router values, gates, and controls are unconstrained.
+The loop adds no parameters, and every column is a plain column: the same
+bank of null, seed, and cell deltas at every site, the same telescoping
+`h_top = seed + sum(cell deltas)` within each column, and a fresh residual
+origin at every column. Feedback and the loop are one operator applied at
+different positions: `f` fuses the payload with the next position's token,
+`l` with the same position's token. A position's payload slot therefore
+always holds the most recent payload for that position, whether it came
+from the left neighbor or from the preceding column, and under `fl` a later
+column carries the cross-column payload through its seed. At one column,
+`fl` equals `f` in values, routes, losses, and gradients. A column never
+depends on the columns after it, so the first column of a looped run is the
+single-column model exactly, and reading out after every column is one
+trajectory.
+
+Every column is read out and supervised, and every column's payload feeds
+MTP. Contraction is not established by construction: the payload writer's
+normalization and fixed scale bound every column's seed, but the column's
+own contribution is unconstrained. [Ouro](../references/refs.yaml) loops
+the whole transformer stack with an exit at every step; this model re-enters
+through the shared fusion, so the raw token embedding is re-injected and the
+state crosses the boundary as a normalized payload rather than a raw
+residual.
 
 ### Depth, caches, and training
 
-The keyed depth stream draws once per optimizer step, independently of the
-feedback draws, and every pass/microbatch shares the result:
+The recurrence roll draws once per optimizer step, and every pass, column,
+and microbatch of the step shares the result;
+[design](design.md#the-recurrence-roll) defines it. `f` reads its pass
+component, `l` its column component, and `fl` both, so a step has the same
+shape in every condition that shares the roll. Evaluation and decode hold
+`r = r_eval` fixed for the request, defaulting to two columns.
+`--loop-iterations` sets this fixed count within `1..3` and does not change
+the training distribution.
+Each column has its own mixer cache track at every layer and reads earlier
+token positions' writes at the same column index. Every current prefill pass
+starts those tracks from zero, and sequential decode advances the shared
+position once per token, after its last column. A pass executes `4r` cells.
 
-```text
-u ~ Uniform(0, 1)
-r = 1 if u < 0.30
-    2 if u < 0.60
-    3 if u < 0.80
-    4 if u < 0.90
-    5 otherwise
-```
-
-The weights `LOOP_ITERATION_WEIGHTS=(3,3,2,1,1)` are common to every scale:
-`r_train_mean=2.4` and `r_max=5`. Evaluation/decode hold `r = r_eval` fixed
-for the request, defaulting to three visits. `--loop-iterations` sets this
-fixed depth within `1..5` and does not change the training distribution.
-Each iteration has its own mixer cache track and reads earlier token
-positions' writes at the same iteration.
-Every current prefill pass starts those tracks from zero. Cache position is
-shared across tracks. A pass executes `2+c*r` cells.
-
-All passes and iterations remain differentiable. Readout occurs after the
-coda, and auxiliary prediction runs once per pass. On CUDA the per-pass
-epilogues around the compiled blocks (the payload's routed add, norm, and scale,
-shared jittered fusion, feedback shift/prefix selection, and both heads'
-readout) compile as their own small regions. The compiled blocks carry an
-Inductor activation memory budget of 0.9, the
+All passes and columns remain differentiable. Readout occurs after every
+column, and auxiliary prediction runs once per column. On CUDA the
+per-column epilogues around the compiled blocks (the payload's routed add,
+norm, and scale, the shared jittered fusions, feedback shift/prefix
+selection, and both heads' readout) compile as their own small regions. The
+compiled blocks carry an Inductor activation memory budget of 0.9, the
 partitioner tier that recomputes cheap fused tensors in backward and never a
 custom operator. CUDA captures one training graph per reachable
-`(pass count,r)` pair and no-grad evaluation graphs at the fixed depth. Every
+`(pass count,r)` shape and no-grad evaluation graphs at the fixed count. Every
 graph, the optimizer step, and the periodic monitors share one private memory
 pool: the eager work runs on the capture stream inside it, so nothing between
 replays grows memory outside the pool, which needs the allocator's expandable
@@ -394,25 +412,27 @@ start-up the trainer measures, from two eager forwards, the activation bytes
 one block invocation retains and the bytes one recomputed block releases,
 takes the device memory still free once the static footprint exists less a
 3.5 GiB default margin for backward workspaces, recomputation, allocator
-rounding, and graph instantiation, and plans each graph: a one-pass graph
-replays the largest row multiple whose raw
+rounding, and graph instantiation, and plans each graph: a single-column
+graph replays the largest row multiple whose raw
 activations fit, and otherwise the first PKDA and auxiliary block invocations
 of the logical forward, as many as the shortfall needs, recompute in
 backward. Global-attention blocks are always retained. Checkpoint wrappers
 remain outside compiled blocks.
 
-`ColumnOutput` exposes `iterations`, `core_entry`, and `core_state`; route
-keys include iteration, such as `L4i2.attn`. `depth_trace` defaults to sweeping
-`1..5`, reading out after the coda at each depth and reporting core-update
-norms. The depth telemetry labels the fixed evaluation depth `r_eval` and
-its held-out loss `loss_eval`, separately from `r_train_mean` and `r_max`.
-The payload self-composition trace holds depth fixed. Paired `f`/`fl` runs
-share initialization, rows, schedule, and feedback draws. Equal steps match
-data; compute comparisons need cell-tokens and auxiliary work or device time.
+`multipass` returns `[pass][column]` outputs, and `forward_iterations` runs
+every column of one position range. `depth_trace` runs the maximum count
+and reads out after every column, reporting each column's held-out loss and
+top-state update norm. The depth telemetry labels the fixed evaluation
+count `r_eval` and its held-out loss `loss_eval`, beside `loss_one` for the
+first column and `loss_max` for the last. The payload self-composition
+trace holds the count fixed. Paired `f`/`fl` runs share initialization,
+rows, schedule, the roll, and the feedback draws; the loop's own jitter is
+drawn after them. Equal steps match data; compute comparisons need
+cell-tokens and auxiliary work or device time.
 
 ## Two-token prediction
 
-One independent auxiliary prediction block runs after each column pass.
+One independent auxiliary prediction block runs after every column.
 Its input is computed by the model's shared concat-linear fusion:
 
 ```text
@@ -428,8 +448,10 @@ logits_mtp,t = (final_norm(v_t) * 1536 / D) @ embed_tokens.weight.T
 condition. The two inputs each have width `D`, and the concatenation places
 the token first and payload second. One `embed_tokens` call looks up the whole
 stored row before slicing; those raw embeddings serve the blank-fused plain
-seeds, MTP, and feedback across all passes. Each pass adds jitter after the writer's payload
-normalization and fixed scale, then computes `u` once for both consumers.
+seeds, MTP, feedback, and the loop across all passes. Each column adds
+jitter after the writer's payload normalization and fixed scale, then
+computes `u` once for MTP and the next pass; a following looped column
+fuses the same jittered payload with the position's own embedding.
 Fusion accepts these inputs directly, with no normalization or second scaling.
 
 The auxiliary block has its own PKDA mixer and one shared plus top-`k`-of-`n`
@@ -442,11 +464,11 @@ convolution states start from zero for each row and pass.
 `--jitter` is relative to `BASE_NORMAL_INIT_STD`, with default `0.02`.
 Training samples the buffer directly in payload units: uniform
 `[-BASE_NORMAL_INIT_STD * jitter, BASE_NORMAL_INIT_STD * jitter]`, or
-`[-0.0004,0.0004]` by default. This draw happens for every supervised pass,
-including the final or only pass and `l` without `f`. MTP and the next
-feedback pass use the same realization. For the latter, `u_t` becomes
-the seed at position `t+1`, with positions inside the selected plain prefix
-restored to their blank-fused seeds. The auxiliary block's output `v`
+`[-0.0004,0.0004]` by default. This draw happens for every supervised
+column, including the final or only pass and `l` without `f`. MTP, the next
+looped column, and the next feedback pass use the same realization. For the
+latter, `u_t` becomes the seed at position `t+1`, with positions inside the
+selected plain prefix restored to their blank-fused seeds. The auxiliary block's output `v`
 is used only for MTP; it is not an early trunk readout or an extra feedback layer.
 Evaluation and diagnostics set jitter to zero.
 
@@ -465,18 +487,18 @@ auxiliary objective trains the payload router, payload normalization, trunk,
 shared fusion, and token embedding.
 The causal PKDA recurrence never sees the second-token target. The auxiliary
 block's output never feeds into the column or payload.
-`multipass` exposes each pass's shared tensor as `ColumnOutput.fused_input`.
+`multipass` exposes each column's shared tensor as `ColumnOutput.fused_input`.
 `DeltaModel.forward_mtp_fused` runs the block on this tensor;
 `forward_mtp(payload, next_tokens)` embeds and fuses supplied next-token IDs
 as a convenience. Both return balancing loss, assignment counts, and optional
 expert weights.
 
 Each head averages over its own valid positions, and both heads' rows go
-through one unreduced vocabulary pass per model pass: their readout rows are
-concatenated into a single cut cross-entropy request, and the pass scalars are
-weighted sums of the returned rows. For either head,
-`combine(ell)=ell_1` with one pass, otherwise
-`ell_1 + mean(ell_2,...,ell_K)`:
+through one unreduced vocabulary pass per column: their readout rows are
+concatenated into a single cut cross-entropy request, and the column scalars
+are weighted sums of the returned rows. For either head, over the step's
+`K` columns in execution order, `combine(ell)=ell_1` with one column,
+otherwise `ell_1 + mean(ell_2,...,ell_K)`:
 
 ```text
 loss = combine(CE_ntp) + z_coef * combine(z_ntp)
@@ -486,8 +508,8 @@ loss = combine(CE_ntp) + z_coef * combine(z_ntp)
 
 The cooldown z-loss is the mean squared log-partition. `--mtp-weight` is a
 finite nonnegative constant, default 0.3. `ntp` and `mtp` report cross-entropies
-before coefficients/z-loss, `pass1` is ordinary first-pass CE, and `loss` is
-the optimized objective. `val_mtp` and feedback's `val_mtp_fused` remain
+before coefficients/z-loss, `pass1` is the first column's ordinary CE, and
+`loss` is the optimized objective. `val_mtp` and feedback's `val_mtp_fused` remain
 separate from ordinary validation. Generation does not run the auxiliary
 block or allocate its cache; speculative decoding is not implemented.
 
@@ -531,8 +553,8 @@ GEMM and recomputes the activation there, so the forward retains only the
 pre-activation; expert weight gradients accumulate in FP32 sinks, and an
 expert without assignments leaves its sink untouched. Head calls first accumulate classifier
 gradients in a BF16 buffer, flushed into the FP32 sink at the configured
-`--head-flush-every` cadence and before the optimizer update. Each pass makes
-one head call, covering both prediction depths. A captured microbatch
+`--head-flush-every` cadence and before the optimizer update. Each column
+makes one head call, covering both prediction depths. A captured microbatch
 exceeding the cadence uses the FP32 sink per call; cadence 1 therefore gives
 per-call precision throughout.
 

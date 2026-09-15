@@ -33,9 +33,9 @@ references:
   - arxiv: "2606.16899"
     slug: chen2026-hyperball
     note: Fixed realized Frobenius radius; this repo adds spectral tangent steps.
-  - arxiv: "2502.05171"
-    slug: geiping2025-recurrent-depth
-    note: Prelude/core/coda and log-normal Poisson depth draw.
+  - arxiv: "2510.25741"
+    slug: zhu2025-ouro
+    note: Whole-stack looped language model with an exit at every step; this repo re-enters through the shared fusion.
   - arxiv: "2203.03466"
     slug: yang2022-tensor-programs-v
     note: Width-scaled hidden-matrix learning rates and readout.

@@ -32,8 +32,7 @@ GEOMETRY = {
 
 def tiny(condition="f", *, seed=13):
     torch.manual_seed(seed)
-    geometry = GEOMETRY | ({"layers": 16} if "l" in condition else {})
-    return DeltaModel(condition_config(condition, **geometry)).eval()
+    return DeltaModel(condition_config(condition, **GEOMETRY)).eval()
 
 
 def tokens(length=8):
@@ -41,16 +40,37 @@ def tokens(length=8):
     return torch.randint(0, GEOMETRY["vocab_size"], (2, length), generator=generator)
 
 
-def passes(model, toks, count, *, jitter=None):
+def passes(model, toks, count, *, jitter=None, loop_jitter=None, iterations=1):
+    """``[pass][column]`` outputs of ``count`` passes with a fixed prefix."""
     prefixes = torch.full((count - 1, toks.shape[0]), 2, dtype=torch.long)
-    return multipass(model, toks, count, prefix_lens=prefixes, jitter=jitter)
+    return multipass(
+        model,
+        toks,
+        count,
+        iterations=iterations,
+        prefix_lens=prefixes,
+        jitter=jitter,
+        loop_jitter=loop_jitter,
+    )
 
 
-def jitter_for(model, toks, count):
+def columns(outs):
+    """Every column of a multipass result in execution order."""
+    return [out for pass_outs in outs for out in pass_outs]
+
+
+def jitter_for(model, toks, count, iterations=1):
+    """(pass jitter [k, B, T+1, D], loop jitter [k, r-1, B, T+1, D] or None)."""
     generator = torch.Generator().manual_seed(37)
-    return torch.empty(count, *toks.shape, model.cfg.dim).uniform_(
+    jitter = torch.empty(count, *toks.shape, model.cfg.dim).uniform_(
         -0.0004, 0.0004, generator=generator
     )
+    if iterations == 1:
+        return jitter, None
+    loop_jitter = torch.empty(
+        count, iterations - 1, *toks.shape, model.cfg.dim
+    ).uniform_(-0.0004, 0.0004, generator=generator)
+    return jitter, loop_jitter
 
 
 def explicit_embedding(model, toks):
@@ -143,9 +163,9 @@ def test_second_token_prediction_cannot_see_its_target():
         changed[:, edited_position] + 7
     ) % model.cfg.vocab_size
     count = 2
-    jitter = jitter_for(model, original, count)
-    original_out = passes(model, original, count, jitter=jitter)
-    changed_out = passes(model, changed, count, jitter=jitter)
+    jitter, _ = jitter_for(model, original, count)
+    original_out = columns(passes(model, original, count, jitter=jitter))
+    changed_out = columns(passes(model, changed, count, jitter=jitter))
 
     for before, after in zip(original_out, changed_out, strict=True):
         original_hidden = model.forward_mtp_fused(before.fused_input).hidden
@@ -188,17 +208,25 @@ def test_the_padded_auxiliary_row_leaves_the_supervised_rows_unchanged():
     """Appending the unsupervised last row cannot move any earlier row."""
     model = tiny()
     toks = tokens(length=6)
-    out = passes(model, toks, 1)[0]
+    out = passes(model, toks, 1)[0][0]
     full = model.forward_mtp(out.payload, toks[:, 1:]).hidden
     cropped = model.forward_mtp(out.payload[:, :-1], toks[:, 1:-1]).hidden
     torch.testing.assert_close(full[:, :-1], cropped, atol=2e-6, rtol=1e-5)
 
 
 @pytest.mark.parametrize("condition, count", [("f", 1), ("l", 1), ("fl", 2)])
-def test_mtp_trains_shared_fusion_and_payload_on_every_pass(condition, count):
+def test_mtp_trains_shared_fusion_and_payload_on_every_column(condition, count):
     model = tiny(condition)
     toks = tokens(length=5)
-    outs = passes(model, toks, count, jitter=jitter_for(model, toks, count))
+    iterations = 2 if model.cfg.loop else 1
+    jitter, loop_jitter = jitter_for(model, toks, count, iterations)
+    outs = columns(
+        passes(
+            model, toks, count, iterations=iterations, jitter=jitter,
+            loop_jitter=loop_jitter,
+        )
+    )
+    assert len(outs) == count * iterations
     for out in outs:
         assert out.payload is not None
         auxiliary = model.forward_mtp_fused(out.fused_input)
@@ -255,42 +283,70 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         with torch.no_grad():
             candidate.blank_payload.copy_(torch.linspace(-0.02, 0.02, candidate.cfg.dim))
     toks = tokens(length=6)
-    jitter = jitter_for(model, toks, count)
+    iterations = 2
+    jitter, loop_jitter = jitter_for(model, toks, count, iterations)
     prefixes = torch.tensor([[1, 3], [4, 2]])
-    outs = multipass(model, toks, count, prefix_lens=prefixes, jitter=jitter)
+    outs = multipass(
+        model, toks, count, iterations=iterations, prefix_lens=prefixes,
+        jitter=jitter, loop_jitter=loop_jitter,
+    )
     actual = multipass_loss(model, toks, outs, mtp_weight=coefficient, z_coef=z_coef)
-    assert len(actual.ntp) == count and len(actual.mtp) == count
+    assert [len(pass_outs) for pass_outs in actual.ntp] == [iterations] * count
+    assert [len(pass_outs) for pass_outs in actual.mtp] == [iterations] * count
 
-    # Feedback and MTP deliberately perform their own embedding lookups and
-    # fusion. They share parameters, but have no shared prepared tensor. The
-    # plain seed is the same concat equation with the blank payload.
+    # Feedback, the loop, and MTP deliberately perform their own embedding
+    # lookups and fusion. They share parameters, but have no shared prepared
+    # tensor. The plain seed is the same concat equation with the blank
+    # payload; a column's jitter row is the pass draw at a pass's last column
+    # and the loop draw before it.
     e = explicit_embedding(reference, toks[:, :-1])
     seed = explicit_fusion(reference, reference.blank_payload.expand_as(e), e)
-    reference_outs = [reference.forward_column(seed)]
     length = e.shape[1]
-    for index in range(count - 1):
-        payload = reference_outs[-1].payload + jitter[index, :, :length]
-        # Keep the production order (fuse, then shift): changing the rows
-        # presented to the matrix product adds FP32 roundoff that the deep
-        # recurrence amplifies. The two consumers still recompute separately.
-        unshifted = explicit_fusion(
-            reference, payload, explicit_embedding(reference, toks[:, 1:])
-        )
-        fused = torch.cat((torch.zeros_like(unshifted[:, :1]), unshifted[:, :-1]), 1)
-        plain = torch.arange(length)[None, :] < prefixes[index, :, None]
-        reference_outs.append(
-            reference.forward_column(torch.where(plain[..., None], seed, fused))
-        )
+
+    def draw(index, column):
+        source = jitter[index] if column + 1 == iterations else loop_jitter[index, column]
+        return source[:, :length]
+
+    reference_outs = []
+    x = seed
+    for index in range(count):
+        pass_outs = []
+        for column in range(iterations):
+            pass_outs.append(reference.forward_column(x))
+            payload = pass_outs[-1].payload + draw(index, column)
+            if column + 1 < iterations:
+                # The loop re-enters with the position's own raw embedding.
+                x = explicit_fusion(reference, payload, e)
+        reference_outs.append(pass_outs)
+        if index + 1 < count:
+            # Keep the production order (fuse, then shift): changing the rows
+            # presented to the matrix product adds FP32 roundoff that the deep
+            # recurrence amplifies. The two consumers still recompute separately.
+            unshifted = explicit_fusion(
+                reference, payload, explicit_embedding(reference, toks[:, 1:])
+            )
+            fused = torch.cat((torch.zeros_like(unshifted[:, :1]), unshifted[:, :-1]), 1)
+            plain = torch.arange(length)[None, :] < prefixes[index, :, None]
+            x = torch.where(plain[..., None], seed, fused)
 
     ntp, mtp, ntp_z, mtp_z = [], [], [], []
     expert_aux, expert_counts = [], []
-    for index, (out, expected_out) in enumerate(zip(outs, reference_outs, strict=True)):
+    pairs = [
+        (index, column, out, expected_out)
+        for index, (pass_outs, expected_pass) in enumerate(
+            zip(outs, reference_outs, strict=True)
+        )
+        for column, (out, expected_out) in enumerate(
+            zip(pass_outs, expected_pass, strict=True)
+        )
+    ]
+    for index, column, out, expected_out in pairs:
         torch.testing.assert_close(out.h_top, expected_out.h_top)
         torch.testing.assert_close(out.payload, expected_out.payload)
         ce, z = explicit_head_losses(reference, expected_out.h_top, toks[:, 1:])
         fused = explicit_fusion(
             reference,
-            expected_out.payload + jitter[index, :, :length],
+            expected_out.payload + draw(index, column),
             explicit_embedding(reference, toks[:, 1:]),
         )
         torch.testing.assert_close(out.fused_input, fused)
@@ -298,7 +354,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
             fused, None, None, None, True
         )
         second_ce, second_z = explicit_mtp_losses(reference, hidden, toks)
-        invocations = reference.cfg.executed_layers(expected_out.iterations)
+        invocations = reference.cfg.layers
         expert_aux.append(
             (expected_out.expert_aux_loss * invocations + aux)
             / (invocations + 1)
@@ -317,8 +373,10 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         ntp_z.append(z)
         mtp.append(second_ce)
         mtp_z.append(second_z)
-        torch.testing.assert_close(actual.ntp[index], ce)
-        torch.testing.assert_close(actual.mtp[index], second_ce)
+        torch.testing.assert_close(actual.ntp[index][column], ce)
+        torch.testing.assert_close(actual.mtp[index][column], second_ce)
+    # The first column at full weight plus the mean over every other column,
+    # for both heads and their z-losses.
     expected = (
         feedback_sum(ntp)
         + z_coef * feedback_sum(ntp_z)
@@ -340,7 +398,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         assert (parameter.grad is None) == (expected_parameter.grad is None), name
         if parameter.grad is not None:
             # Reusing the lookup and fusion changes FP32 gradient summation
-            # order through the repeated feedback and core iterations. The
+            # order through the repeated feedback passes and looped columns. The
             # small raw seeds amplify that drift in early PKDA decay gradients
             # even with identical forward states. Bound aggregate drift and
             # individual coordinates relative to the tensor's RMS.
@@ -350,12 +408,17 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
             assert error.abs().max() < 2e-6 + 2e-4 * scale, name
 
 
-def test_training_reuses_one_lookup_and_one_scaled_payload_and_fusion_per_pass(monkeypatch):
-    """One raw lookup serves every pass; each pass writes one scaled payload
-    and fuses it once; pass 1 adds the one blank-payload fusion of its seed."""
+@pytest.mark.parametrize("condition, iterations", [("f", 1), ("fl", 2)])
+def test_training_reuses_one_lookup_and_one_scaled_payload_per_column(
+    monkeypatch, condition, iterations
+):
+    """One raw lookup serves every column; each column writes one scaled
+    payload and fuses it once for MTP, plus once more to re-enter the loop
+    when another column follows; pass 1 adds the one blank-payload fusion of
+    its seed."""
     import delta_feedback_experiment.model as implementation
 
-    model = tiny()
+    model = tiny(condition)
     toks, count = tokens(length=5), 3
     calls = {"embedding": 0, "payload_norm": 0, "fusion": 0}
     auxiliary_inputs = []
@@ -382,21 +445,28 @@ def test_training_reuses_one_lookup_and_one_scaled_payload_and_fusion_per_pass(m
         lambda module, args: auxiliary_inputs.append(args[0])
     )
     try:
-        outs = passes(model, toks, count, jitter=jitter_for(model, toks, count))
+        jitter, loop_jitter = jitter_for(model, toks, count, iterations)
+        outs = passes(
+            model, toks, count, iterations=iterations, jitter=jitter,
+            loop_jitter=loop_jitter,
+        )
         multipass_loss(model, toks, outs)
     finally:
         embedding_hook.remove()
         payload_norm_hook.remove()
         mtp_hook.remove()
+    executed = count * iterations
     assert calls == {
-        "embedding": 1, "payload_norm": count, "fusion": count + 1
+        "embedding": 1,
+        "payload_norm": executed,
+        "fusion": 1 + executed + count * (iterations - 1),
     }
     assert all(
         payload is out.payload
-        for payload, out in zip(written_payloads, outs, strict=True)
+        for payload, out in zip(written_payloads, columns(outs), strict=True)
     )
-    assert len(auxiliary_inputs) == count
+    assert len(auxiliary_inputs) == executed
     assert all(
         auxiliary is out.fused_input
-        for auxiliary, out in zip(auxiliary_inputs, outs, strict=True)
+        for auxiliary, out in zip(auxiliary_inputs, columns(outs), strict=True)
     )

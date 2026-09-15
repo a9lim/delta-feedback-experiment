@@ -62,16 +62,22 @@ class DeltaScorer:
         ids = ids.to(self.device)
         with analysis.autocast(self.device):
             e = model.embed_tokens(ids)
-            out = model.forward_column(model.plain_seed(e), need_payload=self.passes > 0)
+            # Under l every pass runs the evaluation column count and scores
+            # its last column.
+            out = model.forward_iterations(
+                model.plain_seed(e), e, need_payload=self.passes > 0
+            )[-1]
             if self.mode == "soft":
                 # Plain context, feedback along the scored continuation only.
                 prefix = torch.tensor([start for start, _ in spans], device=self.device)
             else:
                 prefix = 1
             for i in range(self.passes):
-                out = model.forward_column(
-                    analysis.fused_inputs(model, e, out.payload, prefix), need_payload=i < self.passes - 1
-                )
+                out = model.forward_iterations(
+                    analysis.fused_inputs(model, e, out.payload, prefix),
+                    e,
+                    need_payload=i < self.passes - 1,
+                )[-1]
             weight = model.embed_tokens.weight
             head = lambda h: F.linear(model.readout_input(h), weight.to(h.dtype))
             return downstream.span_scores(out.h_top, ids, spans, head)

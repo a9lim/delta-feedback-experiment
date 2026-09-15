@@ -10,12 +10,13 @@ General capture and readout tooling belongs to the sibling
 |---|---|---|
 | Token position | PKDA matrix/diagonal/convolution state and GQA prefix K/V | All |
 | Latent feedback | Previous column's payload is fused with the next token's embedding | `f`, `fl` |
-| Core depth | Tied middle cells repeatedly update the column | `l`, `fl` |
+| Looped depth | The whole column re-runs from its own payload | `l`, `fl` |
 
 A Jacobi pass recomputes mixer state from zero and consumes the prior pass's
 shifted payload. Sequential feedback decode advances mixer caches and carries
-the previous token's payload. Core iterations have separate mixer-cache
-tracks. Label token, pass, and depth coordinates when comparing states.
+the previous token's payload. Looped columns have separate mixer-cache
+tracks at every layer. Label token, pass, and column coordinates when
+comparing states.
 
 `embed_tokens(tokens)` returns raw token features in the residual dtype;
 they enter the column only through the shared fusion. `plain_seed(e)` is the
@@ -33,8 +34,12 @@ source bank and labels, expert balance loss/counts, and optional route/expert
 weights. The sources obey `h_top = seed + sum(completed cell deltas)`.
 `want_weights=True` exposes MHDB source weights separately from sparse routed
 expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
+`forward_iterations` runs every column of one position range and returns
+them in order; `multipass` returns `[pass][column]`.
 Outputs from `multipass` also expose `fused_input`: the shared projected tensor
-supplied to MTP and the following feedback pass. `forward_mtp_fused`
+supplied to MTP and the following feedback pass; a following looped column's
+seed is the same jittered payload fused with the position's own embedding.
+`forward_mtp_fused`
 runs the independent auxiliary block directly on that tensor; `forward_mtp`
 accepts payloads and next-token IDs and computes their fusion with raw token
 embeddings first. The
@@ -46,7 +51,7 @@ auxiliary block's last row has no second token and carries no training weight.
 |---|---|
 | `scripts/route_report.py` | Plain/fused source mass and entropy by site/group, source/null scale, query geometry |
 | `scripts/payload_swap.py` | Trained, top-only, uniform, and forced-source payload enrichment; optional single-group intervention |
-| `scripts/depth_trace.py` | Held-out loss, core updates, and route mass over fixed depths, default `1..5` |
+| `scripts/depth_trace.py` | Held-out loss, top-state updates, and route mass after every column, default `1..3` |
 | `scripts/downstream_eval.py` | Workspace zero-shot tasks in Standard, Soft, or Fused mode |
 | `scripts/training_curves.py` | Main/auxiliary training and validation CE, gradient norm, and throughput from current logs |
 
@@ -55,8 +60,8 @@ snapshots with trainer numerics, including CUDA BF16. Commands are in
 [operations.md](operations.md#inspect-a-checkpoint). JSON records and figures
 under `figures/` can be regenerated from snapshots or logs.
 
-The trainer also records fixed-token payload self-composition and tied-depth
-summaries in `delta watch`. A small update indicates little state movement;
+The trainer also records fixed-token payload self-composition and per-column
+depth summaries in `delta watch`. A small update indicates little state movement;
 loss and interventions are needed to determine why.
 
 ## Interpreting results

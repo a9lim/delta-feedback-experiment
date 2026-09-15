@@ -2,7 +2,7 @@
 
 `--scale screen|bridge|flagship|extension` selects geometry and batch settings.
 Explicit geometry or recipe flags override their preset fields. Conditions are `f`,
-`l`, and `fl`; tied depth adds no parameters. The trainer is single-process.
+`l`, and `fl`; looped depth adds no parameters. The trainer is single-process.
 Preset availability does not establish GPU fit or throughput.
 
 ## Geometry and parameters
@@ -11,10 +11,9 @@ Preset availability does not establish GPU fit or throughput.
 |---|---:|---:|---:|---:|
 | Residual width `D` | 768 | 1,152 | 1,536 | 2,304 |
 | Layers / four-layer cells | 16 / 4 | 16 / 4 | 16 / 4 | 16 / 4 |
-| Prelude / core / coda cells | 1 / 2 / 1 | 1 / 2 / 1 | 1 / 2 / 1 | 1 / 2 / 1 |
-| Core iterations, training mean / maximum (`l`, `fl`) | 2.4 / 5 | 2.4 / 5 | 2.4 / 5 | 2.4 / 5 |
-| Default evaluation / decode core iterations | 3 | 3 | 3 | 3 |
-| Executed trunk layers, training mean / evaluation / maximum | 27.2 / 32 / 48 | 27.2 / 32 / 48 | 27.2 / 32 / 48 | 27.2 / 32 / 48 |
+| Columns per position on rolled steps, mean / maximum (`l`, `fl`) | 2.12 / 3 | 2.12 / 3 | 2.12 / 3 | 2.12 / 3 |
+| Default evaluation / decode columns per position | 2 | 2 | 2 | 2 |
+| Executed trunk layers per pass, rolled mean / evaluation / maximum | 33.9 / 32 / 48 | 33.9 / 32 / 48 | 33.9 / 32 / 48 | 33.9 / 32 / 48 |
 | Trunk and MTP per-expert width `h` | 832 | 832 | 832 | 832 |
 | Shared + selected / routed experts | 1 + 3 / 15 | 1 + 5 / 23 | 1 + 7 / 31 | 1 + 11 / 47 |
 | Active FFN width `H = (k+1)h` | 3,328 | 4,992 | 6,656 | 9,984 |
@@ -135,27 +134,28 @@ the publisher's DCLM-100B subset, preventing paired per-token comparisons.
 
 ## Loop compute and decode state
 
-With `C` unique cells, the core contains `C-2` cells. At depth `r`, a pass
-executes `2+(C-2)r` cells. Every preset has `C=4`, so all scales execute
-`2+2r` cells, or `8+8r` transformer layers. Every scale uses the same fixed
-training distribution:
+With `C` unique cells, a pass of `r` columns executes `Cr` cells. Every
+preset has `C=4`, so a column is 16 layers and a pass `16r`. Every scale
+uses the same recurrence roll, defined in
+[design.md](design.md#the-recurrence-roll); on rolled steps it gives:
 
-| Core iterations `r` | 1 | 2 | 3 | 4 | 5 |
-|---|---:|---:|---:|---:|---:|
-| Probability | 30% | 30% | 20% | 10% | 10% |
+| Step shape (passes x columns) | 3 x 2 | 2 x 3 | 2 x 2 |
+|---|---:|---:|---:|
+| Probability | 12% | 12% | 76% |
+| Columns per position, `f` / `l` / `fl` | 3 / 2 / 6 | 2 / 3 / 6 | 2 / 2 / 4 |
 
-The actual training mean is 2.4 core visits, or 27.2 trunk layers per pass;
-the maximum is five visits, or 48 layers. Evaluation and decode default to
-three visits, or 32 layers. `--loop-iterations` overrides only their fixed
-depth within `1..5`; scale and geometry overrides do not change the training
-distribution. Without `l`, every scale executes its 16 unique layers once
-per pass.
+On rolled steps `f` and `l` each average 2.12 columns per position and `fl`
+4.48; the maximum is six columns, or 96 layers, and `l` alone peaks at three
+columns, or 48 layers. Evaluation and decode default to two columns, or 32
+layers. `--loop-iterations` overrides only their fixed count within `1..3`;
+scale and geometry overrides do not change the roll. Without `l`, every
+scale executes its 16 unique layers once per pass.
 
-Resumes and continuations inherit the saved evaluation depth unless explicitly
-pinned; conflicting overrides are rejected. `--scale` pins geometry and batch
-settings, while core-depth defaults are common to every scale. The fixed
-sampling recipe and evaluation-depth argument are part of the checkpoint
-v40 contract.
+Resumes and continuations inherit the saved evaluation count unless
+explicitly pinned; conflicting overrides are rejected. `--scale` pins
+geometry and batch settings, while the roll and the evaluation-count default
+are common to every scale. The roll's arguments and the evaluation-count
+argument are part of the checkpoint v41 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its
@@ -164,14 +164,14 @@ vocabulary loss. Measured device time includes routing and execution overhead.
 For 4,096 cached positions, BF16 GQA K/V and convolution histories plus FP32
 PKDA matrix/diagonal states cost:
 
-| Scale | One cell | Flat / `r=1` | Default evaluation `r=3` | Maximum `r=5` |
+| Scale | One cell | Flat / `r=1` | Default evaluation `r=2` | Maximum `r=3` |
 |---|---:|---:|---:|---:|
 | Screen | 13.96 MiB | 55.82 MiB | 111.64 MiB | 167.47 MiB |
 | Bridge | 20.93 MiB | 83.73 MiB | 167.47 MiB | 251.20 MiB |
 | Flagship | 27.91 MiB | 111.64 MiB | 223.29 MiB | 334.93 MiB |
 | Extension | 41.87 MiB | 167.47 MiB | 334.93 MiB | 502.40 MiB |
 
-Each core iteration keeps its own mixer cache. These per-sequence state
+Each column keeps its own mixer cache at every layer. These per-sequence state
 counts exclude payload, logits, allocator overhead, and serving metadata.
 Training also holds activations, gradients, optimizer state, and CUDA graph
 pools; decode-state arithmetic is not a training-memory estimate.

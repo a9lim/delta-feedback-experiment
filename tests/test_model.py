@@ -9,6 +9,7 @@ from delta_feedback_experiment.cuda_kernels import MAX_ROUTE_TILES, _route_launc
 from delta_feedback_experiment.model import (
     DeltaModel,
     KVCache,
+    combine_column_losses,
     condition_config,
     multipass,
     multipass_loss,
@@ -35,8 +36,7 @@ TINY = {
 
 def tiny(condition="f", **overrides):
     torch.manual_seed(7)
-    geometry = TINY | ({"layers": 16} if "l" in condition else {}) | overrides
-    return DeltaModel(condition_config(condition, **geometry)).eval()
+    return DeltaModel(condition_config(condition, **(TINY | overrides))).eval()
 
 
 def tokens():
@@ -44,15 +44,17 @@ def tokens():
 
 
 def test_multipass_seed_has_standard_strides():
-    """Pass 1 and the feedback passes must reach the compiled blocks through
-    one stride pattern, or Dynamo compiles pass 1 its own copy of every block
-    and the plain prefix of a later pass stops being bitwise pass 1."""
-    model = tiny()
+    """Pass 1, the feedback passes, and the looped columns must reach the
+    compiled blocks through one stride pattern, or Dynamo compiles pass 1 its
+    own copy of every block and the plain prefix of a later pass stops being
+    bitwise pass 1."""
+    model = tiny("fl")
     outs = multipass(model, tokens(), 2, prefix_lens=torch.tensor([[2]]))
-    seed = outs[0].sources[0]
+    seed = outs[0][0].sources[0]
     _, length, dim = seed.shape
     assert seed.stride() == (length * dim, dim, 1)
-    assert outs[1].sources[0].stride() == seed.stride()
+    assert outs[0][1].sources[0].stride() == seed.stride()
+    assert outs[1][0].sources[0].stride() == seed.stride()
 
 
 def test_plain_and_standard_inputs_fuse_raw_embeddings_with_the_blank():
@@ -71,20 +73,20 @@ def test_plain_and_standard_inputs_fuse_raw_embeddings_with_the_blank():
         model.fuse_proj.weight,
     )
     outs = multipass(model, toks, 2, prefix_lens=torch.tensor([[2]]))
-    torch.testing.assert_close(outs[0].sources[0], seeds[:, :-1])
-    torch.testing.assert_close(outs[1].sources[0][:, :2], seeds[:, :2])
+    torch.testing.assert_close(outs[0][0].sources[0], seeds[:, :-1])
+    torch.testing.assert_close(outs[1][0].sources[0][:, :2], seeds[:, :2])
     cache = KVCache(model.cfg, batch=1, device="cpu", dtype=torch.float32)
     standard = model.step(toks[:, :1], None, cache)
     torch.testing.assert_close(standard.sources[0], seeds[:, :1])
 
     # The plain input path contributes directly to the shared embedding table.
     gradient = torch.autograd.grad(
-        outs[0].h_top.square().mean(), model.embed_tokens.weight
+        outs[0][0].h_top.square().mean(), model.embed_tokens.weight
     )[0]
     assert torch.isfinite(gradient).all()
     assert gradient[toks[:, :-1].unique()].abs().sum() > 0
     # The classifier independently reads the same raw table.
-    hidden = outs[0].h_top.detach()
+    hidden = outs[0][0].h_top.detach()
     expected_logits = F.linear(model.readout_input(hidden), model.embed_tokens.weight)
     torch.testing.assert_close(model.logits(hidden), expected_logits, atol=0, rtol=0)
     with torch.no_grad():
@@ -174,9 +176,6 @@ def test_routing_matches_normalized_math_and_telescopes():
     torch.testing.assert_close(
         out.h_top, out.sources[0] + torch.stack(out.sources[1:]).sum(0)
     )
-    torch.testing.assert_close(
-        out.core_state - out.core_entry, out.sources[2] + out.sources[3]
-    )
 
 
 def test_routing_sub_tiles_cover_the_head_width():
@@ -211,17 +210,20 @@ def test_feedback_and_loop_are_token_causal():
     before = multipass(model, original, 2, prefix_lens=prefix)
     hook.remove()
     after = multipass(model, edited, 2, prefix_lens=prefix)
-    for left, right in zip(before, after, strict=True):
+    assert [len(columns) for columns in before] == [2, 2]
+    flat_before = [out for columns in before for out in columns]
+    flat_after = [out for columns in after for out in columns]
+    for left, right in zip(flat_before, flat_after, strict=True):
         torch.testing.assert_close(
             left.h_top[:, :3], right.h_top[:, :3], atol=5e-5, rtol=1e-5
         )
         assert not torch.allclose(left.h_top[:, 3:], right.h_top[:, 3:])
     # Sparse expert batches can round FP32 GEMMs differently after the edit;
     # the exact zero derivative also checks that no future dependency exists.
-    before[-1].h_top[:, :3].square().sum().backward()
+    before[-1][-1].h_top[:, :3].square().sum().backward()
     assert torch.count_nonzero(embeddings[0].grad[:, 3:]) == 0
     plain = model.forward_column(model.plain_seed(model.embed_tokens(original[:, :-1]))).h_top
-    torch.testing.assert_close(before[0].h_top, plain)
+    torch.testing.assert_close(before[0][0].h_top, plain)
 
 
 def test_blank_payload_seeds_every_plain_position():
@@ -238,11 +240,11 @@ def test_blank_payload_seeds_every_plain_position():
     torch.testing.assert_close(seed, model.fuse(blank, e), atol=0, rtol=0)
     assert torch.equal(analysis.fused_inputs(model, e, blank, 1), seed)
     outs = multipass(model, toks, 2, prefix_lens=torch.ones(1, 1, dtype=torch.long))
-    assert torch.equal(outs[0].sources[0], seed)
-    torch.testing.assert_close(outs[0].h_top, model.forward_column(seed).h_top)
+    assert torch.equal(outs[0][0].sources[0], seed)
+    torch.testing.assert_close(outs[0][0].h_top, model.forward_column(seed).h_top)
     # Position 0 of the feedback pass is plain: the same blank-fused seed.
-    assert torch.equal(outs[1].sources[0][:, :1], seed[:, :1])
-    assert not torch.equal(outs[1].sources[0][:, 1:], seed[:, 1:])
+    assert torch.equal(outs[1][0].sources[0][:, :1], seed[:, :1])
+    assert not torch.equal(outs[1][0].sources[0][:, 1:], seed[:, 1:])
     # A plain vector parameter: zero at construction, NAdam-owned, and
     # trained by every plain position.
     fresh = tiny()
@@ -252,6 +254,57 @@ def test_blank_payload_seeds_every_plain_position():
     gradient = fresh.blank_payload.grad
     assert gradient is not None and torch.isfinite(gradient).all()
     assert gradient.abs().sum() > 0
+
+
+def test_looped_columns_reenter_through_the_shared_fusion():
+    """Under ``l`` a pass's later columns are seeded by the shared fusion of
+    the preceding column's jittered payload with the position's own raw
+    embedding; every column is read out; a column never depends on the
+    columns after it; and the first column is the single-column model."""
+    model = tiny("fl")
+    toks = tokens()
+    e = model.embed_tokens(toks)
+    length = toks.shape[1] - 1
+    generator = torch.Generator().manual_seed(5)
+    jitter = torch.empty(1, *toks.shape, model.cfg.dim).uniform_(
+        -4e-4, 4e-4, generator=generator
+    )
+    loop_jitter = torch.empty(1, 1, *toks.shape, model.cfg.dim).uniform_(
+        -4e-4, 4e-4, generator=generator
+    )
+    outs = multipass(
+        model, toks, 1, iterations=2, jitter=jitter, loop_jitter=loop_jitter
+    )
+    assert [len(columns) for columns in outs] == [2]
+    first, second = outs[0]
+    torch.testing.assert_close(
+        first.h_top, model.forward_column(model.plain_seed(e[:, :-1])).h_top
+    )
+    reentry = model.fuse(first.payload + loop_jitter[0, 0][:, :length], e[:, :-1])
+    torch.testing.assert_close(second.sources[0], reentry)
+    torch.testing.assert_close(second.h_top, model.forward_column(reentry).h_top)
+    # One jitter draw per column serves both consumers of its payload: the
+    # MTP fusion with the next tokens and the loop re-entry with its own.
+    torch.testing.assert_close(
+        first.fused_input,
+        model.fuse(first.payload + loop_jitter[0, 0][:, :length], e[:, 1:]),
+    )
+    torch.testing.assert_close(
+        second.fused_input, model.fuse(second.payload + jitter[0][:, :length], e[:, 1:])
+    )
+    single = multipass(model, toks, 1, iterations=1, jitter=jitter)
+    torch.testing.assert_close(single[0][0].h_top, first.h_top, atol=0, rtol=0)
+    # The loss reads every column: the first at full weight, the rest as a mean.
+    result = multipass_loss(model, toks, outs)
+    assert [len(columns) for columns in result.ntp] == [2]
+    assert [len(columns) for columns in result.mtp] == [2]
+    one, two, four = (torch.tensor(value) for value in (1.0, 2.0, 4.0))
+    assert combine_column_losses([[one, two], [four]]).item() == 1.0 + 3.0
+    assert combine_column_losses([[one]]).item() == 1.0
+    with pytest.raises(ValueError, match="loop jitter"):
+        multipass(model, toks, 1, iterations=2, jitter=jitter)
+    with pytest.raises(ValueError, match="loop jitter"):
+        multipass(model, toks, 1, iterations=1, jitter=jitter, loop_jitter=loop_jitter)
 
 
 def test_loop_once_pairs_with_flat_values_and_gradients():
@@ -299,14 +352,11 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
         torch.testing.assert_close(result.expert_counts, logical_counts, atol=0, rtol=0)
         for bank, before in zip(model.expert_banks, biases, strict=True):
             torch.testing.assert_close(bank.expert_bias, before, atol=0, rtol=0)
-        trunk_count = 2 * (tokens().shape[1] - 1) * 2
-        auxiliary_count = 2 * (tokens().shape[1] - 1) * 2
-        assert logical_counts.sum(-1).tolist() == (
-            [trunk_count] * 4
-            + [2 * trunk_count] * 8
-            + [trunk_count] * 4
-            + [auxiliary_count]
-        )
+        # Two passes of two columns: every trunk bank and the auxiliary bank
+        # dispatch once per column.
+        columns = 2 * model.cfg.loop_iterations
+        count = columns * (tokens().shape[1] - 1) * 2
+        assert logical_counts.sum(-1).tolist() == [count] * (model.cfg.layers + 1)
         for name in (
             "fuse_proj.weight",
             "payload_norm.weight",
@@ -334,25 +384,30 @@ def test_checkpointing_preserves_feedback_loop_and_auxiliary_gradients():
 
 
 @torch.no_grad()
-def test_cached_decode_matches_full_recomputation():
-    model = tiny("fl")
+@pytest.mark.parametrize("condition", ["fl", "l"])
+def test_cached_decode_matches_full_recomputation(condition):
+    model = tiny(condition)
     separate_expert_selection(model)
     toks = tokens()
     embedded = model.embed_tokens(toks)
     seeds = model.plain_seed(embedded)
     cache = KVCache(model.cfg, batch=1, device="cpu", dtype=torch.float32)
-    prefill = model.forward_column(seeds[:, :3], cache=cache)
+    prefill = model.forward_iterations(seeds[:, :3], embedded[:, :3], cache=cache)[-1]
+    assert cache.pos == 3
     payload = prefill.payload[:, -1:] if model.cfg.feedback else None
     reference_rows = seeds[:, :3]
     for position in range(3, toks.shape[1]):
         out = model.step(toks[:, position : position + 1], payload, cache)
+        assert cache.pos == position + 1
         new = seeds[:, position : position + 1]
         if model.cfg.feedback:
-            reference_payload = model.forward_column(reference_rows).payload[:, -1:]
+            reference_payload = model.forward_iterations(
+                reference_rows, embedded[:, :position]
+            )[-1].payload[:, -1:]
             new = model.fuse(reference_payload, embedded[:, position : position + 1])
         reference_rows = torch.cat([reference_rows, new], dim=1)
-        reference = model.forward_column(reference_rows)
-        # The two-cell core compounds full-row versus single-row projection
+        reference = model.forward_iterations(reference_rows, embedded[:, : position + 1])[-1]
+        # Two looped columns compound full-row versus single-row projection
         # rounding. Bound both aggregate drift and spikes against state scale,
         # including coordinates where the reference happens to cross zero.
         expected = reference.h_top[:, -1:]
@@ -364,8 +419,10 @@ def test_cached_decode_matches_full_recomputation():
         assert relative_l2 < 1e-4, relative_l2.item()
         assert relative_peak < 2e-4, relative_peak.item()
         payload = out.payload[:, -1:] if model.cfg.feedback else None
-    assert cache.k.shape[0] == 6  # prelude + two cells * two iterations + coda
-    assert len(cache.pkda_states) == 18
+    # Every layer owns one track per column: one GQA layer and three PKDA
+    # layers at two columns.
+    assert cache.k.shape[0] == 2
+    assert len(cache.pkda_states) == 6
 
 
 def test_partial_checkpointing_counts_blocks_and_preserves_gradients():
@@ -398,5 +455,6 @@ def test_partial_checkpointing_counts_blocks_and_preserves_gradients():
         everything, tokens(), 2, prefix_lens=torch.ones(1, 1, dtype=torch.long)
     )
     multipass_loss(everything, tokens(), outs)
-    executed = everything.cfg.executed_pkda_layers(everything.cfg.loop_iterations)
-    assert everything.checkpoint_blocks - everything._checkpoint_left == 2 * (executed + 1)
+    columns = 2 * everything.cfg.loop_iterations
+    eligible = columns * (everything.cfg.pkda_layers + 1)
+    assert everything.checkpoint_blocks - everything._checkpoint_left == eligible

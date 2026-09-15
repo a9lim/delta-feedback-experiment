@@ -24,8 +24,9 @@ def cuda_probe() -> None:
         parse_run_args,
     )
 
-    # Three four-layer cells exercise both mixers and a repeated core. Both
-    # mixers keep their production head widths; experts and rows stay tiny.
+    # Three four-layer cells exercise both mixers; the loop repeats the whole
+    # column. Both mixers keep their production head widths; experts and rows
+    # stay tiny.
     args = parse_run_args(
         [
             "probe",
@@ -33,9 +34,9 @@ def cuda_probe() -> None:
             "fl",
             "--steps",
             "2",
-            "--feedback-start",
+            "--recurrence-start",
             "0",
-            "--three-pass",
+            "--three-rate",
             "0",
             "--batch-rows",
             "2",
@@ -144,9 +145,8 @@ def cuda_probe() -> None:
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         tokens = data.rows[:1, :4].cuda()
         cache = KVCache(model.cfg, batch=1, device="cuda", dtype=torch.bfloat16)
-        prefill = model.forward_column(
-            model.plain_seed(model.embed_tokens(tokens[:, :3])), cache=cache
-        )
+        e = model.embed_tokens(tokens[:, :3])
+        prefill = model.forward_iterations(model.plain_seed(e), e, cache=cache)[-1]
         decoded = model.step(tokens[:, 3:], prefill.payload[:, -1:], cache)
         assert cache.pos == 4 and decoded.h_top.shape == (1, 1, args.dim)
         assert torch.isfinite(decoded.h_top).all()

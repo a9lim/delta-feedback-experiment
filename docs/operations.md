@@ -75,7 +75,7 @@ both tags must have no active or queued references and the destination must
 be free. Use `--out-dir` for snapshots outside `runs/`; custom outputs are
 not renamed. Existing figures retain their labels until regenerated.
 
-Resume and continuation accept only [v40 snapshots](design.md#checkpoints-and-queue).
+Resume and continuation accept only [v41 snapshots](design.md#checkpoints-and-queue).
 The queue stores arguments and refreshes the checkout before each job.
 Use `delta train --help` for recipe and runtime overrides.
 
@@ -85,8 +85,10 @@ Use `delta train --help` for recipe and runtime overrides.
 |---|---|
 | `loss` | Full optimized objective |
 | `ntp`, `mtp` | Combined main / auxiliary CE before weights and z-loss |
-| `pass1` | Main first-pass CE; `ntp - pass1` is mean feedback CE on multipass steps |
-| `val`, `val_fused` | Main plain / fused validation CE |
+| `pass1` | Main CE of the first column; `ntp - pass1` is the mean over the other columns on rolled steps |
+| `k`, `r` | The step's passes and columns per pass; `r` appears under `l` |
+| `val`, `val_fused` | Main plain / fused validation CE at the evaluation column count |
+| `val_one` | Main plain validation CE after the first column, under `l` |
 | `val_mtp`, `val_mtp_fused` | Auxiliary plain / fused validation CE |
 | `expert_balance` | Unweighted mean sequence balance loss |
 | `expert_max_violation` | Worst bank's whole-update `max(load)/mean(load)-1` |
@@ -111,7 +113,7 @@ Routing profiles expose null, seed and previous-cell mass, maximum weight with
 its `1/n` reference, head divergence, and learned-null RMS. Expert assignment
 heatmaps show each executed site's share per expert; hovering or focusing a cell
 also reports expert coverage and gate entropy. Bias heatmaps show each parameter
-bank once because core iterations share its parameters. Both diagnostics use up
+bank once because every column shares its parameters. Both diagnostics use up
 to two validation rows: routing uses the fused pass with feedback, while expert
 loads use pass-1 and the teacher-forced MTP block. Both diagnostics disable
 payload jitter. These are sample diagnostics.
@@ -163,18 +165,18 @@ CUDA uses BF16 activations with FP32 parameters, accumulated gradients,
 optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native Flash
 SDPA handles full-row attention and FlexAttention handles cached prefixes.
 CCE reads a BF16 classifier shadow and flushes gradients to the FP32 sink at
-`--head-flush-every` calls and before each optimizer update. A pass makes one
-head call, covering both prediction depths, so the default cadence of 2 holds
-one two-pass microbatch.
+`--head-flush-every` calls and before each optimizer update. A column makes
+one head call, covering both prediction depths, so the default cadence of 2
+holds one two-column microbatch.
 
 Training compiles blocks and captures fixed-address graphs for reachable
-pass/depth pairs. Inductor caches persist at
+pass/column shapes. Inductor caches persist at
 `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
 them. Before capture the trainer measures, from two eager forwards, the
 activation bytes one block invocation retains and the bytes one recomputed
 block releases, and plans each graph against the device memory still free
 once the static footprint exists minus `--checkpoint-margin-gib` (default
-3.5): rows per replay for one-pass graphs, otherwise how many leading PKDA
+3.5): rows per replay for single-column graphs, otherwise how many leading PKDA
 and auxiliary block invocations recompute in backward. The `execution`
 record reports the static footprint, the budget, the bytes per block, and
 the bytes per recomputed block. These measurements also appear in

@@ -70,8 +70,9 @@ def main() -> None:
             with analysis.autocast(device):
                 outs = multipass(model, rows, 2, prefix_lens=prefix)
                 per_pass = multipass_loss(model, rows, outs).ntp
-            sums[0] += per_pass[0].item()
-            sums[1] += per_pass[1].item()
+            # Each pass reads out at its last column, the evaluation depth.
+            sums[0] += per_pass[0][-1].item()
+            sums[1] += per_pass[1][-1].item()
             batches += 1
         return sums[0] / batches, sums[1] / batches
 

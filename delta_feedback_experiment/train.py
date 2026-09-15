@@ -1,8 +1,8 @@
 """One condition's training run under the binding recipe.
 
 The loop is a pure function of (init seed, data seed, step): data rows
-are step-addressed slices of the fixed stream, feedback randomness
-(pass counts, prefix lengths, jitter) derives from keyed generators
+are step-addressed slices of the fixed stream, recurrence randomness
+(the pass and column roll, prefix lengths, jitter) derives from keyed generators
 rather than ambient RNG state, and the WSD schedule is the shared
 :class:`Schedule` addressed by cumulative step.  That is what makes a
 resumed invocation bit-identical to an uninterrupted one and every
@@ -39,12 +39,10 @@ from .model import (
     DEFAULT_LOOP_ITERATIONS,
     EXPERT_BALANCE_COEF,
     EXPERT_BIAS_RATE,
-    LOOP_ITERATION_WEIGHTS,
     LOOP_MAX_ITERATIONS,
-    LOOP_MEAN_ITERATIONS,
     MTP_LOSS_WEIGHT,
     DeltaModel,
-    combine_pass_losses,
+    combine_column_losses,
     condition_config,
     depth_trace,
     iterate_fused,
@@ -62,7 +60,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=40, resumable=frozenset({40}), surface_version=40
+    version=41, resumable=frozenset({41}), surface_version=41
 )
 
 
@@ -158,8 +156,8 @@ EXACT_FIELDS = (
     "steps",
     "warmup_frac",
     "cooldown_frac",
-    "feedback_start",
-    "three_pass",
+    "recurrence_start",
+    "three_rate",
     "loop_iterations",
     "lr_normuonh",
     "lr_nadam",
@@ -233,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="f",
         metavar="{f,l,fl}",
         help=(
-            "feedback (f), tied depth (l), or both (fl); default f: "
+            "feedback (f), looped depth (l), or both (fl); default f: "
             + "; ".join(
                 f"{letter} = {change}"
                 for letter, (_, change) in CONDITION_LETTERS.items()
@@ -319,19 +317,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="fraction of total steps used for 1-sqrt learning-rate cooldown",
     )
     schedule.add_argument(
-        "--feedback-start",
+        "--recurrence-start",
         type=probability,
         default=0.75,
         help=(
-            "fraction of steps before feedback passes begin; every later step "
-            "draws two or three passes"
+            "fraction of steps before the recurrence roll begins; every earlier "
+            "step is one plain column and every later step rolls two or three "
+            "passes (f) and two or three columns per pass (l)"
         ),
     )
     schedule.add_argument(
-        "--three-pass",
+        "--three-rate",
         type=probability,
         default=0.12,
-        help="P(k = 3) on each feedback-phase step; otherwise k = 2",
+        help=(
+            "on each rolled step, P(three passes at two columns) and, "
+            "separately, P(three columns at two passes); otherwise two and two"
+        ),
     )
 
     recipe = parser.add_argument_group("recipe (state-defining)")
@@ -385,8 +387,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, LOOP_MAX_ITERATIONS + 1),
         default=DEFAULT_LOOP_ITERATIONS,
         help=(
-            "l: fixed evaluation/decode core visits (default: 3 at every scale); "
-            "training always samples 1..5 visits with probabilities 30/30/20/10/10%%"
+            "l: fixed evaluation/decode columns per position (default: 2); "
+            "training draws two or three from the recurrence roll"
         ),
     )
 
@@ -433,7 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--head-flush-every",
         type=int,
         default=2,
-        help="head calls (one per pass, shared by both prediction depths) whose "
+        help="head calls (one per column, shared by both prediction depths) whose "
         "classifier gradient accumulates in BF16 before it is flushed into "
         "the FP32 embedding sink; 1 is the per-call path exactly, and wider "
         "windows trade the head's gradient precision for the flush's bandwidth; "
@@ -463,9 +465,9 @@ def mix(*parts: int) -> int:
     return value
 
 
-def feedback_boundary(args, total: int) -> int:
-    """Last one-pass step; feedback conditions draw k > 1 on every later step."""
-    return round(args.feedback_start * total)
+def recurrence_boundary(args, total: int) -> int:
+    """Last single-column step; every later step rolls passes and columns."""
+    return round(args.recurrence_start * total)
 
 
 def continuation_step(
@@ -474,54 +476,49 @@ def continuation_step(
     """The last step of a finished run that a longer schedule reproduces.
 
     Up to it every step was warmup or heat under both schedules and on the
-    same side of both feedback boundaries, so a run restored from its snapshot
-    there and trained on under the longer schedule is the longer run from that
-    step on, apart from the warmup it inherited. When the feedback boundary
-    moves that is the boundary itself, the last one-pass state; otherwise it
-    is the cooldown boundary.
+    same side of both recurrence boundaries, so a run restored from its
+    snapshot there and trained on under the longer schedule is the longer run
+    from that step on, apart from the warmup it inherited. When the boundary
+    moves that is the boundary itself, the last single-column state;
+    otherwise it is the cooldown boundary.
     """
     fork = min(source_schedule.heat_end, schedule.heat_end)
-    old = feedback_boundary(source, source_schedule.total)
-    new = feedback_boundary(args, schedule.total)
+    old = recurrence_boundary(source, source_schedule.total)
+    new = recurrence_boundary(args, schedule.total)
     if old != new:
         fork = min(fork, old, new)
     return fork
 
 
-def draw_passes(args, step: int, total: int) -> int:
-    """The step's pass count — shared across every condition with ``f``.
+def draw_recurrence(args, step: int, total: int) -> tuple[int, int]:
+    """The step's (passes, columns per pass) roll, before any condition
+    projects it.
 
-    Before the boundary every step is one pass. After it there are no
-    one-pass steps at all: each step draws three passes with probability
-    ``three_pass`` and two passes otherwise, so the fused mode is trained
-    on every update rather than eroded between them.
+    Before the boundary every step is one pass of one column. After it there
+    are no single-column steps at all, so each recurrent mode is trained on
+    every update rather than eroded between them: one keyed uniform draw
+    lands on three passes at two columns with probability ``three_rate``, on
+    three columns at two passes with the same probability, and otherwise on
+    two and two. ``f`` reads the pass count, ``l`` the column count, and
+    ``fl`` both, so the three conditions align step by step, and the pass
+    projection is the feedback draw of a condition without ``l``.
     """
-    if step <= feedback_boundary(args, total):
-        return 1
+    if step <= recurrence_boundary(args, total):
+        return 1, 1
     generator = torch.Generator().manual_seed(mix(args.data_seed, step, 1))
     draw = torch.rand((), generator=generator).item()
-    return 3 if draw < args.three_pass else 2
+    if draw < args.three_rate:
+        return 3, 2
+    if draw < 2 * args.three_rate:
+        return 2, 3
+    return 2, 2
 
 
-def draw_iterations(args, step: int, loop: bool) -> int:
-    """The step's core iteration count under ``l``, shared by every pass and
-    microbatch of the step.
-
-    Every scale draws 1..5 visits with probabilities 30/30/20/10/10 percent,
-    independently of the evaluation/decode depth. Its keyed sub-stream keeps
-    pass, prefix, and jitter draws identical to the condition without ``l``.
-    """
-    if not loop:
-        return 1
-    generator = torch.Generator().manual_seed(mix(args.data_seed, 0x6C6F6F70, step))
-    draw = torch.rand((), generator=generator).item()
-    cumulative = 0
-    total = sum(LOOP_ITERATION_WEIGHTS)
-    for iterations, weight in enumerate(LOOP_ITERATION_WEIGHTS[:-1], start=1):
-        cumulative += weight
-        if draw < cumulative / total:
-            return iterations
-    return LOOP_MAX_ITERATIONS
+def step_shape(args, step: int, total: int, cfg) -> tuple[int, int]:
+    """The (passes, columns per pass) a condition runs at ``step``: the
+    roll's components its letters read, one each for the letters it lacks."""
+    passes, iterations = draw_recurrence(args, step, total)
+    return (passes if cfg.feedback else 1), (iterations if cfg.loop else 1)
 
 
 def micro_draws(
@@ -529,18 +526,24 @@ def micro_draws(
     step: int,
     first_row: int,
     n_passes: int,
+    iterations: int,
     n_rows: int,
     dim: int,
     device,
     *,
     prefix_out: torch.Tensor | None = None,
     jitter_out: torch.Tensor | None = None,
+    loop_jitter_out: torch.Tensor | None = None,
     generator: torch.Generator | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """(prefix_lens [k-1, n], jitter [k, n, seq_len+1, dim]) for one
-    microbatch, keyed by (data seed, step, first global row) — identical
-    across conditions for any run sharing the batch geometry. Jitter is drawn
-    directly in scaled payload units: BASE_NORMAL_INIT_STD * args.jitter."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """(prefix_lens [k-1, n], jitter [k, n, seq_len+1, dim], loop jitter
+    [k, r-1, n, seq_len+1, dim] or None at one column) for one microbatch,
+    keyed by (data seed, step, first global row) — identical across
+    conditions for any run sharing the batch geometry. The prefix and the
+    pass jitter, which perturbs each pass's last column, are drawn first, so
+    a condition with ``l`` shares them with the condition without it; the
+    loop jitter for the earlier columns follows. Jitter is drawn directly in
+    scaled payload units: BASE_NORMAL_INIT_STD * args.jitter."""
     if generator is None:
         generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
     generator.manual_seed(mix(args.data_seed, step, first_row))
@@ -551,18 +554,24 @@ def micro_draws(
     # Plain-prefix lengths in 1..seq_len-1: position 0 is always plain and
     # every row keeps at least one fused position.
     torch.randint(1, args.seq_len, shape, generator=generator, out=prefix_out)
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     jitter_shape = (n_passes, n_rows, columns, dim)
     if jitter_out is None:
-        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
         jitter_out = torch.empty(jitter_shape, dtype=dtype, device=device)
     amplitude = BASE_NORMAL_INIT_STD * args.jitter
     jitter_out.uniform_(-amplitude, amplitude, generator=generator)
-    return prefix_out, jitter_out
+    if iterations == 1:
+        return prefix_out, jitter_out, None
+    loop_shape = (n_passes, iterations - 1, n_rows, columns, dim)
+    if loop_jitter_out is None:
+        loop_jitter_out = torch.empty(loop_shape, dtype=dtype, device=device)
+    loop_jitter_out.uniform_(-amplitude, amplitude, generator=generator)
+    return prefix_out, jitter_out, loop_jitter_out
 
 
 @dataclass(frozen=True)
 class GraphSpec:
-    """One captured training graph: its pass count and core iteration count."""
+    """One captured training graph: its pass count and columns per pass."""
 
     n_passes: int
     iterations: int = 1
@@ -585,6 +594,7 @@ class CapturedMicro:
     rows: torch.Tensor
     prefix: torch.Tensor
     jitter: torch.Tensor
+    loop_jitter: torch.Tensor | None
     z_coef: torch.Tensor
     loss_sum: torch.Tensor
     pass1_sum: torch.Tensor
@@ -605,7 +615,7 @@ The optimizer step and periodic monitors reuse the graphs' pool
 (``pool_scope``)."""
 
 ROW_MULTIPLES = (2, 1)
-"""Rows-per-replay multiples of ``micro_rows`` a one-pass graph may use. Two
+"""Rows-per-replay multiples of ``micro_rows`` a single-column graph may use. Two
 rows per replay run 4% faster per row than one on the 4090; four run 1%
 slower per row than two, so the budget is not spent on them."""
 
@@ -613,13 +623,12 @@ slower per row than two, so the budget is not spent on them."""
 def block_invocations(cfg, spec: GraphSpec) -> tuple[int, int]:
     """(all, checkpoint-eligible) block invocations of one logical forward.
 
-    Every pass runs its executed trunk layers plus the auxiliary block. The
-    PKDA blocks and the auxiliary block can recompute in backward; the
+    Every column runs the trunk layers plus the auxiliary block. The PKDA
+    blocks and the auxiliary block can recompute in backward; the
     global-attention blocks stay retained.
     """
-    executed = cfg.executed_layers(spec.iterations)
-    eligible = cfg.executed_pkda_layers(spec.iterations)
-    return spec.n_passes * (executed + 1), spec.n_passes * (eligible + 1)
+    columns = spec.n_passes * spec.iterations
+    return columns * (cfg.layers + 1), columns * (cfg.pkda_layers + 1)
 
 
 def plan_replay(
@@ -640,18 +649,18 @@ def plan_replay(
     calibrated too, because the eligible blocks retain more than the average
     (the global-attention blocks retain less and are never recomputed).
 
-    A one-pass graph replays the largest row multiple whose raw activations
-    fit; keyed feedback draws address single microbatches, so multi-pass
-    graphs keep ``micro_rows``. When even one microbatch does not fit raw,
-    the first blocks of the logical forward recompute in backward, as many
-    as the shortfall needs.
+    A single-column graph replays the largest row multiple whose raw
+    activations fit; keyed feedback and loop draws that shape trunk inputs
+    address single microbatches, so every other graph keeps ``micro_rows``.
+    When even one microbatch does not fit raw, the first blocks of the
+    logical forward recompute in backward, as many as the shortfall needs.
     """
     blocks, eligible = block_invocations(cfg, spec)
 
     def needed(rows: int) -> float:
         return (rows / args.micro_rows) * blocks * bytes_per_block
 
-    multiples = ROW_MULTIPLES if spec.n_passes == 1 else (1,)
+    multiples = ROW_MULTIPLES if spec == GraphSpec(1, 1) else (1,)
     for multiple in multiples:
         rows = multiple * args.micro_rows
         if args.batch_rows % rows:
@@ -877,15 +886,10 @@ class CudaGraphTrainer:
             current.wait_stream(stream)
 
     def _reachable_specs(self, schedule: Schedule) -> list[GraphSpec]:
-        specs = set()
-        for step in range(1, schedule.total + 1):
-            n_passes = (
-                draw_passes(self.args, step, schedule.total)
-                if self.model.cfg.feedback
-                else 1
-            )
-            iterations = draw_iterations(self.args, step, self.model.cfg.loop)
-            specs.add(GraphSpec(n_passes, iterations))
+        specs = {
+            GraphSpec(*step_shape(self.args, step, schedule.total, self.model.cfg))
+            for step in range(1, schedule.total + 1)
+        }
         return sorted(specs, key=lambda spec: (spec.n_passes, spec.iterations))
 
     def _plan(
@@ -906,7 +910,7 @@ class CudaGraphTrainer:
 
     def _inputs(
         self, spec: GraphSpec, rows: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         tokens = torch.zeros(
             rows, self.args.seq_len + 1, dtype=torch.long, device=self.device
         )
@@ -921,12 +925,23 @@ class CudaGraphTrainer:
             dtype=torch.bfloat16,
             device=self.device,
         )
-        return tokens, prefix, jitter
+        loop_jitter = None
+        if spec.iterations > 1:
+            loop_jitter = torch.zeros(
+                spec.n_passes,
+                spec.iterations - 1,
+                rows,
+                self.args.seq_len + 1,
+                self.args.dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+        return tokens, prefix, jitter, loop_jitter
 
     def _retained(self, spec: GraphSpec, checkpoint_blocks: int) -> int:
         """Bytes one eager forward of ``spec`` at ``micro_rows`` rows leaves
         allocated once it returns: exactly what its backward would consume."""
-        tokens, prefix, jitter = self._inputs(spec, self.args.micro_rows)
+        tokens, prefix, jitter, loop_jitter = self._inputs(spec, self.args.micro_rows)
         self.model.checkpoint_blocks = checkpoint_blocks
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
@@ -935,9 +950,10 @@ class CudaGraphTrainer:
                 self.model,
                 tokens,
                 spec.n_passes,
+                iterations=spec.iterations,
                 prefix_lens=prefix,
                 jitter=jitter,
-                iterations=spec.iterations,
+                loop_jitter=loop_jitter,
             )
             result = multipass_loss(
                 self.model, tokens, outs, mtp_weight=self.args.mtp_weight
@@ -968,13 +984,14 @@ class CudaGraphTrainer:
         return per_block, released if released > 0 else per_block
 
     def _allocate(self, spec: GraphSpec, plan: ReplayPlan) -> CapturedMicro:
-        tokens, prefix, jitter = self._inputs(spec, plan.rows_per_replay)
+        tokens, prefix, jitter, loop_jitter = self._inputs(spec, plan.rows_per_replay)
         return CapturedMicro(
             spec,
             plan,
             tokens,
             prefix,
             jitter,
+            loop_jitter,
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
@@ -1000,9 +1017,10 @@ class CudaGraphTrainer:
                 self.model,
                 state.rows,
                 state.spec.n_passes,
+                iterations=state.spec.iterations,
                 prefix_lens=state.prefix,
                 jitter=state.jitter,
-                iterations=state.spec.iterations,
+                loop_jitter=state.loop_jitter,
             )
             loss_result = multipass_loss(
                 self.model, state.rows, outs, z_coef=state.z_coef,
@@ -1011,9 +1029,9 @@ class CudaGraphTrainer:
             loss, losses = loss_result.total, loss_result.ntp
         (loss * scale).backward()
         state.loss_sum.add_(loss.detach() * scale)
-        state.pass1_sum.add_(losses[0].detach() * scale)
-        state.ntp_sum.add_(combine_pass_losses(loss_result.ntp).detach() * scale)
-        state.mtp_sum.add_(combine_pass_losses(loss_result.mtp).detach() * scale)
+        state.pass1_sum.add_(losses[0][0].detach() * scale)
+        state.ntp_sum.add_(combine_column_losses(loss_result.ntp).detach() * scale)
+        state.mtp_sum.add_(combine_column_losses(loss_result.mtp).detach() * scale)
         # These are outputs of logical forwards, collected outside the
         # checkpointed blocks. Recomputed backwards cannot count again.
         state.expert_counts.add_(loss_result.expert_counts)
@@ -1133,8 +1151,8 @@ class CudaGraphTrainer:
         return state
 
     def _head_calls(self, state: CapturedMicro) -> int:
-        """Head calls one replay makes: both depths share one call per pass."""
-        return state.spec.n_passes
+        """Head calls one replay makes: both depths share one call per column."""
+        return state.spec.n_passes * state.spec.iterations
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
         state.rows.copy_(rows, non_blocking=rows.is_cuda)
@@ -1143,11 +1161,13 @@ class CudaGraphTrainer:
             step,
             first,
             state.spec.n_passes,
+            state.spec.iterations,
             state.plan.rows_per_replay,
             self.args.dim,
             self.device,
             prefix_out=state.prefix,
             jitter_out=state.jitter,
+            loop_jitter_out=state.loop_jitter,
             generator=self.generator,
         )
         state.graph.replay()
@@ -1210,13 +1230,14 @@ class CapturedEval:
     fused_sum: torch.Tensor
     mtp_sum: torch.Tensor
     mtp_fused_sum: torch.Tensor
+    one_sum: torch.Tensor
     graph: torch.cuda.CUDAGraph | None = None
 
     def reset(self) -> None:
-        self.val_sum.zero_()
-        self.fused_sum.zero_()
-        self.mtp_sum.zero_()
-        self.mtp_fused_sum.zero_()
+        for total in (
+            self.val_sum, self.fused_sum, self.mtp_sum, self.mtp_fused_sum, self.one_sum
+        ):
+            total.zero_()
 
 
 class CudaEvalRunner:
@@ -1247,12 +1268,15 @@ class CudaEvalRunner:
             )
             losses = result.ntp
         rows = state.rows.shape[0]
-        state.val_sum.add_(losses[0].detach() * rows)
+        # Each pass reads out after its last column, at the evaluation depth;
+        # the first pass's first column is the single-column model.
+        state.val_sum.add_(losses[0][-1].detach() * rows)
+        state.one_sum.add_(losses[0][0].detach() * rows)
         if n_passes > 1:
-            state.fused_sum.add_(losses[1].detach() * rows)
-        state.mtp_sum.add_(result.mtp[0].detach() * rows)
+            state.fused_sum.add_(losses[1][-1].detach() * rows)
+        state.mtp_sum.add_(result.mtp[0][-1].detach() * rows)
         if n_passes > 1:
-            state.mtp_fused_sum.add_(result.mtp[1].detach() * rows)
+            state.mtp_fused_sum.add_(result.mtp[1][-1].detach() * rows)
 
     @torch.no_grad()
     def _capture(self, rows: int, pool) -> CapturedEval:
@@ -1268,6 +1292,7 @@ class CudaEvalRunner:
                 if self.model.cfg.feedback
                 else None
             ),
+            torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
             torch.zeros((), dtype=torch.float32, device=self.device),
@@ -1297,6 +1322,7 @@ class CudaEvalRunner:
         total_fused = torch.zeros_like(total_val)
         total_mtp = torch.zeros_like(total_val)
         total_mtp_fused = torch.zeros_like(total_val)
+        total_one = torch.zeros_like(total_val)
         for first in range(0, self.args.eval_rows, self.args.micro_rows):
             rows = min(self.args.micro_rows, self.args.eval_rows - first)
             state = self.states[rows]
@@ -1308,12 +1334,15 @@ class CudaEvalRunner:
                 total_fused.add_(state.fused_sum)
             total_mtp.add_(state.mtp_sum)
             total_mtp_fused.add_(state.mtp_fused_sum)
+            total_one.add_(state.one_sum)
         result = {"val": (total_val / self.args.eval_rows).item()}
         if self.model.cfg.feedback:
             result["val_fused"] = (total_fused / self.args.eval_rows).item()
         result["val_mtp"] = (total_mtp / self.args.eval_rows).item()
         if self.model.cfg.feedback:
             result["val_mtp_fused"] = (total_mtp_fused / self.args.eval_rows).item()
+        if self.model.cfg.loop:
+            result["val_one"] = (total_one / self.args.eval_rows).item()
         self.model.train(was_training)
         return result
 
@@ -1342,7 +1371,8 @@ def evaluate(
     device,
     graph_runner: CudaEvalRunner | None = None,
 ) -> dict[str, float]:
-    """Paired val losses: pass-1 always; one fused pass on feedback conditions."""
+    """Paired val losses at the evaluation depth: pass 1 always, one fused
+    pass on feedback conditions, and the single-column readout under ``l``."""
     if graph_runner is not None:
         return graph_runner.run(data_val)
     model.eval()
@@ -1359,17 +1389,18 @@ def evaluate(
         )
         result = multipass_loss(model, rows, outs, mtp_weight=args.mtp_weight)
         losses = result.ntp
-        sums["val"] = sums.get("val", 0.0) + losses[0].item() * rows.shape[0]
+        count = rows.shape[0]
+        sums["val"] = sums.get("val", 0.0) + losses[0][-1].item() * count
         if n_passes > 1:
-            sums["val_fused"] = (
-                sums.get("val_fused", 0.0) + losses[1].item() * rows.shape[0]
-            )
-        counted += rows.shape[0]
-        sums["val_mtp"] = sums.get("val_mtp", 0.0) + result.mtp[0].item() * rows.shape[0]
+            sums["val_fused"] = sums.get("val_fused", 0.0) + losses[1][-1].item() * count
+        counted += count
+        sums["val_mtp"] = sums.get("val_mtp", 0.0) + result.mtp[0][-1].item() * count
         if n_passes > 1:
             sums["val_mtp_fused"] = (
-                sums.get("val_mtp_fused", 0.0) + result.mtp[1].item() * rows.shape[0]
+                sums.get("val_mtp_fused", 0.0) + result.mtp[1][-1].item() * count
             )
+        if model.cfg.loop:
+            sums["val_one"] = sums.get("val_one", 0.0) + losses[0][0].item() * count
     model.train()
     return {key: value / counted for key, value in sums.items()}
 
@@ -1381,9 +1412,9 @@ def route_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[
     rows = data_val.batch(0, min(2, args.eval_rows), device)
     if model.cfg.feedback:
         prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
-        out = multipass(model, rows, 2, prefix_lens=prefix, want_weights=True)[-1]
+        out = multipass(model, rows, 2, prefix_lens=prefix, want_weights=True)[-1][-1]
     else:
-        out = multipass(model, rows, 1, want_weights=True)[0]
+        out = multipass(model, rows, 1, want_weights=True)[0][-1]
     records = []
     for site, weights in out.route_weights.items():
         w = weights.float()
@@ -1409,9 +1440,8 @@ def route_summary(model: DeltaModel, data_val: TokenData, args, device) -> list[
         if site == "payload":
             router = model.payload_router
         else:
-            # A core site under l is tagged by iteration: ``L4i2.attn``.
             layer_kind, sublayer = site.split(".")
-            block = model.blocks[int(layer_kind[1:].partition("i")[0])]
+            block = model.blocks[int(layer_kind[1:])]
             router = getattr(block, f"{sublayer}_router")
         record["null_rms"] = round(router.null.float().square().mean().sqrt().item(), 4)
         records.append(record)
@@ -1431,11 +1461,11 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
             if device.type == "cuda"
             else contextlib.nullcontext()
         ):
-            outs = multipass(model, rows, 1, want_weights=True)
+            out = multipass(model, rows, 1, want_weights=True)[0][0]
             # The training geometry: every payload row, next tokens 1..T.
-            mtp = model.forward_mtp_fused(outs[0].fused_input, want_weights=True)
+            mtp = model.forward_mtp_fused(out.fused_input, want_weights=True)
         records = []
-        weights_by_site = outs[0].expert_weights | {"mtp.experts": mtp.expert_weights}
+        weights_by_site = out.expert_weights | {"mtp.experts": mtp.expert_weights}
         for site, weights in weights_by_site.items():
             w = weights.float()
             load = (w > 0).float().mean(dim=(0, 1)) / model.cfg.experts_per_token
@@ -1452,7 +1482,7 @@ def expert_summary(model: DeltaModel, data_val: TokenData, args, device) -> list
             )
             bank = (
                 model.mtp.block.mlp if site == "mtp.experts"
-                else model.blocks[int(site.split(".")[0][1:].partition("i")[0])].mlp
+                else model.blocks[int(site.split(".")[0][1:])].mlp
             )
             record.update({
                 f"bias{i}": round(value, 6)
@@ -1604,6 +1634,8 @@ def resolve_run_args(
     args = parser.parse_args(argv)
     if args.seq_len < 2:
         parser.error("two-token prediction requires --seq-len at least 2")
+    if 2 * args.three_rate > 1:
+        parser.error("--three-rate covers two roll outcomes; it must be at most 0.5")
     explicit = checkpoints.explicit_destinations(parser, argv)
     pinned = set(explicit)
     for field, value in SCALES[args.scale].items():
@@ -1854,10 +1886,10 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
         if device.type == "cuda"
         else contextlib.nullcontext()
     )
-    # Persistent snapshots at the cooldown boundary, the feedback boundary
-    # (the last one-pass state), and the end, so cooldown and feedback
+    # Persistent snapshots at the cooldown boundary, the recurrence boundary
+    # (the last single-column state), and the end, so cooldown and recurrence
     # variants can continue from the exact pre-boundary state.
-    protected = {schedule.heat_end, feedback_boundary(args, total), total} - {0}
+    protected = {schedule.heat_end, recurrence_boundary(args, total), total} - {0}
     end_step = total
     if args.max_steps is not None:
         end_step = min(total, start_step + args.max_steps)
@@ -1867,7 +1899,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
         preheat_steps=schedule.preheat_steps,
         heat_steps=schedule.heat_steps,
         cooldown_steps=schedule.cooldown_steps,
-        feedback_boundary=feedback_boundary(args, total),
+        recurrence_boundary=recurrence_boundary(args, total),
         start_step=start_step,
         end_step=end_step,
         total_steps=total,
@@ -1898,10 +1930,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             learning_rates = apply_schedule(optimizers, schedule, step)
             phase = schedule.phase(step)[0]
             z_coef = args.zloss if phase == "cooldown" else 0.0
-            n_passes = 1
-            if model.cfg.feedback:
-                n_passes = draw_passes(args, step, total)
-            iterations = draw_iterations(args, step, model.cfg.loop)
+            n_passes, iterations = step_shape(args, step, total, model.cfg)
 
             micros = args.batch_rows // args.micro_rows
             if graph_runner is not None:
@@ -1931,11 +1960,12 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 for micro in range(micros):
                     first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
                     rows = data_train.batch(first_row, args.micro_rows, device)
-                    prefix, jitter = micro_draws(
+                    prefix, jitter, loop_jitter = micro_draws(
                         args,
                         step,
                         first_row,
                         n_passes,
+                        iterations,
                         rows.shape[0],
                         args.dim,
                         device,
@@ -1945,9 +1975,10 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                             model,
                             rows,
                             n_passes,
+                            iterations=iterations,
                             prefix_lens=prefix,
                             jitter=jitter,
-                            iterations=iterations,
+                            loop_jitter=loop_jitter,
                         )
                         loss_result = multipass_loss(
                             model, rows, outs, z_coef=z_coef, mtp_weight=args.mtp_weight
@@ -1955,9 +1986,9 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                         loss, losses = loss_result.total, loss_result.ntp
                     (loss / micros).backward()
                     step_loss += loss.item() / micros
-                    pass1_loss += losses[0].item() / micros
-                    ntp_loss += combine_pass_losses(loss_result.ntp).item() / micros
-                    mtp_loss += combine_pass_losses(loss_result.mtp).item() / micros
+                    pass1_loss += losses[0][0].item() / micros
+                    ntp_loss += combine_column_losses(loss_result.ntp).item() / micros
+                    mtp_loss += combine_column_losses(loss_result.mtp).item() / micros
                     expert_counts.add_(loss_result.expert_counts)
                     expert_balance += loss_result.expert_aux_loss.item() / micros
 
@@ -1971,10 +2002,10 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     graph_runner.zero_grad()
                 else:
                     model.zero_grad(set_to_none=True)
-            # A pass executes ``executed_layers / cell`` cell-equivalents, so
-            # cell-tokens beside pass-tokens keep matched data apart from
-            # matched compute when the loop makes the column deeper.
-            cells = model.cfg.executed_layers(iterations) / model.cfg.routing_block_size
+            # A pass executes ``iterations`` columns of ``routing_blocks``
+            # cells, so cell-tokens beside pass-tokens keep matched data apart
+            # from matched compute when the loop runs more columns.
+            cells = iterations * model.cfg.routing_blocks
             window_tokens += args.batch_rows * args.seq_len
             window_pass_tokens += n_passes * args.batch_rows * args.seq_len
             window_cell_tokens += cells * n_passes * args.batch_rows * args.seq_len
@@ -1990,8 +2021,8 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             }
             fields["mtp"] = telemetry.format_metric(mtp_loss)
             fields["expert_balance"] = telemetry.format_metric(expert_balance)
-            # Each physical bank has its own target, including the core
-            # banks that execute repeatedly on looped steps.
+            # Each physical bank has its own target; every bank executes once
+            # per column, repeatedly on looped steps.
             loads = expert_counts.float()
             violation = (
                 model.cfg.num_routed_experts
@@ -2078,7 +2109,6 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                             "depth",
                             step=address,
                             r_eval=model.cfg.loop_iterations,
-                            r_train_mean=LOOP_MEAN_ITERATIONS,
                             r_max=LOOP_MAX_ITERATIONS,
                             loss_one=telemetry.format_metric(by_depth[1]["loss"]),
                             loss_eval=telemetry.format_metric(

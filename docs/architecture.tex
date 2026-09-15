@@ -3,10 +3,12 @@
 %   tectonic --outdir figures/architecture docs/architecture.tex
 % Generated outputs remain untracked in figures/.
 %
-% Source contract: model.py::{Block,DeltaModel.forward_column,multipass,
-% _jittered_fused_input,_feedback_entry,KVCache}; pkda.py; moe.py.
-% The outer feedback loop advances token/pass coordinates. It is not a
-% same-token algebraic cycle. Dotted cutaway leaders are not data edges.
+% Source contract: model.py::{Block,DeltaModel.forward_column,
+% DeltaModel.forward_iterations,multipass,_jittered_fused_input,
+% _feedback_entry,KVCache}; pkda.py; moe.py.
+% The outer feedback loop advances token/pass coordinates and the loop
+% re-entry advances the column index at one token. Neither is a same-column
+% algebraic cycle. Dotted cutaway leaders are not data edges.
 \documentclass[tikz,border=10pt]{standalone}
 \usepackage[T1]{fontenc}
 \usepackage{tgheros}
@@ -78,40 +80,31 @@
 \path[use as bounding box] (0,-.85) rectangle (23.75,32.2);
 
 \node[font=\bfseries\fontsize{23}{27}\selectfont] at (11.9,31.5)
-  {Delta: feedback + tied depth};
+  {Delta: feedback + looped depth};
 \node[note,font=\fontsize{10}{13}\selectfont] at (11.9,30.8)
   {Full \texttt{fl} architecture\quad $\cdot$\quad 16 unique trunk layers\quad $\cdot$\quad four cells};
 
 % The main column is the single bottom-to-top spine.
 \draw[draw=line!60,fill=soft,rounded corners=6pt]
   (5.15,11.05) rectangle (11.25,24.18);
-\draw[draw=purpleink!60,fill=purple!24,dashed,rounded corners=5pt,line width=.85pt]
-  (5.3,14.58) rectangle (11.1,20.93);
-\cell{prelude}{12.8}{Prelude cell}
-\cell{coreone}{16.1}{Core cell R$_1$}
-\cell{coretwo}{19.4}{Core cell R$_2$}
-\cell{coda}{22.7}{Coda cell}
+\cell{cellone}{12.8}{Cell 1}
+\cell{celltwo}{16.1}{Cell 2}
+\cell{cellthree}{19.4}{Cell 3}
+\cell{cellfour}{22.7}{Cell 4}
 
 \node[font=\smalltext] (tokens) at (8.2,3.7) {Input token $x_t$};
 \node[box,tokenop,text width=4.6cm] (embedding) at (8.2,5.05)
   {\textbf{Token embedding $E$}\\$e_t=E(x_t)$};
 \node[box,fusionop,text width=4.6cm] (seed) at (8.2,9.7)
-  {\textbf{Column seed $s_t$}\\fusion of $e_t$ with $p_{t-1}$, or with the blank $p_0$};
+  {\textbf{Column seed $s_t$}\\fusion of $e_t$ with $p_{t-1}$ (f), with $p_t^{(i)}$ (l), or with the blank $p_0$};
 \draw[flow] (tokens) -- (embedding);
 \draw[flow] (embedding) -- (seed);
 \node[note,anchor=east,text width=2.8cm] at (7.95,8.02)
   {Blank payload $p_0$:\\pass 1 / prefix\\standard decode};
-\draw[flow] (seed) -- (prelude);
-\draw[flow] (prelude) -- (coreone);
-\draw[flow] (coreone) -- (coretwo);
-\draw[flow] (coretwo) -- (coda);
-
-% An explicit internal-depth loop, distinct from token/pass feedback.
-\draw[feedback] (8.2,20.96) -- (11.65,20.96) -- (11.65,14.4)
-  -- (8.2,14.4) -- (coreone.south);
-\fill[purpleink] (8.2,20.96) circle (1.4pt);
-\node[rotate=90,text=purpleink,font=\smalltext,fill=white,inner sep=3pt]
-  at (12.02,17.85) {$r$ core iterations; same weights};
+\draw[flow] (seed) -- (cellone);
+\draw[flow] (cellone) -- (celltwo);
+\draw[flow] (celltwo) -- (cellthree);
+\draw[flow] (cellthree) -- (cellfour);
 
 \coordinate (top) at (8.2,24.72);
 \node[box,normop,text width=4.6cm] (finalnorm) at (8.2,26.15)
@@ -120,7 +113,7 @@
   {\textbf{Tied classifier $E^\top$}};
 \node[align=center,font=\bfseries\fontsize{11}{14}\selectfont]
   (mainoutput) at (8.2,29.15) {Next-token logits\\\normalfont\smalltext predict $x_{t+1}$};
-\draw[flow] (coda) -- (finalnorm);
+\draw[flow] (cellfour) -- (finalnorm);
 \fill[ink] (top) circle (1.6pt);
 \node[anchor=west,edgeword] at (8.38,24.72) {$h_{\mathrm{top}}$};
 \draw[flow] (finalnorm) -- node[right,edgeword] {$\times\,1536/D$} (classifier);
@@ -130,14 +123,14 @@
 % causally available contributions. Every MHDB site owns its own null.
 \draw[bankwire,rounded corners=3pt] (4.25,9.7) -- (4.25,30.08)
   -- (23.3,30.08) -- (23.3,17.22);
-\foreach \name/\y/\value in {seed/9.7/s_t,prelude/12.8/\Delta_{\mathrm P},coreone/16.1/\Delta_{\mathrm R_1},coretwo/19.4/\Delta_{\mathrm R_2},coda/22.7/\Delta_{\mathrm C}} {
+\foreach \name/\y/\value in {seed/9.7/s_t,cellone/12.8/\Delta_1,celltwo/16.1/\Delta_2,cellthree/19.4/\Delta_3,cellfour/22.7/\Delta_4} {
   \draw[bankwire] (\name.west) -- (4.25,\y);
   \fill[greenink] (4.25,\y) circle (1.3pt);
   \node[edgeword,text=greenink] at (4.9,\y+.23) {$\value$};
 }
 \node[note,text width=2.5cm,text=greenink] at (2.7,19.6)
   {\textbf{Cell-delta bank}\\[4pt]
-   One delta per cell.\\Core deltas add up\\across iterations.};
+   One delta per cell,\\fresh in every column.};
 \node[edgeword,text=greenink] at (17.8,30.08)
   {layer reads: seed + available other-cell deltas};
 \node[rotate=90,edgeword,text=greenink] at (23.3,24.55)
@@ -169,6 +162,13 @@
   -- (20.2,1.55) -- (jitter.south);
 \node[rotate=90,text=purpleink,font=\smalltext,fill=white,inner sep=3pt]
   at (.3,15.6) {Full-bandwidth payload feedback};
+% The loop re-entry: the same jittered payload, fused with this token's own
+% embedding, seeds the next column at the same position.
+\draw[feedback] (.3,9.45) -- (seed.west |- 0,9.45);
+\fill[purpleink] (.3,9.45) circle (1.4pt);
+\node[note,text=purpleink,text width=3.5cm,anchor=north] at (3.1,9.28)
+  {Looped depth (l): $p_t^{(i)}+\xi_t^{(i)}$ with $e_t$\\
+   seeds column $i{+}1$ at $t$;\\$r$ columns, same weights};
 \node[box,tokenop,text width=3.3cm] (nextembedding) at (15.2,3.1)
   {\textbf{Token embedding $E$}\\$e_{t+1}=E(x_{t+1})$};
 \node[box,fusionop,text width=7.5cm,minimum height=1.12cm]
@@ -185,14 +185,14 @@
 \node[edgeword,anchor=west,text=purpleink] at (17.88,7.6) {$u_t$};
 \draw[feedback] (fused) -- (11.8,7.6) -- (11.8,9.7) -- (seed.east);
 \node[note,text=purpleink,text width=2.3cm,anchor=west] at (12.03,8.77)
-  {Shift one token:\\seed at $t+1$\\in the next column/pass};
+  {Shift one token:\\seed at $t+1$\\in the next pass};
 \node[note,text width=6.6cm] at (16.9,2.05)
   {Default jitter: $\xi_t\sim U(-0.0004,0.0004)$.\\Evaluation: $\xi_t=0$.};
 
 % MTP is a connected side branch of the very same fusion tensor.
 \node[box,pkdaop,text width=4.6cm,minimum height=1.2cm]
   (mtp) at (17.7,9.43)
-  {\textbf{PKDA + MoE}\\independent auxiliary block\\\tinytext no MHDB read or tied-depth loop};
+  {\textbf{PKDA + MoE}\\independent auxiliary block\\\tinytext no MHDB read or looped depth};
 \draw[flow] (fused) -- (mtp.south);
 \node[box,normop,text width=4.6cm] (mtpnorm) at (17.7,11.17)
   {\textbf{RMSNorm}\\shared output norm $N_o$};
@@ -205,13 +205,13 @@
 \draw[flow] (mtpnorm) -- node[right,edgeword] {$\times\,1536/D$} (mtpclassifier);
 \draw[flow] (mtpclassifier) -- (mtpoutput);
 \node[note,text width=8.2cm] at (17.8,15.05)
-  {MTP runs once per training pass; its output does not feed the trunk.};
+  {MTP runs once per column; its output does not feed the trunk.};
 
 % One attached cutaway, not a second architecture or a separate panel.
 \draw[draw=line,densely dotted,line width=1pt,fill=soft,rounded corners=5pt]
   (13.25,15.95) rectangle (22.8,29.65);
 \draw[draw=line,densely dotted,line width=.95pt]
-  (codagqa.east) -- (13.25,23.65);
+  (cellfourgqa.east) -- (13.25,23.65);
 \node[edgeword,rotate=20,text=muted] at (11.85,23.27) {cutaway};
 \node[font=\bfseries\fontsize{11}{14}\selectfont] at (18.02,29.13)
   {Inside one residual layer};
@@ -290,15 +290,15 @@
 \draw[state] (tokenmixer.east) -- (history.west);
 \node[note,text width=8.8cm] at (18.0,16.36)
   {Read the live partial when present.\\
-   Cache per core iteration; reset in Jacobi, retain in decode.};
+   Cache per column; reset in Jacobi, retain in decode.};
 
 % Small labels stay adjacent to their mechanisms rather than becoming panels.
 \node[note,text width=4.8cm] at (8.2,2.48)
-  {All core iterations and feedback passes remain differentiable.};
+  {All looped columns and feedback passes remain differentiable.};
 \draw[flow] (1.0,.6) -- (1.85,.6);
 \node[anchor=west,note] at (2.0,.6) {computation};
 \draw[feedback] (5.55,.6) -- (6.4,.6);
-\node[anchor=west,note] at (6.55,.6) {feedback / tied depth};
+\node[anchor=west,note] at (6.55,.6) {feedback / looped depth};
 \draw[bankread] (12.2,.6) -- (13.05,.6);
 \node[anchor=west,note] at (13.2,.6) {MHDB sources};
 \draw[state] (18.3,.6) -- (19.15,.6);

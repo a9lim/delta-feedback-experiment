@@ -6,19 +6,19 @@ Conditions, token streams, and schedules for the current model.
 
 ## Conditions
 
-| Condition | Feedback between columns | Tied core depth |
+| Condition | Feedback between positions | Looped columns per position |
 |---|---|---|
-| `f` (default) | Yes | One iteration |
-| `l` | No | Sampled during training |
-| `fl` | Yes | Sampled during training |
+| `f` (default) | Yes | One |
+| `l` | No | Rolled during training |
+| `fl` | Yes | Rolled during training |
 
 Every condition includes PKDA/GQA cells, MHDB routing, shared and routed
-experts, and auxiliary second-token prediction (MTP). MTP and feedback share
-the same concat-linear fusion, including its parameters and
-per-pass jitter. Shared parameters pair identically for a given initialization
-seed. Data rows and feedback draws use keyed streams; tied depth uses a
-separate stream. At one core iteration,
-`fl` and `f` have identical values and gradients.
+experts, and auxiliary second-token prediction (MTP). MTP, feedback, and the
+loop share the same concat-linear fusion, including its parameters and
+per-column jitter. Shared parameters pair identically for a given
+initialization seed. Data rows and recurrence draws use keyed streams; one
+roll per step shapes every condition. At one column, `fl` and `f` have
+identical values and gradients.
 
 ## Data
 
@@ -56,7 +56,7 @@ A row is a nonoverlapping window of `seq_len+1` tokens. Ordinary prediction
 uses `seq_len` targets; MTP runs over the same `seq_len` positions and
 supervises the `seq_len-1` of them that have a second token. Rows and
 attention can cross document boundaries. Step `n` starts at row
-`(n-1)*batch_rows`. Feedback draws depend on data seed and step;
+`(n-1)*batch_rows`. The recurrence roll depends on data seed and step;
 prefix/jitter draws also depend on the first global row of the microbatch.
 
 `delta tokenize --scale S --tokens-per-param R` includes validation and
@@ -76,9 +76,10 @@ The full FP32 gradient is clipped to L2 norm 10 before NorMuonH and NAdam
 update. Expert-selection biases update once from the whole step's assignment
 counts.
 
-Every pass trains ordinary next-token prediction and MTP. For each head,
-`combine(CE)` is pass-1 CE plus the mean later-pass CE, or just pass-1 CE
-when only one pass runs. The objective is:
+Every column trains ordinary next-token prediction and MTP. For each head,
+`combine(CE)` is the first column's CE plus the mean over every other column
+of the step, or just the first column's CE when only one runs. The
+objective is:
 
 ```text
 loss = combine(CE_ntp) + mtp_weight * combine(CE_mtp)
@@ -89,14 +90,14 @@ loss = combine(CE_ntp) + mtp_weight * combine(CE_mtp)
 `mtp_weight` defaults to 0.3. Each head averages over its own valid positions.
 `z` is the mean squared log-partition; its coefficient is `1e-5` in cooldown
 and zero otherwise. Expert balancing averages across executed trunk and MTP
-invocations, then passes; its coefficient is independent of `mtp_weight`.
+invocations, then columns; its coefficient is independent of `mtp_weight`.
 [Architecture](architecture.md#two-token-prediction) defines target alignment
 and balancing equations.
 
 ### Feedback passes
 
 A feedback step starts with plain teacher forcing, using raw token embeddings
-as column seeds. Every supervised pass applies the writer's learned RMSNorm
+as column seeds. Every supervised column applies the writer's learned RMSNorm
 with its fixed output scale `BASE_NORMAL_INIT_STD=0.02`, then adds keyed
 uniform jitter without detaching it. `--jitter` sets the relative half-width,
 default `0.02`; the actual draw is uniform in
@@ -108,29 +109,46 @@ This includes single-pass batches, the final pass, and `l` without `f`. The
 independent MTP block consumes that fused tensor. When another feedback pass
 follows, it right-shifts the same tensor and restores raw embeddings
 before a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
-plain. Mixer states restart each pass; both consumers backpropagate through
-the shared fusion.
+plain. When another looped column follows at the same position, the same
+jittered payload is fused once more with the position's own raw embedding
+to seed it; no prefix applies, since every position has its own preceding
+column. Mixer states restart each pass; every consumer backpropagates
+through the shared fusion.
 
 One `embed_tokens` call looks up the whole stored row before slicing, serving
-plain seeds and both fusion consumers across all passes. The tied classifier
+plain seeds and every fusion consumer across all passes. The tied classifier
 uses the same raw embedding weight. The jitter generator writes the draw
 directly in scaled payload units, so the fusion path adds the buffer without
-another scale factor. Jitter has shape
+another scale factor. The pass jitter has shape
 `[n_passes, B, seq_len+1, dim]`, where `B` is the number of rows in the
-microbatch or replay; the first `seq_len` positions of each pass's draw
-perturb its payload. Evaluation and diagnostics use no jitter.
+microbatch or replay, and perturbs each pass's last column; the loop jitter
+`[n_passes, r-1, B, seq_len+1, dim]` perturbs the columns before it and is
+drawn after the prefix and pass jitter, so a condition with `l` shares those
+with the condition without it. The first `seq_len` positions of each draw
+perturb its column's payload. Evaluation and diagnostics use no jitter.
 
-### Core iterations
+### The recurrence roll
 
-With `l`, one independent keyed categorical draw sets the core depth for the
-whole optimizer step, shared by every microbatch and feedback pass. All four
-scales use probabilities `30/30/20/10/10%` for one through five total core
-visits, giving an actual mean of 2.4. Evaluation and decode use three visits
-by default; `--loop-iterations` changes only that fixed depth within `1..5`.
-For `C` cells, each pass executes `2+(C-2)r` cells. Every preset has four
-cells, so expected training depth is 27.2 trunk layers, default evaluation
-depth is 32, and maximum depth is 48. See
-[scaling.md](scaling.md#loop-compute-and-decode-state).
+One keyed uniform draw per step, shared by every pass, column, and
+microbatch, sets the step's shape once the roll begins. Before the boundary
+every step is one pass of one column. After it, no step is single-column:
+with probability `three_rate` (default `0.12`) the step runs three passes of
+two columns, with the same probability two passes of three columns, and
+otherwise two passes of two columns. `f` reads the pass count, `l` the
+column count, and `fl` both, so the three conditions align step by step and
+the pass projection is the feedback draw a condition without `l` makes:
+
+| Roll | Probability | `f` | `l` | `fl` |
+|---|---:|---|---|---|
+| three passes, two columns | 0.12 | 3 passes | 2 columns | 3 x 2 |
+| two passes, three columns | 0.12 | 2 passes | 3 columns | 2 x 3 |
+| two passes, two columns | 0.76 | 2 passes | 2 columns | 2 x 2 |
+
+Every scale uses the same roll. Evaluation and decode use two columns by
+default; `--loop-iterations` changes only that fixed count within `1..3`.
+A step of `k` passes and `r` columns executes `4kr` cells; on rolled steps
+`f` and `l` each run 2.12 columns per position on average and `fl` 4.48.
+See [scaling.md](scaling.md#loop-compute-and-decode-state).
 
 ### Schedule
 
@@ -143,11 +161,13 @@ All optimizer groups share a warmup-stable-cooldown multiplier. Warmup is
 linear over 2% of the shorter of the run and its 25x schedule. Cooldown takes
 the final 20%, using `1-sqrt(u)` and reaching zero at the final update.
 
-Feedback starts after 75% of the schedule. Subsequent steps use three passes
-with probability 0.12, otherwise two. This gives approximately 75% / 22% / 3%
-one-/two-/three-pass steps and 1.28 pass-tokens per predicted token. `l`
-without `f` always uses one pass. MTP adds computation without increasing the
-ordinary predicted-token budget.
+The recurrence roll starts after 75% of the schedule (`--recurrence-start`).
+Over a whole run this gives approximately 75% / 22% / 3% one-/two-/three-pass
+steps under `f`, the same split of one-/two-/three-column steps under `l`,
+and 1.28 pass-tokens per predicted token for `f`; `fl` multiplies the two.
+Screen runs at this token budget have rolled from the first step with
+`--recurrence-start 0`. `l` without `f` always uses one pass. MTP adds
+computation without increasing the ordinary predicted-token budget.
 
 ### Knobs
 
@@ -160,22 +180,22 @@ ordinary predicted-token budget.
 | `--tokens-per-param`, `--steps` | Schedule length |
 | `--lr-normuonh`, `--lr-nadam` | Peak optimizer rates; defaults `0.006`, `0.0003` |
 | `--warmup-frac`, `--cooldown-frac` | Schedule shape |
-| `--feedback-start`, `--three-pass` | Feedback mixture |
+| `--recurrence-start`, `--three-rate` | Recurrence roll: its boundary and the probability of each three-deep outcome |
 | `--jitter` | Relative payload-jitter half-width, default `0.02`; actual amplitude is `0.02 * jitter` |
-| `--loop-iterations` | Fixed evaluation/decode core depth, default 3 within `1..5`; training distribution is fixed |
+| `--loop-iterations` | Fixed evaluation/decode columns per position, default 2 within `1..3`; training draws from the roll |
 | `--mtp-weight` | Auxiliary prediction weight |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | Batch geometry |
 | `--resume`, `--continue TAG`, `--max-steps` | Run lifecycle |
 
 ### Checkpoints and queue
 
-Checkpoint v40 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v41 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v40 snapshots are accepted. The core-depth training recipe is the fixed
-`30/30/20/10/10%` distribution, independent of the saved evaluation-depth
+Only v41 snapshots are accepted. The recurrence roll's boundary and rate are
+saved schedule arguments, independent of the saved evaluation-count
 argument. Token lookups are raw, payloads use the
 writer's learned RMSNorm with fixed output scale `BASE_NORMAL_INIT_STD=0.02`,
 and jitter buffers are sampled in those scaled payload units. The same
@@ -187,8 +207,8 @@ parameter names and optimizer ownership. The fusion projection belongs to
 ordinary NorMuonH; the writer's payload norm and the blank payload belong to
 base NAdam.
 
-The trainer keeps the latest two snapshots and protected feedback, cooldown,
-and final boundaries. `--continue TAG` extends a finished run under a new tag
+The trainer keeps the latest two snapshots and protected recurrence,
+cooldown, and final boundaries. `--continue TAG` extends a finished run under a new tag
 by restoring its last snapshot that the longer schedule reproduces. Other
 settings are inherited. Warmup is fixed per scale at or above 25x; shorter
 source schedules may differ in warmup, as reported by the continuation record.
@@ -199,12 +219,14 @@ changes do not stop an active child. Operational commands are in
 
 ## Evaluation
 
-`val` is plain held-out next-token CE. With `f`, `val_fused` is a second pass
-with plain-prefix length 1. `val_mtp` and `val_mtp_fused` measure the separate
-second-token predictor over its supervised positions, before weights and
-z-loss. All four come from the same per-row head results the training
-objective uses, with jitter disabled for both heads. Evaluation reads the
-first `--eval-rows` validation rows, 128 by default.
+`val` is plain held-out next-token CE, read after the evaluation column
+count. With `f`, `val_fused` is a second pass with plain-prefix length 1.
+With `l`, `val_one` is the first column's CE, the single-column model.
+`val_mtp` and `val_mtp_fused` measure the separate second-token predictor
+over its supervised positions, before weights and z-loss. All come from the
+same per-row head results the training objective uses, with jitter disabled
+for both heads. Evaluation reads the first `--eval-rows` validation rows,
+128 by default.
 
 Generation uses three modes: **Standard** prefills and decodes without
 feedback; **Soft** prefills plainly and feeds payloads back during decode;
@@ -217,6 +239,6 @@ time: equal data does not imply equal compute. The `f`, `l`, and `fl`
 conditions isolate conditional additions of feedback or depth; they omit a
 no-recurrence control.
 
-The trainer records fixed-token payload self-composition and tied-depth
-traces. [Interpretability](interpretability.md) describes the retained
+The trainer records fixed-token payload self-composition and per-column
+depth traces. [Interpretability](interpretability.md) describes the retained
 checkpoint tools and how to read their measurements.

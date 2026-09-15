@@ -38,22 +38,14 @@ from delta_feedback_experiment.model import multipass
 
 
 def site_names(cfg) -> list[str]:
-    """Every routing site in execution order; a core site under ``l`` is
-    tagged by iteration (``L4i2.attn``) at the evaluation count."""
-    names = []
-    for layer in range(cfg.layers):
-        labels = (
-            [f"i{i}" for i in range(cfg.loop_iterations)]
-            if cfg.is_core_layer(layer)
-            else [""]
-        )
-        names += [f"L{layer}{label}.{kind}" for label in labels for kind in ("attn", "mlp")]
-    return names
+    """Every routing site of one column in execution order."""
+    return [f"L{layer}.{kind}" for layer in range(cfg.layers) for kind in ("attn", "mlp")]
 
 
 @torch.no_grad()
 def collect(model, data_val, device, rows: int, micro: int):
-    """Routing statistics per (pass, site) over `rows` val rows.
+    """Routing statistics per (pass, site) over `rows` val rows; under ``l``
+    each pass is read at its last column, the evaluation depth.
 
     Returns (mean weights [N,H], per-head token stats {max, H_tok},
     normalized cross-head JS) keyed by (pass, site).  Mean weights say
@@ -82,7 +74,8 @@ def collect(model, data_val, device, rows: int, micro: int):
                 prefix_lens=prefix if feedback else None,
                 want_weights=True,
             )
-        for p, out in enumerate(outs):
+        for p, columns in enumerate(outs):
+            out = columns[-1]
             values = torch.stack(out.sources)  # [N, B, T, D]
             rms = values.float().pow(2).mean(-1).sqrt().mean((1, 2)).cpu() * n
             norms[p] = norms.get(p, 0.0) + rms

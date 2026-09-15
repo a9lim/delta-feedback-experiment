@@ -31,7 +31,7 @@ TINY = {
     "pkda_heads": 2,
     "pkda_head_dim": 8,
     "pkda_conv_size": 4,
-    "loop_iterations": 4,
+    "loop_iterations": 2,
 }
 
 
@@ -70,10 +70,10 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
     assert torch.equal(want, got)
 
 
-def test_v40_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
+def test_v41_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
     model, path = snapshot(tmp_path, "f")
     payload = read_checkpoint(path)
-    assert payload["version"] == CONTRACT.version == 40
+    assert payload["version"] == CONTRACT.version == 41
     # These retired depth settings were unused for f, including extension's
     # six-visit default, and must not prevent reading its unchanged weights.
     payload["args"].update(loop_iterations=6, loop_max_iterations=12)
@@ -107,6 +107,6 @@ def test_fused_inputs_match_multipass(tmp_path):
         x = analysis.fused_inputs(model, e, first.payload, prefix[0])
         second = model.forward_column(x, need_payload=False)
         fused_ce = analysis.token_ce(model, second.h_top, tokens[:, 1:]).mean()
-    assert torch.equal(second.h_top, outs[1].h_top)
-    assert fused_ce.item() == pytest.approx(losses[1].item(), rel=1e-5)
+    assert torch.equal(second.h_top, outs[1][0].h_top)
+    assert fused_ce.item() == pytest.approx(losses[1][0].item(), rel=1e-5)
     assert analysis.plain_mask(5, 1, "cpu").squeeze(-1).sum() == 1
