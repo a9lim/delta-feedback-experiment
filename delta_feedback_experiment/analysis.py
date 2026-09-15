@@ -96,13 +96,16 @@ def plain_mask(length: int, prefix: int | Tensor, device) -> Tensor:
 def fused_inputs(
     model: DeltaModel, e: Tensor, payload: Tensor, prefix: int | Tensor = 1
 ) -> Tensor:
-    """The next pass's column input: plain prefix, concat-fused suffix.
+    """The next pass's column input: blank-fused prefix, payload-fused suffix.
 
     ``e`` is the raw lookup returned by ``model.embed_tokens``.
     ``payload`` is the preceding pass's payload at the same positions; it is
     shifted one column right (position 0 receives zero) before fusion. This
     has the same causal alignment as ``multipass``, which shifts the shared
-    fused tensor instead. ``prefix`` is a plain-prefix length or a per-row tensor.
+    fused tensor instead. ``prefix`` is a plain-prefix length or a per-row
+    tensor; prefix positions take ``model.plain_seed(e)``.
     """
     fused = model.fuse(shift_right(payload), e)
-    return torch.where(plain_mask(e.shape[1], prefix, e.device), e, fused)
+    return torch.where(
+        plain_mask(e.shape[1], prefix, e.device), model.plain_seed(e), fused
+    )

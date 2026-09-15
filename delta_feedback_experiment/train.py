@@ -62,7 +62,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=39, resumable=frozenset({39}), surface_version=39
+    version=40, resumable=frozenset({40}), surface_version=40
 )
 
 

@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from delta_feedback_experiment import analysis
 from delta_feedback_experiment.cuda_kernels import MAX_ROUTE_TILES, _route_launch
 from delta_feedback_experiment.model import (
     DeltaModel,
@@ -12,6 +13,7 @@ from delta_feedback_experiment.model import (
     multipass,
     multipass_loss,
 )
+from delta_feedback_experiment.optim import split_parameters
 
 TINY = {
     "vocab_size": 31,
@@ -53,21 +55,27 @@ def test_multipass_seed_has_standard_strides():
     assert outs[1].sources[0].stride() == seed.stride()
 
 
-def test_plain_and_standard_inputs_preserve_raw_embedding_magnitudes():
+def test_plain_and_standard_inputs_fuse_raw_embeddings_with_the_blank():
     model = tiny()
     toks = tokens()
     with torch.no_grad():
         model.embed_tokens.weight.mul_(
             torch.linspace(0.5, 2, model.cfg.vocab_size)[:, None]
         )
+        model.blank_payload.copy_(torch.linspace(-0.02, 0.02, model.cfg.dim))
     expected = F.embedding(toks, model.embed_tokens.weight)
     torch.testing.assert_close(model.embed_tokens(toks), expected, atol=0, rtol=0)
+    # Raw magnitudes reach the seed through the fusion, unnormalized.
+    seeds = F.linear(
+        torch.cat((expected, model.blank_payload.expand_as(expected)), dim=-1),
+        model.fuse_proj.weight,
+    )
     outs = multipass(model, toks, 2, prefix_lens=torch.tensor([[2]]))
-    torch.testing.assert_close(outs[0].sources[0], expected[:, :-1])
-    torch.testing.assert_close(outs[1].sources[0][:, :2], expected[:, :2])
+    torch.testing.assert_close(outs[0].sources[0], seeds[:, :-1])
+    torch.testing.assert_close(outs[1].sources[0][:, :2], seeds[:, :2])
     cache = KVCache(model.cfg, batch=1, device="cpu", dtype=torch.float32)
     standard = model.step(toks[:, :1], None, cache)
-    torch.testing.assert_close(standard.sources[0], expected[:, :1])
+    torch.testing.assert_close(standard.sources[0], seeds[:, :1])
 
     # The plain input path contributes directly to the shared embedding table.
     gradient = torch.autograd.grad(
@@ -212,8 +220,38 @@ def test_feedback_and_loop_are_token_causal():
     # the exact zero derivative also checks that no future dependency exists.
     before[-1].h_top[:, :3].square().sum().backward()
     assert torch.count_nonzero(embeddings[0].grad[:, 3:]) == 0
-    plain = model.forward_column(model.embed_tokens(original[:, :-1])).h_top
+    plain = model.forward_column(model.plain_seed(model.embed_tokens(original[:, :-1]))).h_top
     torch.testing.assert_close(before[0].h_top, plain)
+
+
+def test_blank_payload_seeds_every_plain_position():
+    """Every seed is one fusion product: a plain position fuses its raw
+    embedding with the learned blank payload, so feeding the blank as if it
+    were feedback reproduces the plain pass exactly."""
+    model = tiny()
+    with torch.no_grad():
+        model.blank_payload.copy_(torch.linspace(-0.02, 0.02, model.cfg.dim))
+    toks = tokens()
+    e = model.embed_tokens(toks[:, :-1])
+    seed = model.plain_seed(e)
+    blank = model.blank_payload.expand_as(e)
+    torch.testing.assert_close(seed, model.fuse(blank, e), atol=0, rtol=0)
+    assert torch.equal(analysis.fused_inputs(model, e, blank, 1), seed)
+    outs = multipass(model, toks, 2, prefix_lens=torch.ones(1, 1, dtype=torch.long))
+    assert torch.equal(outs[0].sources[0], seed)
+    torch.testing.assert_close(outs[0].h_top, model.forward_column(seed).h_top)
+    # Position 0 of the feedback pass is plain: the same blank-fused seed.
+    assert torch.equal(outs[1].sources[0][:, :1], seed[:, :1])
+    assert not torch.equal(outs[1].sources[0][:, 1:], seed[:, 1:])
+    # A plain vector parameter: zero at construction, NAdam-owned, and
+    # trained by every plain position.
+    fresh = tiny()
+    assert torch.equal(fresh.blank_payload, torch.zeros(fresh.cfg.dim))
+    assert any(p is fresh.blank_payload for p in split_parameters(fresh)["nadam"])
+    multipass_loss(fresh, toks, multipass(fresh, toks, 1)).total.backward()
+    gradient = fresh.blank_payload.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
 
 
 def test_loop_once_pairs_with_flat_values_and_gradients():
@@ -301,16 +339,17 @@ def test_cached_decode_matches_full_recomputation():
     separate_expert_selection(model)
     toks = tokens()
     embedded = model.embed_tokens(toks)
+    seeds = model.plain_seed(embedded)
     cache = KVCache(model.cfg, batch=1, device="cpu", dtype=torch.float32)
-    prefill = model.forward_column(embedded[:, :3], cache=cache)
+    prefill = model.forward_column(seeds[:, :3], cache=cache)
     payload = prefill.payload[:, -1:] if model.cfg.feedback else None
-    reference_rows = embedded[:, :3]
+    reference_rows = seeds[:, :3]
     for position in range(3, toks.shape[1]):
         out = model.step(toks[:, position : position + 1], payload, cache)
-        new = embedded[:, position : position + 1]
+        new = seeds[:, position : position + 1]
         if model.cfg.feedback:
             reference_payload = model.forward_column(reference_rows).payload[:, -1:]
-            new = model.fuse(reference_payload, new)
+            new = model.fuse(reference_payload, embedded[:, position : position + 1])
         reference_rows = torch.cat([reference_rows, new], dim=1)
         reference = model.forward_column(reference_rows)
         # The two-cell core compounds full-row versus single-row projection

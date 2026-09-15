@@ -29,8 +29,8 @@ def core_route_mass(model, rows, iterations: int) -> dict[str, dict[int, dict[st
     """Mean route mass per source at every core site, keyed by iteration."""
     device = rows.device
     with autocast(device):
-        e = model.embed_tokens(rows[:, :-1])
-        out = model.forward_column(e, want_weights=True, iterations=iterations)
+        seed = model.plain_seed(model.embed_tokens(rows[:, :-1]))
+        out = model.forward_column(seed, want_weights=True, iterations=iterations)
     routes: dict[str, dict[int, dict[str, float]]] = {}
     for site, weights in out.route_weights.items():
         layer_kind, _, sublayer = site.partition(".")

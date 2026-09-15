@@ -252,6 +252,8 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     for candidate in (model, reference):
         for bank in candidate.expert_banks:
             bank.expert_bias[-bank.experts_per_token :] = 2
+        with torch.no_grad():
+            candidate.blank_payload.copy_(torch.linspace(-0.02, 0.02, candidate.cfg.dim))
     toks = tokens(length=6)
     jitter = jitter_for(model, toks, count)
     prefixes = torch.tensor([[1, 3], [4, 2]])
@@ -260,9 +262,11 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     assert len(actual.ntp) == count and len(actual.mtp) == count
 
     # Feedback and MTP deliberately perform their own embedding lookups and
-    # fusion. They share parameters, but have no shared prepared tensor.
+    # fusion. They share parameters, but have no shared prepared tensor. The
+    # plain seed is the same concat equation with the blank payload.
     e = explicit_embedding(reference, toks[:, :-1])
-    reference_outs = [reference.forward_column(e)]
+    seed = explicit_fusion(reference, reference.blank_payload.expand_as(e), e)
+    reference_outs = [reference.forward_column(seed)]
     length = e.shape[1]
     for index in range(count - 1):
         payload = reference_outs[-1].payload + jitter[index, :, :length]
@@ -275,7 +279,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         fused = torch.cat((torch.zeros_like(unshifted[:, :1]), unshifted[:, :-1]), 1)
         plain = torch.arange(length)[None, :] < prefixes[index, :, None]
         reference_outs.append(
-            reference.forward_column(torch.where(plain[..., None], e, fused))
+            reference.forward_column(torch.where(plain[..., None], seed, fused))
         )
 
     ntp, mtp, ntp_z, mtp_z = [], [], [], []
@@ -347,6 +351,8 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
 
 
 def test_training_reuses_one_lookup_and_one_scaled_payload_and_fusion_per_pass(monkeypatch):
+    """One raw lookup serves every pass; each pass writes one scaled payload
+    and fuses it once; pass 1 adds the one blank-payload fusion of its seed."""
     import delta_feedback_experiment.model as implementation
 
     model = tiny()
@@ -383,7 +389,7 @@ def test_training_reuses_one_lookup_and_one_scaled_payload_and_fusion_per_pass(m
         payload_norm_hook.remove()
         mtp_hook.remove()
     assert calls == {
-        "embedding": 1, "payload_norm": count, "fusion": count
+        "embedding": 1, "payload_norm": count, "fusion": count + 1
     }
     assert all(
         payload is out.payload

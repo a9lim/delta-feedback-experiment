@@ -25,8 +25,8 @@ Preset availability does not establish GPU fit or throughput.
 | MHDB groups | 4 | 6 | 8 | 12 |
 | PKDA heads, width 128 | 10 | 15 | 20 | 30 |
 | PKDA projection width | 1,280 | 1,920 | 2,560 | 3,840 |
-| Total parameters, every condition | 638,861,448 | 1,403,104,268 | 2,463,889,552 | 5,475,087,512 |
-| Training-active non-embedding parameters | 209,174,664 | 465,284,108 | 822,409,360 | 1,839,707,288 |
+| Total parameters, every condition | 638,862,216 | 1,403,105,420 | 2,463,891,088 | 5,475,089,816 |
+| Training-active non-embedding parameters | 209,175,432 | 465,285,260 | 822,410,896 | 1,839,709,592 |
 | Included auxiliary MTP total parameters | 35,181,480 | 78,750,908 | 139,639,504 | 313,374,200 |
 | Included auxiliary MTP active parameters | 12,178,344 | 26,993,852 | 47,626,960 | 106,345,976 |
 
@@ -113,10 +113,10 @@ ratio is 25; larger ratios are supported arithmetic scenarios.
 
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|
-| Screen | 9,975 | 5,229,772,800 | 159,588 | 83,670,073,344 |
-| Bridge | 22,187 | 11,632,377,856 | 354,984 | 186,113,851,392 |
-| Flagship | 39,216 | 20,560,478,208 | 627,449 | 328,963,981,312 |
-| Extension | 87,725 | 45,993,164,800 | 1,403,586 | 735,883,296,768 |
+| Screen | 9,975 | 5,229,772,800 | 159,589 | 83,670,597,632 |
+| Bridge | 22,187 | 11,632,377,856 | 354,985 | 186,114,375,680 |
+| Flagship | 39,216 | 20,560,478,208 | 627,450 | 328,964,505,600 |
+| Extension | 87,725 | 45,993,164,800 | 1,403,588 | 735,884,345,344 |
 
 Warmup is 2% of the shorter of the run and its 25x length: 200, 444, 784,
 and 1,754 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
@@ -155,7 +155,7 @@ Resumes and continuations inherit the saved evaluation depth unless explicitly
 pinned; conflicting overrides are rejected. `--scale` pins geometry and batch
 settings, while core-depth defaults are common to every scale. The fixed
 sampling recipe and evaluation-depth argument are part of the checkpoint
-v39 contract.
+v40 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its

@@ -42,8 +42,8 @@ and a configurable number of selected routed experts. All presets have four
 cells; the middle two form the tied core under `l`.
 
 ```text
-raw token embedding + incoming payload (f)
-  -> column seed
+raw token embedding + incoming payload (f) or the learned blank payload
+  -> shared concat-linear fusion -> column seed
   -> prelude cell
   -> middle cells, repeated r times under l
   -> coda cell
@@ -60,8 +60,9 @@ Each cell has four residual layers, each with its own token mixer and expert
 FFN. An MHDB read enriches each branch's input with the seed and cell deltas.
 Linear maps are bias-free except PKDA's output-gate expansion.
 
-Pass 1, plain-prefix positions, and Standard decoding seed the column from
-the raw token embedding `e_t`. The readout applies
+Every column seed is the shared fusion of the raw token embedding `e_t` with
+a payload. Pass 1, plain-prefix positions, and Standard decoding, which have
+no incoming payload, fuse the learned blank payload `p_0` instead. The readout applies
 `final_norm(h_top) * 1536 / D` before the tied classifier.
 PKDA and GQA caches carry additional state along tokens; the payload carries
 feedback between columns and between Jacobi passes.
@@ -284,7 +285,17 @@ or extra scaling. Splitting its matrix into two width-`D` blocks gives
 the routed payload replaces its preceding hidden state and is normalized and
 scaled at the writer before training jitter, the token input remains raw,
 and the result is shared with cross-column feedback. Plain-prefix, pass-1,
-and Standard-decoding positions use `e_t`. The actual seed is both residual
+and Standard-decoding positions use the same product with the learned blank
+payload `p_0` in place of `p_(t-1)`:
+
+```text
+seed_t = fuse_proj(concat(e_t, p_0))          (no incoming payload)
+```
+
+`p_0` is a width-`D` vector in scaled payload units, zero-initialized and
+present in every condition, so every seed passes through `fuse_proj` and a
+feedback position differs from a plain one only by `W_p (p_(t-1) - p_0)`.
+Neither the blank nor its fusion receives jitter. The actual seed is both residual
 origin and MHDB source. Every condition has a dedicated payload router that reads its
 null, seed, and every completed cell delta:
 
@@ -318,7 +329,7 @@ same tensor right and restores the per-row plain prefix. Mixer states restart
 inside each pass.
 Sequential generation instead retains the preceding payload and advances all
 mixer caches once per new token, computing one fusion with that token's
-raw embedding and no jitter.
+raw embedding and no jitter; Standard decoding fuses the blank payload.
 
 ## Letter l: the tied-depth loop
 
@@ -416,8 +427,8 @@ logits_mtp,t = (final_norm(v_t) * 1536 / D) @ embed_tokens.weight.T
 `fuse_proj` is the exact projection used by feedback, present in every
 condition. The two inputs each have width `D`, and the concatenation places
 the token first and payload second. One `embed_tokens` call looks up the whole
-stored row before slicing; those raw embeddings serve plain seeds, MTP, and
-feedback across all passes. Each pass adds jitter after the writer's payload
+stored row before slicing; those raw embeddings serve the blank-fused plain
+seeds, MTP, and feedback across all passes. Each pass adds jitter after the writer's payload
 normalization and fixed scale, then computes `u` once for both consumers.
 Fusion accepts these inputs directly, with no normalization or second scaling.
 
@@ -435,7 +446,7 @@ Training samples the buffer directly in payload units: uniform
 including the final or only pass and `l` without `f`. MTP and the next
 feedback pass use the same realization. For the latter, `u_t` becomes
 the seed at position `t+1`, with positions inside the selected plain prefix
-restored to their raw embeddings. The auxiliary block's output `v`
+restored to their blank-fused seeds. The auxiliary block's output `v`
 is used only for MTP; it is not an early trunk readout or an extra feedback layer.
 Evaluation and diagnostics set jitter to zero.
 
@@ -447,8 +458,8 @@ whose second token lies past the end of the stored row and which therefore
 carries no loss weight. That row
 is causally last in the auxiliary recurrence, so the supervised rows are the
 same ones the cropped geometry produced. One lookup of the whole stored row
-serves both heads, the plain column seed taking positions `0..T-1` and the
-shared fusion taking next-token features at `1..T`.
+serves both heads, the blank-fused plain seed taking positions `0..T-1` and the
+payload fusion taking next-token features at `1..T`.
 Both inputs and the reused fused tensor remain differentiable, so the
 auxiliary objective trains the payload router, payload normalization, trunk,
 shared fusion, and token embedding.
@@ -497,7 +508,7 @@ standard deviation `1/sqrt(2D)`. The same `BASE_NORMAL_INIT_STD` supplies the
 payload RMSNorm's fixed output scale and the jitter generator's reference
 amplitude; it does not change fusion projection initialization. Depthwise
 convolutions retain Kaiming-uniform initialization. Learned RMSNorm gains
-start at one; MHDB queries and nulls start at zero.
+start at one; MHDB queries and nulls and the blank payload start at zero.
 
 Shared parameters pair byte-identically across conditions for a given seed.
 Experts are constructed directly as part of the common model initialization.

@@ -96,11 +96,11 @@
 \node[box,tokenop,text width=4.6cm] (embedding) at (8.2,5.05)
   {\textbf{Token embedding $E$}\\$e_t=E(x_t)$};
 \node[box,fusionop,text width=4.6cm] (seed) at (8.2,9.7)
-  {\textbf{Column seed $s_t$}\\plain $e_t$ or incoming fusion};
+  {\textbf{Column seed $s_t$}\\fusion of $e_t$ with $p_{t-1}$, or with the blank $p_0$};
 \draw[flow] (tokens) -- (embedding);
 \draw[flow] (embedding) -- (seed);
 \node[note,anchor=east,text width=2.8cm] at (7.95,8.02)
-  {Plain token entry:\\pass 1 / prefix\\standard decode};
+  {Blank payload $p_0$:\\pass 1 / prefix\\standard decode};
 \draw[flow] (seed) -- (prelude);
 \draw[flow] (prelude) -- (coreone);
 \draw[flow] (coreone) -- (coretwo);

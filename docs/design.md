@@ -169,20 +169,23 @@ ordinary predicted-token budget.
 
 ### Checkpoints and queue
 
-Checkpoint v39 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v40 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v39 snapshots are accepted. The core-depth training recipe is the fixed
+Only v40 snapshots are accepted. The core-depth training recipe is the fixed
 `30/30/20/10/10%` distribution, independent of the saved evaluation-depth
 argument. Token lookups are raw, payloads use the
 writer's learned RMSNorm with fixed output scale `BASE_NORMAL_INIT_STD=0.02`,
 and jitter buffers are sampled in those scaled payload units. The same
 constant sets token embedding initialization. Fusion concatenates its
-inputs and projects them without further scaling. This defines the current
+inputs and projects them without further scaling, and every column seed is
+one such product: positions without an incoming payload fuse the learned
+blank payload `blank_payload`. This defines the current
 parameter names and optimizer ownership. The fusion projection belongs to
-ordinary NorMuonH; the writer's payload norm belongs to base NAdam.
+ordinary NorMuonH; the writer's payload norm and the blank payload belong to
+base NAdam.
 
 The trainer keeps the latest two snapshots and protected feedback, cooldown,
 and final boundaries. `--continue TAG` extends a finished run under a new tag

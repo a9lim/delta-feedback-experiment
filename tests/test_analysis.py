@@ -65,15 +65,15 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
         assert torch.equal(a, b), name
     tokens = torch.randint(0, 97, (1, 6), generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
-        want = model.forward_column(model.embed_tokens(tokens[:, :-1])).h_top
-        got = loaded.forward_column(loaded.embed_tokens(tokens[:, :-1])).h_top
+        want = model.forward_column(model.plain_seed(model.embed_tokens(tokens[:, :-1]))).h_top
+        got = loaded.forward_column(loaded.plain_seed(loaded.embed_tokens(tokens[:, :-1]))).h_top
     assert torch.equal(want, got)
 
 
-def test_v39_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
+def test_v40_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
     model, path = snapshot(tmp_path, "f")
     payload = read_checkpoint(path)
-    assert payload["version"] == CONTRACT.version == 39
+    assert payload["version"] == CONTRACT.version == 40
     # These retired depth settings were unused for f, including extension's
     # six-visit default, and must not prevent reading its unchanged weights.
     payload["args"].update(loop_iterations=6, loop_max_iterations=12)
@@ -88,7 +88,7 @@ def test_token_ce_matches_sequence_ce(tmp_path):
     model, _ = snapshot(tmp_path)
     tokens = torch.randint(0, 97, (1, 6), generator=torch.Generator().manual_seed(1))
     with torch.no_grad():
-        out = model.forward_column(model.embed_tokens(tokens[:, :-1]))
+        out = model.forward_column(model.plain_seed(model.embed_tokens(tokens[:, :-1])))
         per_token = analysis.token_ce(model, out.h_top, tokens[:, 1:], chunk=5)
         mean, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
     assert per_token.shape == (1, 5)
@@ -103,7 +103,7 @@ def test_fused_inputs_match_multipass(tmp_path):
         outs = multipass(model, tokens, 2, prefix_lens=prefix)
         losses = multipass_loss(model, tokens, outs).ntp
         e = model.embed_tokens(tokens[:, :-1])
-        first = model.forward_column(e, need_payload=True)
+        first = model.forward_column(model.plain_seed(e), need_payload=True)
         x = analysis.fused_inputs(model, e, first.payload, prefix[0])
         second = model.forward_column(x, need_payload=False)
         fused_ce = analysis.token_ce(model, second.h_top, tokens[:, 1:]).mean()

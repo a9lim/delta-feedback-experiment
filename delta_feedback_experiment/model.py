@@ -990,6 +990,12 @@ class DeltaModel(nn.Module):
         self.fuse_proj_shadow: Tensor | None = None
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
         self.fuse_proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
+        self.blank_payload = nn.Parameter(torch.zeros(cfg.dim))
+        """Learned stand-in payload, in scaled payload units, for positions
+        with no incoming payload: pass 1, plain prefixes, and Standard
+        decoding. Every column seed therefore passes through ``fuse_proj``,
+        and a feedback position differs from a plain one only by
+        ``W_p (p_(t-1) - p_0)``. Zero-initialized, consuming no draws."""
         self.checkpoint_blocks = 0
         """Runtime switch: how many PKDA and auxiliary block invocations of
         each logical forward, in execution order, recompute in backward
@@ -1071,7 +1077,9 @@ class DeltaModel(nn.Module):
 
         The writer scales its learned norm by BASE_NORMAL_INIT_STD. Any
         jitter is already in those scaled units. Raw token magnitudes and
-        learned payload gains survive the linear fusion.
+        learned payload gains survive the linear fusion. Every column seed
+        is one of these products; ``plain_seed`` supplies the blank payload
+        where no payload arrives.
         """
         return sink_linear(
             torch.cat((token_embedding, payload), dim=-1),
@@ -1079,6 +1087,12 @@ class DeltaModel(nn.Module):
             (self.fuse_proj_sink,),
             self.fuse_proj_shadow,
         )
+
+    def plain_seed(self, token_embedding: Tensor) -> Tensor:
+        """The seed of a position with no incoming payload: the shared fusion
+        of its raw token embedding with the learned blank payload."""
+        blank = self.blank_payload.to(token_embedding.dtype).expand_as(token_embedding)
+        return self.fuse(blank, token_embedding)
 
     def forward_mtp(
         self, payload: Tensor, next_tokens: Tensor, *, want_weights: bool = False
@@ -1543,8 +1557,10 @@ class DeltaModel(nn.Module):
     ) -> ColumnOutput:
         """Run the stack once over inputs x [B, T, D].
 
-        ``x`` is the actual column input: raw embeddings on pass 1 and
-        standard decoding, or the concat-fused input on feedback passes. With a
+        ``x`` is the actual column input: the shared fusion of raw embeddings
+        with the blank payload (``plain_seed``) on pass 1, plain prefixes, and
+        Standard decoding, or with the preceding payload on feedback
+        positions. With a
         cache, positions start at ``cache.pos`` and every mixer cache advances
         by ``T`` exactly once. ``iterations`` is the core iteration count
         under ``l``; the default is the configured mean, or the count the
@@ -1767,7 +1783,7 @@ class DeltaModel(nn.Module):
         e = self.embed_tokens(tokens)
         if payload is not None and not self.cfg.feedback:
             raise ValueError("a condition without f cannot consume a payload")
-        x = self.fuse(payload, e) if payload is not None else e
+        x = self.fuse(payload, e) if payload is not None else self.plain_seed(e)
         return self.forward_column(x, cache=cache, want_weights=want_weights)
 
 
@@ -1779,6 +1795,10 @@ def shift_right(x: Tensor) -> Tensor:
     return torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
 
 
+def _plain_seed(model, token_embedding):
+    return model.plain_seed(token_embedding)
+
+
 def _fused_input(model, payload, token_embedding):
     return model.fuse(payload, token_embedding)
 
@@ -1787,11 +1807,16 @@ def _jittered_fused_input(model, payload, jitter, token_embedding):
     return model.fuse(payload + jitter, token_embedding)
 
 
-def _feedback_entry(fused_input, e, positions, prefix):
-    """Reuse the preceding pass's fused input, restoring this pass's prefix."""
+def _feedback_entry(fused_input, seed, positions, prefix):
+    """Reuse the preceding pass's fused input, restoring this pass's prefix
+    to the blank-fused plain seed."""
     plain = positions[None, :] < prefix[:, None]
-    return torch.where(plain[..., None], e, shift_right(fused_input))
+    return torch.where(plain[..., None], seed, shift_right(fused_input))
 
+
+_compiled_plain_seed = torch.compile(
+    _plain_seed, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
+)
 
 _compiled_fused_input = torch.compile(
     _fused_input, fullgraph=True, dynamic=False, mode=INDUCTOR_MODE
@@ -1820,6 +1845,8 @@ def multipass(
 
     tokens [B, T+1] is one stored row: the model executes its first T
     positions, which are exactly the positions that predict tokens 1..T.
+    Pass 1 seeds every position through the shared fusion with the blank
+    payload; feedback passes replace the suffix past each row's prefix.
     The final stored token is a main-head target and MTP input, but needs no
     trunk column.  prefix_lens [n_passes-1, B] holds
     values in 1..T-1 (the plain-embedding prefix per feedback pass; position
@@ -1844,30 +1871,28 @@ def multipass(
     # One logical forward: its trunk passes here and the auxiliary blocks in
     # ``multipass_loss`` share this recomputation budget in execution order.
     model._checkpoint_left = model.checkpoint_blocks
-    # One raw lookup of the whole stored row feeds both heads: the
-    # column seed is positions 0..T-1 and the auxiliary head's next-token
-    # input is 1..T, so the second lookup and its gradient scatter are gone.
-    # The seed is copied into a fresh tensor with the standard strides. The
-    # routing bank allocates its gradient accumulator with ``zeros_like`` and
-    # the routing and FLA kernels read packed rows, and Dynamo guards on
-    # strides: a seed left as a view of the T+1 row (which ``contiguous`` is,
-    # a size-one batch never breaking contiguity) gives pass 1 its own compiled
-    # copy of every block, rounding differently from the passes whose entry is
-    # a fresh tensor. The lookup reads the whole stored row once;
-    # plain seeds and fusion reuse its slices across all passes.
+    # One raw lookup of the whole stored row feeds both heads: the plain
+    # seed fuses positions 0..T-1 with the blank payload and the auxiliary
+    # head's next-token input is 1..T, so the second lookup and its gradient
+    # scatter are gone. The blank fusion is a fresh packed tensor, as every
+    # feedback entry is, so pass 1 shares the compiled blocks and their
+    # rounding with the later passes: the routing bank allocates its gradient
+    # accumulator with ``zeros_like``, the routing and FLA kernels read packed
+    # rows, and Dynamo guards on strides.
     e_all = model.embed_tokens(tokens)
-    e = e_all[:, :-1].clone(memory_format=torch.contiguous_format)
-    length = e.shape[1]
+    compiled = e_all.is_cuda
+    plain = _compiled_plain_seed if compiled else _plain_seed
+    seed = plain(model, e_all[:, :-1])
+    length = seed.shape[1]
     positions = torch.arange(length, device=tokens.device)
-    compiled = e.is_cuda
     token_embedding = e_all[:, 1:]
     entry = _compiled_feedback_entry if compiled else _feedback_entry
     outs = []
-    x = e
+    x = seed
     for i in range(n_passes):
         if i:
             x = entry(
-                outs[-1].fused_input, e, positions, prefix_lens[i - 1]
+                outs[-1].fused_input, seed, positions, prefix_lens[i - 1]
             )
         out = model.forward_column(
             x,
@@ -2213,18 +2238,19 @@ def iterate_fused(
         raise ValueError("the contraction diagnostic needs a condition with f")
     with _monitor_autocast(tokens):
         e = model.embed_tokens(tokens[:, :-1])
+        seed = model.plain_seed(e)
         batch, length = e.shape[:2]
         positions = torch.arange(length, device=tokens.device)
         plain = (positions[None, :] < 1).expand(batch, -1)
 
-        out = model.forward_column(e, iterations=iterations)
+        out = model.forward_column(seed, iterations=iterations)
         records = []
         for _ in range(n_iters):
             previous = out.h_top
             p_shifted = shift_right(out.payload)
             fused = model.fuse(p_shifted, e)
             out = model.forward_column(
-                torch.where(plain[..., None], e, fused), iterations=iterations
+                torch.where(plain[..., None], seed, fused), iterations=iterations
             )
             loss, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
             delta = (out.h_top - previous).float().norm(dim=-1).mean()
@@ -2262,6 +2288,7 @@ def depth_trace(
     cfg.resolve_iterations(iterations)
     with _monitor_autocast(tokens):
         e = model.embed_tokens(tokens[:, :-1])
+        seed = model.plain_seed(e)
         targets = tokens[:, 1:]
         batch, length = e.shape[:2]
         positions = torch.arange(length, device=tokens.device)
@@ -2269,11 +2296,11 @@ def depth_trace(
         records = []
         previous = None
         for depth in range(1, iterations + 1):
-            x = e
+            x = seed
             if fused:
-                first = model.forward_column(e, iterations=depth)
+                first = model.forward_column(seed, iterations=depth)
                 x = torch.where(
-                    plain[..., None], e, model.fuse(shift_right(first.payload), e)
+                    plain[..., None], seed, model.fuse(shift_right(first.payload), e)
                 )
             out = model.forward_column(x, need_payload=False, iterations=depth)
             loss, _ = sequence_ce(model, out.h_top, targets)

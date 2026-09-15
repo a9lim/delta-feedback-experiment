@@ -18,7 +18,7 @@ Update affected code, CLI help, tests, and docs together.
 
 Preserve differentiable feedback/core iterations, telescoping cell deltas,
 paired initialization and keyed randomness, FP32 accumulated gradients, and
-exact resume of checkpoint v39 with the current tokenizer. Use the existing
+exact resume of checkpoint v40 with the current tokenizer. Use the existing
 checkpoint readers and run lifecycle CLI. Generated data, logs, snapshots,
 figures, and fetched papers remain untracked.
 

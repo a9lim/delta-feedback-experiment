@@ -17,10 +17,14 @@ shifted payload. Sequential feedback decode advances mixer caches and carries
 the previous token's payload. Core iterations have separate mixer-cache
 tracks. Label token, pass, and depth coordinates when comparing states.
 
-`embed_tokens(tokens)` returns raw token features in the residual dtype for
-pass 1, plain-prefix positions, Standard decoding, and fusion inputs.
-`embed_tokens.weight` is the tied embedding/classifier matrix. Patches to
-plain column seeds therefore act on raw embedding features. Payloads are in
+`embed_tokens(tokens)` returns raw token features in the residual dtype;
+they enter the column only through the shared fusion. `plain_seed(e)` is the
+seed of pass 1, plain-prefix positions, and Standard decoding: the fusion of
+`e` with the learned blank payload `blank_payload`, so a feedback position
+differs from a plain one only by `W_p (p_(t-1) - p_0)`. Replacing a payload
+with the blank is therefore an in-distribution ablation, and patches to plain
+seeds act either on `e` before fusion or on the projected seed.
+`embed_tokens.weight` is the tied embedding/classifier matrix. Payloads are in
 the writer's scaled units: `payload_norm(h_top + routed)`, with fixed output
 multiplier `BASE_NORMAL_INIT_STD=0.02` and a learned gain initialized to one.
 

@@ -146,8 +146,8 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         768,
         3,
         15,
-        638861448,
-        209174664,
+        638862216,
+        209175432,
     )
     from delta_feedback_experiment.cli import stream_target
     from delta_feedback_experiment.data import (
@@ -413,7 +413,7 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
         assert resumed[key] == full[key]
     complete = trainer.read_checkpoint(tmp_path / "runs/full.pt.2")
     restored = trainer.read_checkpoint(tmp_path / "runs/renamed.pt.2")
-    assert complete["version"] == CONTRACT.version == 39
+    assert complete["version"] == CONTRACT.version == 40
     assert (
         complete["args"]["loop_iterations"] == restored["args"]["loop_iterations"] == 2
     )
