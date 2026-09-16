@@ -2,7 +2,8 @@
 
 `--scale screen|bridge|flagship|extension` selects geometry and batch settings.
 Explicit geometry or recipe flags override their preset fields. Conditions are `f`,
-`l`, and `fl`; looped depth adds no parameters. The trainer is single-process.
+`l`, and `fl`; looped depth adds no parameters. The trainer runs one process
+per device; `--ranks` splits each step's rows across them.
 Preset availability does not establish GPU fit or throughput.
 
 ## Geometry and parameters

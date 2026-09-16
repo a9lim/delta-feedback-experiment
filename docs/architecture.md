@@ -544,25 +544,37 @@ Attention gates, the fusion matrix, and the auxiliary module use separate
 deterministic streams. Fusion initialization does not advance shared draws.
 Feedback/depth recipe draws are separately keyed.
 
-Parameters, accumulated gradients, and optimizer state are FP32, except
+Weights, accumulated gradients, and optimizer state are FP32, except
 NorMuonH's momentum, which CUDA stores in BF16 rounded to nearest with its
-update computed in FP32. CUDA residuals,
-routed values, payloads, and mixer caches use BF16, except PKDA matrix/diagonal
-boundaries. CCE reads an address-stable BF16 classifier shadow refreshed after
-each optimizer step; it is runtime state, excluded from snapshots.
+update computed in FP32. CUDA residuals, routed values, payloads, and mixer
+caches use BF16, except PKDA matrix/diagonal boundaries.
 
-Packed projection backpropagation writes into persistent FP32 sinks. PKDA
-Q/K/V row views share an allocation, as do dense QKV and gate gradients;
-each parameter is updated once. The routed experts' backward keeps
-the SwiGLU derivative in FP32 inside the epilogue of the activation-gradient
-GEMM and recomputes the activation there, so the forward retains only the
-pre-activation; expert weight gradients accumulate in FP32 sinks, and an
-expert without assignments leaves its sink untouched. Head calls first accumulate classifier
-gradients in a BF16 buffer, flushed into the FP32 sink at the configured
-`--head-flush-every` cadence and before the optimizer update. Each column
-makes one head call, covering both prediction depths. A captured microbatch
-exceeding the cadence uses the FP32 sink per call; cadence 1 therefore gives
-per-call precision throughout.
+Under the trainer every parameter belongs to one site: the three PKDA
+projections behind one GEMM, a dense layer's QKV projection with its
+attention gate, an expert bank's stacked gate/up or down matrices with the
+shared expert first, the fusion matrix, and one flat arena for everything
+NAdam owns. A site holds a working copy in the activation dtype that the
+kernels read and an FP32 gradient sink the backward accumulates into, and
+each parameter is a view of both. A NorMuonH matrix's FP32 weight is the
+optimizer's master, packed per shape bucket on the rank that owns the
+matrix; after each update the master is rewritten into the working copy, so
+on CUDA the model holds each such matrix once in BF16 and its owner holds
+the FP32 master. The NAdam parameters keep FP32 masters on every rank and
+the mixers read BF16 working copies refreshed after each update; the tied
+embedding's classifier readout is one of them. Working copies are runtime
+state, excluded from snapshots, which record the FP32 masters.
+
+Packed projection backpropagation writes into the persistent FP32 sinks.
+PKDA Q/K/V row views share an allocation, as do dense QKV and gate
+gradients; each parameter is updated once. The routed experts' backward
+keeps the SwiGLU derivative in FP32 inside the epilogue of the
+activation-gradient GEMM and recomputes the activation there, so the forward
+retains only the pre-activation; expert weight gradients accumulate in the
+bank's FP32 sink, and an expert without assignments leaves its rows
+untouched. Every head call accumulates its classifier gradient straight into
+the tied embedding's FP32 sink, tile by tile in FP32, so the number of rows
+a call spans never changes its precision. Each column makes one head call,
+covering both prediction depths.
 
 ## NorMuonH and NAdam
 
@@ -666,8 +678,8 @@ U_t = ((1-mu_t)*G_t/(1-P_t) + mu_(t+1)*m_t/(1-P_t*mu_(t+1)))
 theta_t = theta_(t-1) - lr*U_t
 ```
 
-CUDA NAdam and the global FP32 gradient norm run outside forward/backward
-graphs. The scalar step and momentum-product state remain on CPU; moments
+CUDA NAdam and the global FP32 gradient norm, reduced across ranks, run
+outside forward/backward graphs. The scalar step and momentum-product state remain on CPU; moments
 and parameters remain FP32 on-device. Before both optimizers, the complete
 accumulated gradient's L2 norm is measured and reported; a non-finite norm
 stops the run. Nothing is clipped: NorMuonH's spectral step is scale-free,

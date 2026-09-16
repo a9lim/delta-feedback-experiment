@@ -1150,14 +1150,14 @@ def _pack_control_gradients_impl(
 
 
 @torch.library.custom_op(
-    "delta_feedback::dw_accum", mutates_args=(), device_types="cpu"
+    "delta_feedback::dw_accum", mutates_args=(), device_types=("cpu", "mps")
 )
 def dw_accum(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Tensor:
     """sink += grad_output^T @ activations, accumulated in FP32 in place.
 
     ``grad_output`` is ``[tokens, rows]`` and ``activations`` ``[tokens, cols]``;
     ``sink`` is the persistent FP32 ``[rows, cols]`` weight gradient.  The CPU
-    kernel is the literal reference; CUDA hands cuBLAS the BF16 operands with
+    and MPS kernel is the literal reference; CUDA hands cuBLAS the BF16 operands with
     the FP32 sink as both the ``beta=1`` addend and the output, so a weight
     gradient is never materialized separately from its accumulator.
 

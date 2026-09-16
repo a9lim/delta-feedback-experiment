@@ -3,11 +3,18 @@
 The loop is a pure function of (init seed, data seed, step): data rows
 are step-addressed slices of the fixed stream, recurrence randomness
 (the pass and column roll, prefix lengths, jitter) derives from keyed generators
-rather than ambient RNG state, and the WSD schedule is the shared
-:class:`Schedule` addressed by cumulative step.  That is what makes a
-resumed invocation bit-identical to an uninterrupted one and every
-condition's batches the same bytes (the paired-comparison contract; paired
-runs must share ``data_seed``, ``batch_rows``, and ``micro_rows``).
+addressed by step and global row rather than ambient RNG state, and the WSD
+schedule is the shared :class:`Schedule` addressed by cumulative step.  That
+is what makes a resumed invocation bit-identical to an uninterrupted one on
+the same replay plan and every condition's batches the same bytes (the
+paired-comparison contract; paired runs must share ``data_seed`` and
+``batch_rows``).
+
+Data parallelism splits each step's rows across ``--ranks`` processes, one
+per device, launched through ``torchrun``. Every rank replays the same graphs
+on its own rows; the FP32 gradient sinks reduce onto the ranks that own each
+matrix, NorMuonH steps the matrices it owns, and the updated working copies
+gather back. One rank is the same code without communication.
 
 Operational layer — telemetry records, immutable ``runs``-addressed
 snapshots, resume reconciliation — comes from ``transformer_experiments``.
@@ -19,6 +26,7 @@ import argparse
 import contextlib
 import gc
 import math
+import os
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -32,6 +40,7 @@ import torch
 from transformer_experiments import checkpoints, runs, telemetry
 from transformer_experiments.schedule import Schedule
 
+from . import distributed
 from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
     CONDITION_LETTERS,
@@ -52,10 +61,12 @@ from .model import (
 from .optim import (
     DEFAULT_NADAM_LR,
     DEFAULT_NORMUONH_LR,
+    NorMuonH,
     OptimizerPair,
     apply_schedule,
     build_optimizers,
 )
+from .sites import ParameterSites
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
@@ -148,7 +159,6 @@ EXACT_FIELDS = (
     "data_seed",
     "seq_len",
     "batch_rows",
-    "micro_rows",
     "steps",
     "warmup_frac",
     "cooldown_frac",
@@ -183,10 +193,11 @@ RUNTIME_FIELDS = (
     "eval_every",
     "snapshot_every",
     "eval_rows",
-    "head_flush_every",
+    "micro_rows",
     "checkpoint_margin_gib",
 )
-"""Per-invocation settings: inherited unless retyped."""
+"""Per-invocation settings: inherited unless retyped. ``--ranks`` is neither:
+it describes this invocation's processes alone and is never inherited."""
 
 
 def probability(value: str) -> float:
@@ -342,7 +353,6 @@ def build_parser() -> argparse.ArgumentParser:
             "step, as does a retyped --seq-len without this flag"
         ),
     )
-    recipe.add_argument("--micro-rows", type=int, default=1)
     recipe.add_argument("--seq-len", type=int, default=4096)
     recipe.add_argument(
         "--lr-normuonh",
@@ -427,14 +437,20 @@ def build_parser() -> argparse.ArgumentParser:
         "4,096 is one optimizer batch of predictions",
     )
     runtime.add_argument(
-        "--head-flush-every",
+        "--micro-rows",
         type=int,
-        default=2,
-        help="head calls (one per column, shared by both prediction depths) whose "
-        "classifier gradient accumulates in BF16 before it is flushed into "
-        "the FP32 embedding sink; 1 is the per-call path exactly, and wider "
-        "windows trade the head's gradient precision for the flush's bandwidth; "
-        "microbatches wider than the window use per-call FP32 accumulation",
+        default=1,
+        help="smallest rows per replay, and the evaluation microbatch; the "
+        "trainer replays the largest divisor of a rank's rows whose "
+        "activations fit, never changing the keyed per-row draws (default: 1)",
+    )
+    runtime.add_argument(
+        "--ranks",
+        type=int,
+        default=1,
+        help="data-parallel processes, one per device, launched through "
+        "torchrun; each takes batch-rows/ranks rows of every step (default: 1; "
+        "never inherited by a resume)",
     )
     runtime.add_argument(
         "--checkpoint-margin-gib",
@@ -532,35 +548,48 @@ def micro_draws(
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """(prefix_lens [k-1, n], jitter [k, n, seq_len+1, dim], loop jitter
-    [k, r-1, n, seq_len+1, dim] or None at one column) for one microbatch,
-    keyed by (data seed, step, first global row) — identical across
-    conditions for any run sharing the batch geometry. The prefix and the
-    pass jitter, which perturbs each pass's last column, are drawn first, so
-    a condition with ``l`` shares them with the condition without it; the
-    loop jitter for the earlier columns follows. Jitter is drawn directly in
-    payload units, uniform in +/- args.jitter."""
+    [k, r-1, n, seq_len+1, dim] or None at one column) for ``n_rows``
+    consecutive rows starting at global row ``first_row``.
+
+    Every row's draws are keyed by (data seed, step, its own global row), so
+    they are identical across conditions sharing the batch geometry and
+    independent of how many rows a replay holds or which rank replays them.
+    Within a row the prefix and the pass jitter, which perturbs each pass's
+    last column, are drawn first, so a condition with ``l`` shares them with
+    the condition without it; the loop jitter for the earlier columns
+    follows. Jitter is drawn directly in payload units, uniform in +/-
+    args.jitter.
+    """
     if generator is None:
         generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
-    generator.manual_seed(mix(args.data_seed, step, first_row))
     columns = args.seq_len + 1
-    shape = (n_passes - 1, n_rows)
     if prefix_out is None:
-        prefix_out = torch.empty(shape, dtype=torch.long, device=device)
-    # Plain-prefix lengths in 1..seq_len-1: position 0 is always plain and
-    # every row keeps at least one fused position.
-    torch.randint(1, args.seq_len, shape, generator=generator, out=prefix_out)
+        prefix_out = torch.empty((n_passes - 1, n_rows), dtype=torch.long, device=device)
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    jitter_shape = (n_passes, n_rows, columns, dim)
     if jitter_out is None:
-        jitter_out = torch.empty(jitter_shape, dtype=dtype, device=device)
+        jitter_out = torch.empty(
+            (n_passes, n_rows, columns, dim), dtype=dtype, device=device
+        )
+    if iterations > 1 and loop_jitter_out is None:
+        loop_jitter_out = torch.empty(
+            (n_passes, iterations - 1, n_rows, columns, dim), dtype=dtype, device=device
+        )
     amplitude = args.jitter
-    jitter_out.uniform_(-amplitude, amplitude, generator=generator)
+    for row in range(n_rows):
+        generator.manual_seed(mix(args.data_seed, step, first_row + row))
+        # Plain-prefix lengths in 1..seq_len-1: position 0 is always plain and
+        # every row keeps at least one fused position.
+        torch.randint(
+            1, args.seq_len, (n_passes - 1, 1), generator=generator,
+            out=prefix_out[:, row : row + 1],
+        )
+        jitter_out[:, row].uniform_(-amplitude, amplitude, generator=generator)
+        if iterations > 1:
+            loop_jitter_out[:, :, row].uniform_(
+                -amplitude, amplitude, generator=generator
+            )
     if iterations == 1:
         return prefix_out, jitter_out, None
-    loop_shape = (n_passes, iterations - 1, n_rows, columns, dim)
-    if loop_jitter_out is None:
-        loop_jitter_out = torch.empty(loop_shape, dtype=dtype, device=device)
-    loop_jitter_out.uniform_(-amplitude, amplitude, generator=generator)
     return prefix_out, jitter_out, loop_jitter_out
 
 
@@ -612,10 +641,16 @@ record's peak allocated bytes show what a run actually needed above its
 static footprint and retained activations. The optimizer step and periodic
 monitors reuse the graphs' pool (``pool_scope``)."""
 
-ROW_MULTIPLES = (2, 1)
-"""Rows-per-replay multiples of ``micro_rows`` a single-column graph may use. Two
-rows per replay run 4% faster per row than one on the 4090; four run 1%
-slower per row than two, so the budget is not spent on them."""
+def replay_widths(rank_rows: int, micro_rows: int) -> list[int]:
+    """Rows per replay a rank may use, largest first: the divisors of its
+    rows of the step that are multiples of the smallest replay."""
+    if rank_rows % micro_rows:
+        raise ValueError("a rank's rows must be a multiple of micro-rows")
+    return [
+        rows
+        for rows in range(rank_rows, 0, -1)
+        if rank_rows % rows == 0 and rows % micro_rows == 0
+    ]
 
 
 def block_invocations(cfg, spec: GraphSpec) -> tuple[int, int]:
@@ -636,6 +671,7 @@ def plan_replay(
     bytes_per_block: float,
     bytes_per_checkpoint: float,
     budget_bytes: float,
+    rank_rows: int | None = None,
 ) -> ReplayPlan:
     """Fit one graph into the activation budget.
 
@@ -647,22 +683,20 @@ def plan_replay(
     calibrated too, because the eligible blocks retain more than the average
     (the global-attention blocks retain less and are never recomputed).
 
-    A single-column graph replays the largest row multiple whose raw
-    activations fit; keyed feedback and loop draws that shape trunk inputs
-    address single microbatches, so every other graph keeps ``micro_rows``.
-    When even one microbatch does not fit raw, the first blocks of the
-    logical forward recompute in backward, as many as the shortfall needs.
+    Every graph replays the largest divisor of the rank's rows whose raw
+    activations fit; the keyed draws are per row, so the width changes no
+    value. When even the smallest replay does not fit raw, the first blocks
+    of the logical forward recompute in backward, as many as the shortfall
+    needs.
     """
     blocks, eligible = block_invocations(cfg, spec)
+    if rank_rows is None:
+        rank_rows = args.batch_rows
 
     def needed(rows: int) -> float:
         return (rows / args.micro_rows) * blocks * bytes_per_block
 
-    multiples = ROW_MULTIPLES if spec == GraphSpec(1, 1) else (1,)
-    for multiple in multiples:
-        rows = multiple * args.micro_rows
-        if args.batch_rows % rows:
-            continue
+    for rows in replay_widths(rank_rows, args.micro_rows):
         if needed(rows) <= budget_bytes:
             return ReplayPlan(rows, 0, eligible, needed(rows) / 2**30)
     rows = args.micro_rows
@@ -712,73 +746,232 @@ def _capture_without_gc(graph, pool):
             gc.enable()
 
 
-class CudaGraphTrainer:
+@dataclass
+class StepSums:
+    """One step's accumulated losses and expert counts on the device."""
+
+    loss_sum: torch.Tensor
+    pass1_sum: torch.Tensor
+    ntp_sum: torch.Tensor
+    mtp_sum: torch.Tensor
+    expert_balance_sum: torch.Tensor
+    expert_counts: torch.Tensor
+
+    @classmethod
+    def zeros(cls, model: DeltaModel, device: torch.device) -> StepSums:
+        scalar = lambda: torch.zeros((), dtype=torch.float32, device=device)  # noqa: E731
+        return cls(
+            scalar(), scalar(), scalar(), scalar(), scalar(),
+            torch.zeros(
+                (len(model.expert_banks), model.cfg.num_routed_experts),
+                dtype=torch.int64,
+                device=device,
+            ),
+        )
+
+    def reset(self) -> None:
+        for total in (
+            self.loss_sum, self.pass1_sum, self.ntp_sum, self.mtp_sum,
+            self.expert_balance_sum, self.expert_counts,
+        ):
+            total.zero_()
+
+
+class Trainer:
+    """What both execution engines share: the sites, the gradient table, the
+    optimizer materialization, and the rows of the step this rank runs.
+
+    The tied embedding and the large projections accumulate into their sinks
+    in place from inside backward and hand autograd no gradient; NorMuonH
+    reads those sinks through the gradient table. The replicated parameters
+    NAdam owns keep ordinary autograd gradients whose ``.grad`` is a view of
+    the FP32 arena.
+    """
+
+    def __init__(
+        self,
+        model: DeltaModel,
+        optimizers,
+        sites: ParameterSites,
+        args,
+        topology: distributed.Topology,
+    ):
+        self.model = model
+        self.optimizers = optimizers
+        self.sites = sites
+        self.args = args
+        self.topology = topology
+        self.device = next(model.parameters()).device
+        self.rank_rows = args.batch_rows // topology.world
+        if not sites.allocated:
+            sites.allocate()
+        self.model.refresh_shadows()
+        self.gradients = sites.gradients()
+        self.sharded = sites.sharded
+        self.replicated = [
+            parameter for parameter in self.gradients if parameter not in self.sharded
+        ]
+        self.normuonh = next(o for o in optimizers if isinstance(o, NorMuonH))
+        self.normuonh.bind_gradients(self.gradients)
+        for parameter in self.replicated:
+            parameter.grad = self.gradients[parameter]
+        self._initialize_optimizers()
+        self.normuonh.materialize()
+        # From here the sharded matrices exist only as working copies plus the
+        # owner's FP32 master.
+        sites.adopt()
+
+    def _initialize_optimizers(self) -> None:
+        """Materialize persistent state before anything transient."""
+        if any(optimizer.state for optimizer in self.optimizers):
+            # Resume already restored state; only warm the compiled NorMuonH body.
+            for optimizer in self.optimizers:
+                warmup = getattr(optimizer, "warmup", None)
+                if warmup is not None:
+                    warmup()
+            return
+
+        saved = [group["lr"] for opt in self.optimizers for group in opt.param_groups]
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                group["lr"] = 0.0
+            optimizer.step()
+        for optimizer in self.optimizers:
+            for values in optimizer.state.values():
+                for name, value in values.items():
+                    if not isinstance(value, torch.Tensor) or name == "radius":
+                        continue
+                    if name == "mu_product":
+                        value.fill_(1)
+                    else:
+                        value.zero_()
+        for rate, group in zip(
+            saved,
+            (group for opt in self.optimizers for group in opt.param_groups),
+            strict=True,
+        ):
+            group["lr"] = rate
+
+    def rank_first_row(self, first_row: int) -> int:
+        """The first of this rank's rows within a step starting at ``first_row``."""
+        return first_row + self.topology.rank * self.rank_rows
+
+    def prepare_optimizer(self, active: frozenset[torch.nn.Parameter]) -> None:
+        """Hand the optimizers the reduced step gradient of the active parameters.
+
+        An absent parameter keeps its weights and state. Any per-pattern
+        optimizer tensor must be allocated here, outside ``pool_scope``: one
+        allocated inside would sit in memory the next replay overwrites.
+        """
+        self.normuonh.bind_gradients(
+            {p: g for p, g in self.gradients.items() if p in active and p in self.sharded}
+        )
+        for parameter in self.replicated:
+            parameter.grad = self.gradients[parameter] if parameter in active else None
+        for optimizer in self.optimizers:
+            prepare = getattr(optimizer, "prepare", None)
+            if prepare is not None:
+                prepare()
+
+    def zero_grad(self) -> None:
+        self.sites.zero_gradients()
+        for parameter in self.replicated:
+            parameter.grad = self.gradients[parameter]
+
+    @contextlib.contextmanager
+    def pool_scope(self):
+        yield
+
+
+class EagerTrainer(Trainer):
+    """The portable engine: eager microbatches of ``micro_rows`` rows."""
+
+    def __init__(self, model, optimizers, sites, args, topology):
+        super().__init__(model, optimizers, sites, args, topology)
+        self.active = frozenset(self.gradients)
+        self.sums = StepSums.zeros(model, self.device)
+
+    def begin(self, spec: GraphSpec, z_coef: float = 0.0) -> StepSums:
+        self.spec = spec
+        self.z_coef = z_coef
+        self.sums.reset()
+        return self.sums
+
+    def replay_batch(self, state: StepSums, data: TokenData, step: int, first_row: int):
+        args = self.args
+        first = self.rank_first_row(first_row)
+        scale = args.micro_rows / args.batch_rows
+        for offset in range(0, self.rank_rows, args.micro_rows):
+            rows = data.batch(first + offset, args.micro_rows, self.device)
+            prefix, jitter, loop_jitter = micro_draws(
+                args, step, first + offset, self.spec.n_passes, self.spec.iterations,
+                rows.shape[0], args.dim, self.device,
+            )
+            outs = multipass(
+                self.model, rows, self.spec.n_passes, iterations=self.spec.iterations,
+                prefix_lens=prefix, jitter=jitter, loop_jitter=loop_jitter,
+            )
+            loss_result = multipass_loss(
+                self.model, rows, outs, z_coef=self.z_coef, mtp_weight=args.mtp_weight
+            )
+            loss, losses = loss_result.total, loss_result.ntp
+            (loss * scale).backward()
+            state.loss_sum.add_(loss.detach() * scale)
+            state.pass1_sum.add_(losses[0][0].detach() * scale)
+            state.ntp_sum.add_(combine_column_losses(loss_result.ntp).detach() * scale)
+            state.mtp_sum.add_(combine_column_losses(loss_result.mtp).detach() * scale)
+            state.expert_counts.add_(loss_result.expert_counts)
+            state.expert_balance_sum.add_(loss_result.expert_aux_loss.detach() * scale)
+
+    def prepare_optimizer(self, state: StepSums) -> None:  # type: ignore[override]
+        super().prepare_optimizer(self.active)
+
+
+class CudaGraphTrainer(Trainer):
     """Fixed-address forward/backward graphs for every reachable step mode.
 
-    The model's gradient tensors and every graph input are allocated once.
+    The model's gradient slabs and every graph input are allocated once.
     Data and keyed CUDA randomness are copied/drawn into those addresses before
     replay.  Graphs share a private pool and never overlap; each captured body
     ends after backward, so no saved activation survives between replays.
 
-    Every persistent FP32 gradient buffer and the optimizer state exist before
-    the first forward, so the activation budget is measured against the real
-    static footprint: the cheapest reachable graph runs one eager forward,
-    its retained bytes per block invocation calibrate ``plan_replay``, and
-    every graph then gets its rows per replay and its recomputed block count.
+    Every persistent FP32 gradient slab, the optimizer state, and the owned
+    FP32 masters exist before the first forward, and the replicated FP32
+    parameters are gone, so the activation budget is measured against the
+    real static footprint: the cheapest reachable graph runs one eager
+    forward, its retained bytes per block invocation calibrate
+    ``plan_replay``, and every graph then gets its rows per replay and its
+    recomputed block count. The budget is the smallest across ranks, so every
+    rank replays the same plan.
 
-    The tied embedding and the large projections accumulate into their
-    buffers in place from inside backward and hand autograd no gradient, so a
-    buffer that warm-up touched marks its parameter active for that mode
-    exactly as an autograd gradient marks the remaining vectors and small
-    matrices.
-
-    The head is the one site whose gradient does not reach its FP32 sink on
-    every microbatch: every head call lock-adds into one persistent BF16
-    classifier buffer, and the buffer is added into the sink and cleared
-    whenever another replay would take it past ``head_flush_every`` head calls,
-    plus once more before the optimizer reads the step's gradient.
+    A slab that warm-up touched marks its parameter active for that mode
+    exactly as an autograd gradient marks the replicated vectors and small
+    matrices. The head's classifier gradient accumulates straight into the
+    tied embedding's FP32 sink on every call, whatever the replay's width.
     """
 
-    def __init__(self, model: DeltaModel, optimizers, args, schedule: Schedule):
-        self.model = model
-        self.optimizers = optimizers
-        self.args = args
-        self.device = next(model.parameters()).device
+    def __init__(self, model: DeltaModel, optimizers, sites, args, schedule: Schedule, topology):
+        super().__init__(model, optimizers, sites, args, topology)
         self.autocast = torch.autocast("cuda", dtype=torch.bfloat16)
         self.generator = torch.Generator(device=self.device)
-        self.parameters = [p for p in model.parameters() if p.requires_grad]
         self.batch_stager = CudaBatchStager(
-            args.batch_rows, args.seq_len + 1, self.device
+            self.rank_rows, args.seq_len + 1, self.device
         )
-        self.model.refresh_shadows()
-        self._buffers = model.allocate_gradient_buffers()
-        self.sink_fed = model.bind_gradient_sinks(self._buffers)
 
-        # The head's classifier gradient lands in one persistent BF16 buffer
-        # instead of a fresh 233 MB zero tensor per call, and reaches the FP32
-        # sink once every ``head_flush_every`` head calls.  It exists and is
-        # zeroed before warm-up traces the head, carries no autograd history,
-        # and keeps its address through capture.
-        self.head_flush_every = args.head_flush_every
-        self._head_pending = 0
-        self.head_accum = None
-        if model.embed_tokens.grad_sink is not None:
-            self.head_accum = torch.zeros_like(model._classifier_shadow)
-            model.bind_classifier_accum(self.head_accum)
-
-        # Materialize the optimizer state before anything transient, so the
-        # free memory the activation budget starts from already excludes the
-        # static footprint. Measuring what the device reports free, with the
-        # allocator's cache emptied, also excludes the CUDA context and any
+        # Measure what the device reports free, with the allocator's cache
+        # emptied: that excludes the CUDA context, the communicator, and any
         # other process, which a total-minus-static estimate would count.
-        for parameter in self.parameters:
-            parameter.grad = self._buffers[parameter]
-        self._initialize_optimizers()
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         self.static_bytes = torch.cuda.memory_allocated()
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
-        self.budget_bytes = free_bytes - args.checkpoint_margin_gib * 2**30
+        budget = torch.tensor(
+            [-(free_bytes - args.checkpoint_margin_gib * 2**30)],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        # The smallest budget across ranks plans every rank.
+        self.budget_bytes = -distributed.all_reduce_(budget, maximum=True).item()
         specs = self._reachable_specs(schedule)
         base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
         self.bytes_per_block, self.bytes_per_checkpoint = self._calibrate(base)
@@ -812,25 +1005,12 @@ class CudaGraphTrainer:
                 estimated_gib=round(state.plan.estimated_gib, 2),
             )
             active_by_spec[spec] = self._warm(state)
-        model.zero_grad(set_to_none=True)
-        union = set().union(*active_by_spec.values())
-        self.grad_buffers = {p: self._buffers[p] for p in self.parameters if p in union}
-        del self._buffers
-        # Rebinding drops the sinks of parameters no reachable mode ever touches.
-        model.bind_classifier_accum(self.head_accum)
-        self.sink_fed = model.bind_gradient_sinks(self.grad_buffers)
-        # A dropped embedding sink takes the head's accumulator with it.
-        self.head_accum = model._classifier_accum
-        for parameter, gradient in self.grad_buffers.items():
-            parameter.grad = gradient
-
-        self.model.refresh_shadows()
+        self.zero_grad()
         for active in active_by_spec.values():
             for optimizer in self.optimizers:
                 warmup = getattr(optimizer, "warmup", None)
                 if warmup is not None:
                     warmup(active)
-        self.zero_grad()
         torch.cuda.empty_cache()
 
         # A MemPool object, not a bare handle: ``pool_scope`` needs the
@@ -861,7 +1041,7 @@ class CudaGraphTrainer:
         its captured addresses without allocating, so a tensor from this scope
         that is still alive at the next replay aliases what that replay
         writes. No ``graph.replay()`` may run inside the scope for the same
-        reason.
+        reason, and the collectives stay outside it too.
 
         The graph bodies free every activation they allocate, but a private
         pool never returns its segments, so eager work between replays would
@@ -904,6 +1084,7 @@ class CudaGraphTrainer:
             bytes_per_block,
             bytes_per_checkpoint,
             budget_bytes,
+            self.rank_rows,
         )
 
     def _inputs(
@@ -959,7 +1140,7 @@ class CudaGraphTrainer:
         torch.cuda.synchronize()
         alive = torch.cuda.memory_allocated() - before
         del outs, result
-        self.model.zero_grad(set_to_none=True)
+        self.zero_grad()
         torch.cuda.synchronize()
         return alive
 
@@ -983,6 +1164,7 @@ class CudaGraphTrainer:
 
     def _allocate(self, spec: GraphSpec, plan: ReplayPlan) -> CapturedMicro:
         tokens, prefix, jitter, loop_jitter = self._inputs(spec, plan.rows_per_replay)
+        sums = StepSums.zeros(self.model, self.device)
         return CapturedMicro(
             spec,
             plan,
@@ -991,23 +1173,16 @@ class CudaGraphTrainer:
             jitter,
             loop_jitter,
             torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros((), dtype=torch.float32, device=self.device),
-            torch.zeros(
-                (len(self.model.expert_banks), self.model.cfg.num_routed_experts),
-                dtype=torch.int64,
-                device=self.device,
-            ),
+            sums.loss_sum,
+            sums.pass1_sum,
+            sums.ntp_sum,
+            sums.mtp_sum,
+            sums.expert_balance_sum,
+            sums.expert_counts,
         )
 
     def _body(self, state: CapturedMicro) -> None:
         self.model.checkpoint_blocks = state.plan.checkpoint_blocks
-        self.model.bind_classifier_accum(
-            self.head_accum if self._head_calls(state) <= self.head_flush_every else None
-        )
         # Each replay's mean loss enters the step in proportion to its rows.
         scale = state.plan.rows_per_replay / self.args.batch_rows
         with self.autocast:
@@ -1035,63 +1210,33 @@ class CudaGraphTrainer:
         state.expert_counts.add_(loss_result.expert_counts)
         state.expert_balance_sum.add_(loss_result.expert_aux_loss.detach() * scale)
 
-    def _drain_head_accum(self) -> None:
-        """Add the head's accumulated BF16 gradient into its FP32 sink.
-
-        Eager work between replays, never inside a captured body: the buffer's
-        contents are the only thing that crosses, its address does not move,
-        and the sink is the same one every other bound site accumulates into.
-        """
-        self.model.embed_tokens.grad_sink.add_(self.head_accum)
-        self.head_accum.zero_()
-        self._head_pending = 0
-
-    def flush_head_accum(self) -> None:
-        """Drain the head accumulator when a replay has written into it."""
-        if self.head_accum is not None and self._head_pending:
-            self._drain_head_accum()
-
     def _warm(self, state: CapturedMicro) -> set[torch.nn.Parameter]:
-        for parameter in self.sink_fed:
-            self._buffers[parameter].zero_()
-        if self.head_accum is not None:
-            self.head_accum.zero_()
-            self._head_pending = 0
+        self.zero_grad()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for _ in range(2):
-                self.model.zero_grad(set_to_none=True)
+                self.zero_grad()
                 self._body(state)
-                # Warm-up decides which parameters a mode touches from its
-                # buffers, so the head's gradient has to reach the sink here
-                # exactly as a replayed step's does.
-                if self.head_accum is not None:
-                    self._drain_head_accum()
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
-        active = {p for p in self.parameters if p.grad is not None}
-        active |= {p for p in self.sink_fed if bool(self._buffers[p].any())}
+        # Warm-up decides which parameters a mode touches from its slabs.
+        active = {p for p, g in self.gradients.items() if bool(g.any())}
         # Warm-up rows can select only a few experts. Replay data changes
         # those choices, so activity is structural for the entire bank.
         active.update(
             parameter
             for bank in self.model.expert_banks
             for parameter in bank.parameters()
-            if parameter.requires_grad
         )
         return active
 
     def _capture(self, state: CapturedMicro, pool) -> None:
-        for gradient in self.grad_buffers.values():
-            gradient.zero_()
-        if self.head_accum is not None:
-            # Capture records the head's accumulation into this buffer; the
-            # zeroing stays outside the body, where every replay leaves it.
-            self.head_accum.zero_()
-            self._head_pending = 0
+        self.zero_grad()
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+        state.ntp_sum.zero_()
+        state.mtp_sum.zero_()
         state.expert_balance_sum.zero_()
         state.expert_counts.zero_()
         # Capturing on a blocking stream cannot inherit unfinished
@@ -1103,39 +1248,10 @@ class CudaGraphTrainer:
         state.graph = graph
         state.loss_sum.zero_()
         state.pass1_sum.zero_()
+        state.ntp_sum.zero_()
+        state.mtp_sum.zero_()
         state.expert_balance_sum.zero_()
         state.expert_counts.zero_()
-
-    def _initialize_optimizers(self) -> None:
-        """Materialize persistent state before the graph-private pool grows."""
-        if any(optimizer.state for optimizer in self.optimizers):
-            # Resume already restored state; only warm the compiled NorMuonH body.
-            for optimizer in self.optimizers:
-                warmup = getattr(optimizer, "warmup", None)
-                if warmup is not None:
-                    warmup()
-            return
-
-        saved = [group["lr"] for opt in self.optimizers for group in opt.param_groups]
-        for optimizer in self.optimizers:
-            for group in optimizer.param_groups:
-                group["lr"] = 0.0
-            optimizer.step()
-        for optimizer in self.optimizers:
-            for values in optimizer.state.values():
-                for name, value in values.items():
-                    if not isinstance(value, torch.Tensor) or name == "radius":
-                        continue
-                    if name == "mu_product":
-                        value.fill_(1)
-                    else:
-                        value.zero_()
-        for rate, group in zip(
-            saved,
-            (group for opt in self.optimizers for group in opt.param_groups),
-            strict=True,
-        ):
-            group["lr"] = rate
 
     def begin(self, spec: GraphSpec, z_coef: float = 0.0) -> CapturedMicro:
         state = self.states[spec]
@@ -1147,10 +1263,6 @@ class CudaGraphTrainer:
         state.expert_balance_sum.zero_()
         state.expert_counts.zero_()
         return state
-
-    def _head_calls(self, state: CapturedMicro) -> int:
-        """Head calls one replay makes: both depths share one call per column."""
-        return state.spec.n_passes * state.spec.iterations
 
     def replay(self, state: CapturedMicro, rows: torch.Tensor, step: int, first: int):
         state.rows.copy_(rows, non_blocking=rows.is_cuda)
@@ -1169,52 +1281,18 @@ class CudaGraphTrainer:
             generator=self.generator,
         )
         state.graph.replay()
-        calls = self._head_calls(state)
-        if self.head_accum is not None and calls <= self.head_flush_every:
-            # The window counts actual head calls, not replays.
-            # Every call rounds the running BF16
-            # sum, so the cadence has to hold the number of contributions
-            # between flushes fixed across conditions. Draining before the
-            # next replay would overrun keeps that number at or under the
-            # window even when it is not a multiple of the pass count.
-            self._head_pending += calls
-            if self._head_pending + calls > self.head_flush_every:
-                self._drain_head_accum()
 
     def replay_batch(
         self, state: CapturedMicro, data: TokenData, step: int, first_row: int
     ) -> None:
-        rows = self.batch_stager.stage(data, first_row)
+        first = self.rank_first_row(first_row)
+        rows = self.batch_stager.stage(data, first)
         width = state.plan.rows_per_replay
-        for offset in range(0, self.args.batch_rows, width):
-            self.replay(state, rows[offset : offset + width], step, first_row + offset)
-        # A microbatch count that is not a multiple of the flush cadence leaves
-        # a remainder; the step's gradient is complete only once it is drained.
-        self.flush_head_accum()
+        for offset in range(0, self.rank_rows, width):
+            self.replay(state, rows[offset : offset + width], step, first + offset)
 
-    def prepare_optimizer(self, state: CapturedMicro) -> None:
-        self.flush_head_accum()
-        for parameter in self.parameters:
-            parameter.grad = (
-                self.grad_buffers.get(parameter) if parameter in state.active else None
-            )
-        # Any per-pattern optimizer tensor must be allocated here, outside
-        # ``pool_scope``: one allocated inside would sit in memory the next
-        # replay overwrites.
-        for optimizer in self.optimizers:
-            prepare = getattr(optimizer, "prepare", None)
-            if prepare is not None:
-                prepare()
-
-    def zero_grad(self) -> None:
-        if self.head_accum is not None:
-            self.head_accum.zero_()
-            self._head_pending = 0
-        for parameter in self.parameters:
-            gradient = self.grad_buffers.get(parameter)
-            parameter.grad = gradient
-            if gradient is not None:
-                gradient.zero_()
+    def prepare_optimizer(self, state: CapturedMicro) -> None:  # type: ignore[override]
+        super().prepare_optimizer(state.active)
 
 
 # -- evaluation ----------------------------------------------------------------
@@ -1238,16 +1316,29 @@ class CapturedEval:
             total.zero_()
 
 
+def eval_slice(args, topology: distributed.Topology) -> tuple[int, int]:
+    """(first row, rows) of the held-out slice this rank evaluates.
+
+    The rows split evenly across ranks, the last rank taking the remainder;
+    the per-row sums all-reduce, so every rank reports the same means.
+    """
+    per_rank = -(-args.eval_rows // topology.world)
+    first = min(topology.rank * per_rank, args.eval_rows)
+    return first, max(0, min(per_rank, args.eval_rows - first))
+
+
 class CudaEvalRunner:
     """No-grad validation graphs sharing the trainer's private memory pool."""
 
-    def __init__(self, model: DeltaModel, args, pool):
+    def __init__(self, model: DeltaModel, args, pool, topology: distributed.Topology):
         self.model = model
         self.args = args
+        self.topology = topology
         self.device = next(model.parameters()).device
         self.autocast = torch.autocast("cuda", dtype=torch.bfloat16)
-        remainder = args.eval_rows % args.micro_rows
-        sizes = {min(args.eval_rows, args.micro_rows)}
+        self.first, self.count = eval_slice(args, topology)
+        remainder = self.count % args.micro_rows
+        sizes = {min(self.count, args.micro_rows)} - {0}
         if remainder:
             sizes.add(remainder)
         self.states = {size: self._capture(size, pool) for size in sorted(sizes)}
@@ -1321,11 +1412,11 @@ class CudaEvalRunner:
         total_mtp = torch.zeros_like(total_val)
         total_mtp_fused = torch.zeros_like(total_val)
         total_one = torch.zeros_like(total_val)
-        for first in range(0, self.args.eval_rows, self.args.micro_rows):
-            rows = min(self.args.micro_rows, self.args.eval_rows - first)
+        for offset in range(0, self.count, self.args.micro_rows):
+            rows = min(self.args.micro_rows, self.count - offset)
             state = self.states[rows]
             state.reset()
-            state.rows.copy_(data_val.batch(first, rows))
+            state.rows.copy_(data_val.batch(self.first + offset, rows))
             state.graph.replay()
             total_val.add_(state.val_sum)
             if self.model.cfg.feedback:
@@ -1333,6 +1424,11 @@ class CudaEvalRunner:
             total_mtp.add_(state.mtp_sum)
             total_mtp_fused.add_(state.mtp_fused_sum)
             total_one.add_(state.one_sum)
+        totals = torch.stack(
+            [total_val, total_fused, total_mtp, total_mtp_fused, total_one]
+        )
+        distributed.all_reduce_(totals)
+        total_val, total_fused, total_mtp, total_mtp_fused, total_one = totals.unbind()
         result = {"val": (total_val / self.args.eval_rows).item()}
         if self.model.cfg.feedback:
             result["val_fused"] = (total_fused / self.args.eval_rows).item()
@@ -1348,6 +1444,9 @@ class CudaEvalRunner:
 def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, float]:
     """Production CUDA telemetry without assuming a packed mixer layout.
 
+    ``static_gib`` is this rank's footprint: the working copies, the FP32
+    gradient slabs, the replicated NAdam parameters and moments, and the FP32
+    masters and NorMuonH state of the matrices this rank owns.
     ``peak_allocated_gib`` is the most memory live at once through
     calibration, warm-up, and capture, so minus the static footprint and the
     deepest graph's retained activations it is the transient the margin has
@@ -1360,7 +1459,8 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, float]
         "cce": 1,
         "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
         "eval_graphs": len(eval_graph_runner.states),
-        "head_flush_every": graph_runner.head_flush_every,
+        "ranks": graph_runner.topology.world,
+        "rank_rows": graph_runner.rank_rows,
         "static_gib": round(graph_runner.static_bytes / 2**30, 2),
         "activation_budget_gib": round(graph_runner.budget_bytes / 2**30, 2),
         "block_mib": round(graph_runner.bytes_per_block / 2**20, 1),
@@ -1378,17 +1478,19 @@ def evaluate(
     args,
     device,
     graph_runner: CudaEvalRunner | None = None,
+    topology: distributed.Topology = distributed.Topology(),
 ) -> dict[str, float]:
     """Paired val losses at the evaluation depth: pass 1 always, one fused
     pass on feedback conditions, and the single-column readout under ``l``."""
     if graph_runner is not None:
         return graph_runner.run(data_val)
     model.eval()
-    sums = {}
-    counted = 0
-    for first in range(0, args.eval_rows, args.micro_rows):
+    keys = ("val", "val_fused", "val_mtp", "val_mtp_fused", "val_one")
+    sums = dict.fromkeys(keys, 0.0)
+    start, count = eval_slice(args, topology)
+    for offset in range(0, count, args.micro_rows):
         rows = data_val.batch(
-            first, min(args.micro_rows, args.eval_rows - first), device
+            start + offset, min(args.micro_rows, count - offset), device
         )
         n_passes = 2 if model.cfg.feedback else 1
         prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
@@ -1397,20 +1499,22 @@ def evaluate(
         )
         result = multipass_loss(model, rows, outs, mtp_weight=args.mtp_weight)
         losses = result.ntp
-        count = rows.shape[0]
-        sums["val"] = sums.get("val", 0.0) + losses[0][-1].item() * count
+        weight = rows.shape[0]
+        sums["val"] += losses[0][-1].item() * weight
+        sums["val_mtp"] += result.mtp[0][-1].item() * weight
         if n_passes > 1:
-            sums["val_fused"] = sums.get("val_fused", 0.0) + losses[1][-1].item() * count
-        counted += count
-        sums["val_mtp"] = sums.get("val_mtp", 0.0) + result.mtp[0][-1].item() * count
-        if n_passes > 1:
-            sums["val_mtp_fused"] = (
-                sums.get("val_mtp_fused", 0.0) + result.mtp[1][-1].item() * count
-            )
+            sums["val_fused"] += losses[1][-1].item() * weight
+            sums["val_mtp_fused"] += result.mtp[1][-1].item() * weight
         if model.cfg.loop:
-            sums["val_one"] = sums.get("val_one", 0.0) + losses[0][0].item() * count
+            sums["val_one"] += losses[0][0].item() * weight
+    totals = torch.tensor([sums[key] for key in keys], dtype=torch.float64, device=device)
+    distributed.all_reduce_(totals)
+    means = dict(zip(keys, (totals / args.eval_rows).tolist(), strict=True))
     model.train()
-    return {key: value / counted for key, value in sums.items()}
+    wanted = ["val"] + (["val_fused"] if model.cfg.feedback else []) + ["val_mtp"]
+    wanted += ["val_mtp_fused"] if model.cfg.feedback else []
+    wanted += ["val_one"] if model.cfg.loop else []
+    return {key: means[key] for key in wanted}
 
 
 @torch.no_grad()
@@ -1522,13 +1626,90 @@ def _write_snapshot(
     return path
 
 
-class AsyncSnapshotWriter:
-    """Single-flight immutable staging plus background atomic serialization."""
+class SnapshotState:
+    """The model's checkpoint state with every sharded matrix's FP32 master.
 
-    def __init__(self, args, model, pair, protected: set[int]):
-        self.args = args
+    Rank zero assembles the dict a single process would write: replicated
+    parameters and buffers as they are, and each sharded matrix's master from
+    its owner, local ones as device views the stager copies asynchronously
+    and remote ones as host copies. Other ranks take part in the gather and
+    return nothing.
+    """
+
+    def __init__(self, model: DeltaModel, sites: ParameterSites, normuonh: NorMuonH):
         self.model = model
-        self.pair = pair
+        self.sites = sites
+        self.normuonh = normuonh
+
+    def state_dict(self) -> dict:
+        contents = self.model.state_dict()
+        owned = self.sites.owned
+        for name, parameter in self.model.named_parameters():
+            if parameter not in self.sites.sharded:
+                continue
+            master = self.normuonh.master_of(parameter) if parameter in owned else None
+            gathered = self.sites.collect(
+                parameter, master, shape=tuple(parameter.shape), dtype=torch.float32
+            )
+            if self.sites.topology.main:
+                contents[name] = gathered
+        return contents if self.sites.topology.main else {}
+
+
+class SnapshotOptimizer:
+    """The optimizer stack's checkpoint state, whole, on rank zero.
+
+    NAdam is replicated and its state dict is the same on every rank.
+    NorMuonH's parameter groups are global while each rank's state names the
+    matrices it owns, so rank zero gathers every matrix's momentum, row
+    moment, radius, and right vector from its owner into one state dict of
+    the single-process schema.
+    """
+
+    def __init__(self, optimizers, sites: ParameterSites):
+        self.optimizers = optimizers
+        self.sites = sites
+
+    def state_dict(self) -> dict:
+        stack = [
+            self._normuonh(optimizer)
+            if isinstance(optimizer, NorMuonH)
+            else optimizer.state_dict()
+            for optimizer in self.optimizers
+        ]
+        return {"stack": stack} if self.sites.topology.main else {}
+
+    def _normuonh(self, optimizer: NorMuonH) -> dict:
+        local = optimizer.state_dict()
+        state: dict[int, dict] = {}
+        owned = self.sites.owned
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                entry = optimizer.state[parameter] if parameter in owned else None
+                gathered = {}
+                for name, (shape, dtype) in optimizer.state_shapes(parameter).items():
+                    tensor = entry[name] if entry else None
+                    value = self.sites.collect(parameter, tensor, shape=shape, dtype=dtype)
+                    if self.sites.topology.main:
+                        gathered[name] = value
+                if self.sites.topology.main:
+                    state[optimizer.index_of(parameter)] = gathered
+        return {"state": state, "param_groups": local["param_groups"]}
+
+
+class AsyncSnapshotWriter:
+    """Single-flight immutable staging plus background atomic serialization.
+
+    Every rank stages, since the staging gathers the sharded state to rank
+    zero, and only rank zero serializes.
+    """
+
+    def __init__(self, args, model, sites, optimizers, protected: set[int]):
+        self.args = args
+        self.topology = sites.topology
+        normuonh = next(o for o in optimizers if isinstance(o, NorMuonH))
+        self.state = SnapshotState(model, sites, normuonh)
+        self.optimizer = SnapshotOptimizer(optimizers, sites)
         self.protected = protected
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="snapshot")
         self.pending: Future[Path] | None = None
@@ -1545,15 +1726,16 @@ class AsyncSnapshotWriter:
         # host memory and write failures explicit rather than accumulating them.
         self.poll(wait=True)
         path = runs.snapshot_path(self.args.tag, step, self.args.out_dir)
-        staged = checkpoints.stage(CONTRACT, self.model, self.pair, self.args, step)
-        self.pending = self.executor.submit(
-            _write_snapshot,
-            path,
-            staged,
-            self.args,
-            step,
-            self.protected,
-        )
+        staged = checkpoints.stage(CONTRACT, self.state, self.optimizer, self.args, step)
+        if self.topology.main:
+            self.pending = self.executor.submit(
+                _write_snapshot,
+                path,
+                staged,
+                self.args,
+                step,
+                self.protected,
+            )
         return path
 
     def close(self) -> None:
@@ -1675,14 +1857,23 @@ def parse_run_args(argv: list[str]) -> argparse.Namespace:
     return resolve_run_args(build_parser(), argv)[0]
 
 
-def pick_device(name: str | None) -> torch.device:
+def pick_device(
+    name: str | None, topology: distributed.Topology = distributed.Topology()
+) -> torch.device:
+    """The device of this rank: a named one, else CUDA by local rank, MPS, CPU."""
     if name:
-        return torch.device(name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+        device = torch.device(name)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+    if device.type == "cuda":
+        if device.index is None:
+            device = torch.device("cuda", topology.local_rank)
+        torch.cuda.set_device(device)
+    return device
 
 
 def build_schedule(args) -> Schedule:
@@ -1712,32 +1903,33 @@ def build_schedule(args) -> Schedule:
     return schedule
 
 
-def gradient_norm(parameters) -> float:
-    """L2 norm of the accumulated global gradient vector; non-finite stops the run.
-
-    Nothing is clipped. NorMuonH's spectral step is scale-free and NAdam's
-    nearly so, and with the residual stream entering at unit scale the graph
-    shapes' norms sit within a factor of two of each other, so a ceiling
-    would only re-weight rare spikes inside the momentum. The norm is
-    telemetry and the finite check.
-    """
-    grads = [p.grad for p in parameters if p.grad is not None]
-    return torch.nn.utils.get_total_norm(
-        grads, norm_type=2.0, error_if_nonfinite=True
-    ).item()
-
-
 def train(argv: list[str] | None = None) -> dict:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
     args, pinned = resolve_run_args(parser, argv)
+    topology = distributed.Topology.from_environment()
+    if args.ranks != topology.world:
+        raise ValueError(
+            f"--ranks {args.ranks} but this invocation has {topology.world} "
+            "process(es); launch through torchrun or run `delta train` directly"
+        )
+    if not topology.main:
+        telemetry.silence()
     tags = (args.tag, args.continue_from) if args.continue_from else (args.tag,)
-    with runs.lock_tags(args.out_dir, *tags):
-        return _train(args, pinned)
+    # The tag lock belongs to one process; the other ranks share its fate.
+    lock = runs.lock_tags(args.out_dir, *tags) if topology.main else contextlib.nullcontext()
+    try:
+        with lock:
+            return _train(args, pinned, topology)
+    finally:
+        distributed.shutdown()
 
 
-def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
-    device = pick_device(args.device)
+def _train(
+    args: argparse.Namespace, pinned: frozenset[str], topology: distributed.Topology
+) -> dict:
+    device = pick_device(args.device, topology)
+    distributed.initialize(topology, device)
     if device.type == "cuda":
         # TF32 for the FP32 matmuls that remain outside autocast: NorMuonH's
         # spectral power iterations and the FP32 diagnostics. The Newton-Schulz
@@ -1820,10 +2012,13 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
         if path != latest_path:
             payload = read_checkpoint(path)
 
-    if args.batch_rows % args.micro_rows:
-        raise ValueError("batch-rows must be a multiple of micro-rows")
-    if args.head_flush_every < 1:
-        raise ValueError("head-flush-every must be at least one head call")
+    if args.micro_rows < 1:
+        raise ValueError("micro-rows must be positive")
+    if args.batch_rows % (topology.world * args.micro_rows):
+        raise ValueError(
+            "batch-rows must be a multiple of ranks times micro-rows, so every "
+            "rank takes the same whole replays of every step"
+        )
     schedule = build_schedule(args)
     total = schedule.total
 
@@ -1848,10 +2043,12 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
     model = DeltaModel(condition_config(args.condition, **model_fields(args))).to(
         device
     )
+    sites = ParameterSites(model, topology)
     optimizers = build_optimizers(
         model,
         lr_normuonh=args.lr_normuonh,
         lr_nadam=args.lr_nadam,
+        owned=sites.owned,
     )
     pair = OptimizerPair(optimizers)
 
@@ -1872,6 +2069,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             source=args.source,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
+            ranks=topology.world,
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
             expert_lr_scale=model.cfg.expert_lr_scale,
@@ -1892,11 +2090,6 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                 path=str(path),
             )
 
-    autocast = (
-        torch.autocast("cuda", dtype=torch.bfloat16)
-        if device.type == "cuda"
-        else contextlib.nullcontext()
-    )
     # Persistent snapshots at the cooldown boundary, the recurrence boundary
     # (the last single-column state), and the end, so cooldown and recurrence
     # variants can continue from the exact pre-boundary state.
@@ -1916,231 +2109,200 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
         total_steps=total,
     )
     model.train()
-    graph_runner = None
+    sites.allocate()
     eval_graph_runner = None
-    eager_scope = contextlib.nullcontext
     if device.type == "cuda":
-        graph_runner = CudaGraphTrainer(model, optimizers, args, schedule)
-        eval_graph_runner = CudaEvalRunner(model, args, graph_runner.pool)
-        eager_scope = graph_runner.pool_scope
+        trainer = CudaGraphTrainer(model, optimizers, sites, args, schedule, topology)
+        eval_graph_runner = CudaEvalRunner(model, args, trainer.pool, topology)
         telemetry.log(
             "execution",
-            **execution_fields(model, graph_runner, eval_graph_runner),
+            **execution_fields(model, trainer, eval_graph_runner),
         )
         torch.cuda.reset_peak_memory_stats()
+    else:
+        trainer = EagerTrainer(model, optimizers, sites, args, topology)
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0
     window_cell_tokens = 0.0
     summary: dict = {}
     interrupted = False
-    snapshot_writer = AsyncSnapshotWriter(args, model, pair, protected)
+    snapshot_writer = AsyncSnapshotWriter(args, model, sites, optimizers, protected)
 
     try:
-        for step in range(start_step + 1, end_step + 1):
-            snapshot_writer.poll()
-            learning_rates = apply_schedule(optimizers, schedule, step)
-            phase = schedule.phase(step)[0]
-            z_coef = args.zloss if phase == "cooldown" else 0.0
-            n_passes, iterations = step_shape(args, step, total, model.cfg)
+        with distributed.Interrupt() as interrupt:
+            for step in range(start_step + 1, end_step + 1):
+                snapshot_writer.poll()
+                learning_rates = apply_schedule(optimizers, schedule, step)
+                phase = schedule.phase(step)[0]
+                z_coef = args.zloss if phase == "cooldown" else 0.0
+                n_passes, iterations = step_shape(args, step, total, model.cfg)
 
-            micros = args.batch_rows // args.micro_rows
-            if graph_runner is not None:
                 spec = GraphSpec(n_passes, iterations)
-                graph_state = graph_runner.begin(spec, z_coef)
-                graph_runner.replay_batch(
-                    graph_state, data_train, step, (step - 1) * args.batch_rows
+                state = trainer.begin(spec, z_coef)
+                trainer.replay_batch(state, data_train, step, (step - 1) * args.batch_rows)
+                sites.reduce_gradients()
+                # The step's sums and the stop flag settle in two collectives.
+                floats = torch.stack(
+                    [
+                        state.loss_sum, state.pass1_sum, state.ntp_sum,
+                        state.mtp_sum, state.expert_balance_sum,
+                    ]
                 )
-                step_loss = graph_state.loss_sum.item()
-                pass1_loss = graph_state.pass1_sum.item()
-                ntp_loss = graph_state.ntp_sum.item()
-                mtp_loss = graph_state.mtp_sum.item()
-                expert_balance = graph_state.expert_balance_sum.item()
-                expert_counts = graph_state.expert_counts
-                graph_runner.prepare_optimizer(graph_state)
-            else:
-                model.checkpoint_blocks = 0
-                step_loss = 0.0
-                pass1_loss = 0.0
-                ntp_loss = mtp_loss = 0.0
-                expert_balance = 0.0
-                expert_counts = torch.zeros(
-                    (len(model.expert_banks), model.cfg.num_routed_experts),
-                    dtype=torch.int64,
-                    device=device,
+                integers = torch.cat(
+                    [
+                        state.expert_counts.flatten(),
+                        torch.tensor([int(interrupt.requested)], device=device),
+                    ]
                 )
-                for micro in range(micros):
-                    first_row = (step - 1) * args.batch_rows + micro * args.micro_rows
-                    rows = data_train.batch(first_row, args.micro_rows, device)
-                    prefix, jitter, loop_jitter = micro_draws(
-                        args,
-                        step,
-                        first_row,
-                        n_passes,
-                        iterations,
-                        rows.shape[0],
-                        args.dim,
-                        device,
-                    )
-                    with autocast:
-                        outs = multipass(
-                            model,
-                            rows,
-                            n_passes,
-                            iterations=iterations,
-                            prefix_lens=prefix,
-                            jitter=jitter,
-                            loop_jitter=loop_jitter,
-                        )
-                        loss_result = multipass_loss(
-                            model, rows, outs, z_coef=z_coef, mtp_weight=args.mtp_weight
-                        )
-                        loss, losses = loss_result.total, loss_result.ntp
-                    (loss / micros).backward()
-                    step_loss += loss.item() / micros
-                    pass1_loss += losses[0][0].item() / micros
-                    ntp_loss += combine_column_losses(loss_result.ntp).item() / micros
-                    mtp_loss += combine_column_losses(loss_result.mtp).item() / micros
-                    expert_counts.add_(loss_result.expert_counts)
-                    expert_balance += loss_result.expert_aux_loss.item() / micros
-
-            with eager_scope():
-                grad_norm = gradient_norm(model.parameters())
-                for optimizer in optimizers:
-                    optimizer.step()
-                model.update_expert_bias(expert_counts)
+                distributed.all_reduce_(floats)
+                distributed.all_reduce_(integers)
+                step_loss, pass1_loss, ntp_loss, mtp_loss, expert_balance = (
+                    floats.tolist()
+                )
+                expert_counts = integers[:-1].view_as(state.expert_counts)
+                stop = bool(integers[-1].item())
+                trainer.prepare_optimizer(state)
+                grad_norm = sites.gradient_norm()
+                with trainer.pool_scope():
+                    for optimizer in optimizers:
+                        optimizer.step()
+                    model.update_expert_bias(expert_counts)
+                sites.gather_weights()
                 model.refresh_shadows()
-                if graph_runner is not None:
-                    graph_runner.zero_grad()
-                else:
-                    model.zero_grad(set_to_none=True)
-            # A pass executes ``iterations`` columns of ``routing_blocks``
-            # cells, so cell-tokens beside pass-tokens keep matched data apart
-            # from matched compute when the loop runs more columns.
-            cells = iterations * model.cfg.routing_blocks
-            window_tokens += args.batch_rows * args.seq_len
-            window_pass_tokens += n_passes * args.batch_rows * args.seq_len
-            window_cell_tokens += cells * n_passes * args.batch_rows * args.seq_len
+                trainer.zero_grad()
+                # A pass executes ``iterations`` columns of ``routing_blocks``
+                # cells, so cell-tokens beside pass-tokens keep matched data apart
+                # from matched compute when the loop runs more columns.
+                cells = iterations * model.cfg.routing_blocks
+                window_tokens += args.batch_rows * args.seq_len
+                window_pass_tokens += n_passes * args.batch_rows * args.seq_len
+                window_cell_tokens += cells * n_passes * args.batch_rows * args.seq_len
 
-            elapsed = time.monotonic() - window_start
-            fields = {
-                "step": telemetry.step_address(step, total),
-                "phase": phase,
-                "loss": telemetry.format_metric(step_loss),
-                "pass1": telemetry.format_metric(pass1_loss),
-                "ntp": telemetry.format_metric(ntp_loss),
-                "k": n_passes,
-            }
-            fields["mtp"] = telemetry.format_metric(mtp_loss)
-            fields["expert_balance"] = telemetry.format_metric(expert_balance)
-            # Each physical bank has its own target; every bank executes once
-            # per column, repeatedly on looped steps.
-            loads = expert_counts.float()
-            violation = (
-                model.cfg.num_routed_experts
-                * loads.amax(dim=-1)
-                / loads.sum(dim=-1).clamp_min(1)
-                - 1
-            )
-            fields["expert_max_violation"] = telemetry.format_metric(
-                violation.max().item()
-            )
-            fields["expert_bias_max"] = telemetry.format_metric(
-                torch.stack([bank.expert_bias for bank in model.expert_banks])
-                .abs().max().item()
-            )
-            if model.cfg.loop:
-                fields["r"] = iterations
-            fields |= {
-                "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
-                "lr_normuonh_expert_in": telemetry.format_metric(
-                    learning_rates["normuonh_expert_in"]
-                ),
-                "lr_normuonh_expert_out": telemetry.format_metric(
-                    learning_rates["normuonh_expert_out"]
-                ),
-                "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
-                "lr_nadam_width": telemetry.format_metric(
-                    learning_rates["nadam_width"]
-                ),
-                "gnorm": telemetry.format_metric(grad_norm),
-                "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
-                "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),
-                "cell_tok_s": (f"{window_cell_tokens / max(elapsed, 1e-9):.0f}"),
-                "elapsed": f"{time.monotonic() - process_start:.1f}",
-            }
-            if device.type == "cuda":
-                fields["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
-            telemetry.log("step", **fields)
-            window_start, window_tokens, window_pass_tokens = (
-                time.monotonic(),
-                0,
-                0,
-            )
-            window_cell_tokens = 0.0
-
-            if step % args.eval_every == 0 or step == total:
-                address = telemetry.step_address(step, total)
-                scores = evaluate(
-                    model, data_val, args, device, graph_runner=eval_graph_runner
+                elapsed = time.monotonic() - window_start
+                fields = {
+                    "step": telemetry.step_address(step, total),
+                    "phase": phase,
+                    "loss": telemetry.format_metric(step_loss),
+                    "pass1": telemetry.format_metric(pass1_loss),
+                    "ntp": telemetry.format_metric(ntp_loss),
+                    "k": n_passes,
+                }
+                fields["mtp"] = telemetry.format_metric(mtp_loss)
+                fields["expert_balance"] = telemetry.format_metric(expert_balance)
+                # Each physical bank has its own target; every bank executes once
+                # per column, repeatedly on looped steps.
+                loads = expert_counts.float()
+                violation = (
+                    model.cfg.num_routed_experts
+                    * loads.amax(dim=-1)
+                    / loads.sum(dim=-1).clamp_min(1)
+                    - 1
                 )
-                telemetry.log(
-                    "eval",
-                    step=address,
-                    **{
-                        key: telemetry.format_metric(value)
-                        for key, value in scores.items()
-                    },
+                fields["expert_max_violation"] = telemetry.format_metric(
+                    violation.max().item()
                 )
-                summary.update(scores)
-                # The monitors run eagerly and allocate only transients, so
-                # they take the pool too; ``evaluate`` replays graphs and
-                # therefore stays outside.
-                with eager_scope():
-                    for record in route_summary(model, data_val, args, device):
-                        telemetry.log("route", step=address, **record)
-                    for record in expert_summary(model, data_val, args, device):
-                        telemetry.log("expert", step=address, **record)
-                    if model.cfg.feedback:
-                        trace = iterate_fused(
-                            model, data_val.batch(0, 2, device), n_iters=8
-                        )
-                        model.train()
-                        telemetry.log(
-                            "contract",
-                            step=address,
-                            loss0=telemetry.format_metric(trace[0]["loss"]),
-                            loss8=telemetry.format_metric(trace[-1]["loss"]),
-                            upd8=telemetry.format_metric(trace[-1]["update_norm"]),
-                        )
-                    if model.cfg.loop:
-                        sweep = depth_trace(model, data_val.batch(0, 2, device))
-                        model.train()
-                        by_depth = {record["iterations"]: record for record in sweep}
-                        telemetry.log(
-                            "depth",
-                            step=address,
-                            r_eval=model.cfg.loop_iterations,
-                            r_max=LOOP_MAX_ITERATIONS,
-                            loss_one=telemetry.format_metric(by_depth[1]["loss"]),
-                            loss_eval=telemetry.format_metric(
-                                by_depth[model.cfg.loop_iterations]["loss"]
-                            ),
-                            loss_max=telemetry.format_metric(sweep[-1]["loss"]),
-                            upd_max=telemetry.format_metric(
-                                sweep[-1]["update_norm"]
-                            ),
-                        )
+                fields["expert_bias_max"] = telemetry.format_metric(
+                    torch.stack([bank.expert_bias for bank in model.expert_banks])
+                    .abs().max().item()
+                )
+                if model.cfg.loop:
+                    fields["r"] = iterations
+                fields |= {
+                    "lr_normuonh": telemetry.format_metric(learning_rates["normuonh"]),
+                    "lr_normuonh_expert_in": telemetry.format_metric(
+                        learning_rates["normuonh_expert_in"]
+                    ),
+                    "lr_normuonh_expert_out": telemetry.format_metric(
+                        learning_rates["normuonh_expert_out"]
+                    ),
+                    "lr_nadam": telemetry.format_metric(learning_rates["nadam"]),
+                    "lr_nadam_width": telemetry.format_metric(
+                        learning_rates["nadam_width"]
+                    ),
+                    "gnorm": telemetry.format_metric(grad_norm),
+                    "tok_s": f"{window_tokens / max(elapsed, 1e-9):.0f}",
+                    "pass_tok_s": (f"{window_pass_tokens / max(elapsed, 1e-9):.0f}"),
+                    "cell_tok_s": (f"{window_cell_tokens / max(elapsed, 1e-9):.0f}"),
+                    "elapsed": f"{time.monotonic() - process_start:.1f}",
+                }
+                if device.type == "cuda":
+                    fields["mem"] = f"{torch.cuda.max_memory_allocated() / 2**30:.1f}G"
+                telemetry.log("step", **fields)
+                window_start, window_tokens, window_pass_tokens = (
+                    time.monotonic(),
+                    0,
+                    0,
+                )
+                window_cell_tokens = 0.0
 
-            if step % args.snapshot_every == 0 or step in protected:
-                snapshot_writer.submit(step)
-            summary["step"] = step
-            summary["loss"] = step_loss
-    except KeyboardInterrupt:
-        interrupted = True
-        step = summary.get("step", start_step)
-        if step > start_step:
-            snapshot_writer.submit(step)
-        telemetry.log("interrupt", step=telemetry.step_address(step, total))
+                if step % args.eval_every == 0 or step == total:
+                    address = telemetry.step_address(step, total)
+                    scores = evaluate(
+                        model, data_val, args, device,
+                        graph_runner=eval_graph_runner, topology=topology,
+                    )
+                    telemetry.log(
+                        "eval",
+                        step=address,
+                        **{
+                            key: telemetry.format_metric(value)
+                            for key, value in scores.items()
+                        },
+                    )
+                    summary.update(scores)
+                    # The monitors run eagerly on one rank and allocate only
+                    # transients, so they take the pool too; ``evaluate``
+                    # replays graphs and therefore stays outside.
+                    if topology.main:
+                        with trainer.pool_scope():
+                            for record in route_summary(model, data_val, args, device):
+                                telemetry.log("route", step=address, **record)
+                            for record in expert_summary(model, data_val, args, device):
+                                telemetry.log("expert", step=address, **record)
+                            if model.cfg.feedback:
+                                trace = iterate_fused(
+                                    model, data_val.batch(0, 2, device), n_iters=8
+                                )
+                                model.train()
+                                telemetry.log(
+                                    "contract",
+                                    step=address,
+                                    loss0=telemetry.format_metric(trace[0]["loss"]),
+                                    loss8=telemetry.format_metric(trace[-1]["loss"]),
+                                    upd8=telemetry.format_metric(trace[-1]["update_norm"]),
+                                )
+                            if model.cfg.loop:
+                                sweep = depth_trace(model, data_val.batch(0, 2, device))
+                                model.train()
+                                by_depth = {
+                                    record["iterations"]: record for record in sweep
+                                }
+                                telemetry.log(
+                                    "depth",
+                                    step=address,
+                                    r_eval=model.cfg.loop_iterations,
+                                    r_max=LOOP_MAX_ITERATIONS,
+                                    loss_one=telemetry.format_metric(by_depth[1]["loss"]),
+                                    loss_eval=telemetry.format_metric(
+                                        by_depth[model.cfg.loop_iterations]["loss"]
+                                    ),
+                                    loss_max=telemetry.format_metric(sweep[-1]["loss"]),
+                                    upd_max=telemetry.format_metric(
+                                        sweep[-1]["update_norm"]
+                                    ),
+                                )
+
+                snapshotted = step % args.snapshot_every == 0 or step in protected
+                if snapshotted:
+                    snapshot_writer.submit(step)
+                summary["step"] = step
+                summary["loss"] = step_loss
+                if stop:
+                    interrupted = True
+                    if not snapshotted:
+                        snapshot_writer.submit(step)
+                    telemetry.log("interrupt", step=telemetry.step_address(step, total))
+                    break
     except BaseException:
         snapshot_writer.close()
         raise
@@ -2168,8 +2330,30 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
     return summary
 
 
+LAUNCHER = "torch.distributed.run"
+
+
 def main() -> None:
-    train()
+    """Run one invocation, under ``torchrun`` when it asks for several ranks.
+
+    A direct ``--ranks N`` invocation replaces itself with the launcher, which
+    starts one process per device running this same module with the same
+    arguments; the spool keeps the process id it started, and a stop signal
+    reaches every rank through the launcher.
+    """
+    argv = sys.argv[1:]
+    ranks = parse_run_args(argv).ranks
+    if ranks > 1 and "WORLD_SIZE" not in os.environ:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execv(
+            sys.executable,
+            [
+                sys.executable, "-m", LAUNCHER, "--standalone",
+                f"--nproc-per-node={ranks}", "-m", __spec__.name, *argv,
+            ],
+        )
+    train(argv)
 
 
 if __name__ == "__main__":

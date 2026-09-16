@@ -24,15 +24,16 @@ from delta_feedback_experiment.train import (
     CONTRACT,
     CudaGraphTrainer,
     GraphSpec,
+    Trainer,
     build_parser,
     build_schedule,
-    gradient_norm,
     draw_recurrence,
     micro_draws,
     mix,
     model_fields,
     parse_run_args,
     reference_active,
+    replay_widths,
     resolve_run_args,
     step_shape,
 )
@@ -62,19 +63,6 @@ def test_normuonh_applies_nesterov_before_orthogonalization():
     assert torch.allclose(optimizer.state[weight]["row_moment"], row_moment)
 
 
-def test_gradient_norm_is_global_unclipped_and_finite_checked():
-    first = torch.nn.Parameter(torch.zeros(2))
-    second = torch.nn.Parameter(torch.zeros(1))
-    first.grad = torch.tensor([3.0, 4.0])
-    second.grad = torch.tensor([12.0])
-
-    assert gradient_norm([first, second]) == pytest.approx(13.0)
-    assert first.grad.tolist() == [3.0, 4.0] and second.grad.tolist() == [12.0]
-    second.grad[0] = float("nan")
-    with pytest.raises(RuntimeError, match="non-finite"):
-        gradient_norm([first, second])
-
-
 def test_optimizer_materialization_restores_fresh_nadam_state():
     embedding = torch.nn.Parameter(torch.randn(4))
     other = torch.nn.Parameter(torch.randn(4))
@@ -86,7 +74,7 @@ def test_optimizer_materialization_restores_fresh_nadam_state():
         betas=DEFAULT_NADAM_BETAS,
     )
     nadam.param_groups[0]["stable_lr"] = DEFAULT_NADAM_LR
-    runner = object.__new__(CudaGraphTrainer)
+    runner = object.__new__(Trainer)
     runner.optimizers = [nadam]
 
     runner._initialize_optimizers()
@@ -331,6 +319,14 @@ def test_keyed_jitter_covers_single_and_final_passes_and_replay_buffers():
         torch.testing.assert_close(repeated[1], jitter, atol=0, rtol=0)
         _, changed, _ = micro_draws(args, 2, 2, count, 1, 2, 16, device)
         assert not torch.equal(jitter, changed)
+        # Every row is keyed by its own global row: a two-row draw is the two
+        # one-row draws side by side, whatever the replay width or rank.
+        for row in (0, 1):
+            single_prefix, single_jitter, _ = micro_draws(
+                args, 2, row, count, 1, 1, 16, device
+            )
+            torch.testing.assert_close(single_prefix[:, 0], prefix[:, row], atol=0, rtol=0)
+            torch.testing.assert_close(single_jitter[:, 0], jitter[:, row], atol=0, rtol=0)
         # Looped columns draw their jitter after the pass draws, so a condition
         # with l shares its prefix and pass jitter with the one without it.
         looped_prefix, looped_jitter, loop = micro_draws(
@@ -454,9 +450,8 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
 
 
 def test_replay_plan_fits_rows_then_recomputes_blocks():
-    """Single-column graphs take the largest row multiple that fits raw,
-    capped at two rows; every other graph keeps the keyed microbatch width; a
-    shortfall recomputes exactly as many block invocations as the calibrated
+    """Every graph takes the largest divisor of the rank's rows that fits raw;
+    a shortfall recomputes exactly as many block invocations as the calibrated
     release of one recomputed block needs, never more than are eligible."""
     from delta_feedback_experiment.model import condition_config
     from delta_feedback_experiment.train import (
@@ -482,15 +477,23 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
         return plan_replay(cfg, args, spec, block, release, budget_bytes)
 
     flat = GraphSpec(1, 1)
-    assert plan(flat, budget(8, flat)).rows_per_replay == 2
+    assert replay_widths(16, 1) == [16, 8, 4, 2, 1]
+    assert replay_widths(12, 2) == [12, 6, 4, 2]
+    with pytest.raises(ValueError, match="multiple"):
+        replay_widths(6, 4)
+    assert plan(flat, budget(8, flat)).rows_per_replay == 8
+    assert plan(flat, budget(7, flat)).rows_per_replay == 4
     assert plan(flat, budget(2, flat)).rows_per_replay == 2
     assert plan(flat, budget(2, flat) - 1).rows_per_replay == 1
     assert plan(flat, budget(1, flat)).rows_per_replay == 1
     looped = GraphSpec(1, 2)
-    assert plan(looped, budget(8, looped)).rows_per_replay == 1
+    assert plan(looped, budget(8, looped)).rows_per_replay == 8
     two = GraphSpec(2, 1)
     generous = plan(two, budget(8, two))
-    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (1, 0)
+    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (8, 0)
+    # A rank's rows bound the width: sixteen rows of a step never replay more.
+    sixteen = plan_replay(cfg, args, flat, block, release, budget(128, flat), 16)
+    assert sixteen.rows_per_replay == 16
     # A shortfall is sized by what a recomputed block releases, not by the
     # average block: five releases cover a five-average-block shortfall.
     short = plan(two, budget(1, two) - 5 * block)

@@ -12,14 +12,15 @@ from dataclasses import replace
 def cuda_probe() -> None:
     import torch
 
+    from . import distributed
     from .model import LOOP_MAX_ITERATIONS, DeltaModel, KVCache, condition_config
     from .optim import apply_schedule, build_optimizers
+    from .sites import ParameterSites
     from .train import (
         CudaEvalRunner,
         CudaGraphTrainer,
         GraphSpec,
         build_schedule,
-        gradient_norm,
         model_fields,
         parse_run_args,
     )
@@ -70,6 +71,9 @@ def cuda_probe() -> None:
     )
 
     class ProbeTrainer(CudaGraphTrainer):
+        def __init__(self, model, optimizers, args, schedule, topology):
+            super().__init__(model, optimizers, sites, args, schedule, topology)
+
         def _reachable_specs(self, schedule):
             return [GraphSpec(1, 1), GraphSpec(2, LOOP_MAX_ITERATIONS)]
 
@@ -89,24 +93,28 @@ def cuda_probe() -> None:
     torch.manual_seed(7)
     torch.set_float32_matmul_precision("high")
     started = time.monotonic()
+    topology = distributed.Topology()
     model = DeltaModel(condition_config(args.condition, **model_fields(args))).cuda()
-    optimizers = build_optimizers(model)
+    sites = ParameterSites(model, topology)
+    optimizers = build_optimizers(model, owned=sites.owned)
     schedule = build_schedule(args)
     print("cuda probe | train graph", flush=True)
-    runner = ProbeTrainer(model, optimizers, args, schedule)
+    runner = ProbeTrainer(model, optimizers, args, schedule, topology)
     data = Rows()
     initial = model.embed_tokens.weight.detach().clone()
+    parameters = dict(model.named_parameters())
+    normuonh = optimizers[0]
     for spec in runner.states:
         for step in (1, 2):
             apply_schedule(optimizers, schedule, step)
             runner.zero_grad()
             state = runner.begin(spec, args.zloss)
             runner.replay_batch(state, data, step, 0)
+            sites.reduce_gradients()
             runner.prepare_optimizer(state)
             assert math.isfinite(state.loss_sum.item())
-            assert math.isfinite(gradient_norm(model.parameters()))
-            assert runner.head_accum is not None and not runner.head_accum.any()
-            parameters = dict(model.named_parameters())
+            assert math.isfinite(sites.gradient_norm())
+            gradients = sites.gradients()
             for name in (
                 "embed_tokens.weight",
                 "fuse_proj.weight",
@@ -119,27 +127,35 @@ def cuda_probe() -> None:
                 "blocks.4.attn.control_proj.weight",
                 "blocks.0.mlp.shared.down_proj.weight",
             ):
-                gradient = parameters[name].grad
-                assert gradient is not None and gradient.dtype == torch.float32, name
+                gradient = gradients[parameters[name]]
+                assert gradient.dtype == torch.float32, name
                 assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0, name
+                if parameters[name] not in sites.sharded:
+                    assert parameters[name].grad is gradient, name
             routed = [
-                expert.down_proj.weight.grad for expert in model.blocks[0].mlp.experts
+                gradients[expert.down_proj.weight]
+                for expert in model.blocks[0].mlp.experts
             ]
-            assert all(
-                gradient is not None and gradient.dtype == torch.float32
-                for gradient in routed
-            )
             assert sum(gradient.abs().sum() for gradient in routed) > 0
+            # Every sharded matrix is its BF16 working copy; the optimizer
+            # holds its FP32 master and writes both.
+            matrix = parameters["blocks.3.attn.o_proj.weight"]
+            assert matrix.dtype == torch.bfloat16
+            master = normuonh.master_of(matrix)
+            assert master.dtype == torch.float32
+            assert torch.equal(matrix, master.to(torch.bfloat16))
             with runner.pool_scope():
                 for optimizer in optimizers:
                     optimizer.step()
                 model.update_expert_bias(state.expert_counts)
-                model.refresh_shadows()
+            sites.gather_weights()
+            model.refresh_shadows()
+            assert torch.equal(matrix, normuonh.master_of(matrix).to(torch.bfloat16))
     assert not torch.equal(initial, model.embed_tokens.weight)
     runner.zero_grad()
 
     print("cuda probe | eval graph and cached decode", flush=True)
-    evaluator = CudaEvalRunner(model, args, runner.pool)
+    evaluator = CudaEvalRunner(model, args, runner.pool, topology)
     assert all(math.isfinite(value) for value in evaluator.run(data).values())
     model.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):

@@ -46,6 +46,7 @@ from torch import Tensor, nn
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
+from .sites import Binding, SlabSpec
 from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
@@ -955,7 +956,6 @@ class DeltaModel(nn.Module):
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.register_buffer("_classifier_shadow", None, persistent=False)
-        self.register_buffer("_classifier_accum", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -971,7 +971,9 @@ class DeltaModel(nn.Module):
         )
         self.fuse_proj_sink: Tensor | None = None
         self.fuse_proj_shadow: Tensor | None = None
-        self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
+        self._shadow_refresh: dict[str, tuple[Tensor, Tensor]] = {}
+        """Replicated working copies to refresh from their FP32 masters after
+        every optimizer update, keyed by the site that bound them."""
         self.fuse_proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
         self.blank_payload = nn.Parameter(torch.zeros(cfg.dim))
         """Learned stand-in payload, in payload units, for positions
@@ -1125,49 +1127,138 @@ class DeltaModel(nn.Module):
             yield block, gate
         yield self.mtp.block, None
 
-    # -- persistent gradient sinks -------------------------------------------
+    # -- parameter sites -------------------------------------------------------
 
-    def allocate_gradient_buffers(self) -> dict[nn.Parameter, Tensor]:
-        """Allocate FP32 gradients, packing projections that share a GEMM.
+    def slab_specs(self) -> list[SlabSpec]:
+        """Every trainable parameter's site, in a fixed order.
 
-        Q/K/V and dense QKV/gate retain separate parameters and optimizer
-        state. Their gradients are disjoint contiguous row views of one
-        backing allocation, so the backward can accumulate the whole GEMM
-        without materializing or combining per-parameter gradients.
+        The trainer allocates one working slab and one FP32 gradient slab per
+        site and binds them here. Every large projection then reads its
+        working copy and accumulates its weight gradient in place through the
+        backward, the expert banks as one stacked operand each, and the
+        parameters NAdam owns share a flat gradient arena while keeping their
+        FP32 masters. Binding ``None`` restores ordinary autograd gradients
+        and per-call operand casts. Q/K/V and dense QKV/gate keep separate
+        parameters and optimizer state behind one packed GEMM.
         """
-        buffers: dict[nn.Parameter, Tensor] = {}
+        if any(not parameter.requires_grad for parameter in self.parameters()):
+            raise ValueError("parameter sites cover trainable models only")
+        specs: list[SlabSpec] = []
         for block, gate in self._parameter_blocks():
             attn = block.attn
+            prefix = "mtp" if block is self.mtp.block else f"L{block.layer}"
             if block.is_pkda:
-                parameters = (
-                    attn.q_proj.weight,
-                    attn.k_proj.weight,
-                    attn.v_proj.weight,
+                specs.append(
+                    SlabSpec(
+                        f"{prefix}.qkv",
+                        (attn.q_proj.weight, attn.k_proj.weight, attn.v_proj.weight),
+                        self._bind_pkda_qkv(attn),
+                    )
                 )
             else:
-                parameters = (
-                    attn.qkv_proj.weight,
-                    gate,
+                specs.append(
+                    SlabSpec(
+                        f"{prefix}.qkv",
+                        (attn.qkv_proj.weight, gate),
+                        self._bind_attention_qkv(f"{prefix}.qkv", attn, gate),
+                        sharded=(True, False),
+                    )
                 )
-            if not all(parameter.requires_grad for parameter in parameters):
-                continue
-            slab = torch.zeros(
-                (
-                    sum(parameter.shape[0] for parameter in parameters),
-                    parameters[0].shape[1],
-                ),
-                device=parameters[0].device,
-                dtype=torch.float32,
+            specs.append(SlabSpec(f"{prefix}.o", (attn.o_proj.weight,), self._bind_o(attn)))
+            for name in ("gate_up", "down"):
+                specs.append(block.mlp.site_spec(f"{prefix}.{name}", name))
+        specs.append(SlabSpec("fuse", (self.fuse_proj.weight,), self._bind_fuse))
+        covered = {member for spec in specs for member in spec.members}
+        rest = tuple(p for p in self.parameters() if p not in covered)
+        specs.append(SlabSpec("nadam", rest, self._bind_arena(rest), kind="arena"))
+        return specs
+
+    def _bind_pkda_qkv(self, attn):
+        def bind(binding: Binding | None) -> None:
+            if binding is None:
+                attn.q_sink = attn.k_sink = attn.v_sink = None
+                attn.packed_qkv_sink = attn.qkv_shadow = None
+                return
+            attn.q_sink, attn.k_sink, attn.v_sink = (m.grad for m in binding.members)
+            attn.packed_qkv_sink = binding.grad
+            attn.qkv_shadow = binding.weight
+
+        return bind
+
+    def _bind_attention_qkv(self, name: str, attn, gate: nn.Parameter):
+        def bind(binding: Binding | None) -> None:
+            if binding is None:
+                attn.qkv_sink = attn.gate_sink = None
+                attn.packed_qkv_sink = attn.qkv_shadow = None
+                self._shadow_refresh.pop(name, None)
+                return
+            attn.qkv_sink, attn.gate_sink = (m.grad for m in binding.members)
+            attn.packed_qkv_sink = binding.grad
+            attn.qkv_shadow = binding.weight
+            # The NAdam-owned gate keeps its FP32 master; its rows of the
+            # packed operand are a replicated working copy.
+            self._shadow_refresh[name] = (binding.members[1].weight, gate.detach())
+
+        return bind
+
+    @staticmethod
+    def _bind_o(attn):
+        def bind(binding: Binding | None) -> None:
+            if binding is None:
+                attn.o_sink = attn.o_shadow = None
+                return
+            attn.o_sink = binding.members[0].grad
+            attn.o_shadow = binding.weight
+
+        return bind
+
+    def _bind_fuse(self, binding: Binding | None) -> None:
+        if binding is None:
+            self.fuse_proj_sink = self.fuse_proj_shadow = None
+            return
+        self.fuse_proj_sink = binding.members[0].grad
+        self.fuse_proj_shadow = binding.weight
+
+    def _bind_arena(self, members: tuple[nn.Parameter, ...]):
+        """The replicated parameters: an FP32 gradient view each, and on CUDA
+        a BF16 working copy of every NAdam matrix the mixers read, refreshed
+        from its master after each update. The tied embedding's sink is also
+        where the head's classifier gradient accumulates."""
+        controls = [
+            block.attn for block, _ in self._parameter_blocks() if block.is_pkda
+        ]
+
+        def bind(binding: Binding | None) -> None:
+            if binding is None:
+                self.embed_tokens.grad_sink = None
+                for attn in controls:
+                    attn.control_shadow = attn.decay_up_shadow = None
+                    attn.output_gate_shadow = None
+                for key in [k for k in self._shadow_refresh if k.startswith("nadam.")]:
+                    del self._shadow_refresh[key]
+                return
+            views = dict(zip(members, binding.members, strict=True))
+            embedding = self.embed_tokens.weight
+            self.embed_tokens.grad_sink = (
+                views[embedding].grad if embedding.is_cuda else None
             )
-            start = 0
-            for parameter in parameters:
-                rows = parameter.shape[0]
-                buffers[parameter] = slab[start : start + rows]
-                start += rows
-        for parameter in self.parameters():
-            if parameter.requires_grad and parameter not in buffers:
-                buffers[parameter] = torch.zeros_like(parameter, dtype=torch.float32)
-        return buffers
+            for index, attn in enumerate(controls):
+                for name, matrix in (
+                    ("control", attn.control_proj.weight),
+                    ("decay_up", attn.decay_up.weight),
+                    ("output_gate", attn.output_gate_up.weight),
+                ):
+                    current = getattr(attn, f"{name}_shadow")
+                    key = f"nadam.{index}.{name}"
+                    if not matrix.is_cuda:
+                        setattr(attn, f"{name}_shadow", None)
+                        continue
+                    if current is None or current.shape != matrix.shape:
+                        current = matrix.detach().to(torch.bfloat16)
+                        setattr(attn, f"{name}_shadow", current)
+                    self._shadow_refresh[key] = (current, matrix.detach())
+
+        return bind
 
     @torch.no_grad()
     def update_expert_bias(
@@ -1182,154 +1273,6 @@ class DeltaModel(nn.Module):
             )
         for bank, bank_counts in zip(self.expert_banks, counts, strict=True):
             bank.update_bias(bank_counts, rate=rate)
-
-    def bind_gradient_sinks(
-        self, sinks: dict[nn.Parameter, Tensor] | None
-    ) -> set[nn.Parameter]:
-        """Attach trainer-owned FP32 gradient buffers to every sink-capable site.
-
-        The tied embedding, every large projection, and the fusion projection
-        then accumulate their gradients in place and return no autograd
-        gradient; ``None`` restores ordinary autograd accumulation.  Returns
-        the parameters that were bound, so the trainer can treat a touched
-        buffer as that parameter's activity for the captured mode.
-
-        On CUDA every bound site also receives an address-stable BF16 shadow of
-        its (concatenated) weights.  ``refresh_shadows`` rewrites the shadows
-        from the FP32 masters once per optimizer update, so no replay casts or
-        concatenates parameters; the shadows are neither parameters nor
-        checkpoint state.
-
-        Buffers from ``allocate_gradient_buffers`` also expose a packed sink
-        for each concatenated projection. Ordinary independently allocated
-        buffers remain valid; their backward accumulates each segment alone.
-        """
-        lookup = sinks or {}
-        bound: set[nn.Parameter] = set()
-        refresh: list[tuple[Tensor, Tensor]] = []
-
-        def sink(parameter: nn.Parameter) -> Tensor | None:
-            buffer = lookup.get(parameter)
-            if buffer is not None:
-                bound.add(parameter)
-            return buffer
-
-        def packed_sink(
-            current: Tensor | None, *parameters: nn.Parameter
-        ) -> Tensor | None:
-            parts = [lookup.get(parameter) for parameter in parameters]
-            if any(part is None for part in parts):
-                return None
-            first = parts[0]
-            columns = parameters[0].shape[1]
-            offset = first.storage_offset()
-            base_address = first.untyped_storage().data_ptr()
-            for parameter, part in zip(parameters, parts, strict=True):
-                if (
-                    part.shape != parameter.shape
-                    or part.dtype != torch.float32
-                    or part.device != first.device
-                    or not part.is_contiguous()
-                    or part.untyped_storage().data_ptr() != base_address
-                    or part.storage_offset() != offset
-                ):
-                    return None
-                offset += part.numel()
-            shape = (sum(parameter.shape[0] for parameter in parameters), columns)
-            if (
-                current is not None
-                and current.shape == shape
-                and current.dtype == first.dtype
-                and current.device == first.device
-                and current.untyped_storage().data_ptr() == base_address
-                and current.storage_offset() == first.storage_offset()
-            ):
-                return current
-            return first.as_strided(shape, (columns, 1))
-
-        def shadow(current: Tensor | None, *weights: Tensor) -> Tensor | None:
-            # Rebinding keeps an existing shadow: the compiled blocks were
-            # traced against these exact tensors, and an address must not
-            # change between warm-up and capture.
-            if sinks is None or not weights[0].is_cuda:
-                return None
-            rows = sum(weight.shape[0] for weight in weights)
-            shape = (rows, weights[0].shape[1])
-            fresh = current is None or current.shape != shape
-            if fresh:
-                current = torch.empty(
-                    shape, device=weights[0].device, dtype=torch.bfloat16
-                )
-            start = 0
-            for weight in weights:
-                segment = current[start : start + weight.shape[0]]
-                if fresh:
-                    # A shadow is valid from the moment it exists; warm-up may
-                    # trace the blocks before the trainer's first refresh. The
-                    # copy must leave no autograd history on the shadow: a
-                    # recorded CopySlices node lives on this (uncaptured)
-                    # stream and would break the captured backward.
-                    segment.copy_(weight.detach())
-                refresh.append((segment, weight.detach()))
-                start += weight.shape[0]
-            return current
-
-        # The portable head reads the tied weight through autograd, so only the
-        # CUDA path (CCE plus the bespoke lookup) owns an embedding sink.
-        self.embed_tokens.grad_sink = (
-            sink(self.embed_tokens.weight) if self.embed_tokens.weight.is_cuda else None
-        )
-        if self.embed_tokens.grad_sink is None:
-            # The classifier accumulator drains into that sink; without one it
-            # would strand the head's gradient.
-            self._classifier_accum = None
-        for block, gate in self._parameter_blocks():
-            expert_bound, expert_refresh = block.mlp.bind_gradient_sinks(sinks)
-            bound.update(expert_bound)
-            refresh.extend(expert_refresh)
-            attn = block.attn
-            if block.is_pkda:
-                attn.q_sink = sink(attn.q_proj.weight)
-                attn.k_sink = sink(attn.k_proj.weight)
-                attn.v_sink = sink(attn.v_proj.weight)
-                attn.packed_qkv_sink = packed_sink(
-                    attn.packed_qkv_sink,
-                    attn.q_proj.weight,
-                    attn.k_proj.weight,
-                    attn.v_proj.weight,
-                )
-                attn.o_sink = sink(attn.o_proj.weight)
-                attn.qkv_shadow = shadow(
-                    attn.qkv_shadow,
-                    attn.q_proj.weight,
-                    attn.k_proj.weight,
-                    attn.v_proj.weight,
-                )
-                attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-                # The NAdam-owned control matrices keep ordinary autograd
-                # gradients but read shadows too, so no replay casts them.
-                attn.control_shadow = shadow(
-                    attn.control_shadow, attn.control_proj.weight
-                )
-                attn.decay_up_shadow = shadow(
-                    attn.decay_up_shadow, attn.decay_up.weight
-                )
-                attn.output_gate_shadow = shadow(
-                    attn.output_gate_shadow, attn.output_gate_up.weight
-                )
-            else:
-                attn.qkv_sink = sink(attn.qkv_proj.weight)
-                attn.gate_sink = sink(gate)
-                attn.packed_qkv_sink = packed_sink(
-                    attn.packed_qkv_sink, attn.qkv_proj.weight, gate
-                )
-                attn.o_sink = sink(attn.o_proj.weight)
-                attn.qkv_shadow = shadow(attn.qkv_shadow, attn.qkv_proj.weight, gate)
-                attn.o_shadow = shadow(attn.o_shadow, attn.o_proj.weight)
-        self.fuse_proj_sink = sink(self.fuse_proj.weight)
-        self.fuse_proj_shadow = shadow(self.fuse_proj_shadow, self.fuse_proj.weight)
-        self._shadow_refresh = refresh
-        return bound
 
     def readout_input(self, h_top: Tensor) -> Tensor:
         """``final_norm(h_top)`` under the muP readout multiplier.
@@ -1347,74 +1290,59 @@ class DeltaModel(nn.Module):
 
     @torch.no_grad()
     def refresh_shadows(self) -> None:
-        """Refresh every CUDA-only BF16 operand copy from its FP32 master.
+        """Refresh every replicated working copy from its FP32 master.
 
-        That is the classifier readout of the tied embedding plus the trunk
-        shadows bound with the gradient sinks. None of them is ``state_dict``
-        content. Their addresses are allocated once before graph capture and
-        remain stable across optimizer updates; only their contents change.
+        That is the CUDA classifier readout of the tied embedding plus every
+        NAdam-owned matrix a bound site reads through a working copy, on any
+        device. None of them is ``state_dict`` content. Their addresses are
+        allocated once before graph capture and remain stable across
+        optimizer updates; only their contents change. Sharded matrices are
+        not refreshed: their working copies are what the optimizer writes and
+        the gather fills.
         """
         master = self.embed_tokens.weight
         if not master.is_cuda:
             self._classifier_shadow = None
-            return
-        shadow = self._classifier_shadow
-        if (
-            shadow is None
-            or shadow.shape != master.shape
-            or shadow.device != master.device
-        ):
-            shadow = torch.empty_like(master, dtype=torch.bfloat16)
-            self._classifier_shadow = shadow
-        shadow.copy_(master)
+        else:
+            shadow = self._classifier_shadow
+            if (
+                shadow is None
+                or shadow.shape != master.shape
+                or shadow.device != master.device
+            ):
+                shadow = torch.empty_like(master, dtype=torch.bfloat16)
+                self._classifier_shadow = shadow
+            shadow.copy_(master)
+        # The packed sites hold replicated rows on every device: a dense
+        # layer's gate rides in its QKV operand as a copy of the NAdam master.
         if self._shadow_refresh:
+            pairs = list(self._shadow_refresh.values())
             torch._foreach_copy_(
-                [copy for copy, _ in self._shadow_refresh],
-                [weight for _, weight in self._shadow_refresh],
+                [copy for copy, _ in pairs], [weight for _, weight in pairs]
             )
-
-    def bind_classifier_accum(self, buffer: Tensor | None) -> None:
-        """Bind the trainer's persistent BF16 classifier-gradient accumulator.
-
-        With one bound the head's backward adds its dC straight into this
-        buffer over several microbatches, and the trainer flushes it into the
-        FP32 embedding sink and clears it on its own cadence; without one every
-        head call widens its own dC into the sink. The buffer is neither a
-        parameter nor checkpoint state, and it is only meaningful alongside a
-        bound embedding sink, which is where its contents eventually land.
-        """
-        if buffer is not None:
-            master = self.embed_tokens.weight
-            if self.embed_tokens.grad_sink is None:
-                raise RuntimeError("the classifier accumulator needs a bound sink")
-            if buffer.shape != master.shape or buffer.dtype != torch.bfloat16:
-                raise ValueError("the classifier accumulator must be the BF16 operand")
-        self._classifier_accum = buffer
 
     def classifier_for_loss(self) -> tuple[Tensor, Tensor | None]:
         """The head's classifier operand and the buffer its gradient lands in.
 
         One decision, so the operand and the destination cannot disagree. On
-        CUDA the operand is always the graph-stable BF16 shadow: with an
-        accumulator bound and gradients live the head hands it over plainly and
-        names the buffer, because CCE's backward writes the classifier gradient
-        there itself; otherwise the shadow is read through the shared operand,
-        whose backward widens that gradient into the FP32 sink. The portable
-        path reads the FP32 master through ordinary autograd.
+        CUDA the operand is always the graph-stable BF16 shadow. With the
+        tied embedding's FP32 sink bound and gradients live, the head hands
+        the shadow over plainly and names the sink: CCE's backward accumulates
+        the classifier gradient straight into it in FP32, whatever the number
+        of rows in the call, and the classifier receives no autograd gradient.
+        Without a sink the shadow is read through the shared operand, whose
+        backward widens the gradient into the master's autograd gradient. The
+        portable path reads the FP32 master through ordinary autograd.
         """
         master = self.embed_tokens.weight
         if not master.is_cuda:
             return master, None
         if self._classifier_shadow is None:
             raise RuntimeError("CUDA classifier shadow was not prepared")
-        if self._classifier_accum is not None and torch.is_grad_enabled():
-            return self._classifier_shadow, self._classifier_accum
-        return (
-            ShadowOperand.apply(
-                master, self._classifier_shadow, self.embed_tokens.grad_sink
-            ),
-            None,
-        )
+        sink = self.embed_tokens.grad_sink
+        if sink is not None and torch.is_grad_enabled():
+            return self._classifier_shadow, sink
+        return ShadowOperand.apply(master, self._classifier_shadow, None), None
 
     # -- one column pass -------------------------------------------------------
 

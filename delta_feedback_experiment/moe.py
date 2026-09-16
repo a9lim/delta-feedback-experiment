@@ -15,6 +15,7 @@ from torch import Tensor, nn
 
 from .cuda_kernels import sink_linear
 from .moe_kernels import sparse_experts
+from .sites import Binding, SlabSpec
 
 EXPERT_BIAS_RATE = 0.001
 
@@ -229,78 +230,29 @@ class MixtureOfExperts(nn.Module):
         direction = (counts.sum() - self.num_routed_experts * counts).sign()
         self.expert_bias.add_(direction.to(self.expert_bias), alpha=rate)
 
-    def bind_gradient_sinks(
-        self, sinks: dict[nn.Parameter, Tensor] | None
-    ) -> tuple[set[nn.Parameter], list[tuple[Tensor, Tensor]]]:
-        """Bind FP32 sinks and retain address-stable, nonpersistent BF16 copies.
+    def site_spec(self, name: str, kind: str) -> SlabSpec:
+        """The bank's gate/up or down matrices as one stacked site.
 
-        Packed copies contain only BF16 operands. Every master parameter and
-        optimizer-facing gradient remains its own two-dimensional matrix.
-        Returned refresh pairs join the model's once-per-step shadow refresh.
+        The shared expert is entry zero and the routed experts follow, so the
+        routed operand the grouped kernels read is the contiguous tail of the
+        working slab. Every master parameter and optimizer-facing gradient
+        remains its own two-dimensional matrix, a view of the slabs.
         """
-        lookup = sinks or {}
-        bound: set[nn.Parameter] = set()
-        refresh: list[tuple[Tensor, Tensor]] = []
+        if kind not in ("gate_up", "down"):
+            raise ValueError(f"unknown expert matrix kind {kind!r}")
+        experts = (self.shared, *self.experts)
+        members = tuple(getattr(expert, f"{kind}_proj").weight for expert in experts)
 
-        def bind(expert: Expert) -> None:
-            for name in ("gate_up", "down"):
-                parameter = getattr(expert, f"{name}_proj").weight
-                sink = lookup.get(parameter) if parameter.requires_grad else None
-                if sink is not None:
-                    if (
-                        sink.shape != parameter.shape
-                        or sink.dtype != torch.float32
-                        or sink.device != parameter.device
-                        or not sink.is_contiguous()
-                    ):
-                        raise ValueError(
-                            "MoE sinks must match their FP32 matrix parameters"
-                        )
-                    bound.add(parameter)
-                setattr(expert, f"{name}_sink", sink)
+        def bind(binding: Binding | None) -> None:
+            if binding is None:
+                for expert in experts:
+                    setattr(expert, f"{kind}_sink", None)
+                    setattr(expert, f"{kind}_shadow", None)
+                setattr(self, f"_{kind}_shadow", None)
+                return
+            for expert, view in zip(experts, binding.members, strict=True):
+                setattr(expert, f"{kind}_sink", view.grad)
+                setattr(expert, f"{kind}_shadow", view.weight)
+            setattr(self, f"_{kind}_shadow", binding.weight[1:])
 
-        def shadows(
-            current: Tensor | None, parameters: tuple[Tensor, ...]
-        ) -> Tensor | None:
-            if sinks is None or not parameters[0].is_cuda:
-                return None
-            shape = (len(parameters), *parameters[0].shape)
-            fresh = (
-                current is None
-                or current.shape != shape
-                or current.device != parameters[0].device
-            )
-            if fresh:
-                current = torch.empty(
-                    shape, device=parameters[0].device, dtype=torch.bfloat16
-                )
-            for index, parameter in enumerate(parameters):
-                segment = current[index]
-                if fresh:
-                    segment.copy_(parameter.detach())
-                refresh.append((segment, parameter.detach()))
-            return current
-
-        bind(self.shared)
-        for name in ("gate_up", "down"):
-            parameter = getattr(self.shared, f"{name}_proj").weight
-            existing = getattr(self.shared, f"{name}_shadow")
-            packed = None
-            if getattr(self.shared, f"{name}_sink") is not None:
-                packed = shadows(
-                    None if existing is None else existing.unsqueeze(0), (parameter,)
-                )
-            setattr(
-                self.shared, f"{name}_shadow", None if packed is None else packed[0]
-            )
-        for expert in self.experts:
-            bind(expert)
-        self._gate_up_shadow = shadows(
-            self._gate_up_shadow,
-            tuple(expert.gate_up_proj.weight for expert in self.experts),
-        )
-        self._down_shadow = shadows(
-            self._down_shadow,
-            tuple(expert.down_proj.weight for expert in self.experts),
-        )
-        return bound, refresh
+        return SlabSpec(name, members, bind, kind="stack")

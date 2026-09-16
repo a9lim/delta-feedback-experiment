@@ -36,5 +36,6 @@ smoke. Queue startup runs training directly. Keep cyclic Python garbage
 collection outside train/eval graph capture.
 
 The queue stores arguments and refreshes the checkout before each job;
-source changes do not stop an active child. Distributed training is absent.
+source changes do not stop an active child. `--ranks N` trains data-parallel
+over N devices through torchrun; one rank is the same code path.
 Prime spending requires a9's decision.

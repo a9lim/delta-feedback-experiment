@@ -56,8 +56,11 @@ A row is a nonoverlapping window of `seq_len+1` tokens. Ordinary prediction
 uses `seq_len` targets; MTP runs over the same `seq_len` positions and
 supervises the `seq_len-1` of them that have a second token. Rows and
 attention can cross document boundaries. Step `n` starts at row
-`(n-1)*batch_rows`. The recurrence roll depends on data seed and step;
-prefix/jitter draws also depend on the first global row of the microbatch.
+`(n-1)*batch_rows`; with several ranks each takes a contiguous
+`batch_rows/ranks` slice of it. The recurrence roll depends on data seed and
+step; each row's prefix and jitter draws depend on data seed, step, and its
+own global row, so they are the same bytes whatever the replay width or the
+rank that runs the row.
 
 `delta tokenize --scale S --tokens-per-param R` includes validation and
 extra row targets, then rounds storage up to a billion tokens. A new screen
@@ -68,13 +71,13 @@ concurrency; `RAYON_NUM_THREADS` controls tokenizer threads per process.
 
 ## Training
 
-All presets accumulate 128 one-row microbatches of 4,096 predictions:
-524,288 predicted tokens per optimizer update. A one-pass graph may replay
-several microbatches at once when their raw activations fit; each replay
+All presets accumulate 128 rows of 4,096 predictions: 524,288 predicted
+tokens per optimizer update. Every graph replays the largest divisor of a
+rank's rows whose raw activations fit, at least `--micro-rows`; each replay
 enters the step in proportion to its rows, so the arithmetic is unchanged.
-The full FP32 gradient's L2 norm is measured, unclipped, before NorMuonH and
-NAdam update; a non-finite norm stops the run. Expert-selection biases update once from the whole step's assignment
-counts.
+The full FP32 gradient, summed across ranks, has its L2 norm measured,
+unclipped, before NorMuonH and NAdam update; a non-finite norm stops the run.
+Expert-selection biases update once from the whole step's assignment counts.
 
 Every column trains ordinary next-token prediction and MTP. For each head,
 `combine(CE)` applies FBT's first-plus-mean rule along passes within each
@@ -185,17 +188,21 @@ computation without increasing the ordinary predicted-token budget.
 | `--jitter` | Payload-jitter half-width in payload units, default `0.02` |
 | `--loop-iterations` | Fixed evaluation/decode columns per position, default 2 within `1..3`; training draws from the roll |
 | `--mtp-weight` | Auxiliary prediction weight |
-| `--seq-len`, `--batch-rows`, `--micro-rows` | Batch geometry |
+| `--seq-len`, `--batch-rows` | Batch geometry |
+| `--ranks`, `--micro-rows` | Processes per invocation and the smallest replay; runtime, not state |
 | `--resume`, `--continue TAG`, `--max-steps` | Run lifecycle |
 
 ### Checkpoints and queue
 
 Checkpoint v42 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
-explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
-can change. The checkpoint includes expert-selection biases and NorMuonH
-radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v42 snapshots are accepted. The recurrence roll's boundary and rate are
+explicit conflicts. Device, paths, evaluation cadence, snapshot cadence, the
+smallest replay, and the rank count can change: a snapshot is one file of
+FP32 masters and whole optimizer state whatever number of ranks wrote it,
+and any number of ranks resumes it, each taking the matrices it owns. The
+checkpoint includes expert-selection biases and NorMuonH radius/spectral
+state; transient counts and working copies are rebuilt. Only v42 snapshots
+are accepted. The recurrence roll's boundary and rate are
 saved schedule arguments, independent of the saved evaluation-count
 argument. Token lookups multiply the tied table by
 `1/BASE_NORMAL_INIT_STD`, payloads use the writer's learned RMSNorm with a

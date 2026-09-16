@@ -54,6 +54,8 @@ delta train example-f-s1 --condition f --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
 delta queue example-fl-s1 --condition fl --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
+delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 \
+  --data-root /data/delta --source dclm-100b
 delta train example-f-s1 --resume
 delta queue example-f-s1-50x --continue example-f-s1 --tokens-per-param 50
 
@@ -67,9 +69,16 @@ delta clear TAG
 delta move old-tag new-tag
 ```
 
-`stop live` preserves pending jobs; `stop queue` preserves the active job.
-Stopping sends SIGINT so the trainer snapshots its completed step; a child
-that does not exit within 120 seconds is killed. `--max-steps` caps one
+`--ranks N` runs `N` processes, one per CUDA device, through `torchrun`:
+`delta train` replaces itself with the launcher, so the spool keeps the
+process it started. Each rank takes `batch-rows/ranks` rows of every step,
+which must divide evenly. The rank count is per invocation, never inherited
+by a resume, and a snapshot written by any rank count resumes under any
+other. `stop live` preserves pending jobs; `stop queue` preserves the active
+job. Stopping sends SIGINT, which the launcher forwards to every rank; the
+ranks finish the step they are on, agree to stop, snapshot it, and exit. A
+second SIGINT aborts without a snapshot. A child that does not exit within
+120 seconds is killed. `--max-steps` caps one
 invocation without shortening the schedule. `clear` moves an idle run's artifacts into timestamped recovery. `move` renames idle snapshots, logs, and standard analysis paths;
 both tags must have no active or queued references and the destination must
 be free. Use `--out-dir` for snapshots outside `runs/`; custom outputs are
@@ -164,13 +173,27 @@ defines each retained tool's measurement.
 
 ## CUDA execution
 
-CUDA uses BF16 activations with FP32 parameters, accumulated gradients,
+CUDA uses BF16 activations with FP32 masters, accumulated gradients,
 optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native Flash
 SDPA handles full-row attention and FlexAttention handles cached prefixes.
-CCE reads a BF16 classifier shadow and flushes gradients to the FP32 sink at
-`--head-flush-every` calls and before each optimizer update. A column makes
-one head call, covering both prediction depths, so the default cadence of 2
-holds one two-column microbatch.
+CCE reads the BF16 classifier working copy and accumulates its gradient
+straight into the tied embedding's FP32 sink on every call. A column makes
+one head call, covering both prediction depths.
+
+Every parameter is a view of its site's two slabs, a working copy the
+kernels read and an FP32 gradient sink ([architecture](architecture.md#precision-and-initialization)).
+With several ranks, an expert bank is chunked along its expert axis so each
+rank owns a contiguous run of experts, every other NorMuonH site is owned
+whole by one rank, and the NAdam parameters are replicated. A step reduces
+the sinks onto their owners in place (reduce-scatter for banks, reduce for
+dense sites, all-reduce for the replicated arena), each rank steps the
+matrices it owns against their FP32 masters, and the updated working copies
+gather back. Per rank a NorMuonH matrix costs two bytes per element for the
+working copy and four for its gradient on every rank, plus four for the
+master and two for the momentum on its owner; the static footprint the
+`execution` record reports is therefore this rank's. The communicator's
+buffers are allocated before that footprint is measured, and the activation
+budget is the smallest across ranks, so every rank replays the same plan.
 
 Training compiles blocks and captures fixed-address graphs for reachable
 pass/column shapes. Inductor caches persist at
@@ -179,25 +202,28 @@ them. Before capture the trainer measures, from two eager forwards, the
 activation bytes one block invocation retains and the bytes one recomputed
 block releases, and plans each graph against the device memory still free
 once the static footprint exists minus `--checkpoint-margin-gib` (default
-2): rows per replay for single-column graphs, otherwise how many leading PKDA
-and auxiliary block invocations recompute in backward. The `execution`
-record reports the static footprint, the budget, the bytes per block, the
-bytes per recomputed block, the peak bytes allocated through calibration,
-warm-up, and capture, and the bytes reserved and free once capture ends; the
-peak minus the static footprint and the deepest graph's retained activations
-is the transient the margin covered. These measurements also appear in
-`memory_plan` before warm-up; each `plan` record precedes its graph's warm-up
-and reports its rows and recomputed block count, and `capture` identifies
-each graph before capture starts. The margin covers backward workspaces,
-checkpoint recomputation, allocator rounding, and graph instantiation that
-the retained-forward measurements do not include, and the CUDA context grows
-as kernels compile after the budget is measured. On the 24 GiB card a 1 GiB
+2): the largest divisor of the rank's rows that fits raw, at least
+`--micro-rows`, otherwise the smallest replay with as many leading PKDA and
+auxiliary block invocations recomputing in backward as the shortfall needs.
+The `execution` record reports the rank count and rows per rank, the static
+footprint, the budget, the bytes per block, the bytes per recomputed block,
+the peak bytes allocated through calibration, warm-up, and capture, and the
+bytes reserved and free once capture ends; the peak minus the static
+footprint and the deepest graph's retained activations is the transient the
+margin covered. These measurements also appear in `memory_plan` before
+warm-up; each `plan` record precedes its graph's warm-up and reports its
+rows and recomputed block count, and `capture` identifies each graph before
+capture starts. The margin covers backward workspaces, checkpoint
+recomputation, allocator rounding, and graph instantiation that the
+retained-forward measurements do not include, and the CUDA context grows as
+kernels compile after the budget is measured. On the 24 GiB card a 1 GiB
 margin ran out of memory in the eager warm-up backward of the deepest screen
 fl graph and 3.5 GiB ran; raise the margin if warm-up or capture runs out of
-memory. The optimizer step and the periodic
-monitors run inside the graphs' memory pool on the capture stream, which
-requires the allocator's expandable segments: the package sets
-`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on import, and the trainer
-refuses to run without them. Keep cyclic Python garbage collection outside
-train/eval capture.
-CPU/MPS use eager attention, literal PKDA, and chunked tied-head loss.
+memory. The optimizer step and the periodic monitors run inside the graphs'
+memory pool on the capture stream, which requires the allocator's expandable
+segments: the package sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+on import, and the trainer refuses to run without them. The collectives and
+the evaluation replays stay outside the pool. Keep cyclic Python garbage
+collection outside train/eval capture.
+CPU/MPS use eager attention, literal PKDA, and chunked tied-head loss with
+the same sites and, under gloo, the same collectives.

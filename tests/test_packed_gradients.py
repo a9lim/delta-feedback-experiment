@@ -31,36 +31,46 @@ def tiny(condition):
     )
 
 
-def test_gradient_slabs_cover_parameters_without_overlap():
-    condition = "f"
-    model = tiny(condition)
-    buffers = model.allocate_gradient_buffers()
-    assert set(buffers) == {p for p in model.parameters() if p.requires_grad}
+def test_sites_cover_parameters_once_and_pack_shared_gemms():
+    """Every trainable parameter is a view of exactly one site's slabs; the
+    projections behind one GEMM share a packed sink; expert banks stack the
+    shared expert before the routed ones; binding None restores autograd."""
+    from delta_feedback_experiment.distributed import Topology
+    from delta_feedback_experiment.sites import ParameterSites
+
+    model = tiny("f")
+    sites = ParameterSites(model, Topology())
+    trainable = {p for p in model.parameters() if p.requires_grad}
+    assert sites.sharded | sites.replicated == trainable
+    assert not sites.sharded & sites.replicated
+    assert sites.owned == sites.sharded
+    sites.allocate()
+    gradients = sites.gradients()
+    assert set(gradients) == trainable
     intervals = {}
-    for parameter, buffer in buffers.items():
+    for parameter, buffer in gradients.items():
         assert buffer.shape == parameter.shape
         assert buffer.dtype == torch.float32
         assert buffer.is_contiguous()
-        storage = buffer.untyped_storage()
-        key = storage.data_ptr()
+        key = buffer.untyped_storage().data_ptr()
         intervals.setdefault(key, []).append(
             (buffer.storage_offset(), buffer.storage_offset() + buffer.numel())
         )
-    # Every allocation is covered exactly once, including the packed slabs.
+    # Every slab is covered exactly once by member views, except the tail a
+    # stacked bank pads to a rank multiple (none at one rank).
     for spans in intervals.values():
         spans.sort()
         assert spans[0][0] == 0
         assert all(left[1] == right[0] for left, right in pairwise(spans))
     allocated = {
-        buffer.untyped_storage().data_ptr(): buffer.untyped_storage().nbytes()
-        for buffer in buffers.values()
+        slab.grad.untyped_storage().data_ptr(): slab.grad.untyped_storage().nbytes()
+        for slab in sites.slabs
     }
-    assert sum(allocated.values()) == sum(p.numel() * 4 for p in buffers)
+    assert sum(allocated.values()) == sum(p.numel() * 4 for p in trainable)
 
-    model.bind_gradient_sinks(buffers)
     blocks = [*model.blocks, model.mtp.block]
-    first_binding = [block.attn.packed_qkv_sink for block in blocks]
-    for block, packed in zip(blocks, first_binding, strict=True):
+    for block in blocks:
+        packed = block.attn.packed_qkv_sink
         assert packed is not None
         if block.is_pkda:
             parameters = (
@@ -75,18 +85,25 @@ def test_gradient_slabs_cover_parameters_without_overlap():
             )
         start = 0
         for index, parameter in enumerate(parameters):
-            buffers[parameter].fill_(index + 1)
+            gradients[parameter].fill_(index + 1)
             rows = parameter.shape[0]
-            torch.testing.assert_close(packed[start : start + rows], buffers[parameter])
+            torch.testing.assert_close(packed[start : start + rows], gradients[parameter])
             start += rows
-    # The trainer rebinds after warming. Preserve objects as well as addresses.
-    model.bind_gradient_sinks(buffers)
-    assert all(
-        block.attn.packed_qkv_sink is packed
-        for block, packed in zip(blocks, first_binding, strict=True)
-    )
-    model.bind_gradient_sinks(None)
+        bank = block.mlp
+        assert bank._gate_up_shadow.shape[0] == bank.num_routed_experts
+        assert bank.shared.gate_up_sink is gradients[bank.shared.gate_up_proj.weight]
+        for expert, view in zip(bank.experts, bank._gate_up_shadow, strict=True):
+            assert view.data_ptr() == expert.gate_up_shadow.data_ptr()
+    # The working copies hold the parameters; on CPU they are the FP32 weights.
+    for parameter in sites.sharded:
+        pass
+    sites.adopt()
+    matrix = model.blocks[0].attn.o_proj.weight
+    assert matrix.data_ptr() == model.blocks[0].attn.o_shadow.data_ptr()
+    assert matrix.dtype == torch.float32
+    sites.release()
     assert all(block.attn.packed_qkv_sink is None for block in blocks)
+    assert model.blocks[0].mlp._gate_up_shadow is None
 
 
 def test_packed_linear_repeated_backward_preserves_segment_gradients():

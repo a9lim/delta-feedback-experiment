@@ -31,13 +31,21 @@ traffic, and replaying 120 identical recorded gradients keeps the accumulated
 update within cosine 0.9999 of FP32 storage. CPU and MPS keep FP32 throughout.
 Each shape bucket holds its momenta, row moments, radii, and right vectors in
 one packed tensor per state kind, with every parameter's state entries as
-views into them, so a step packs only parameters and gradients.
+views into them, plus the packed FP32 masters of its matrices. The masters
+are what the step updates; each parameter is then rewritten from its master
+in the parameter's own dtype, so the model may hold a BF16 working copy
+while the optimizer keeps the FP32 weights. Under data parallelism each
+rank's NorMuonH holds buckets for the matrices it owns only, reads their
+reduced gradients from the trainer's gradient table rather than ``.grad``,
+and its state dict names those matrices alone; the trainer assembles the
+whole optimizer state when it writes a checkpoint.
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 
 import torch
@@ -199,52 +207,37 @@ def _normuonh_batch(
     return updated.to(momentum.dtype), row_moment, projected, spectral_vectors
 
 
-def _normuonh_bucket_values(
-    parameters: list[Tensor],
-    gradients: list[Tensor],
-    momentum: Tensor,
-    row_moment: Tensor,
-    radii: Tensor,
-    spectral_vectors: Tensor,
-    lr: Tensor,
-    momentum_beta: float,
-    beta2: float,
-    eps: float,
-    ns_steps: int,
-    ns_dtype: torch.dtype,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Compile packing and update arithmetic without mutating their inputs.
-
-    State arrives already packed; only the parameters and gradients, which are
-    separate tensors owned by the model and the gradient buffers, are stacked.
-    """
-    return _normuonh_batch(
-        momentum,
-        row_moment,
-        torch.stack(parameters),
-        radii,
-        spectral_vectors,
-        torch.stack(gradients),
-        lr,
-        momentum_beta,
-        beta2,
-        eps,
-        ns_steps,
-        ns_dtype,
-    )
-
-
-_compiled_normuonh_bucket_values = torch.compile(
-    _normuonh_bucket_values,
+_compiled_normuonh_batch = torch.compile(
+    _normuonh_batch,
     fullgraph=True,
     dynamic=True,
     mode="max-autotune-no-cudagraphs",
 )
 
 
+def _packed(gradients: list[Tensor]) -> Tensor:
+    """The bucket's gradients as one ``[count, rows, cols]`` tensor.
+
+    Consecutive views of one storage, the layout a stacked site's chunk has,
+    are read in place; anything else is stacked.
+    """
+    first = gradients[0]
+    rows, cols = first.shape
+    stride = rows * cols
+    consecutive = all(g.is_contiguous() for g in gradients) and all(
+        later.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+        and later.storage_offset() == first.storage_offset() + index * stride
+        for index, later in enumerate(gradients)
+    )
+    if consecutive:
+        return first.as_strided((len(gradients), rows, cols), (stride, cols, 1))
+    return torch.stack(gradients)
+
+
 def _normuonh_bucket_step(
     parameters: list[Tensor],
-    gradients: list[Tensor],
+    masters: Tensor,
+    gradient: Tensor,
     momentum: Tensor,
     row_moment: Tensor,
     radii: Tensor,
@@ -258,25 +251,29 @@ def _normuonh_bucket_step(
     # Materialize all results before any writeback. Fusing input momentum
     # mutation into the arithmetic can reread the updated momentum in a
     # singleton bucket, changing the Nesterov direction after the first step.
-    cuda = parameters[0].is_cuda
-    values = _compiled_normuonh_bucket_values if cuda else _normuonh_bucket_values
+    cuda = masters.is_cuda
+    values = _compiled_normuonh_batch if cuda else _normuonh_batch
     new_momentum, new_rows, projected, new_vectors = values(
-        parameters, gradients, momentum, row_moment, radii, spectral_vectors, lr,
+        momentum, row_moment, masters, radii, spectral_vectors, gradient, lr,
         momentum_beta, beta2, eps, ns_steps,
-        NS_CUDA_DTYPE if cuda else parameters[0].dtype,
+        NS_CUDA_DTYPE if cuda else masters.dtype,
     )
     momentum.copy_(new_momentum)
     row_moment.copy_(new_rows)
     spectral_vectors.copy_(new_vectors)
+    masters.copy_(projected)
+    # The working copies, in their own dtype, follow the FP32 masters.
     torch._foreach_copy_(parameters, list(projected.unbind()))
 
 
 @dataclass
 class _ShapeBucket:
-    """One compiled bucket: fixed members, packed state, cached row indices."""
+    """One compiled bucket: fixed members, packed masters and state, cached
+    row indices."""
 
     group_index: int
     params: tuple[torch.nn.Parameter, ...]
+    master: Tensor | None = None
     momentum: Tensor | None = None
     row_moment: Tensor | None = None
     radius: Tensor | None = None
@@ -285,7 +282,13 @@ class _ShapeBucket:
 
 
 class NorMuonH(torch.optim.Optimizer):
-    """Spectrally scaled NorMuon tangent directions on each initial sphere."""
+    """Spectrally scaled NorMuon tangent directions on each initial sphere.
+
+    ``owned`` restricts the matrices this instance steps to those a rank
+    owns; the parameter groups still list every matrix, so schedules and
+    checkpoint schemas are the same on every rank. ``bind_gradients`` names
+    where each matrix's gradient is read from; without it ``.grad`` is.
+    """
 
     def __init__(
         self,
@@ -296,6 +299,7 @@ class NorMuonH(torch.optim.Optimizer):
         eps: float = 1e-8,
         ns_steps: int = 5,
         max_bucket_elements: int | None = None,
+        owned: Collection[torch.nn.Parameter] | None = None,
     ):
         defaults = {
             "lr": lr,
@@ -307,6 +311,12 @@ class NorMuonH(torch.optim.Optimizer):
         super().__init__(params, defaults)
         self.max_bucket_elements = max_bucket_elements
         self._initial_radii: dict[torch.nn.Parameter, Tensor] = {}
+        self._gradients: Mapping[torch.nn.Parameter, Tensor] | None = None
+        every = [parameter for group in self.param_groups for parameter in group["params"]]
+        self._index = {parameter: index for index, parameter in enumerate(every)}
+        self.owned = frozenset(every if owned is None else owned)
+        if not self.owned <= set(every):
+            raise ValueError("owned matrices must belong to the parameter groups")
         for group in self.param_groups:
             for parameter in group["params"]:
                 if parameter.ndim != 2:
@@ -314,7 +324,9 @@ class NorMuonH(torch.optim.Optimizer):
                         f"NorMuonH takes 2D matrices only, got shape "
                         f"{tuple(parameter.shape)}"
                     )
-                radius = parameter.detach().norm()
+                if parameter not in self.owned:
+                    continue
+                radius = parameter.detach().float().norm()
                 radius_value = radius.item()
                 if not math.isfinite(radius_value) or radius_value <= 0:
                     raise ValueError(
@@ -323,16 +335,41 @@ class NorMuonH(torch.optim.Optimizer):
                     )
                 self._initial_radii[parameter] = radius
         self._buckets = self._build_buckets()
+        self._rows_of = {
+            parameter: (bucket, row)
+            for bucket in self._buckets
+            for row, parameter in enumerate(bucket.params)
+        }
+
+    def index_of(self, parameter: torch.nn.Parameter) -> int:
+        """The parameter's position in the state dict, identical on every rank."""
+        return self._index[parameter]
+
+    def bind_gradients(self, gradients: Mapping[torch.nn.Parameter, Tensor] | None) -> None:
+        """Read each matrix's gradient from ``gradients`` instead of ``.grad``.
+
+        A matrix absent from the mapping has no gradient this step and keeps
+        its weights and state, exactly as one whose ``.grad`` is ``None``.
+        """
+        self._gradients = gradients
+
+    def _gradient(self, parameter: torch.nn.Parameter) -> Tensor | None:
+        if self._gradients is not None:
+            return self._gradients.get(parameter)
+        return parameter.grad
 
     def _build_buckets(self) -> list[_ShapeBucket]:
-        """Fix bucket membership once: device, dtype, shape, packing bound."""
+        """Fix bucket membership once: device, shape, packing bound.
+
+        Members keep their group order, so a stacked site's owned chunk
+        arrives as consecutive members and its gradient packs in place.
+        """
         buckets = []
         for index, group in enumerate(self.param_groups):
             shapes = defaultdict(list)
             for parameter in group["params"]:
-                shapes[(parameter.device, parameter.dtype, parameter.shape)].append(
-                    parameter
-                )
+                if parameter in self.owned:
+                    shapes[(parameter.device, parameter.shape)].append(parameter)
             for members in shapes.values():
                 for parameters in self._batches(members):
                     buckets.append(_ShapeBucket(index, tuple(parameters)))
@@ -347,13 +384,19 @@ class NorMuonH(torch.optim.Optimizer):
             yield parameters[start : start + size]
 
     def _allocate(self, bucket: _ShapeBucket) -> None:
-        """Pack one bucket's state into a tensor per kind, radii included."""
-        if bucket.momentum is not None:
+        """Pack one bucket's masters and state into a tensor per kind."""
+        if bucket.master is not None:
             return
         sample = bucket.params[0]
+        if any(parameter.dtype != torch.float32 for parameter in bucket.params):
+            raise RuntimeError(
+                "NorMuonH masters must be materialized while the parameters "
+                "still hold FP32 weights"
+            )
         count = len(bucket.params)
         rows, cols = sample.shape
-        kwargs = {"device": sample.device, "dtype": sample.dtype}
+        kwargs = {"device": sample.device, "dtype": torch.float32}
+        bucket.master = torch.stack([parameter.detach() for parameter in bucket.params])
         bucket.momentum = torch.zeros(
             count, rows, cols, device=sample.device, dtype=_momentum_dtype(sample)
         )
@@ -362,6 +405,41 @@ class NorMuonH(torch.optim.Optimizer):
         bucket.radius = torch.stack(
             [self._initial_radii[parameter] for parameter in bucket.params]
         )
+
+    @torch.no_grad()
+    def materialize(self) -> None:
+        """Allocate every owned bucket's masters and state now.
+
+        The trainer calls this before it replaces the parameters with their
+        working copies, so a resumed run whose checkpoint did not mention a
+        matrix still holds an FP32 master for it.
+        """
+        for bucket in self._buckets:
+            self._allocate(bucket)
+            for row, parameter in enumerate(bucket.params):
+                state = self.state[parameter]
+                if not state:
+                    state.update(self._views(bucket, row))
+
+    @staticmethod
+    def state_shapes(parameter: torch.nn.Parameter) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
+        """Each state kind's shape and dtype for one matrix, on any rank."""
+        rows, cols = parameter.shape
+        return {
+            "momentum": ((rows, cols), _momentum_dtype(parameter)),
+            "row_moment": ((rows, 1), torch.float32),
+            "radius": ((), torch.float32),
+            "spectral_vector": ((cols,), torch.float32),
+        }
+
+    def master_of(self, parameter: torch.nn.Parameter) -> Tensor:
+        """The FP32 master of an owned matrix, a view into its bucket."""
+        try:
+            bucket, row = self._rows_of[parameter]
+        except KeyError:
+            raise KeyError("matrix is not owned by this optimizer") from None
+        self._allocate(bucket)
+        return bucket.master[row]
 
     def _views(self, bucket: _ShapeBucket, row: int) -> dict[str, Tensor]:
         return {
@@ -382,6 +460,13 @@ class NorMuonH(torch.optim.Optimizer):
             bucket.indices[key] = index
         return index
 
+    def _present(self, bucket: _ShapeBucket) -> list[int]:
+        return [
+            row
+            for row, parameter in enumerate(bucket.params)
+            if self._gradient(parameter) is not None
+        ]
+
     @torch.no_grad()
     def prepare(self) -> None:
         """Cache the row indices this gradient pattern will need.
@@ -392,11 +477,7 @@ class NorMuonH(torch.optim.Optimizer):
         such a pool call this beforehand, outside it.
         """
         for bucket in self._buckets:
-            present = [
-                row
-                for row, parameter in enumerate(bucket.params)
-                if parameter.grad is not None
-            ]
+            present = self._present(bucket)
             if present:
                 self._rows(bucket, present)
 
@@ -419,17 +500,15 @@ class NorMuonH(torch.optim.Optimizer):
         sample = bucket.params[0]
         group = self.param_groups[bucket.group_index]
         rows, cols = sample.shape
-        kwargs = {"device": sample.device, "dtype": sample.dtype}
+        kwargs = {"device": sample.device, "dtype": torch.float32}
         matrices = [
-            torch.nn.Parameter(
-                torch.full(sample.shape, 1 / math.sqrt(rows * cols), **kwargs),
-                requires_grad=parameter.requires_grad,
-            )
+            torch.full(sample.shape, 1 / math.sqrt(rows * cols), device=sample.device, dtype=parameter.dtype)
             for parameter in bucket.params[:count]
         ]
         _normuonh_bucket_step(
             matrices,
-            [torch.zeros_like(matrix) for matrix in matrices],
+            torch.full((count, rows, cols), 1 / math.sqrt(rows * cols), **kwargs),
+            torch.zeros(count, rows, cols, **kwargs),
             torch.zeros(
                 count, rows, cols, device=sample.device, dtype=_momentum_dtype(sample)
             ),
@@ -448,11 +527,7 @@ class NorMuonH(torch.optim.Optimizer):
         loss = None if closure is None else closure()
         rates: dict[tuple[int, torch.device], Tensor] = {}
         for bucket in self._buckets:
-            present = [
-                row
-                for row, parameter in enumerate(bucket.params)
-                if parameter.grad is not None
-            ]
+            present = self._present(bucket)
             if not present:
                 continue
             self._allocate(bucket)
@@ -472,11 +547,12 @@ class NorMuonH(torch.optim.Optimizer):
                 group["eps"],
                 group["ns_steps"],
             )
-            gradients = [parameter.grad for parameter in parameters]
+            gradient = _packed([self._gradient(parameter) for parameter in parameters])
             if len(present) == len(bucket.params):
                 _normuonh_bucket_step(
                     parameters,
-                    gradients,
+                    bucket.master,
+                    gradient,
                     bucket.momentum,
                     bucket.row_moment,
                     bucket.radius,
@@ -487,18 +563,21 @@ class NorMuonH(torch.optim.Optimizer):
             # A bucket whose members were not all reached this step gathers the
             # active rows, so absent parameters keep both weights and state.
             index = self._rows(bucket, present)
+            master = bucket.master.index_select(0, index)
             momentum = bucket.momentum.index_select(0, index)
             row_moment = bucket.row_moment.index_select(0, index)
             spectral_vector = bucket.spectral_vector.index_select(0, index)
             _normuonh_bucket_step(
                 parameters,
-                gradients,
+                master,
+                gradient,
                 momentum,
                 row_moment,
                 bucket.radius.index_select(0, index),
                 spectral_vector,
                 *arguments,
             )
+            bucket.master.index_copy_(0, index, master)
             bucket.momentum.index_copy_(0, index, momentum)
             bucket.row_moment.index_copy_(0, index, row_moment)
             bucket.spectral_vector.index_copy_(0, index, spectral_vector)
@@ -507,15 +586,26 @@ class NorMuonH(torch.optim.Optimizer):
     def load_state_dict(self, state_dict) -> None:
         """Copy a restored state into the packed buckets, keeping the views.
 
-        The generic load rebuilds ``self.state`` from the saved tensors; each
-        restored value is copied into its bucket row and replaced by the view
-        again, so resume lands in the same storage a fresh run allocates.
+        Only the owned matrices' entries are read: the generic load rebuilds
+        ``self.state`` from them, and each restored value is copied into its
+        bucket row and replaced by the view again, so resume lands in the
+        same storage a fresh run allocates. Masters come from the parameters,
+        which still hold the restored FP32 weights when this runs.
         """
-        super().load_state_dict(state_dict)
+        owned_indices = {self._index[parameter] for parameter in self.owned}
+        filtered = {
+            "state": {
+                key: value
+                for key, value in state_dict["state"].items()
+                if int(key) in owned_indices
+            },
+            "param_groups": state_dict["param_groups"],
+        }
+        super().load_state_dict(filtered)
         for bucket in self._buckets:
             # Reallocate so rows the checkpoint does not mention start from a
             # fresh run's zeros and initial radius rather than stale values.
-            bucket.momentum = bucket.row_moment = None
+            bucket.master = bucket.momentum = bucket.row_moment = None
             bucket.radius = bucket.spectral_vector = None
             restored = [
                 (row, self.state[parameter])
@@ -562,6 +652,7 @@ def build_optimizers(
     lr_normuonh: float = DEFAULT_NORMUONH_LR,
     lr_nadam: float = DEFAULT_NADAM_LR,
     nadam_betas: tuple[float, float] = DEFAULT_NADAM_BETAS,
+    owned: Collection[torch.nn.Parameter] | None = None,
 ) -> list[torch.optim.Optimizer]:
     """Build the authoritative NorMuonH/NAdam stack with stable WSD rates.
 
@@ -569,6 +660,8 @@ def build_optimizers(
     groups additionally scale their operator-step budget by active count:
     coherently aligned branch changes add as sqrt(k+1) after the bank's
     forward normalization. Initialization and radii retain their fan-in rule.
+    ``owned`` names the NorMuonH matrices this rank steps; NAdam's parameters
+    are replicated and stepped everywhere.
     """
     parameters = split_parameters(model)
     rates = {
@@ -591,6 +684,7 @@ def build_optimizers(
         [group(name) for name in ("normuonh", "normuonh_expert_in", "normuonh_expert_out")],
         lr=lr_normuonh,
         max_bucket_elements=32 * 1024 * 1024,
+        owned=owned,
     )
     nadam_parameters = parameters["nadam"]
     use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda
