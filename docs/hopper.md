@@ -97,7 +97,11 @@ rental session below except the collectives is a single-GPU measurement.
 The machine profile lives in the meta repository's `bootstrap/rental.sh`
 (aarch64 CUDA 13.2 lock, workspace, the token store from the private
 bucket); `scripts/first_hour.sh` runs the session's first hour and writes
-`logs/first-hour/<tag>/summary.json`. The Grace cores are also where the
+`logs/first-hour/<tag>/summary.json`. `scripts/replay_bench.py` is the
+baseline the levers below are scored against: every captured graph replayed
+warm at its production width, seconds per replay, row, and row-column, the
+schedule-weighted step, a loss fingerprint at initialization, and with
+`--trace` one replay's kernel time by class. The Grace cores are also where the
 whole dclm-100b stream gets built and published (`scripts/publish_store.sh`,
 [operations](operations.md#tokenize)), overlapping the GPU work.
 
