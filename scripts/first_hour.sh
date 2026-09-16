@@ -51,6 +51,7 @@ fi
 HALF=$(( STEPS / 2 ))
 OUT="logs/first-hour/$TAG"
 mkdir -p "$OUT"
+rm -f "$OUT/summary.json"
 say() { printf '\n== %s (%s)\n' "$1" "$(date +%H:%M:%S)"; }
 TRAIN=(delta train "$TAG" --condition "$CONDITION" --scale "$SCALE" --seed "$SEED"
        --data-seed "$DATA_SEED" --data-root "$DATA_ROOT" --source "$SOURCE"
@@ -93,26 +94,37 @@ say "resume from the step-$STEPS snapshot for 3 steps"
 say "cooperative stop: SIGINT after two steps of a resumed run"
 delta train "$TAG" --resume --max-steps 50 > "$OUT/stop.log" 2>&1 < /dev/null &
 pid=$!
+ready=false
 for _ in $(seq 1 900); do
-  if (( $(grep -c '^step ' "$OUT/stop.log" 2>/dev/null || true) >= 2 )); then break; fi
+  if (( $(grep -c '^step ' "$OUT/stop.log" 2>/dev/null || true) >= 2 )); then ready=true; break; fi
   kill -0 "$pid" 2>/dev/null || break
   sleep 2
 done
-kill -INT "$pid" 2>/dev/null || true
-if wait "$pid"; then echo "stopped run exited 0"; else echo "stopped run exited $?"; fi
-grep -E '^(interrupt|checkpoint|yield|done) ' "$OUT/stop.log" || echo "no interrupt or checkpoint record in stop.log"
-ls -la runs/"$TAG".pt.* 2>/dev/null || true
+requested=false
+if kill -INT "$pid" 2>/dev/null; then requested=true; fi
+if wait "$pid"; then
+  echo "stopped run exited 0"
+else
+  status=$?
+  echo "cooperative stop failed: run exited $status; see $OUT/stop.log" >&2
+  exit "$status"
+fi
+[[ $ready == true && $requested == true ]] || {
+  echo "cooperative stop failed: did not request SIGINT after two steps; see $OUT/stop.log" >&2
+  exit 1
+}
 
 say "summary -> $OUT/summary.json"
-python - "$OUT" "$TAG" <<'PY'
+python - "$OUT" "$TAG" "$STEPS" "$HALF" <<'PY'
 import json
 import statistics
 import sys
 from pathlib import Path
 
-from transformer_experiments.telemetry import parse_record
+from transformer_experiments.telemetry import parse_record, record_step
 
 out, tag = Path(sys.argv[1]), sys.argv[2]
+expected_steps, interval = map(int, sys.argv[3:5])
 
 
 def records(name):
@@ -127,7 +139,61 @@ def fields(record, *names):
 
 
 train = records("train.log")
+resume = records("resume.log")
+stop = records("stop.log")
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(f"lifecycle validation failed: {message}")
+
+
+def addresses(log, event):
+    return [record_step(r) for r in log if r["event"] == event]
+
+
+for name, log, start, count in (
+    ("train", train, 0, expected_steps),
+    ("resume", resume, expected_steps, 3),
+):
+    end = start + count
+    require(addresses(log, "step") == list(range(start + 1, end + 1)),
+            f"{name} must contain {count} consecutive steps after {start}")
+    require(addresses(log, "yield") + addresses(log, "done") == [end]
+            and not addresses(log, "interrupt"), f"{name} lacks its normal completion record")
+    require(addresses(log, "eval") == [s for s in range(start + 1, end + 1) if s % interval == 0],
+            f"{name} is missing or has unexpected evaluation records")
+    snapshots = addresses(log, "checkpoint")
+    required = {s for s in range(start + 1, end + 1) if s % interval == 0} | {end}
+    require(required <= set(snapshots) and len(snapshots) == len(set(snapshots))
+            and all(s is not None and start < s <= end for s in snapshots),
+            f"{name} is missing or has invalid checkpoint records")
+
+require(addresses(resume, "resume") == [expected_steps], "resume started from the wrong checkpoint")
+stop_start = expected_steps + 3
+require(addresses(stop, "resume") == [stop_start], "stop run resumed the wrong checkpoint")
+stopped_steps = addresses(stop, "step")
+require(2 <= len(stopped_steps) < 50
+        and stopped_steps == list(range(stop_start + 1, stop_start + len(stopped_steps) + 1)),
+        "stop run must contain at least two consecutive steps and stop before its limit")
+stopped_at = stopped_steps[-1]
+require(addresses(stop, "interrupt") == [stopped_at], "stop run lacks its final interrupt record")
+require(not any(r["event"] in ("yield", "done") for r in stop), "stop run completed without a cooperative stop")
+final_snapshots = [r for r in stop if r["event"] == "checkpoint" and record_step(r) == stopped_at]
+require(len(final_snapshots) == 1, "stop run lacks exactly one checkpoint at its final step")
+path = Path(final_snapshots[0]["path"])
+require(path.resolve() == Path(f"runs/{tag}.pt.{stopped_at}").resolve(), "stop checkpoint has an unexpected path")
+# Earlier snapshots were read by the two resumes and may have been pruned.
+# Read only the final checkpoint, using the current version/tokenizer/dtype contract.
+from delta_feedback_experiment.train import read_checkpoint
+
+payload = read_checkpoint(path)
+require(payload["step"] == stopped_at, "stop checkpoint step differs from the interrupted step")
+validated_checkpoint = {"path": str(path), "step": stopped_at, "version": payload["version"]}
+del payload
+
 summary = {"tag": tag}
+summary["validated_checkpoint"] = validated_checkpoint
 for r in train:
     if r["event"] == "memory_plan":
         summary["memory_plan"] = {k: v for k, v in r.items() if k != "event"}
@@ -157,8 +223,7 @@ summary["step_seconds"] = {
 }
 summary["tok_s_last"] = steps[-1].get("tok_s") if steps else None
 summary["evals"] = [fields(r, "step", "val", "val_fused", "val_one", "val_mtp") for r in train if r["event"] == "eval"]
-summary["resume_steps"] = [fields(r, "step", "loss") for r in records("resume.log") if r["event"] == "step"]
-stop = records("stop.log")
+summary["resume_steps"] = [fields(r, "step", "loss") for r in resume if r["event"] == "step"]
 summary["stop"] = {
     "interrupt_at": [r["step"] for r in stop if r["event"] == "interrupt"],
     "checkpoints": [r["path"] for r in stop if r["event"] == "checkpoint"],
