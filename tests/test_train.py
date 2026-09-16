@@ -319,8 +319,8 @@ def test_keyed_jitter_covers_single_and_final_passes_and_replay_buffers():
         assert prefix.shape == (count - 1, 2)
         assert jitter.shape == (count, 2, args.seq_len + 1, 16)
         assert torch.all((prefix >= 1) & (prefix < args.seq_len))
-        assert torch.all(jitter.abs() <= 0.02 * args.jitter)
-        assert jitter.abs().max() > 0.9 * 0.02 * args.jitter
+        assert torch.all(jitter.abs() <= args.jitter)
+        assert jitter.abs().max() > 0.9 * args.jitter
         assert all(draw.count_nonzero() for draw in jitter)
         destination_prefix, destination_jitter = (
             torch.empty_like(prefix), torch.empty_like(jitter)
@@ -342,7 +342,7 @@ def test_keyed_jitter_covers_single_and_final_passes_and_replay_buffers():
         )
         assert torch.equal(looped_prefix, prefix) and torch.equal(looped_jitter, jitter)
         assert loop.shape == (count, 2, 2, args.seq_len + 1, 16)
-        assert torch.all(loop.abs() <= 0.02 * args.jitter) and loop.count_nonzero()
+        assert torch.all(loop.abs() <= args.jitter) and loop.count_nonzero()
         destination_loop = torch.empty_like(loop)
         again = micro_draws(
             args, 2, 0, count, 3, 2, 16, device,
@@ -440,7 +440,7 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
         assert resumed[key] == full[key]
     complete = trainer.read_checkpoint(tmp_path / "runs/full.pt.2")
     restored = trainer.read_checkpoint(tmp_path / "runs/renamed.pt.2")
-    assert complete["version"] == CONTRACT.version == 41
+    assert complete["version"] == CONTRACT.version == 42
     assert (
         complete["args"]["loop_iterations"] == restored["args"]["loop_iterations"] == 2
     )

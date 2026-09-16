@@ -70,7 +70,7 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
     "f": (
         "feedback",
         (
-            "full-bandwidth feedback: fuse the preceding column's scaled payload "
+            "full-bandwidth feedback: fuse the preceding column's payload "
             "with the raw token embedding by concatenation"
         ),
     ),
@@ -101,13 +101,28 @@ def parse_condition(text: str) -> str:
 
 
 BASE_NORMAL_INIT_STD = 0.02
-"""Base Gaussian standard deviation and fixed payload/jitter scale.
+"""Base Gaussian standard deviation.
 
 Embeddings and fixed-head-width expansions use this directly. Gate and control
 matrices with fan-in ``D`` multiply it by ``sqrt(MUP_BASE_DIM / D)``. Adjust
 this constant to tune both families; NorMuonH's fan-in scale is independent.
-The payload's learned RMSNorm and relative training jitter also use this
-fixed multiplier, matching the initial raw embedding RMS at the fusion input.
+Token lookups multiply the tied table by ``EMBEDDING_LOOKUP_SCALE``, its
+inverse, so the fusion sees unit-RMS tokens at initialization while the
+classifier reads the raw table.
+"""
+
+EMBEDDING_LOOKUP_SCALE = 1 / BASE_NORMAL_INIT_STD
+"""Fixed multiplier on every token lookup.
+
+The tied table initializes at ``BASE_NORMAL_INIT_STD`` for the classifier's
+sake, so the lookup carries the inverse: a token enters the shared fusion at
+unit RMS, the payload writer's RMSNorm produces unit RMS, and the fan-in
+scaled fusion seeds the residual stream at unit RMS. A seed at embedding
+scale instead (0.02) left the early pre-norms dividing by a tiny residual,
+which amplified the gradient about 160x through a column and 8x per
+re-entry hop at screen scale, so looped and feedback columns swamped the
+plain column's gradient. A multiplier rather than a larger initialization
+keeps the table at the scale its NAdam rate was tuned for.
 """
 
 MUP_BASE_DIM = 1536
@@ -269,22 +284,18 @@ def condition_config(condition: str, **overrides) -> ModelConfig:
 
 
 class RMSNorm(nn.Module):
-    """Learned RMSNorm with a fixed optional scale, applied in FP32 before cast."""
+    """Learned RMSNorm, applied in FP32 before the cast back."""
 
-    def __init__(self, dim: int, eps: float, *, scale: float = 1.0):
+    def __init__(self, dim: int, eps: float):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
-        self.scale = scale
 
     def forward(self, x: Tensor) -> Tensor:
         dtype = x.dtype
         x = x.float()
         x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        gain = self.weight.float()
-        if self.scale != 1.0:
-            gain = gain * self.scale
-        return (x * gain).to(dtype)
+        return (x * self.weight.float()).to(dtype)
 
 
 class _EmbeddingSink(torch.autograd.Function):
@@ -313,12 +324,15 @@ class _EmbeddingSink(torch.autograd.Function):
 
 
 class ResidualEmbedding(nn.Embedding):
-    """Raw token inputs with FP32 tied weights and accumulated gradients.
+    """Token inputs at unit scale from FP32 tied weights with accumulated gradients.
 
-    ``nn.Embedding`` is not autocast-aware.  Without this explicit boundary its
-    FP32 output silently promotes every residual, payload, and routed source.
-    CUDA autocast casts lookup activations to BF16. Plain seeds, feedback,
-    and MTP all consume this raw lookup; the classifier uses ``weight`` too.
+    The lookup is the tied row times ``EMBEDDING_LOOKUP_SCALE``, unnormalized,
+    so token magnitudes stay learnable while the residual stream starts at
+    unit RMS; the classifier reads ``weight`` raw. ``nn.Embedding`` is not
+    autocast-aware.  Without this explicit boundary its FP32 output silently
+    promotes every residual, payload, and routed source. CUDA autocast casts
+    lookup activations to BF16. Plain seeds, feedback, the loop, and MTP all
+    consume this lookup.
 
     ``grad_sink`` is the trainer-owned persistent FP32 gradient buffer of the
     tied weight.  When it is set, both the lookup and the tied classifier
@@ -335,6 +349,7 @@ class ResidualEmbedding(nn.Embedding):
             out = _EmbeddingSink.apply(tokens, self.weight, sink)
         else:
             out = super().forward(tokens)
+        out = out * EMBEDDING_LOOKUP_SCALE
         if out.is_cuda and torch.is_autocast_enabled("cuda"):
             out = out.to(torch.bfloat16)
         return out
@@ -820,7 +835,7 @@ _compiled_mtp = torch.compile(
 
 
 def _payload_epilogue(norm, h, routed):
-    """Write the routed read plus top state through the scaled payload norm."""
+    """Write the routed read plus top state through the payload norm."""
     return norm(h + routed)
 
 
@@ -943,7 +958,7 @@ class DeltaModel(nn.Module):
         self.register_buffer("_classifier_accum", None, persistent=False)
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
-        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps, scale=BASE_NORMAL_INIT_STD)
+        self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_router = Router(cfg)
         # Capture the exact common-trunk initialization boundary before
         # constructing the attention gates and shared fusion projection,
@@ -959,7 +974,7 @@ class DeltaModel(nn.Module):
         self._shadow_refresh: list[tuple[Tensor, Tensor]] = []
         self.fuse_proj = nn.Linear(2 * cfg.dim, cfg.dim, bias=False)
         self.blank_payload = nn.Parameter(torch.zeros(cfg.dim))
-        """Learned stand-in payload, in scaled payload units, for positions
+        """Learned stand-in payload, in payload units, for positions
         with no incoming payload: pass 1, plain prefixes, and Standard
         decoding. Every column seed therefore passes through ``fuse_proj``,
         and a feedback position differs from a plain one only by
@@ -1041,13 +1056,15 @@ class DeltaModel(nn.Module):
     # -- pieces ----------------------------------------------------------------
 
     def fuse(self, payload: Tensor, token_embedding: Tensor) -> Tensor:
-        """Shared entry W [raw token; scaled payload], with no further norm.
+        """Shared entry W [token; payload], with no further norm.
 
-        The writer scales its learned norm by BASE_NORMAL_INIT_STD. Any
-        jitter is already in those scaled units. Raw token magnitudes and
-        learned payload gains survive the linear fusion. Every column seed
-        is one of these products; ``plain_seed`` supplies the blank payload
-        where no payload arrives.
+        Both inputs are unit RMS at initialization: the lookup carries the
+        fixed ``EMBEDDING_LOOKUP_SCALE`` and the writer's RMSNorm gain starts
+        at one, so the fan-in scaled projection seeds the residual stream at
+        unit RMS. Any jitter is already in payload units. Token magnitudes
+        and learned payload gains survive the linear fusion. Every column
+        seed is one of these products; ``plain_seed`` supplies the blank
+        payload where no payload arrives.
         """
         return sink_linear(
             torch.cat((token_embedding, payload), dim=-1),
@@ -1653,7 +1670,7 @@ class DeltaModel(nn.Module):
         the shared fusion of the preceding column's payload with
         ``token_embedding``, the same raw embeddings ``x`` was fused from,
         after adding that column's row of ``loop_jitter`` [iterations-1, B,
-        T, D] in scaled payload units when given. ``iterations`` is the
+        T, D] in payload units when given. ``iterations`` is the
         column count under ``l``: the configured evaluation/decode count, or
         the count the cache was allocated for. Every column but possibly the
         last writes a payload. With a cache, column ``i`` mixes on track
@@ -1787,7 +1804,7 @@ def multipass(
     prefix_lens [n_passes-1, B] holds values in 1..T-1 (the plain-embedding
     prefix per feedback pass; position 0 is always plain and position T-1 is
     always fused). jitter [n_passes, B, T+1, D] is drawn at the stored-row
-    width in scaled payload units for each pass's last column, and
+    width in payload units for each pass's last column, and
     loop_jitter [n_passes, iterations-1, B, T+1, D] for the columns before
     it. A column's first T jitter rows are added to its payload once, before
     both fusions: the MTP input with the next tokens, and either the next

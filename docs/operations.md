@@ -75,7 +75,7 @@ both tags must have no active or queued references and the destination must
 be free. Use `--out-dir` for snapshots outside `runs/`; custom outputs are
 not renamed. Existing figures retain their labels until regenerated.
 
-Resume and continuation accept only [v41 snapshots](design.md#checkpoints-and-queue).
+Resume and continuation accept only [v42 snapshots](design.md#checkpoints-and-queue).
 The queue stores arguments and refreshes the checkout before each job.
 Use `delta train --help` for recipe and runtime overrides.
 

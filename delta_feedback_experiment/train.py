@@ -34,7 +34,6 @@ from transformer_experiments.schedule import Schedule
 
 from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
 from .model import (
-    BASE_NORMAL_INIT_STD,
     CONDITION_LETTERS,
     DEFAULT_LOOP_ITERATIONS,
     EXPERT_BALANCE_COEF,
@@ -60,7 +59,7 @@ from .optim import (
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
 
 CONTRACT = checkpoints.CheckpointContract(
-    version=41, resumable=frozenset({41}), surface_version=41
+    version=42, resumable=frozenset({42}), surface_version=42
 )
 
 
@@ -370,10 +369,9 @@ def build_parser() -> argparse.ArgumentParser:
     recipe.add_argument(
         "--jitter", type=float, default=0.02,
         help=(
-            "relative uniform +/- payload jitter amplitude; multiplied by the "
-            f"fixed payload scale {BASE_NORMAL_INIT_STD:g} when drawn, shared "
-            "by MTP and feedback "
-            f"(default: 0.02, actual amplitude: {BASE_NORMAL_INIT_STD * 0.02:g})"
+            "uniform +/- payload jitter half-width in payload units, which are "
+            "unit RMS at initialization; one draw per column serves MTP, "
+            "feedback, and the loop (default: 0.02)"
         ),
     )
     recipe.add_argument("--zloss", type=float, default=1e-5)
@@ -543,7 +541,7 @@ def micro_draws(
     pass jitter, which perturbs each pass's last column, are drawn first, so
     a condition with ``l`` shares them with the condition without it; the
     loop jitter for the earlier columns follows. Jitter is drawn directly in
-    scaled payload units: BASE_NORMAL_INIT_STD * args.jitter."""
+    payload units, uniform in +/- args.jitter."""
     if generator is None:
         generator = torch.Generator(device=device if device.type == "cuda" else "cpu")
     generator.manual_seed(mix(args.data_seed, step, first_row))
@@ -558,7 +556,7 @@ def micro_draws(
     jitter_shape = (n_passes, n_rows, columns, dim)
     if jitter_out is None:
         jitter_out = torch.empty(jitter_shape, dtype=dtype, device=device)
-    amplitude = BASE_NORMAL_INIT_STD * args.jitter
+    amplitude = args.jitter
     jitter_out.uniform_(-amplitude, amplitude, generator=generator)
     if iterations == 1:
         return prefix_out, jitter_out, None

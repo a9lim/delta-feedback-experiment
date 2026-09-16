@@ -70,10 +70,10 @@ def test_load_checkpoint_rebuilds_the_saved_model(tmp_path):
     assert torch.equal(want, got)
 
 
-def test_v41_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
+def test_v42_preserves_feedback_only_snapshots_with_unused_depth_settings(tmp_path):
     model, path = snapshot(tmp_path, "f")
     payload = read_checkpoint(path)
-    assert payload["version"] == CONTRACT.version == 41
+    assert payload["version"] == CONTRACT.version == 42
     # These retired depth settings were unused for f, including extension's
     # six-visit default, and must not prevent reading its unchanged weights.
     payload["args"].update(loop_iterations=6, loop_max_iterations=12)

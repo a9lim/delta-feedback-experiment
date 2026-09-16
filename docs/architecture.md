@@ -9,8 +9,10 @@ seeds the next column from that payload and a raw token embedding. Feedback
 fuses the payload with the next position's token, the Full-Bandwidth
 Transformer (FBT) recurrence with Jacobi training; the loop fuses it with the
 same position's token and re-runs the whole column, in the Ouro style. The
-payload is normalized once and multiplied by a fixed `0.02` scale at its
-writer. There is no empty condition.
+payload is normalized once at its writer with a learned gain, and a token
+lookup is the tied embedding row times the fixed `1/BASE_NORMAL_INIT_STD`,
+so both fusion inputs are unit RMS at initialization and the seed enters the
+residual stream at unit scale. There is no empty condition.
 
 [Scaling](scaling.md) owns geometry and accounting, [design](design.md) owns
 data and training, and [references](../references/refs.yaml) records sources.
@@ -47,14 +49,14 @@ cells. Under `l` the whole column runs `r` times per position, each run
 seeded by the preceding run's payload.
 
 ```text
-raw token embedding + incoming payload (f), the preceding column's own
+token embedding + incoming payload (f), the preceding column's own
 payload (l), or the learned blank payload
   -> shared concat-linear fusion -> column seed
   -> four cells
   -> top state -> tied readout -> next-token logits
-       + routed block deltas -> learned RMSNorm -> x 0.02 -> payload
+       + routed block deltas -> learned RMSNorm -> payload
                                   (+ shared jitter in training)
-                                  + raw same-token embedding
+                                  + same-token embedding
                                   -> shared concat-linear fusion
                                      -> next column seed at this position (l)
                                   + raw next-token embedding
@@ -68,7 +70,7 @@ Each cell has four residual layers, each with its own token mixer and expert
 FFN. An MHDB read enriches each branch's input with the seed and cell deltas.
 Linear maps are bias-free except PKDA's output-gate expansion.
 
-Every column seed is the shared fusion of the raw token embedding `e_t` with
+Every column seed is the shared fusion of the token embedding `e_t` with
 a payload. Pass 1, plain-prefix positions, and Standard decoding, which have
 no incoming payload, fuse the learned blank payload `p_0` instead. The readout applies
 `final_norm(h_top) * 1536 / D` before the tied classifier.
@@ -277,9 +279,9 @@ Residuals with cell-level addresses.
 
 ## Payload and letter f: feedback
 
-At a feedback position, fusion concatenates the raw token embedding `e_t`
+At a feedback position, fusion concatenates the token embedding `e_t`
 with incoming payload `p_(t-1)` and projects back to width `D`. The payload
-was normalized and scaled once at its writer. With jitter disabled,
+was normalized once at its writer. With jitter disabled,
 the same fusion used by MTP gives the column seed:
 
 ```text
@@ -291,9 +293,9 @@ only concatenation and projection: it applies no normalization, activation,
 or extra scaling. Splitting its matrix into two width-`D` blocks gives
 `W_e e_t + W_p p_(t-1)`, so both inputs contribute directly to the seed. This adapts
 [DeepSeek-V3's MTP entry, Equation 21](https://arxiv.org/html/2412.19437v2#S2.SS2):
-the routed payload replaces its preceding hidden state and is normalized and
-scaled at the writer before training jitter, the token input remains raw,
-and the result is shared with cross-column feedback. Plain-prefix, pass-1,
+the routed payload replaces its preceding hidden state and is normalized at
+the writer before training jitter, the token input is the scaled lookup
+without normalization, and the result is shared with cross-column feedback. Plain-prefix, pass-1,
 and Standard-decoding positions use the same product with the learned blank
 payload `p_0` in place of `p_(t-1)`:
 
@@ -301,7 +303,7 @@ payload `p_0` in place of `p_(t-1)`:
 seed_t = fuse_proj(concat(e_t, p_0))          (no incoming payload)
 ```
 
-`p_0` is a width-`D` vector in scaled payload units, zero-initialized and
+`p_0` is a width-`D` vector in payload units, zero-initialized and
 present in every condition, so every seed passes through `fuse_proj` and a
 feedback position differs from a plain one only by `W_p (p_(t-1) - p_0)`.
 Neither the blank nor its fusion receives jitter. The actual seed is both residual
@@ -330,7 +332,7 @@ letter controls consumption by the next position's column and the `l` letter
 by the same position's next column. Generation can skip payload construction
 when no feedback, loop, or auxiliary read needs it.
 
-Every training column adds its keyed jitter, already in scaled payload units,
+Every training column adds its keyed jitter, already in payload units,
 to the undetached payload and fuses it with the raw next-token embedding
 once.
 There is no second payload normalization after jitter. MTP consumes the
@@ -461,10 +463,9 @@ It shares the final norm and embedding/readout.
 It has no MHDB read or tied loop. Its independent matrix, diagonal, and
 convolution states start from zero for each row and pass.
 
-`--jitter` is relative to `BASE_NORMAL_INIT_STD`, with default `0.02`.
-Training samples the buffer directly in payload units: uniform
-`[-BASE_NORMAL_INIT_STD * jitter, BASE_NORMAL_INIT_STD * jitter]`, or
-`[-0.0004,0.0004]` by default. This draw happens for every supervised
+`--jitter` is a half-width in payload units, which are unit RMS at
+initialization, with default `0.02`. Training samples the buffer directly
+in those units: uniform `[-jitter, jitter]`. This draw happens for every supervised
 column, including the final or only pass and `l` without `f`. MTP, the next
 looped column, and the next feedback pass use the same realization. For the
 latter, `u_t` becomes the seed at position `t+1`, with positions inside the

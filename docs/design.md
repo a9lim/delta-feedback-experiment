@@ -98,30 +98,29 @@ and balancing equations.
 
 ### Feedback passes
 
-A feedback step starts with plain teacher forcing, using raw token embeddings
-as column seeds. Every supervised column applies the writer's learned RMSNorm
-with its fixed output scale `BASE_NORMAL_INIT_STD=0.02`, then adds keyed
-uniform jitter without detaching it. `--jitter` sets the relative half-width,
-default `0.02`; the actual draw is uniform in
-`[-BASE_NORMAL_INIT_STD * jitter, BASE_NORMAL_INIT_STD * jitter]`, or
-`[-0.0004,0.0004]` by default. It concatenates the raw next-token embedding and jittered payload,
+A feedback step starts with plain teacher forcing, using token embeddings
+fused with the blank payload as column seeds. Every supervised column applies
+the writer's learned RMSNorm, whose gain starts at one, then adds keyed
+uniform jitter without detaching it. `--jitter` sets the half-width in
+payload units, default `0.02`; the draw is uniform in `[-jitter, jitter]`.
+It concatenates the next-token embedding and jittered payload,
 then applies the shared bias-free `2D -> D` projection. Fusion applies no
 normalization or second scaling to either input.
 This includes single-pass batches, the final pass, and `l` without `f`. The
 independent MTP block consumes that fused tensor. When another feedback pass
-follows, it right-shifts the same tensor and restores raw embeddings
+follows, it right-shifts the same tensor and restores plain seeds
 before a per-row prefix drawn uniformly from `1..seq_len-1`. Position zero stays
 plain. When another looped column follows at the same position, the same
-jittered payload is fused once more with the position's own raw embedding
+jittered payload is fused once more with the position's own embedding
 to seed it; no prefix applies, since every position has its own preceding
 column. Mixer states restart each pass; every consumer backpropagates
 through the shared fusion.
 
 One `embed_tokens` call looks up the whole stored row before slicing, serving
-plain seeds and every fusion consumer across all passes. The tied classifier
-uses the same raw embedding weight. The jitter generator writes the draw
-directly in scaled payload units, so the fusion path adds the buffer without
-another scale factor. The pass jitter has shape
+plain seeds and every fusion consumer across all passes. The lookup is the
+tied row times `1/BASE_NORMAL_INIT_STD`; the classifier reads the raw
+weight. The jitter generator writes the draw directly in payload units, so
+the fusion path adds the buffer without another scale factor. The pass jitter has shape
 `[n_passes, B, seq_len+1, dim]`, where `B` is the number of rows in the
 microbatch or replay, and perturbs each pass's last column; the loop jitter
 `[n_passes, r-1, B, seq_len+1, dim]` perturbs the columns before it and is
@@ -183,7 +182,7 @@ computation without increasing the ordinary predicted-token budget.
 | `--lr-normuonh`, `--lr-nadam` | Peak optimizer rates; defaults `0.006`, `0.0003` |
 | `--warmup-frac`, `--cooldown-frac` | Schedule shape |
 | `--recurrence-start`, `--three-rate` | Recurrence roll: its boundary and the probability of each three-deep outcome |
-| `--jitter` | Relative payload-jitter half-width, default `0.02`; actual amplitude is `0.02 * jitter` |
+| `--jitter` | Payload-jitter half-width in payload units, default `0.02` |
 | `--loop-iterations` | Fixed evaluation/decode columns per position, default 2 within `1..3`; training draws from the roll |
 | `--mtp-weight` | Auxiliary prediction weight |
 | `--seq-len`, `--batch-rows`, `--micro-rows` | Batch geometry |
@@ -191,17 +190,17 @@ computation without increasing the ordinary predicted-token budget.
 
 ### Checkpoints and queue
 
-Checkpoint v41 binds model, both optimizers, arguments, step, RNG state, and
+Checkpoint v42 binds model, both optimizers, arguments, step, RNG state, and
 tokenizer identity. Resume inherits state-defining settings and rejects
 explicit conflicts. Device, paths, evaluation cadence, and snapshot cadence
 can change. The checkpoint includes expert-selection biases and NorMuonH
 radius/spectral state; transient counts and classifier shadows are rebuilt.
-Only v41 snapshots are accepted. The recurrence roll's boundary and rate are
+Only v42 snapshots are accepted. The recurrence roll's boundary and rate are
 saved schedule arguments, independent of the saved evaluation-count
-argument. Token lookups are raw, payloads use the
-writer's learned RMSNorm with fixed output scale `BASE_NORMAL_INIT_STD=0.02`,
-and jitter buffers are sampled in those scaled payload units. The same
-constant sets token embedding initialization. Fusion concatenates its
+argument. Token lookups multiply the tied table by
+`1/BASE_NORMAL_INIT_STD`, payloads use the writer's learned RMSNorm with a
+gain initialized to one, and jitter buffers are sampled in those payload
+units, so both fusion inputs are unit RMS at initialization. Fusion concatenates its
 inputs and projects them without further scaling, and every column seed is
 one such product: positions without an incoming payload fuse the learned
 blank payload `blank_payload`. This defines the current

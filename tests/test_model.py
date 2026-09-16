@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from delta_feedback_experiment import analysis
 from delta_feedback_experiment.cuda_kernels import MAX_ROUTE_TILES, _route_launch
 from delta_feedback_experiment.model import (
+    EMBEDDING_LOOKUP_SCALE,
     DeltaModel,
     KVCache,
     combine_column_losses,
@@ -57,17 +58,19 @@ def test_multipass_seed_has_standard_strides():
     assert outs[1][0].sources[0].stride() == seed.stride()
 
 
-def test_plain_and_standard_inputs_fuse_raw_embeddings_with_the_blank():
+def test_plain_and_standard_inputs_fuse_scaled_lookups_with_the_blank():
+    """A lookup is the tied row times the fixed lookup scale, unnormalized,
+    and the classifier reads the raw table."""
     model = tiny()
     toks = tokens()
     with torch.no_grad():
         model.embed_tokens.weight.mul_(
             torch.linspace(0.5, 2, model.cfg.vocab_size)[:, None]
         )
-        model.blank_payload.copy_(torch.linspace(-0.02, 0.02, model.cfg.dim))
-    expected = F.embedding(toks, model.embed_tokens.weight)
+        model.blank_payload.copy_(torch.linspace(-1, 1, model.cfg.dim))
+    expected = F.embedding(toks, model.embed_tokens.weight) * EMBEDDING_LOOKUP_SCALE
     torch.testing.assert_close(model.embed_tokens(toks), expected, atol=0, rtol=0)
-    # Raw magnitudes reach the seed through the fusion, unnormalized.
+    # Token magnitudes reach the seed through the fusion, unnormalized.
     seeds = F.linear(
         torch.cat((expected, model.blank_payload.expand_as(expected)), dim=-1),
         model.fuse_proj.weight,
@@ -85,7 +88,7 @@ def test_plain_and_standard_inputs_fuse_raw_embeddings_with_the_blank():
     )[0]
     assert torch.isfinite(gradient).all()
     assert gradient[toks[:, :-1].unique()].abs().sum() > 0
-    # The classifier independently reads the same raw table.
+    # The classifier independently reads the raw table, without the lookup scale.
     hidden = outs[0][0].h_top.detach()
     expected_logits = F.linear(model.readout_input(hidden), model.embed_tokens.weight)
     torch.testing.assert_close(model.logits(hidden), expected_logits, atol=0, rtol=0)
@@ -96,7 +99,7 @@ def test_plain_and_standard_inputs_fuse_raw_embeddings_with_the_blank():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_payload_scale_precedes_output_cast_and_preserves_learned_gain_gradients(dtype):
+def test_payload_norm_precedes_output_cast_and_preserves_learned_gain_gradients(dtype):
     model = tiny()
     with torch.no_grad():
         model.payload_norm.weight.uniform_(0.5, 1.5)
@@ -104,10 +107,13 @@ def test_payload_scale_precedes_output_cast_and_preserves_learned_gain_gradients
     reference = hidden.detach().clone().requires_grad_()
     gain = model.payload_norm.weight.detach().clone().requires_grad_()
     actual = model.payload_norm(hidden)
-    normalized = reference.float() * torch.rsqrt(
-        reference.float().square().mean(-1, keepdim=True) + model.cfg.norm_eps
+    # One upcast, as in the module: two casts would round two large partial
+    # gradients to BF16 separately before summing them.
+    upcast = reference.float()
+    normalized = upcast * torch.rsqrt(
+        upcast.pow(2).mean(-1, keepdim=True) + model.cfg.norm_eps
     )
-    expected = (normalized * (0.02 * gain)).to(dtype)
+    expected = (normalized * gain).to(dtype)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     cotangent = torch.randn_like(actual)
     actual.backward(cotangent)
@@ -227,12 +233,12 @@ def test_feedback_and_loop_are_token_causal():
 
 
 def test_blank_payload_seeds_every_plain_position():
-    """Every seed is one fusion product: a plain position fuses its raw
+    """Every seed is one fusion product: a plain position fuses its
     embedding with the learned blank payload, so feeding the blank as if it
     were feedback reproduces the plain pass exactly."""
     model = tiny()
     with torch.no_grad():
-        model.blank_payload.copy_(torch.linspace(-0.02, 0.02, model.cfg.dim))
+        model.blank_payload.copy_(torch.linspace(-1, 1, model.cfg.dim))
     toks = tokens()
     e = model.embed_tokens(toks[:, :-1])
     seed = model.plain_seed(e)
@@ -258,7 +264,7 @@ def test_blank_payload_seeds_every_plain_position():
 
 def test_looped_columns_reenter_through_the_shared_fusion():
     """Under ``l`` a pass's later columns are seeded by the shared fusion of
-    the preceding column's jittered payload with the position's own raw
+    the preceding column's jittered payload with the position's own
     embedding; every column is read out; a column never depends on the
     columns after it; and the first column is the single-column model."""
     model = tiny("fl")
@@ -267,10 +273,10 @@ def test_looped_columns_reenter_through_the_shared_fusion():
     length = toks.shape[1] - 1
     generator = torch.Generator().manual_seed(5)
     jitter = torch.empty(1, *toks.shape, model.cfg.dim).uniform_(
-        -4e-4, 4e-4, generator=generator
+        -0.02, 0.02, generator=generator
     )
     loop_jitter = torch.empty(1, 1, *toks.shape, model.cfg.dim).uniform_(
-        -4e-4, 4e-4, generator=generator
+        -0.02, 0.02, generator=generator
     )
     outs = multipass(
         model, toks, 1, iterations=2, jitter=jitter, loop_jitter=loop_jitter
@@ -464,3 +470,30 @@ def test_partial_checkpointing_counts_blocks_and_preserves_gradients():
     columns = 2 * everything.cfg.loop_iterations
     eligible = columns * (everything.cfg.pkda_layers + 1)
     assert everything.checkpoint_blocks - everything._checkpoint_left == eligible
+
+
+def test_unit_scale_entry_keeps_reentry_contracting():
+    """Both fusion inputs are unit RMS at initialization, so the seed enters
+    the residual stream at unit scale and a re-entry hop does not amplify
+    gradients: the second column's loss reaches the first column's top with
+    weight of order one relative to the first column's own loss (0.8 at
+    screen geometry, around one on this small one). With the seed at
+    embedding scale the early pre-norms divided by a tiny residual and each
+    hop multiplied the gradient about tenfold."""
+    model = tiny(
+        "fl", dim=128, head_dim=64, pkda_head_dim=64, layers=8
+    ).train()
+    toks = torch.randint(0, 31, (1, 12), generator=torch.Generator().manual_seed(12))
+
+    def rms(x):
+        return x.float().square().mean().sqrt().item()
+
+    assert 0.5 < rms(model.embed_tokens(toks)) < 2
+    outs = multipass(model, toks, 1, iterations=2)
+    loss = multipass_loss(model, toks, outs)
+    first, second = outs[0]
+    assert 0.5 < rms(first.payload) < 2
+    assert 0.3 < rms(second.sources[0]) < 3
+    own = torch.autograd.grad(loss.ntp[0][0], first.h_top, retain_graph=True)[0]
+    hop = torch.autograd.grad(loss.ntp[0][1], first.h_top)[0]
+    assert hop.norm() < 2 * own.norm()

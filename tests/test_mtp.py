@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from delta_feedback_experiment.model import (
+    EMBEDDING_LOOKUP_SCALE,
     EXPERT_BALANCE_COEF,
     DeltaModel,
     condition_config,
@@ -63,23 +64,23 @@ def jitter_for(model, toks, count, iterations=1):
     """(pass jitter [k, B, T+1, D], loop jitter [k, r-1, B, T+1, D] or None)."""
     generator = torch.Generator().manual_seed(37)
     jitter = torch.empty(count, *toks.shape, model.cfg.dim).uniform_(
-        -0.0004, 0.0004, generator=generator
+        -0.02, 0.02, generator=generator
     )
     if iterations == 1:
         return jitter, None
     loop_jitter = torch.empty(
         count, iterations - 1, *toks.shape, model.cfg.dim
-    ).uniform_(-0.0004, 0.0004, generator=generator)
+    ).uniform_(-0.02, 0.02, generator=generator)
     return jitter, loop_jitter
 
 
 def explicit_embedding(model, toks):
-    """Independent raw lookup from the tied embedding table."""
-    return F.embedding(toks, model.embed_tokens.weight)
+    """Independent lookup: the tied row times the fixed lookup scale."""
+    return F.embedding(toks, model.embed_tokens.weight) * EMBEDDING_LOOKUP_SCALE
 
 
 def explicit_fusion(model, payload, token_embedding):
-    """Independent concat equation: raw token and prepared scaled payload."""
+    """Independent concat equation: scaled token lookup and prepared payload."""
     return F.linear(
         torch.cat((token_embedding, payload), dim=-1), model.fuse_proj.weight
     )
@@ -291,7 +292,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
         for bank in candidate.expert_banks:
             bank.expert_bias[-bank.experts_per_token :] = 2
         with torch.no_grad():
-            candidate.blank_payload.copy_(torch.linspace(-0.02, 0.02, candidate.cfg.dim))
+            candidate.blank_payload.copy_(torch.linspace(-1, 1, candidate.cfg.dim))
     toks = tokens(length=6)
     iterations = 2
     jitter, loop_jitter = jitter_for(model, toks, count, iterations)

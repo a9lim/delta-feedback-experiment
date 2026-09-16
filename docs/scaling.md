@@ -57,10 +57,10 @@ which `seq_len-1` are supervised, and shares the embedding/final norm/readout
 with the main head, including that pass's single vocabulary-loss call.
 It does not execute in generation. MTP and feedback share a concat-linear
 entry containing one `2D -> D` matrix, or `2D^2` parameters. Token embeddings
-enter directly; the payload receives a learned RMSNorm and fixed `0.02`
-scale at its writer, then training jitter in those scaled units. The fusion
-matrix is counted once outside the auxiliary block, and the fixed payload
-scale adds no parameters. Every condition retains the payload writer and
+enter through the fixed lookup multiplier `1/BASE_NORMAL_INIT_STD`; the
+payload receives a learned RMSNorm at its writer, then training jitter in
+payload units. The fusion matrix is counted once outside the auxiliary
+block, and the lookup multiplier adds no parameters. Every condition retains the payload writer and
 shared entry, so `f`, `l`, and `fl` have identical parameter counts.
 MTP trains the shared entry
 even on single-pass batches; `f` selects its consumption by the trunk.
@@ -155,7 +155,7 @@ Resumes and continuations inherit the saved evaluation count unless
 explicitly pinned; conflicting overrides are rejected. `--scale` pins
 geometry and batch settings, while the roll and the evaluation-count default
 are common to every scale. The roll's arguments and the evaluation-count
-argument are part of the checkpoint v41 contract.
+argument are part of the checkpoint v42 contract.
 
 Report predicted tokens, pass-tokens, and cell-tokens together.
 These counters describe the trunk; total compute also includes MTP and its

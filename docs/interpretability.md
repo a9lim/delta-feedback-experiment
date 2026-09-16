@@ -18,16 +18,17 @@ the previous token's payload. Looped columns have separate mixer-cache
 tracks at every layer. Label token, pass, and column coordinates when
 comparing states.
 
-`embed_tokens(tokens)` returns raw token features in the residual dtype;
+`embed_tokens(tokens)` returns token features in the residual dtype, the
+tied row times `1/BASE_NORMAL_INIT_STD`, so unit RMS at initialization;
 they enter the column only through the shared fusion. `plain_seed(e)` is the
 seed of pass 1, plain-prefix positions, and Standard decoding: the fusion of
 `e` with the learned blank payload `blank_payload`, so a feedback position
 differs from a plain one only by `W_p (p_(t-1) - p_0)`. Replacing a payload
 with the blank is therefore an in-distribution ablation, and patches to plain
 seeds act either on `e` before fusion or on the projected seed.
-`embed_tokens.weight` is the tied embedding/classifier matrix. Payloads are in
-the writer's scaled units: `payload_norm(h_top + routed)`, with fixed output
-multiplier `BASE_NORMAL_INIT_STD=0.02` and a learned gain initialized to one.
+`embed_tokens.weight` is the tied embedding/classifier matrix, read raw by
+the classifier. Payloads are `payload_norm(h_top + routed)`: unit RMS times
+a learned gain initialized to one.
 
 `DeltaModel.forward_column` returns `ColumnOutput`: top residual, payload,
 source bank and labels, expert balance loss/counts, and optional route/expert
@@ -41,7 +42,7 @@ supplied to MTP and the following feedback pass; a following looped column's
 seed is the same jittered payload fused with the position's own embedding.
 `forward_mtp_fused`
 runs the independent auxiliary block directly on that tensor; `forward_mtp`
-accepts payloads and next-token IDs and computes their fusion with raw token
+accepts payloads and next-token IDs and computes their fusion with token
 embeddings first. The
 auxiliary block's last row has no second token and carries no training weight.
 
@@ -80,9 +81,9 @@ diverge and measure that additional feedback as part of the outcome.
 
 MTP predicts a second token using the same concat-linear fusion of payload
 and raw ground-truth next-token embedding that feedback consumes.
-The payload receives its learned RMSNorm and fixed `0.02` scale at the writer.
-Training jitter is sampled directly in these payload units, with default
-range `[-0.0004,0.0004]`; fusion adds it without another scale factor.
+The payload receives its learned RMSNorm at the writer. Training jitter is
+sampled directly in payload units, with default range `[-0.02,0.02]`; fusion
+adds it without another scale factor.
 Training shares the fused tensor between
 both consumers; diagnostics and evaluation disable jitter. The auxiliary
 block retains its own PKDA memory, so its
