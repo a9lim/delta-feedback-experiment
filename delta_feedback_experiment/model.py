@@ -175,13 +175,13 @@ class ModelConfig:
     vocab_size: int = VOCAB_SIZE
     dim: int = 768
     layers: int = 16
-    heads: int = 8
-    kv_heads: int = 4
-    head_dim: int = 192
+    heads: int = 4
+    kv_heads: int = 2
+    head_dim: int = 256
     expert_intermediate: int = 832
     num_routed_experts: int = 15
     experts_per_token: int = 3
-    pkda_heads: int = 10
+    pkda_heads: int = 8
     pkda_head_dim: int = 128
     pkda_conv_size: int = 4
     max_seq_len: int = 4096

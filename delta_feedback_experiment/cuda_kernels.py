@@ -128,8 +128,8 @@ if triton is not None:
         """Head offsets plus the offsets and masks of the width sub-tiles.
 
         The head width is walked in ``block_k``-lane sub-tiles instead of being
-        padded to the next power of two: a 192-wide head is three full 64-lane
-        tiles rather than one 256-lane tile with a quarter of its lanes idle.
+        padded to the next power of two: a 384-wide head is three full 128-lane
+        tiles rather than one 512-lane tile with a quarter of its lanes idle.
         Only a width that is not a multiple of ``block_k`` masks anything, and
         only in its last tile.
         """
@@ -921,7 +921,7 @@ def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int, int]:
 
     The head width is covered by ``tiles`` sub-tiles of ``block_k`` lanes
     instead of one tile padded to the next power of two, so the common widths
-    (192 at every trained scale) carry no idle lanes.  A width wider than
+    (384 at every registered scale) carry no idle lanes.  A width wider than
     ``ROUTE_TILE_LANES * MAX_ROUTE_TILES`` widens the sub-tile rather than
     adding tiles, which keeps the kernels' unrolled tile count fixed.
     """

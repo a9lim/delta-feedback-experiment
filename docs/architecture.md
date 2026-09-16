@@ -106,7 +106,7 @@ deltas never become individually addressable sources.
 
 Each PKDA layer combines Kimi Delta Attention with the stable diagonal
 apply-to-key preconditioner from Preconditioned DeltaNet. Key/value head width
-is 128; projection width is five thirds of residual width at the presets.
+is 128; projection width is four thirds of residual width at the presets.
 Bias-free Q/K/V projections pass through separate causal width-4 depthwise
 convolutions and SiLU. Q and K receive per-head L2 normalization, and Q scales
 by `1/sqrt(128)`.
@@ -155,9 +155,9 @@ advance normally during generation.
 
 ### Gated global GQA
 
-The fourth layer of each cell uses causal NoPE GQA, head width 192. At every
-preset, the query/output-gate projection width is `2D` and each K/V projection
-width is `D`; the output projection returns to residual width `D`:
+The fourth layer of each cell uses causal NoPE GQA, head width 256. At every
+preset, the query/output-gate projection width is `4D/3` and each K/V projection
+width is `2D/3`; the output projection returns to residual width `D`:
 
 ```text
 q, k, v = split(W_qkv x)
@@ -168,7 +168,8 @@ o       = W_o(sigmoid(W_g x) * z)
 
 The output gate acts before projection and residual scaling. It changes
 neither attention logits nor softmax weights. CUDA full rows use native
-Flash SDPA for BF16/FP16 and math SDPA for FP32 diagnostics. Cached decoding
+cuDNN SDPA first with Flash fallback for BF16/FP16, and math SDPA for FP32
+diagnostics. Cached decoding
 stores BF16 K/V and uses FlexAttention over the valid prefix. Only the single
 GQA layer in each trunk cell owns K/V storage.
 
@@ -257,7 +258,8 @@ weights over its `T` positions.
 
 Each site owns a zero-initialized width-`D` query `q`, a learned RMS key scale
 `g` initialized to one, and a zero-initialized learned null value. For
-`H = kv_heads` contiguous feature groups and raw source values `v_i`:
+`H = kv_heads` contiguous feature groups and raw source values `v_i`
+(384 features per group at every preset):
 
 ```text
 k_i       = g * v_i / sqrt(mean(v_i^2) + eps)

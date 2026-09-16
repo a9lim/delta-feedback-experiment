@@ -1,5 +1,6 @@
 """Small independent GQA value and gradient oracle."""
 
+import pytest
 import torch
 from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -7,9 +8,10 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from delta_feedback_experiment.attention import _causal_attention
 
 
-def test_causal_gqa_matches_repeated_heads_and_restores_backend():
+@pytest.mark.parametrize("head_dim", [192, 256])
+def test_causal_gqa_matches_repeated_heads_and_restores_backend(head_dim):
     inputs = tuple(
-        torch.randn(1, heads, 7, 192, requires_grad=True) for heads in (4, 2, 2)
+        torch.randn(1, heads, 7, head_dim, requires_grad=True) for heads in (4, 2, 2)
     )
     refs = tuple(value.detach().clone().requires_grad_() for value in inputs)
     priority = torch._C._get_sdp_priority_order()

@@ -103,6 +103,10 @@ def test_resolved_arguments_pin_what_the_operator_fixed(scale):
         "scale",
         "dim",
         "layers",
+        "heads",
+        "kv_heads",
+        "head_dim",
+        "pkda_heads",
         "seq_len",
         "batch_rows",
         "micro_rows",
@@ -157,15 +161,18 @@ def test_precision_is_a_runtime_recipe_a_resume_keeps_unless_retyped():
     assert args.precision == "fp8"
 
 
-def test_preset_accounting_counts_shared_and_selected_experts():
-    scale, dim, selected, routed, total, active = (
-        "screen",
-        768,
-        3,
-        15,
-        638862216,
-        209175432,
-    )
+@pytest.mark.parametrize(
+    "scale,dim,selected,routed,total,active,mtp_total,mtp_active",
+    [
+        ("screen", 768, 3, 15, 621389088, 191702304, 34321312, 11318176),
+        ("bridge", 1152, 5, 23, 1364464240, 426644080, 76867376, 25110320),
+        ("flagship", 1536, 7, 31, 2395794368, 754314176, 136337088, 44324544),
+        ("extension", 2304, 11, 47, 5323219552, 1687839328, 306047456, 99019232),
+    ],
+)
+def test_preset_accounting_counts_shared_and_selected_experts(
+    scale, dim, selected, routed, total, active, mtp_total, mtp_active,
+):
     from delta_feedback_experiment.cli import stream_target
     from delta_feedback_experiment.data import (
         CANONICAL_TARGET_TOKENS,
@@ -183,10 +190,11 @@ def test_preset_accounting_counts_shared_and_selected_experts():
     assert cfg.layers == 16 and cfg.pkda_layers == 12
     assert cfg.routing_blocks == 4
     assert cfg.dim == dim and cfg.expert_intermediate == 832
-    assert cfg.head_dim == ModelConfig().head_dim == 192
-    assert cfg.heads * cfg.head_dim == 2 * dim
+    assert cfg.head_dim == ModelConfig().head_dim == 256
+    assert cfg.heads * cfg.head_dim * 3 == 4 * dim
     assert cfg.heads == 2 * cfg.kv_heads
-    assert cfg.pkda_heads * cfg.pkda_head_dim * 3 == dim * 5
+    assert cfg.dim // cfg.kv_heads == 384
+    assert cfg.pkda_heads * cfg.pkda_head_dim * 3 == dim * 4
     assert cfg.mup_ratio == 1536 / dim
     assert cfg.expert_lr_scale == pytest.approx((8 / (selected + 1)) ** 0.5)
     assert cfg.experts_per_token == selected and cfg.num_routed_experts == routed
@@ -203,11 +211,20 @@ def test_preset_accounting_counts_shared_and_selected_experts():
         for bank in model.expert_banks
     )
     assert reference_active(args) == active
+    assert sum(p.numel() for p in model.mtp.parameters()) == mtp_total
+    inactive_mtp = sum(
+        p.numel()
+        for expert in model.mtp.block.mlp.experts[selected:]
+        for p in expert.parameters()
+    )
+    assert mtp_total - inactive_mtp == mtp_active
     assert args.steps * BATCH_TOKENS >= 25 * active
     assert (args.steps - 1) * BATCH_TOKENS < 25 * active
     # The canonical corpus identity stays fixed when parameter accounting
     # shrinks; it still covers the current 400-token-per-parameter schedule.
-    assert CANONICAL_TARGET_TOKENS >= stream_target(scale, 400, CANONICAL_VAL_TOKENS)
+    if scale == "screen":
+        assert CANONICAL_TARGET_TOKENS == 85_000_000_000
+        assert CANONICAL_TARGET_TOKENS >= stream_target(scale, 400, CANONICAL_VAL_TOKENS)
 
 
 def test_keyed_schedule_draws_are_reproducible():

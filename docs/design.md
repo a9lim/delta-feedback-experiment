@@ -64,7 +64,7 @@ rank that runs the row.
 
 `delta tokenize --scale S --tokens-per-param R` includes validation and
 extra row targets, then rounds storage up to a billion tokens. A new screen
-400x store requires 84B tokens under the current geometry. Allow roughly twice the final store size
+400x store requires 77B tokens under the current geometry. Allow roughly twice the final store size
 while parts and output coexist. `--scratch` moves downloads only.
 `--workers` controls encoding processes; `--readers` controls assembly
 concurrency; `RAYON_NUM_THREADS` controls tokenizer threads per process.

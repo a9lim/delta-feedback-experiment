@@ -19,16 +19,16 @@ Preset availability does not establish GPU fit or throughput.
 | Shared + selected / routed experts | 1 + 3 / 15 | 1 + 5 / 23 | 1 + 7 / 31 | 1 + 11 / 47 |
 | Active FFN width `H = (k+1)h` | 3,328 | 4,992 | 6,656 | 9,984 |
 | Stored FFN width `(n+1)h` | 13,312 | 19,968 | 26,624 | 39,936 |
-| GQA query / KV heads, width 192 | 8 / 4 | 12 / 6 | 16 / 8 | 24 / 12 |
-| GQA query projection width `2D` | 1,536 | 2,304 | 3,072 | 4,608 |
-| GQA K/V projection width, each `D` | 768 | 1,152 | 1,536 | 2,304 |
-| MHDB groups | 4 | 6 | 8 | 12 |
-| PKDA heads, width 128 | 10 | 15 | 20 | 30 |
-| PKDA projection width | 1,280 | 1,920 | 2,560 | 3,840 |
-| Total parameters, every condition | 638,862,216 | 1,403,105,420 | 2,463,891,088 | 5,475,089,816 |
-| Training-active non-embedding parameters | 209,175,432 | 465,285,260 | 822,410,896 | 1,839,709,592 |
-| Included auxiliary MTP total parameters | 35,181,480 | 78,750,908 | 139,639,504 | 313,374,200 |
-| Included auxiliary MTP active parameters | 12,178,344 | 26,993,852 | 47,626,960 | 106,345,976 |
+| GQA query / KV heads, width 256 | 4 / 2 | 6 / 3 | 8 / 4 | 12 / 6 |
+| GQA query projection width `4D/3` | 1,024 | 1,536 | 2,048 | 3,072 |
+| GQA K/V projection width, each `2D/3` | 512 | 768 | 1,024 | 1,536 |
+| MHDB groups, width 384 | 2 | 3 | 4 | 6 |
+| PKDA heads, width 128 | 8 | 12 | 16 | 24 |
+| PKDA projection width `4D/3` | 1,024 | 1,536 | 2,048 | 3,072 |
+| Total parameters, every condition | 621,389,088 | 1,364,464,240 | 2,395,794,368 | 5,323,219,552 |
+| Training-active non-embedding parameters | 191,702,304 | 426,644,080 | 754,314,176 | 1,687,839,328 |
+| Included auxiliary MTP total parameters | 34,321,312 | 76,867,376 | 136,337,088 | 306,047,456 |
+| Included auxiliary MTP active parameters | 11,318,176 | 25,110,320 | 44,324,544 | 99,019,232 |
 
 Every scale has a 50,304-row tied embedding/readout, 4,096 predictions per
 row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
@@ -113,13 +113,13 @@ ratio is 25; larger ratios are supported arithmetic scenarios.
 
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|
-| Screen | 9,975 | 5,229,772,800 | 159,589 | 83,670,597,632 |
-| Bridge | 22,187 | 11,632,377,856 | 354,985 | 186,114,375,680 |
-| Flagship | 39,216 | 20,560,478,208 | 627,450 | 328,964,505,600 |
-| Extension | 87,725 | 45,993,164,800 | 1,403,588 | 735,884,345,344 |
+| Screen | 9,142 | 4,793,040,896 | 146,258 | 76,681,314,304 |
+| Bridge | 20,344 | 10,666,115,072 | 325,504 | 170,657,841,152 |
+| Flagship | 35,969 | 18,858,115,072 | 575,497 | 301,726,171,136 |
+| Extension | 80,483 | 42,196,271,104 | 1,287,720 | 675,136,143,360 |
 
-Warmup is 2% of the shorter of the run and its 25x length: 200, 444, 784,
-and 1,754 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
+Warmup is 2% of the shorter of the run and its 25x length: 183, 407, 719,
+and 1,610 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
 the default mixture costs about 1.28 pass-tokens per prediction. See
 [design.md](design.md#schedule).
 
@@ -127,9 +127,9 @@ the default mixture costs about 1.28 pass-tokens per prediction. See
 longer schedule reproduces.
 Token stores include validation and each row's extra target.
 `delta tokenize --scale S --tokens-per-param R` computes that requirement and
-rounds up to the next billion stored tokens. Screen 100x needs 21B, screen
-400x needs 84B, bridge 400x needs 187B, flagship 400x needs 330B, and extension
-400x needs 737B.
+rounds up to the next billion stored tokens. Screen 100x needs 20B, screen
+400x needs 77B, bridge 400x needs 171B, flagship 400x needs 302B, and extension
+400x needs 676B. The canonical corpus retains its fixed 85B-token identity.
 Full DCLM supports larger stores. Its stream and held-out slice differ from
 the publisher's DCLM-100B subset, preventing paired per-token comparisons.
 
@@ -167,10 +167,10 @@ PKDA matrix/diagonal states cost:
 
 | Scale | One cell | Flat / `r=1` | Default evaluation `r=2` | Maximum `r=3` |
 |---|---:|---:|---:|---:|
-| Screen | 13.96 MiB | 55.82 MiB | 111.64 MiB | 167.47 MiB |
-| Bridge | 20.93 MiB | 83.73 MiB | 167.47 MiB | 251.20 MiB |
-| Flagship | 27.91 MiB | 111.64 MiB | 223.29 MiB | 334.93 MiB |
-| Extension | 41.87 MiB | 167.47 MiB | 334.93 MiB | 502.40 MiB |
+| Screen | 9.56 MiB | 38.26 MiB | 76.52 MiB | 114.77 MiB |
+| Bridge | 14.35 MiB | 57.39 MiB | 114.77 MiB | 172.16 MiB |
+| Flagship | 19.13 MiB | 76.52 MiB | 153.03 MiB | 229.55 MiB |
+| Extension | 28.69 MiB | 114.77 MiB | 229.55 MiB | 344.32 MiB |
 
 Each column keeps its own mixer cache at every layer. These per-sequence state
 counts exclude payload, logits, allocator overhead, and serving metadata.

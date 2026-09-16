@@ -186,14 +186,14 @@ def test_routing_matches_normalized_math_and_telescopes():
 
 def test_routing_sub_tiles_cover_the_head_width():
     """The routing kernels walk a head width in sub-tiles instead of padding it
-    to the next power of two, so 192 -- the width at every trained scale -- is
-    three full 64-lane tiles with no idle lanes."""
-    for num_heads in (4, 6, 8, 12):
-        block_h, block_k, tiles, _ = _route_launch(num_heads, 192)
+    to the next power of two, so 384 -- the width at every registered scale --
+    is three full 128-lane tiles with no idle lanes."""
+    for num_heads in (2, 3, 4, 6):
+        block_h, block_k, tiles, _ = _route_launch(num_heads, 384)
         assert block_h >= num_heads
-        assert (block_k, tiles) == (64, 3)
-        assert block_k * tiles == 192
-    for num_heads, head_dim in ((4, 16), (2, 32), (2, 96), (2, 384), (2, 1024)):
+        assert (block_k, tiles) == (128, 3)
+        assert block_k * tiles == 384
+    for num_heads, head_dim in ((4, 16), (2, 32), (2, 96), (4, 192), (2, 1024)):
         _, block_k, tiles, _ = _route_launch(num_heads, head_dim)
         assert tiles <= MAX_ROUTE_TILES
         assert block_k * (tiles - 1) < head_dim <= block_k * tiles

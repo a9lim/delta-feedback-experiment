@@ -1,6 +1,6 @@
 """Compare a small set of PKDA launch configurations on projected BF16 inputs.
 
-    python scripts/pkda_bench.py --heads 10,15,20 --rows 2 --candidates baseline,state16
+    python scripts/pkda_bench.py --heads 8,12,16 --rows 2 --candidates baseline,state16
     python scripts/pkda_bench.py --heads 15,20 --rows 2,4 --candidates baseline,intra64,wy128
     python scripts/pkda_bench.py --heads 10 --rows 16 --candidates baseline,state16+intra64 --trace
 
@@ -249,7 +249,7 @@ def captured_run(inputs, upstream, lean, warm, repeat, trace):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--heads", default="10,15,20", help="screen, bridge, flagship head counts")
+    parser.add_argument("--heads", default="8,12,16", help="screen, bridge, flagship head counts")
     parser.add_argument("--rows", default="2", help="comma-separated row widths; representative 2,4; wide screen 16")
     parser.add_argument("--length", type=int, default=4096)
     parser.add_argument("--candidates", default="baseline,state16", help="comma-separated candidates; combine using +")

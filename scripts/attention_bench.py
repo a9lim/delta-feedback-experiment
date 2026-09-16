@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--scales", default="screen,bridge,flagship")
     parser.add_argument("--rows", default="2,4")
     parser.add_argument("--seq-len", type=int, default=4096)
-    parser.add_argument("--head-dim", type=int, default=192, help="original Q/K/V head width")
+    parser.add_argument("--head-dim", type=int, default=256, help="original Q/K/V head width")
     parser.add_argument("--heads", type=int, default=None, help="query heads, overriding every selected scale")
     parser.add_argument("--kv-heads", type=int, default=None, help="KV heads, overriding every selected scale")
     parser.add_argument("--pad-to", type=int, default=None,

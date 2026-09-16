@@ -95,12 +95,13 @@ SCALES: dict[str, dict[str, int]] = {
     "screen": {
         "dim": 768,
         "layers": 16,
-        "heads": 8,
-        "kv_heads": 4,
+        "heads": 4,
+        "kv_heads": 2,
+        "head_dim": 256,
         "expert_intermediate": 832,
         "num_routed_experts": 15,
         "experts_per_token": 3,
-        "pkda_heads": 10,
+        "pkda_heads": 8,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -108,12 +109,13 @@ SCALES: dict[str, dict[str, int]] = {
     "bridge": {
         "dim": 1152,
         "layers": 16,
-        "heads": 12,
-        "kv_heads": 6,
+        "heads": 6,
+        "kv_heads": 3,
+        "head_dim": 256,
         "expert_intermediate": 832,
         "num_routed_experts": 23,
         "experts_per_token": 5,
-        "pkda_heads": 15,
+        "pkda_heads": 12,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -121,12 +123,13 @@ SCALES: dict[str, dict[str, int]] = {
     "flagship": {
         "dim": 1536,
         "layers": 16,
-        "heads": 16,
-        "kv_heads": 8,
+        "heads": 8,
+        "kv_heads": 4,
+        "head_dim": 256,
         "expert_intermediate": 832,
         "num_routed_experts": 31,
         "experts_per_token": 7,
-        "pkda_heads": 20,
+        "pkda_heads": 16,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -134,12 +137,13 @@ SCALES: dict[str, dict[str, int]] = {
     "extension": {
         "dim": 2304,
         "layers": 16,
-        "heads": 24,
-        "kv_heads": 12,
+        "heads": 12,
+        "kv_heads": 6,
+        "head_dim": 256,
         "expert_intermediate": 832,
         "num_routed_experts": 47,
         "experts_per_token": 11,
-        "pkda_heads": 30,
+        "pkda_heads": 24,
         "seq_len": 4096,
         "batch_rows": 128,
         "micro_rows": 1,
@@ -406,10 +410,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(tokenizer_id=TOKENIZER_ID)
     trunk.add_argument("--dim", type=int, default=768)
     trunk.add_argument("--layers", type=int, default=16)
-    trunk.add_argument("--heads", type=int, default=8)
-    trunk.add_argument("--kv-heads", type=int, default=4)
+    trunk.add_argument("--heads", type=int, default=4)
+    trunk.add_argument("--kv-heads", type=int, default=2)
     trunk.add_argument(
-        "--head-dim", type=int, default=192, help="GQA head width (default: 192)"
+        "--head-dim", type=int, default=256, help="GQA head width (default: 256)"
     )
     trunk.add_argument(
         "--expert-intermediate",
@@ -419,7 +423,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     trunk.add_argument("--num-routed-experts", type=int, default=15)
     trunk.add_argument("--experts-per-token", type=int, default=3)
-    trunk.add_argument("--pkda-heads", type=int, default=10)
+    trunk.add_argument("--pkda-heads", type=int, default=8)
     trunk.add_argument("--pkda-head-dim", type=int, default=128)
     trunk.add_argument("--pkda-conv-size", type=int, default=4)
 
