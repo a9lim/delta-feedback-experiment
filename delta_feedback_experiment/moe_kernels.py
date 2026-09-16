@@ -4,9 +4,9 @@ The launch envelope covers every possible expert load, while device-side
 offsets skip empty tiles. Storage is exactly the selected assignments per token;
 there is no capacity factor, CPU routing decision, or dense all-expert FFN.
 
-Each GEMM has its own tile configuration, measured on the RTX 4090. The
-backward fuses the SwiGLU derivative into the epilogue of the activation-
-gradient GEMM and recomputes the SwiGLU activation there, so the forward
+Each GEMM has its own tile configuration, with wider weight-gradient tiles
+on Hopper. The backward fuses the SwiGLU derivative into the epilogue of the
+activation-gradient GEMM and recomputes the SwiGLU activation there, so the forward
 saves only the pre-activation for backward.
 
 Under the FP8 recipe the two forward GEMMs and the two activation-gradient
@@ -44,6 +44,10 @@ TILE_DACT = (64, 64, 32, 4, 3)
 TILE_DX = (128, 64, 32, 4, 3)
 TILE_DW_GATE = (64, 64, 64, 4, 3)
 TILE_DW_DOWN = (64, 64, 64, 4, 3)
+# GH200 benefits from wider output/reduction tiles in both BF16 dW GEMMs.
+# The activation GEMMs and their FP8 scale boundaries retain their own tiles.
+TILE_DW_GATE_HOPPER = (64, 128, 128, 4, 3)
+TILE_DW_DOWN_HOPPER = (64, 128, 128, 4, 3)
 SWIGLU_BLOCK = 1024
 
 # The FP8 GEMMs read half the bytes per reduction step, so their tiles reach
@@ -53,6 +57,14 @@ TILE_GATE_UP_FP8 = (64, 128, 64, 4, 3)
 TILE_DOWN_FP8 = (64, 64, 64, 4, 3)
 TILE_DACT_FP8 = (64, 64, 64, 4, 3)
 TILE_DX_FP8 = (128, 64, 64, 4, 3)
+
+
+def _weight_gradient_tiles(device: torch.device):
+    # Select the tensor's device, without creating a CUDA context on import or
+    # accidentally consulting device zero before a distributed rank is placed.
+    if torch.cuda.get_device_capability(device) == (9, 0):
+        return TILE_DW_GATE_HOPPER, TILE_DW_DOWN_HOPPER
+    return TILE_DW_GATE, TILE_DW_DOWN
 
 
 if triton is not None:
@@ -628,8 +640,9 @@ def _backward(
     dx_assignments = _mm(
         dgate_up, gate_weight, assignments, offsets, tokens, dim, TILE_DX, transpose=True
     )
+    gate_tile, down_tile = _weight_gradient_tiles(x.device)
     if any(down_required):
-        block_m, block_n, block_k, warps, stages = TILE_DW_DOWN
+        block_m, block_n, block_k, warps, stages = down_tile
         _grouped_dw[(triton.cdiv(dim, block_m), triton.cdiv(width, block_n), experts)](
             activated,
             gradient,
@@ -649,7 +662,7 @@ def _backward(
             num_stages=stages,
         )
     if any(gate_required):
-        block_m, block_n, block_k, warps, stages = TILE_DW_GATE
+        block_m, block_n, block_k, warps, stages = gate_tile
         _grouped_dw[
             (triton.cdiv(2 * width, block_m), triton.cdiv(dim, block_n), experts)
         ](
@@ -935,8 +948,9 @@ def _backward_fp8(
         num_warps=warps,
         num_stages=stages,
     )
+    gate_tile, down_tile = _weight_gradient_tiles(x.device)
     if any(down_required):
-        block_m, block_n, block_k, warps, stages = TILE_DW_DOWN
+        block_m, block_n, block_k, warps, stages = down_tile
         _grouped_dw[(triton.cdiv(dim, block_m), triton.cdiv(width, block_n), experts)](
             activated,
             gradient,
@@ -956,7 +970,7 @@ def _backward_fp8(
             num_stages=stages,
         )
     if any(gate_required):
-        block_m, block_n, block_k, warps, stages = TILE_DW_GATE
+        block_m, block_n, block_k, warps, stages = gate_tile
         _grouped_dw[
             (triton.cdiv(2 * width, block_m), triton.cdiv(dim, block_n), experts)
         ](

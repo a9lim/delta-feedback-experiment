@@ -64,6 +64,7 @@ CANDIDATES = {
     "bf16-base": Candidate("bf16", BF16_BASE, BF16_BASE),
     "bf16-d64": Candidate("bf16", Tile(128, 128, 64, 4, 3), Tile(128, 128, 64, 4, 3)),
     "bf16-v256": Candidate("bf16", Tile(128, 256, 64, 8, 3), Tile(128, 256, 64, 8, 3)),
+    "bf16-b256": Candidate("bf16", Tile(256, 128, 64, 8, 3), Tile(256, 128, 64, 8, 3)),
     "fp8-base": Candidate("fp8", FP8_FORWARD, FP8_BACKWARD),
     "fp8-v128": Candidate("fp8", Tile(256, 128, 64, 8, 3), Tile(64, 128, 64, 8, 3)),
     "fp8-b128": Candidate("fp8", Tile(256, 128, 128, 8, 3), Tile(128, 128, 64, 8, 3)),

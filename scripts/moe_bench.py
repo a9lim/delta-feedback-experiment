@@ -2,6 +2,7 @@
 
     python scripts/moe_bench.py --rows 2 --routing balanced skewed
     python scripts/moe_bench.py --scale bridge flagship --rows 2 --candidates dw128 k128
+    python scripts/moe_bench.py --scale screen bridge flagship --rows 4 --candidates ada_dw
     python scripts/moe_bench.py --rows 4 16 --candidates baseline k128 dw128
     python scripts/moe_bench.py --check
 
@@ -54,6 +55,10 @@ TILE_NAMES = (
 # Few hypotheses, not a Cartesian sweep. No change to scale granularity.
 CANDIDATES = {
     "baseline": {},
+    "ada_dw": {
+        "TILE_DW_GATE": (64, 64, 64, 4, 3),
+        "TILE_DW_DOWN": (64, 64, 64, 4, 3),
+    },
     "k128": {
         "TILE_GATE_UP": (64, 128, 64, 4, 3),
         "TILE_DOWN": (64, 64, 64, 4, 3),
@@ -84,6 +89,15 @@ CANDIDATES = {
 }
 
 
+def tile_targets(capability):
+    """Keep candidate names conceptual while patching the effective device tiles."""
+    targets = {key: key for key in TILE_NAMES}
+    if capability == (9, 0):
+        for key in ("TILE_DW_GATE", "TILE_DW_DOWN"):
+            targets[key] = key + "_HOPPER"
+    return targets
+
+
 def routes(torch, tokens, kind, experts, selected):
     """Stable expert-major ordering; no duplicated expert within a token.
 
@@ -101,16 +115,16 @@ def routes(torch, tokens, kind, experts, selected):
 
 
 @contextmanager
-def tiles(module, baseline, candidate):
+def tiles(module, baseline, candidate, targets):
     chosen = baseline | CANDIDATES[candidate]
     if chosen["TILE_DACT_FP8"][1] != baseline["TILE_DACT_FP8"][1]:
         raise ValueError("DACT.BN changes the FP8 recipe")
     if chosen["TILE_DACT_FP8"][1] % chosen["TILE_DX_FP8"][2]:
         raise ValueError("DX.BK must divide DACT.BN")
-    previous = {key: getattr(module, key) for key in TILE_NAMES}
+    previous = {key: getattr(module, key) for key in targets.values()}
     try:
         for key, value in chosen.items():
-            setattr(module, key, value)
+            setattr(module, targets[key], value)
         yield chosen
     finally:
         for key, value in previous.items():
@@ -306,7 +320,7 @@ def measure(torch, run, reset, sinks, warm, repeat, reference):
     }, saved
 
 
-def check_cpu(torch, kernels, baseline, geometries):
+def check_cpu(torch, kernels, geometries):
     for _, _, experts, selected, seq_len in geometries.values():
         for rows in (2, 4, 16):
             tokens = rows * seq_len
@@ -319,11 +333,19 @@ def check_cpu(torch, kernels, baseline, geometries):
                     int(offsets[-1]) == tokens * selected
                     and int(counts.max()) <= tokens
                 )
-    for name in CANDIDATES:
-        with tiles(kernels, baseline, name) as chosen:
-            for shape in chosen.values():
-                assert len(shape) == 5 and all(v > 0 for v in shape)
-                assert all(v & (v - 1) == 0 for v in shape[:4])
+    for capability in ((8, 9), (9, 0)):
+        targets = tile_targets(capability)
+        current = {key: getattr(kernels, target) for key, target in targets.items()}
+        for name in CANDIDATES:
+            with tiles(kernels, current, name, targets) as chosen:
+                for key, shape in chosen.items():
+                    assert len(shape) == 5 and all(v > 0 for v in shape)
+                    assert all(v & (v - 1) == 0 for v in shape[:4])
+                    assert getattr(kernels, targets[key]) == shape
+            assert all(
+                getattr(kernels, targets[key]) == shape
+                for key, shape in current.items()
+            )
     # Run the registered fake implementations to check current call shapes.
     dim, width, experts, selected, _ = geometries["screen"]
     x = torch.empty(4, dim, dtype=torch.bfloat16)
@@ -381,7 +403,9 @@ def check_cpu(torch, kernels, baseline, geometries):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--scale", nargs="+", choices=SCALE_NAMES, default=["screen"])
-    parser.add_argument("--rows", nargs="+", type=int, choices=(1, 2, 4, 8, 16), default=[2])
+    parser.add_argument(
+        "--rows", nargs="+", type=int, choices=(1, 2, 4, 8, 16), default=[2]
+    )
     parser.add_argument(
         "--routing",
         nargs="+",
@@ -389,7 +413,10 @@ def main():
         default=["balanced", "skewed"],
     )
     parser.add_argument(
-        "--candidates", nargs="+", choices=tuple(CANDIDATES), default=list(CANDIDATES)
+        "--candidates",
+        nargs="+",
+        choices=tuple(CANDIDATES),
+        default=["baseline", "k128", "dw128", "wide128"],
     )
     parser.add_argument("--precision", choices=("fp8", "bf16"), default="fp8")
     parser.add_argument("--warm", type=int, default=3)
@@ -414,14 +441,15 @@ def main():
         name: tuple(SCALES[name][key] for key in GEOMETRY_KEYS) for name in SCALE_NAMES
     }
 
-    baseline = {key: getattr(kernels, key) for key in TILE_NAMES}
     if args.check:
-        check_cpu(torch, kernels, baseline, geometries)
+        check_cpu(torch, kernels, geometries)
         return
     if not torch.cuda.is_available():
         parser.error("a CUDA GPU is required; use --check for portable validation")
     if args.precision == "fp8" and torch.cuda.get_device_capability() < (8, 9):
         parser.error("FP8 kernels require compute capability 8.9 or newer")
+    targets = tile_targets(torch.cuda.get_device_capability())
+    baseline = {key: getattr(kernels, target) for key, target in targets.items()}
     candidates = list(dict.fromkeys(["baseline", *args.candidates]))
     source = Path(kernels.__file__)
     result = {
@@ -464,7 +492,7 @@ def main():
                         flush=True,
                     )
                     started = time.monotonic()
-                    with tiles(kernels, baseline, candidate) as chosen:
+                    with tiles(kernels, baseline, candidate, targets) as chosen:
                         measured, saved = measure(
                             torch, run, reset, sinks, args.warm, args.repeat, reference
                         )
