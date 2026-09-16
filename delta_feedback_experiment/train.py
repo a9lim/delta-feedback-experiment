@@ -1038,10 +1038,9 @@ class CudaGraphTrainer(Trainer):
     Every persistent FP32 gradient slab, the optimizer state, and the owned
     FP32 masters exist before the first forward, and the replicated FP32
     parameters are gone, so the activation budget is measured against the
-    real static footprint: the cheapest reachable graph runs one eager
-    forward, its retained bytes per block invocation calibrate
-    ``plan_replay``, and every graph then gets its rows per replay and its
-    recomputed block count. The budget is the smallest across ranks, so every
+    real static footprint: a one-pass, one-column forward runs eagerly, its
+    retained bytes per block invocation calibrate ``plan_replay``, and every
+    graph then gets its rows per replay and its recomputed block count. The budget is the smallest across ranks, so every
     rank replays the same plan.
 
     A slab that warm-up touched marks its parameter active for that mode
@@ -1059,16 +1058,20 @@ class CudaGraphTrainer(Trainer):
         )
 
         specs = self._reachable_specs(schedule)
-        base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
         # Compile before the budget is read: the calibration forwards build
         # every block, both recurrence variants, at the smallest replay, and
         # the optimizer warm-up every bucket, so the CUDA context they grow
         # is already outside the memory then measured free. On several ranks
         # the main rank goes first and fills the compile caches the others
         # then read, instead of every rank compiling the same kernels at once.
+        # One pass of one column calibrates the per-block averages whether or
+        # not the roll ever produces it: it is always executable, and the
+        # cheapest reachable graph of a looped run that starts recurring at
+        # step zero is two passes of two columns, whose fully retained
+        # one-row forward alone can exceed a 24 GiB card.
         if not topology.main:
             distributed.barrier()
-        self.calibration = self._calibrate(base)
+        self.calibration = self._calibrate(GraphSpec(1, 1))
         self.normuonh.warmup()
         if topology.main:
             distributed.barrier()
@@ -1262,7 +1265,7 @@ class CudaGraphTrainer(Trainer):
         return alive
 
     def _calibrate(self, spec: GraphSpec) -> Calibration:
-        """The calibration from three eager forwards of the cheapest graph.
+        """The calibration from three eager forwards of ``spec``.
 
         A raw forward divided by its block count is the average a graph
         retains per block, extras included, which the graphs stack per pass

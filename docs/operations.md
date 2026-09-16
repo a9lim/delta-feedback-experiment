@@ -209,9 +209,9 @@ budget is the smallest across ranks, so every rank replays the same plan.
 Training compiles blocks and captures fixed-address graphs for reachable
 pass/column shapes. Inductor caches persist at
 `~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
-them. Before capture the trainer measures, from two eager forwards, the
-activation bytes one block invocation retains and the bytes one recomputed
-block releases, and plans each graph against the device memory still free
+them. Before capture the trainer measures, from eager one-pass, one-column
+forwards, the activation bytes one block invocation retains and the bytes
+one recomputed block releases, and plans each graph against the device memory still free
 once the static footprint exists minus `--checkpoint-margin-gib` (default
 2): the largest divisor of the rank's rows that fits raw, at least
 `--micro-rows`, otherwise the smallest replay with as many leading PKDA and
