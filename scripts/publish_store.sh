@@ -3,7 +3,7 @@
 # uplink (the rental), check it against a reference manifest, and publish it
 # as a public dataset so every later box pulls it at datacenter speed.
 #
-#   scripts/publish_store.sh --disk /data [--target 100e9] [--workers 8]
+#   scripts/publish_store.sh --disk /data [--target 100e9] [--workers 16]
 #       [--repo a9lim/dclm-100b-neox] [--reference /data/delta/dclm-100b/dclm-100b.sha256]
 #       [--skip-upload]
 #
@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-DISK="" TARGET=100e9 WORKERS=8 READERS=8 REPO=a9lim/dclm-100b-neox REFERENCE="" UPLOAD=1
+DISK="" TARGET=100e9 WORKERS=16 READERS=8 REPO=a9lim/dclm-100b-neox REFERENCE="" UPLOAD=1
 TOKENS_PER_DOC=1150   # jobe's 15B build measured 1,308 per document; 1,150 keeps the selection inside the 89.27M-document universe with margin
 
 usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
@@ -45,7 +45,11 @@ OUT="$DISK/build/dclm-100b"
 mkdir -p "$DISK/build"
 say() { printf '\n== %s (%s)\n' "$1" "$(date +%H:%M:%S)"; }
 
-say "build $OUT: target $TARGET tokens, $WORKERS workers ($(nproc) cpus, $(df -BG --output=avail "$DISK" | tail -1 | tr -dc 0-9) GB free)"
+# A worker is one parquet file; the tokenizer's own threads (RAYON) are the
+# other axis. The builder's default is cpus / (2 x workers), which left a
+# 64-core box a third busy; fill the cores unless the caller pins it.
+export RAYON_NUM_THREADS=${RAYON_NUM_THREADS:-$(( $(nproc) / WORKERS > 0 ? $(nproc) / WORKERS : 1 ))}
+say "build $OUT: target $TARGET tokens, $WORKERS workers x $RAYON_NUM_THREADS threads ($(nproc) cpus, $(df -BG --output=avail "$DISK" | tail -1 | tr -dc 0-9) GB free)"
 ( time delta tokenize --source dclm-100b --out "$OUT" --target "$TARGET" \
     --tokens-per-doc "$TOKENS_PER_DOC" --workers "$WORKERS" --readers "$READERS" \
     --scratch "$DISK/build/scratch" ) 2>&1 | tail -40
