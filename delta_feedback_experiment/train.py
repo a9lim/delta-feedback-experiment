@@ -26,7 +26,6 @@ import argparse
 import contextlib
 import gc
 import math
-import os
 import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -603,12 +602,25 @@ class GraphSpec:
 
 @dataclass(frozen=True)
 class ReplayPlan:
-    """How one graph executes: rows per replay and blocks recomputed in backward."""
+    """How one graph executes: rows per replay, whether its recurrences keep
+    or rebuild their intermediates, and blocks recomputed in backward."""
 
     rows_per_replay: int
     checkpoint_blocks: int
     eligible_blocks: int
     estimated_gib: float
+    lean: bool = True
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """Retained bytes per block invocation of one raw forward with the
+    recurrences keeping (``full_block``) or rebuilding (``lean_block``) their
+    intermediates, and the bytes one recomputed lean block releases."""
+
+    full_block: float
+    lean_block: float
+    checkpoint: float
 
 
 @dataclass
@@ -678,41 +690,54 @@ def plan_replay(
     cfg,
     args,
     spec: GraphSpec,
-    bytes_per_block: float,
-    bytes_per_checkpoint: float,
+    calibration: Calibration,
     budget_bytes: float,
     rank_rows: int | None = None,
 ) -> ReplayPlan:
     """Fit one graph into the activation budget.
 
-    ``bytes_per_block`` is the calibrated average one block invocation of a
-    raw forward retains, everything outside the blocks included, so a graph
-    needs its block count times that: the per-pass extras scale with the
-    blocks and a two-pass forward retains exactly twice a one-pass one.
-    ``bytes_per_checkpoint`` is what recomputing one eligible block releases,
-    calibrated too, because the eligible blocks retain more than the average
-    (the global-attention blocks retain less and are never recomputed).
+    The calibrated bytes per block invocation are what a raw forward retains,
+    everything outside the blocks included, so a graph needs its block count
+    times that: the per-pass extras scale with the blocks and a two-pass
+    forward retains exactly twice a one-pass one. The bytes one recomputed
+    block releases are calibrated too, because the eligible blocks retain
+    more than the average (the global-attention blocks retain less and are
+    never recomputed).
 
-    Every graph replays the largest divisor of the rank's rows whose raw
-    activations fit; the keyed draws are per row, so the width changes no
-    value. When even the smallest replay does not fit raw, the first blocks
+    Candidates in order of measured cost per row: any replay wider than the
+    smallest with the recurrences keeping their intermediates, then wider
+    than the smallest rebuilding them (a rebuilt backward costs about as much
+    per row as a lean two-row replay gains over a one-row one, and width
+    beyond that buys nothing by itself); then the smallest replay keeping,
+    then rebuilding; and when even that does not fit raw, the first blocks
     of the logical forward recompute in backward, as many as the shortfall
-    needs.
+    needs. The keyed draws are per row, so the width changes no value.
     """
     blocks, eligible = block_invocations(cfg, spec)
     if rank_rows is None:
         rank_rows = args.batch_rows
+    variants = ((False, calibration.full_block), (True, calibration.lean_block))
 
-    def needed(rows: int) -> float:
-        return (rows / args.micro_rows) * blocks * bytes_per_block
+    def needed(rows: int, per_block: float) -> float:
+        return (rows / args.micro_rows) * blocks * per_block
 
-    for rows in replay_widths(rank_rows, args.micro_rows):
-        if needed(rows) <= budget_bytes:
-            return ReplayPlan(rows, 0, eligible, needed(rows) / 2**30)
+    def plan(rows: int, lean: bool, per_block: float) -> ReplayPlan:
+        return ReplayPlan(rows, 0, eligible, needed(rows, per_block) / 2**30, lean)
+
+    widths = replay_widths(rank_rows, args.micro_rows)
+    for lean, per_block in variants:
+        for rows in widths:
+            if rows > args.micro_rows and needed(rows, per_block) <= budget_bytes:
+                return plan(rows, lean, per_block)
     rows = args.micro_rows
-    shortfall = needed(rows) - budget_bytes
-    count = min(eligible, math.ceil(shortfall / max(bytes_per_checkpoint, 1.0)))
-    return ReplayPlan(rows, count, eligible, needed(rows) / 2**30)
+    for lean, per_block in variants:
+        if needed(rows, per_block) <= budget_bytes:
+            return plan(rows, lean, per_block)
+    shortfall = needed(rows, calibration.lean_block) - budget_bytes
+    count = min(eligible, math.ceil(shortfall / max(calibration.checkpoint, 1.0)))
+    return ReplayPlan(
+        rows, count, eligible, needed(rows, calibration.lean_block) / 2**30, True
+    )
 
 
 class CudaBatchStager:
@@ -991,6 +1016,20 @@ class CudaGraphTrainer(Trainer):
             self.rank_rows, args.seq_len + 1, self.device
         )
 
+        specs = self._reachable_specs(schedule)
+        base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
+        # Compile before the budget is read: the calibration forwards build
+        # every block, both recurrence variants, at the smallest replay, and
+        # the optimizer warm-up every bucket, so the CUDA context they grow
+        # is already outside the memory then measured free. On several ranks
+        # the main rank goes first and fills the compile caches the others
+        # then read, instead of every rank compiling the same kernels at once.
+        if not topology.main:
+            distributed.barrier()
+        self.calibration = self._calibrate(base)
+        self.normuonh.warmup()
+        if topology.main:
+            distributed.barrier()
         # Measure what the device reports free, with the allocator's cache
         # emptied: that excludes the CUDA context, the communicator, and any
         # other process, which a total-minus-static estimate would count.
@@ -1002,7 +1041,6 @@ class CudaGraphTrainer(Trainer):
         # sit between live allocations, so only whole free pages return.
         self.cached_bytes = torch.cuda.memory_reserved() - self.static_bytes
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
-        specs = self._reachable_specs(schedule)
         # Every graph's persistent inputs are allocated once the plans exist
         # and stay live together, so the budget sets them aside first, at the
         # widest replay a plan can choose; a narrower plan leaves the
@@ -1017,8 +1055,6 @@ class CudaGraphTrainer(Trainer):
         )
         # The smallest budget across ranks plans every rank.
         self.budget_bytes = -distributed.all_reduce_(budget, maximum=True).item()
-        base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
-        self.bytes_per_block, self.bytes_per_checkpoint = self._calibrate(base)
         telemetry.log(
             "memory_plan",
             static_gib=round(self.static_bytes / 2**30, 2),
@@ -1026,14 +1062,13 @@ class CudaGraphTrainer(Trainer):
             reserved_gib=round(self.reserved_bytes / 2**30, 2),
             activation_budget_gib=round(self.budget_bytes / 2**30, 2),
             checkpoint_margin_gib=args.checkpoint_margin_gib,
-            block_mib=round(self.bytes_per_block / 2**20, 1),
-            checkpoint_mib=round(self.bytes_per_checkpoint / 2**20, 1),
+            block_mib=round(self.calibration.lean_block / 2**20, 1),
+            block_full_mib=round(self.calibration.full_block / 2**20, 1),
+            checkpoint_mib=round(self.calibration.checkpoint / 2**20, 1),
         )
         self.states: dict[GraphSpec, CapturedMicro] = {}
         for spec in specs:
-            plan = self._plan(
-                spec, self.bytes_per_block, self.bytes_per_checkpoint, self.budget_bytes
-            )
+            plan = self._plan(spec, self.calibration, self.budget_bytes)
             self.states[spec] = self._allocate(spec, plan)
 
         # The package sets Dynamo's recompile budget once for the process, so
@@ -1046,6 +1081,7 @@ class CudaGraphTrainer(Trainer):
                 k=spec.n_passes,
                 r=spec.iterations,
                 rows=state.plan.rows_per_replay,
+                saved="lean" if state.plan.lean else "full",
                 checkpoint_blocks=state.plan.checkpoint_blocks,
                 eligible_blocks=state.plan.eligible_blocks,
                 estimated_gib=round(state.plan.estimated_gib, 2),
@@ -1117,20 +1153,10 @@ class CudaGraphTrainer(Trainer):
         return sorted(specs, key=lambda spec: (spec.n_passes, spec.iterations))
 
     def _plan(
-        self,
-        spec: GraphSpec,
-        bytes_per_block: float,
-        bytes_per_checkpoint: float,
-        budget_bytes: float,
+        self, spec: GraphSpec, calibration: Calibration, budget_bytes: float
     ) -> ReplayPlan:
         return plan_replay(
-            self.model.cfg,
-            self.args,
-            spec,
-            bytes_per_block,
-            bytes_per_checkpoint,
-            budget_bytes,
-            self.rank_rows,
+            self.model.cfg, self.args, spec, calibration, budget_bytes, self.rank_rows
         )
 
     def _inputs(
@@ -1163,11 +1189,12 @@ class CudaGraphTrainer(Trainer):
             )
         return tokens, prefix, jitter, loop_jitter
 
-    def _retained(self, spec: GraphSpec, checkpoint_blocks: int) -> int:
+    def _retained(self, spec: GraphSpec, checkpoint_blocks: int, lean: bool) -> int:
         """Bytes one eager forward of ``spec`` at ``micro_rows`` rows leaves
         allocated once it returns: exactly what its backward would consume."""
         tokens, prefix, jitter, loop_jitter = self._inputs(spec, self.args.micro_rows)
         self.model.checkpoint_blocks = checkpoint_blocks
+        self.model.set_recurrence_saving(lean)
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
         with self.autocast:
@@ -1190,23 +1217,27 @@ class CudaGraphTrainer(Trainer):
         torch.cuda.synchronize()
         return alive
 
-    def _calibrate(self, spec: GraphSpec) -> tuple[float, float]:
-        """(retained bytes per block invocation, bytes one recomputed block
-        releases), from two eager forwards of the cheapest graph.
+    def _calibrate(self, spec: GraphSpec) -> Calibration:
+        """The calibration from three eager forwards of the cheapest graph.
 
-        The raw forward divided by its block count is the average a graph
+        A raw forward divided by its block count is the average a graph
         retains per block, extras included, which the graphs stack per pass
-        and per block. The same forward with its first eligible block
-        recomputed releases what every recomputed block releases: the PKDA
-        and auxiliary blocks retain more than the average, so the difference,
-        not the average, sizes a shortfall in recomputed blocks.
+        and per block; the recurrences keeping and rebuilding their
+        intermediates give the two averages. The lean forward with its first
+        eligible block recomputed releases what every recomputed block
+        releases: the PKDA and auxiliary blocks retain more than the average,
+        so the difference, not the average, sizes a shortfall in recomputed
+        blocks.
         """
         blocks, _ = block_invocations(self.model.cfg, spec)
-        raw = self._retained(spec, 0)
-        released = raw - self._retained(spec, 1)
+        full = self._retained(spec, 0, lean=False)
+        raw = self._retained(spec, 0, lean=True)
+        released = raw - self._retained(spec, 1, lean=True)
         self.model.checkpoint_blocks = 0
         per_block = raw / blocks
-        return per_block, released if released > 0 else per_block
+        return Calibration(
+            full / blocks, per_block, released if released > 0 else per_block
+        )
 
     def _allocate(self, spec: GraphSpec, plan: ReplayPlan) -> CapturedMicro:
         tokens, prefix, jitter, loop_jitter = self._inputs(spec, plan.rows_per_replay)
@@ -1229,6 +1260,7 @@ class CudaGraphTrainer(Trainer):
 
     def _body(self, state: CapturedMicro) -> None:
         self.model.checkpoint_blocks = state.plan.checkpoint_blocks
+        self.model.set_recurrence_saving(state.plan.lean)
         # Each replay's mean loss enters the step in proportion to its rows.
         scale = state.plan.rows_per_replay / self.args.batch_rows
         with self.autocast:

@@ -102,6 +102,10 @@ class PreconditionedKDA(nn.Module):
         self.norm_eps = norm_eps
         self.squash_x = squash_x
         self.squash_eps = squash_eps
+        # Whether the CUDA recurrence rebuilds its WY representation and chunk
+        # states in backward (lean) or keeps them; the trainer's plan sets it
+        # per graph through ``DeltaModel.set_recurrence_saving``.
+        self.lean_recurrence = True
 
         self.q_proj = nn.Linear(hidden_size, self.projection_size, bias=False)
         self.k_proj = nn.Linear(hidden_size, self.projection_size, bias=False)
@@ -432,6 +436,7 @@ class PreconditionedKDA(nn.Module):
                 self.head_dim**-0.5,
                 self.squash_x,
                 self.squash_eps,
+                self.lean_recurrence,
             )
             return output, None, None
         kwargs = {

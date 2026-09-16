@@ -46,10 +46,10 @@ from torch import Tensor, nn
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
-from .sites import Binding, SlabSpec
 from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
+from .sites import Binding, SlabSpec
 from .tokenizer import VOCAB_SIZE
 
 # Model blocks specialize by layer, route count, mode, and gradient state.
@@ -1259,6 +1259,14 @@ class DeltaModel(nn.Module):
                     self._shadow_refresh[key] = (current, matrix.detach())
 
         return bind
+
+    def set_recurrence_saving(self, lean: bool) -> None:
+        """Whether every PKDA recurrence rebuilds its WY representation and
+        chunk states in backward (lean) or keeps them; the trainer's plan
+        decides per graph, from what fits."""
+        for block, _ in self._parameter_blocks():
+            if block.is_pkda:
+                block.attn.lean_recurrence = lean
 
     @torch.no_grad()
     def update_expert_bias(

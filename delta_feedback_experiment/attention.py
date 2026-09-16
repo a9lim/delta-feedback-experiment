@@ -1,8 +1,10 @@
-"""Native PyTorch Flash SDPA for causal GQA, FlexAttention for cached prefixes.
+"""Native PyTorch fused SDPA for causal GQA, FlexAttention for cached prefixes.
 
-Both kernels ship with PyTorch. Training selects Flash explicitly inside its
-compiled region; FP32 diagnostics use dense math. A single decode query
-still reads its complete valid prefix.
+Every kernel ships with PyTorch. Training takes the fused kernels in a fixed
+priority inside its compiled region: cuDNN attention where the platform
+serves the geometry (Hopper at head width 192), else the flash kernel; FP32
+diagnostics use dense math. A single decode query still reads its complete
+valid prefix.
 """
 
 import torch
@@ -14,16 +16,19 @@ from . import INDUCTOR_MODE
 
 
 def _causal_attention(query, key, value):
-    # Flash accepts half precision; FP32 analysis uses the explicit math path.
-    backend = (
-        SDPBackend.FLASH_ATTENTION
+    # Half precision takes the first fused kernel that serves the geometry:
+    # cuDNN on Hopper at head width 192, the flash kernel elsewhere (the 4090
+    # has no cuDNN kernel at that width and falls to flash bitwise). FP32
+    # analysis uses the explicit math path.
+    backends = (
+        [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]
         if query.dtype in (torch.float16, torch.bfloat16)
-        else SDPBackend.MATH
+        else [SDPBackend.MATH]
     )
     # Dynamo records this scoped backend selection, including restoration, in
-    # an enclosing fullgraph block. Training cannot silently select math or
-    # another SDPA backend, and the caller's process-wide preferences survive.
-    with sdpa_kernel(backend):
+    # an enclosing fullgraph block. Training cannot silently select math, and
+    # the caller's process-wide preferences survive.
+    with sdpa_kernel(backends):
         return F.scaled_dot_product_attention(
             query, key, value, is_causal=True, enable_gqa=True
         )

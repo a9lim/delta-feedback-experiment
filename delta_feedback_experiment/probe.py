@@ -81,11 +81,12 @@ def cuda_probe() -> None:
         def _reachable_specs(self, schedule):
             return [GraphSpec(1, 1), GraphSpec(2, LOOP_MAX_ITERATIONS)]
 
-        def _plan(self, spec, bytes_per_block, bytes_per_checkpoint, budget_bytes):
+        def _plan(self, spec, calibration, budget_bytes):
             # The tiny model fits raw; recompute a few blocks anyway so the
-            # checkpoint wrappers run under capture.
-            plan = super()._plan(spec, bytes_per_block, bytes_per_checkpoint, budget_bytes)
-            return replace(plan, checkpoint_blocks=3)
+            # checkpoint wrappers run under capture, and let the looped graph
+            # rebuild its recurrence intermediates while the flat one keeps them.
+            plan = super()._plan(spec, calibration, budget_bytes)
+            return replace(plan, checkpoint_blocks=3, lean=spec.iterations > 1)
 
     class Rows:
         def __init__(self):

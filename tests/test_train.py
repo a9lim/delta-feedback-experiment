@@ -455,6 +455,7 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
     release of one recomputed block needs, never more than are eligible."""
     from delta_feedback_experiment.model import condition_config
     from delta_feedback_experiment.train import (
+        Calibration,
         GraphSpec,
         block_invocations,
         plan_replay,
@@ -468,36 +469,43 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
     assert block_invocations(cfg, GraphSpec(2, 3)) == (102, 78)
     block = 300 * 2**20
     release = 320 * 2**20
+    # A retaining recurrence keeps 30% more per block than a rebuilding one.
+    calibration = Calibration(1.3 * block, block, release)
 
     def budget(rows, spec):
         blocks, _ = block_invocations(cfg, spec)
         return rows * blocks * block
 
     def plan(spec, budget_bytes):
-        return plan_replay(cfg, args, spec, block, release, budget_bytes)
+        return plan_replay(cfg, args, spec, calibration, budget_bytes)
+
+    def chosen(replay):
+        return replay.rows_per_replay, "lean" if replay.lean else "full"
 
     flat = GraphSpec(1, 1)
     assert replay_widths(16, 1) == [16, 8, 4, 2, 1]
     assert replay_widths(12, 2) == [12, 6, 4, 2]
     with pytest.raises(ValueError, match="multiple"):
         replay_widths(6, 4)
-    assert plan(flat, budget(8, flat)).rows_per_replay == 8
-    assert plan(flat, budget(7, flat)).rows_per_replay == 4
-    assert plan(flat, budget(2, flat)).rows_per_replay == 2
-    assert plan(flat, budget(2, flat) - 1).rows_per_replay == 1
-    assert plan(flat, budget(1, flat)).rows_per_replay == 1
+    # Keeping the intermediates at a narrower replay beats rebuilding them at
+    # a wider one; the one-row replay is the last resort either way.
+    assert chosen(plan(flat, budget(8, flat))) == (4, "full")
+    assert chosen(plan(flat, budget(7, flat))) == (4, "full")
+    assert chosen(plan(flat, budget(2, flat))) == (2, "lean")
+    assert chosen(plan(flat, budget(2, flat) - 1)) == (1, "full")
+    assert chosen(plan(flat, budget(1, flat))) == (1, "lean")
     looped = GraphSpec(1, 2)
-    assert plan(looped, budget(8, looped)).rows_per_replay == 8
+    assert chosen(plan(looped, budget(8, looped))) == (4, "full")
     two = GraphSpec(2, 1)
     generous = plan(two, budget(8, two))
-    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (8, 0)
+    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (4, 0)
     # A rank's rows bound the width: sixteen rows of a step never replay more.
-    sixteen = plan_replay(cfg, args, flat, block, release, budget(128, flat), 16)
-    assert sixteen.rows_per_replay == 16
+    sixteen = plan_replay(cfg, args, flat, calibration, budget(128, flat), 16)
+    assert chosen(sixteen) == (16, "full")
     # A shortfall is sized by what a recomputed block releases, not by the
     # average block: five releases cover a five-average-block shortfall.
     short = plan(two, budget(1, two) - 5 * block)
-    assert (short.rows_per_replay, short.checkpoint_blocks) == (1, 5)
+    assert (short.rows_per_replay, short.checkpoint_blocks, short.lean) == (1, 5, True)
     assert plan(two, budget(1, two) - 5 * release).checkpoint_blocks == 5
     assert plan(two, budget(1, two) - 5 * release - 1).checkpoint_blocks == 6
     starved = plan(GraphSpec(1, 3), 0)

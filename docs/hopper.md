@@ -97,8 +97,8 @@ Reductions of mean node step time; the ranges overlap and do not add.
 | 2 | FLA retune of the preconditioned-KDA chain | 4–10% | 3–8% | Yes |
 | 3 | Expert grouped-GEMM retile | 2–5% | 3–7% | Yes |
 | 4 | CCE fixed-configuration retune | 3–6% | 2–5% | Yes |
-| 5 | Attention backend at head width 192 | 2–4% | 1.5–3% | No; to measure, yes |
-| 6 | Replay width and per-graph saved set | 0–10% | 0–8% | Partly |
+| 5 | Attention backend at head width 192 (landed: cuDNN first, flash fallback) | 2–4% | 1.5–3% | No; to measure, yes |
+| 6 | Replay width and per-graph saved set (landed: keep where it fits) | 0–10% | 0–8% | Partly |
 | 7 | Communication layout and overlap | 0.5–2% | 1–3% | No |
 | 8 | Pointwise, MHDB, dispatch, tail | 1–5% | 1–4% | Yes |
 | 9 | Optimizer step, host gaps | <1% | <1% | No |
@@ -143,19 +143,22 @@ Reductions of mean node step time; the ranges overlap and do not add.
    forward/backward configuration swept in the fork with disposable sinks,
    keeping the 128 × 128 token/vocabulary partition so the tile filter's
    semantics do not move.
-5. **Attention backend.** `attention.py` pins `SDPBackend.FLASH_ATTENTION`,
-   the FA2-derived in-tree kernel; torch 2.14 selects cuDNN attention on
-   sm_90 by default (head 192 forward and backward, GQA) and reports up to
-   1.75× over the flash backend on H100. FA3 has abi3 wheels at
+5. **Attention backend.** `attention.py` now asks for cuDNN attention first
+   and the flash kernel second; on the 4090 cuDNN has no kernel at head
+   width 192 and the fallback is bitwise flash, on sm_90 torch 2.14 serves
+   head 192 forward and backward with GQA through cuDNN and reports up to
+   1.75× over the flash backend. Whether it wins there is a first-hour
+   measurement (forward + backward under the compiled wrapper and a graph);
+   if it loses, the order flips. FA3 has abi3 wheels at
    download.pytorch.org (torch ≥ 2.9), head 192 both directions, FP8 forward
-   only. Compare forward + backward under the compiled wrapper and a graph
-   at the real strides; an unsupported configuration must fail, not fall to
-   math.
-6. **Replay geometry.** `plan_replay` already takes the largest divisor that
-   fits raw. The open choice is the saved set per graph: FLA saved set C
-   costs a measured 2.9 ms per row-pass on the 4090 and buys ~80 MiB per
-   invocation; A costs 0.6 ms for 21 MiB. Where 16-row replays fit raw
-   without C, A is ~3% at screen.
+   only.
+6. **Replay geometry.** `plan_replay` takes, in order, any replay wider than
+   the smallest with the recurrences keeping their WY representation and
+   chunk states, then wider ones rebuilding them, then the smallest keeping,
+   then rebuilding, then recomputing blocks: keeping saves a measured 2.3 ms
+   per row-pass at screen for ~60 MiB per invocation. Where a 16-row replay
+   fits raw keeping them, that is ~3% at screen. What remains to measure is
+   whether width beyond the smallest replay buys anything on Hopper.
 7. **Communication.** Grouped launches that keep the site-major storage,
    then the weight all-gather overlapping later optimizer buckets after the
    finite-norm check. Gradient overlap needs last-use events or graph
@@ -192,7 +195,7 @@ for the first node hour.
 |---|---|
 | FP8 dense sites, FP8 working copies, expert GEMMs, CCE | Jobe: numerics (paired steps), 4090 throughput as an Ada signal |
 | Attention backend selection by architecture | Jobe: correctness with cuDNN forced; speed only on the node |
-| Per-graph saved set in the planner | Jobe: memory and time, fully |
+| Per-graph saved set in the planner (landed) | Jobe: memory and time, fully |
 | Communication grouping and gather overlap | Mac/Jobe: gloo two-rank tests; bandwidth only on the node |
 | Compile-cache prewarm across ranks, snapshot gather batching | Mac/Jobe |
 | FLA, expert, CCE retunes; FA3; NVLS/symmetric memory; the real profile | Node only |

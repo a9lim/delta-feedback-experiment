@@ -40,15 +40,18 @@ PKDA_INTERMEDIATES = (
     "a_atk",
     "sa_atk",
 )
-"""What the recurrence hands its own backward, in the order it is carried.
+"""What the recurrence always hands its own backward, in the order carried:
+the intra-chunk products and the preconditioner scan."""
 
-The intra-chunk products and the preconditioner scan are kept. The WY
-representation (``w``, ``u``, ``kg``, the gated query ``qg``), the chunk
-states ``h`` and ``v_new``, and the FP32 gate cumsum are rebuilt in backward
-from them and the inputs, through the fork's own recompute path and the same
-kernels the forward ran: the gradients are bitwise those of a backward that
-had kept everything, and each invocation retains 80 MiB less at one
-4,096-token row.
+PKDA_RETAINED = ("w", "kg", "v_new", "h", "qg")
+"""What a retaining forward keeps as well: the WY representation, the chunk
+states, and the gated query. A lean forward drops them and its backward
+rebuilds them from the products and the inputs through the fork's own
+recompute path and the same kernels the forward ran, so the gradients are
+bitwise those of a backward that had kept them; the lean invocation retains
+about 60 MiB less at one 4,096-token row and its backward costs about 2.3 ms
+more per row-pass at screen. Either way the FP32 gate cumsum is relaunched
+in backward. The trainer's plan picks the variant per graph.
 """
 
 
@@ -57,33 +60,43 @@ def fla_ops_available() -> bool:
 
 
 def _intermediate_meta(
-    q: Tensor, v: Tensor
+    q: Tensor, v: Tensor, lean: bool
 ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
     """Shape and dtype of every saved intermediate, from the input geometry."""
-    del v
     batch, length, heads, key_dim = q.shape
+    value_dim = v.shape[-1]
     chunks = -(-length // CHUNK_SIZE)
     activation = q.dtype
-    return (
+    meta = [
         ((batch, length, heads, CHUNK_SIZE), activation),  # Aqk
         ((batch, length, heads, CHUNK_SIZE), activation),  # Akk
         ((batch, length, heads, key_dim), activation),  # k_precond
         ((batch, chunks, heads, key_dim), torch.float32),  # ac_atk
         ((batch, chunks, heads, key_dim), torch.float32),  # a_atk
         ((batch, chunks, heads), torch.float32),  # sa_atk
-    )
+    ]
+    if not lean:
+        meta += [
+            ((batch, length, heads, key_dim), activation),  # w
+            ((batch, length, heads, key_dim), activation),  # kg
+            ((batch, length, heads, value_dim), activation),  # v_new
+            ((batch, chunks, heads, key_dim, value_dim), activation),  # h
+            ((batch, length, heads, key_dim), activation),  # qg
+        ]
+    return tuple(meta)
 
 
-def _check_intermediates(tensors: list[Tensor], q: Tensor, v: Tensor) -> None:
-    expected = _intermediate_meta(q, v)
+def _check_intermediates(
+    tensors: list[Tensor], q: Tensor, v: Tensor, lean: bool
+) -> None:
+    expected = _intermediate_meta(q, v, lean)
+    names = PKDA_INTERMEDIATES + (() if lean else PKDA_RETAINED)
     if len(tensors) != len(expected):
         raise RuntimeError(
             f"FLA's preconditioned KDA forward returned {len(tensors)} "
             f"intermediates, not {len(expected)}"
         )
-    for name, tensor, (shape, dtype) in zip(
-        PKDA_INTERMEDIATES, tensors, expected, strict=True
-    ):
+    for name, tensor, (shape, dtype) in zip(names, tensors, expected, strict=True):
         ok = (
             tensor is not None
             and tuple(tensor.shape) == shape
@@ -242,14 +255,16 @@ def pkda_recurrence(
     scale: float,
     squash_x: float,
     squash_eps: float,
+    lean: bool,
 ) -> tuple[Tensor, list[Tensor]]:
     """The chunked preconditioned-KDA recurrence and what its backward reuses.
 
     ``g`` is the raw decay projection: the log-space gate and its chunk-local
     cumulative sum happen inside the kernel, exactly as ``use_gate_in_kernel``
     does, and the backward recomputes them the same way.  The returned
-    intermediates are the intra-chunk products and the preconditioner scan;
-    the backward rebuilds everything else.
+    intermediates are the intra-chunk products and the preconditioner scan,
+    and, unless ``lean``, the WY representation, chunk states, and gated
+    query as well; the backward rebuilds whatever is not returned.
 
     Every tensor input is made contiguous here and again in the backward, which
     is what FLA's ``input_guard`` does for its own entry point and what keeps
@@ -309,13 +324,17 @@ def pkda_recurrence(
         eps=squash_eps,
         log_atk_scale=log_atk_scale,
         transpose_state_layout=False,
-        output_qg=False,
+        output_qg=not lean,
     )
     if final_state is not None or at is not None:
         raise RuntimeError("the stateless PKDA recurrence returned a final state")
-    del w, u, kg, v_new, h, qg, cumulative
+    del u, cumulative
     saved = [Aqk, Akk, k_precond, ac_atk, a_atk, sa_atk]
-    _check_intermediates(saved, q, v)
+    if lean:
+        del w, kg, v_new, h, qg
+    else:
+        saved += [w, kg, v_new, h, qg]
+    _check_intermediates(saved, q, v, lean)
     return o.to(q.dtype), saved
 
 
@@ -334,6 +353,7 @@ def _pkda_recurrence_fake(
     scale: float,
     squash_x: float,
     squash_eps: float,
+    lean: bool,
 ) -> tuple[Tensor, list[Tensor]]:
     del k, g, g_atk, beta_atk, beta, A_log, dt_bias, log_atk_scale
     del scale, squash_x, squash_eps
@@ -342,7 +362,7 @@ def _pkda_recurrence_fake(
     )
     saved = [
         torch.empty(shape, device=q.device, dtype=dtype)
-        for shape, dtype in _intermediate_meta(q, v)
+        for shape, dtype in _intermediate_meta(q, v, lean)
     ]
     return output, saved
 
@@ -367,17 +387,22 @@ def _pkda_recurrence_backward(
     squash_x: float,
     squash_eps: float,
     autocast_dtype: torch.dtype | None,
+    lean: bool,
 ) -> list[Tensor]:
     """FLA's preconditioned-KDA backward over the saved products.
 
-    The gate cumsum is relaunched exactly as the forward launched it, and the
-    fork's recompute path rebuilds the WY representation and the chunk states
-    from the saved products and the inputs. ``autocast_dtype`` reproduces
+    The gate cumsum is relaunched exactly as the forward launched it. A lean
+    forward saved the products alone, and the fork's recompute path rebuilds
+    the WY representation and the chunk states from them and the inputs; a
+    retaining forward handed those over too. ``autocast_dtype`` reproduces
     FLA's ``custom_bwd``: its backward runs under the autocast state its
     forward saw, which the surrounding training loop leaves disabled by the
     time ``backward`` is called.
     """
-    Aqk, Akk, k_precond, ac_atk, a_atk, sa_atk = saved
+    Aqk, Akk, k_precond, ac_atk, a_atk, sa_atk, *retained = saved
+    w = kg = v_new = h = qg = None
+    if not lean:
+        w, kg, v_new, h, qg = retained
     q, k, v, g = q.contiguous(), k.contiguous(), v.contiguous(), g.contiguous()
     g_atk, beta_atk, beta = (
         g_atk.contiguous(),
@@ -427,18 +452,18 @@ def _pkda_recurrence_backward(
                 log_atk_scale=log_atk_scale,
                 transpose_state_layout=False,
                 safe_gate=False,
-                disable_recompute=False,
+                disable_recompute=not lean,
                 defer_dg_cumsum=defer_dg_cumsum,
-                w=None,
-                kg=None,
-                v_new=None,
-                h=None,
+                w=w,
+                kg=kg,
+                v_new=v_new,
+                h=h,
                 dat=None,
                 k_precond=k_precond,
                 ac_atk=ac_atk,
                 a_atk=a_atk,
                 sa_atk=sa_atk,
-                qg=None,
+                qg=qg,
             )
         )
         dg, dA_log, ddt_bias = kda_gate_bwd(
@@ -481,8 +506,9 @@ def _pkda_recurrence_backward_fake(
     squash_x: float,
     squash_eps: float,
     autocast_dtype: torch.dtype | None,
+    lean: bool,
 ) -> list[Tensor]:
-    del saved, do, scale, squash_x, squash_eps, autocast_dtype
+    del saved, do, scale, squash_x, squash_eps, autocast_dtype, lean
     return [
         torch.empty_like(tensor)
         for tensor in (
@@ -520,11 +546,11 @@ def _recurrence_backward(ctx, do, _dsaved):
     tensors = ctx.saved_tensors
     inputs = tensors[:10]
     saved = list(tensors[10:])
-    scale, squash_x, squash_eps = ctx.scalars
+    scale, squash_x, squash_eps, lean = ctx.scalars
     gradients = _pkda_recurrence_backward(
-        *inputs, saved, do, scale, squash_x, squash_eps, ctx.autocast_dtype
+        *inputs, saved, do, scale, squash_x, squash_eps, ctx.autocast_dtype, lean
     )
-    return (*gradients, None, None, None)
+    return (*gradients, None, None, None, None)
 
 
 pkda_recurrence.register_autograd(

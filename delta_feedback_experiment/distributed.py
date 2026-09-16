@@ -166,6 +166,12 @@ def all_gather_(slab: Tensor, rank: int, chunk: int) -> Tensor:
     return slab
 
 
+def barrier() -> None:
+    """Hold every rank here until all of them have arrived."""
+    if active():
+        dist.barrier()
+
+
 def agree(flag: bool, device: torch.device) -> bool:
     """Whether any rank raised ``flag``; identical on every rank."""
     if not active():

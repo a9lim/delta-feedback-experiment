@@ -72,9 +72,12 @@ concurrency; `RAYON_NUM_THREADS` controls tokenizer threads per process.
 ## Training
 
 All presets accumulate 128 rows of 4,096 predictions: 524,288 predicted
-tokens per optimizer update. Every graph replays the largest divisor of a
-rank's rows whose raw activations fit, at least `--micro-rows`; each replay
-enters the step in proportion to its rows, so the arithmetic is unchanged.
+tokens per optimizer update. Every graph replays a divisor of a rank's rows
+whose raw activations fit, at least `--micro-rows`, preferring a replay above
+the smallest whose PKDA recurrences keep their backward intermediates over
+one that rebuilds them ([architecture](architecture.md#depth-caches-and-training)); each
+replay enters the step in proportion to its rows, so the arithmetic is
+unchanged.
 The full FP32 gradient, summed across ranks, has its L2 norm measured,
 unclipped, before NorMuonH and NAdam update; a non-finite norm stops the run.
 Expert-selection biases update once from the whole step's assignment counts.

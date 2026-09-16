@@ -142,10 +142,11 @@ normalization, a rank-128 sigmoid output gate, and a bias-free output
 projection. The output-gate expansion bias initializes to zero.
 
 CUDA training/prefill uses the workspace FLA chunk operator at chunk size 64;
-decode uses its recurrent operator. Training's backward rebuilds the
-recurrence's WY representation, chunk states, and gate cumsum from the
-retained intra-chunk products and preconditioner scan, bitwise identically to
-keeping them. CPU/MPS use the literal recurrence.
+decode uses its recurrent operator. Training's backward relaunches the gate
+cumsum and, in a graph whose plan runs the recurrences lean, rebuilds their
+WY representation and chunk states from the retained intra-chunk products
+and preconditioner scan, bitwise identically to keeping them; a graph with
+room keeps them and skips the rebuild. CPU/MPS use the literal recurrence.
 Convolution, SiLU, and Q/K normalization stay FP32 until the final activation
 cast. Decode retains the FP32 matrix and diagonal states plus three BF16
 projected convolution histories of length 3. Each Jacobi pass restarts those
@@ -410,16 +411,21 @@ graph, the optimizer step, and the periodic monitors share one private memory
 pool: the eager work runs on the capture stream inside it, so nothing between
 replays grows memory outside the pool, which needs the allocator's expandable
 segments. At
-start-up the trainer measures, from two eager forwards, the activation bytes
-one block invocation retains and the bytes one recomputed block releases,
-takes the device memory still free once the static footprint exists less a
-2 GiB default margin for backward workspaces, recomputation, allocator
-rounding, and graph instantiation, and plans each graph: a single-column
-graph replays the largest row multiple whose raw
-activations fit, and otherwise the first PKDA and auxiliary block invocations
-of the logical forward, as many as the shortfall needs, recompute in
-backward. Global-attention blocks are always retained. Checkpoint wrappers
-remain outside compiled blocks.
+start-up the trainer measures, from three eager forwards, the activation
+bytes one block invocation retains with the recurrences keeping or rebuilding
+their intermediates and the bytes one recomputed block releases, takes the
+device memory still free once the static footprint and the graphs' inputs
+exist less a 2 GiB default margin for backward workspaces, recomputation,
+allocator rounding, and graph instantiation, and plans each graph: the
+widest replay above the smallest whose raw activations fit with the
+recurrences keeping their intermediates, else rebuilding them; then the
+smallest replay keeping, else rebuilding; and otherwise the first PKDA and
+auxiliary block invocations of the logical forward, as many as the shortfall
+needs, recompute in backward. Global-attention blocks are always retained.
+Checkpoint wrappers remain outside compiled blocks. The compilation the
+calibration and the optimizer warm-up cause runs before the free memory is
+read, and on several ranks the main rank compiles first so the others read
+its caches.
 
 `multipass` returns `[pass][column]` outputs, and `forward_iterations` runs
 every column of one position range. `depth_trace` runs the maximum count
