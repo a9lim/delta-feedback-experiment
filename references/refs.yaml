@@ -1,4 +1,4 @@
-# Mechanism sources for the current model and explicitly noted candidates.
+# Mechanism sources for the current model.
 references:
   - arxiv: "2401.06066"
     slug: dai2024-deepseekmoe
@@ -9,9 +9,6 @@ references:
   - arxiv: "2412.19437"
     slug: deepseek2025-v3
     note: Sigmoid expert routing, sequence balancing, and normalized concat-linear MTP fusion (Eq. 21).
-  - arxiv: "2601.07372"
-    slug: cheng2026-engram
-    note: Candidate, not implemented. Hashed N-gram memory with context-aware gating; GPU-sharded training and host-memory prefetch for inference.
   - arxiv: "2607.27230"
     slug: luo2026-multi-head-attention-residuals
     note: Grouped softmax over depth sources.

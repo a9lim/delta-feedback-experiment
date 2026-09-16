@@ -1,60 +1,30 @@
 # delta-feedback-experiment
 
-A recurrent language model with a latent channel between token columns,
-grown for interpretability and monitoring experiments.
+A recurrent language model for interpretability experiments. The full `fl`
+model combines cross-token latent feedback with repeated execution of a
+shared column. Each column contains four `[PKDA, PKDA, PKDA, NoPE-GGQA]`
+cells, shared and routed SwiGLU experts, and Multi-Head Delta Block routing
+over the seed and cell deltas. A shared fusion projection connects token
+embeddings, payloads, and an auxiliary second-token predictor.
 
-The model uses four-layer `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells, Multi-Head
-Delta Block (MHDB) routing over the seed and cell deltas, and shared plus
-selected routed SwiGLU experts. Raw token embeddings enter both plain columns
-and feedback/MTP fusion. Each column's payload passes through a learned
-RMSNorm and a fixed `0.02` scale, receives training jitter in those scaled
-units, then joins the next token's embedding in a shared concat-linear
-projection. This DeepSeek-style fusion feeds an independent auxiliary
-PKDA/expert block and, under feedback, the next position's column, and,
-under the loop, the same position's next column. The auxiliary block trains
-the payload to predict a second token.
+The `f`, `l`, and `fl` conditions select feedback, looped depth, or both.
+They share parameters, paired initialization, and keyed training draws.
+Four presets span 621M–5.32B stored parameters; the CLI defaults to screen
+scale and `f`. Ordinary generation uses the main next-token head.
 
-| Condition | Computation |
+Start with [installation and run commands](docs/operations.md). Training
+uses Python 3.13 and the parent `transformer-experiments` workspace;
+general capture/readout tooling lives in `interpretability-experiments`.
+
+| Document | Owns |
 |---|---|
-| `f` (default) | Latent feedback between positions |
-| `l` | The whole column re-run from its own payload |
-| `fl` | Both |
+| [Architecture](docs/architecture.md) | The full `fl` computation, component equations, state, initialization, and optimizer mechanics |
+| [Training recipe](docs/design.md) | Conditions, data identity, objectives, randomness, schedules, and evaluation |
+| [Scaling](docs/scaling.md) | Presets, parameter/token/compute accounting, decode memory, and runtime estimates |
+| [Operations](docs/operations.md) | Installation, tokenization, run/checkpoint control, telemetry, CUDA, and Hopper/node workflows |
+| [Interpretability](docs/interpretability.md) | Analysis APIs, tools, interventions, and measurement limits |
+| [Mechanism sources](references/refs.yaml) | References for implemented components |
 
-All presets have sixteen unique layers and expert intermediate width 832.
-Screen, bridge, flagship, and extension use residual widths 768, 1,152,
-1,536, and 2,304. Shared parameters initialize identically for a seed;
-data and recurrent recipe draws use keyed streams. One recurrence roll per
-step shapes every condition: after the boundary a step runs three passes of
-two columns or two passes of three columns with probability `0.12` each,
-otherwise two of two; `f` reads the passes, `l` the columns, and `fl` both.
-Evaluation and decode default to two columns; `--loop-iterations` overrides
-their fixed count within `1..3`.
-
-The pinned GPT-NeoX/ChatML tokenizer supports arbitrary and repeated roles.
-Pretraining uses raw web documents. Ordinary generation uses the main
-next-token head; MTP is auxiliary supervision.
-
-## Use
-
-Install the workspace package, then this project in the shared Python 3.13
-environment. CUDA and tokenization extras are described in
-[operations](docs/operations.md).
-
-```bash
-uv pip install -e .
-python -m pytest
-delta probe  # CUDA smoke; run when the GPU is idle
-delta train example-f-s1 --condition f --seed 1 --data-seed 0 \
-  --data-root /data/delta --source dclm-100b
-delta status
-delta watch
-```
-
-- [Architecture](docs/architecture.md): equations, state, precision, and optimizers.
-- [Recipe](docs/design.md): data, schedules, snapshots, and evaluation.
-- [Scaling](docs/scaling.md): geometry, parameter/token counts, and decode state.
-- [Operations](docs/operations.md): installation, tokenization, and run control.
-- [Hopper execution](docs/hopper.md): current GH200 recipe, measurements, and node validation.
-- [Runtime estimates](docs/runtime.md): GH200 and eight-H100 durations across scales and token budgets.
-- [Analysis](docs/interpretability.md): checkpoint tools and measurement boundaries.
-- [Sources](references/refs.yaml): mechanisms used by the model.
+Documentation describes the current implementation. Generated data,
+checkpoints, logs, figures, and fetched papers remain untracked; Git retains
+project history.

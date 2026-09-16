@@ -94,7 +94,7 @@
 
 \node[font=\smalltext] (tokens) at (8.2,3.7) {Input token $x_t$};
 \node[box,tokenop,text width=4.6cm] (embedding) at (8.2,5.05)
-  {\textbf{Token embedding $E$}\\$e_t=E(x_t)$};
+  {\textbf{Token embedding $E$}\\$e_t=50\,E(x_t)$};
 \node[box,fusionop,text width=4.6cm] (seed) at (8.2,9.7)
   {\textbf{Column seed $s_t$}\\fusion of $e_t$ with $p_{t-1}$ (f), with $p_t^{(i)}$ (l), or with the blank $p_0$};
 \draw[flow] (tokens) -- (embedding);
@@ -132,12 +132,12 @@
   {\textbf{Cell-delta bank}\\[4pt]
    One delta per cell,\\fresh in every column.};
 \node[edgeword,text=greenink] at (17.8,30.08)
-  {layer reads: seed + available other-cell deltas};
+  {layer reads: seed + completed cell deltas};
 \node[rotate=90,edgeword,text=greenink] at (23.3,24.55)
   {site-local null + available live partial};
 
 % Payload write retains the direct top-state path, before final readout norm.
-% Its learned RMSNorm includes fixed output scale BASE_NORMAL_INIT_STD=0.02.
+% Its learned RMSNorm writes the payload without an additional fixed scale.
 \node[box,mhdbop,text width=2.7cm] (payloadroute) at (2.5,24.0)
   {\textbf{MHDB read}\\payload: seed + all deltas\\+ learned null};
 \draw[bankread] (4.25,24.0) -- (payloadroute.east);
@@ -151,9 +151,9 @@
 \node[circle,draw=purpleink!50,fusionop,minimum size=.68cm,inner sep=0pt]
   (payload) at (2.5,28.75) {$p_t$};
 \draw[flow] (payloadadd) -- (payloadnorm);
-\draw[flow] (payloadnorm) -- node[right,edgeword] {$\times\,0.02$} (payload);
+\draw[flow] (payloadnorm) -- (payload);
 
-% The outer feedback path carries p_t to fusion with raw E(x_{t+1}).
+% The outer feedback path carries p_t to fusion with e_{t+1}=50 E(x_{t+1}).
 % Both token paths share E; one lookup serves the whole row.
 % Fusion is computed once and reused by MTP and shifted feedback.
 \node[box,fusionop,text width=3.3cm] (jitter) at (20.2,3.1)
@@ -170,7 +170,7 @@
   {Looped depth (l): $p_t^{(i)}+\xi_t^{(i)}$ with $e_t$\\
    seeds column $i{+}1$ at $t$;\\$r$ columns, same weights};
 \node[box,tokenop,text width=3.3cm] (nextembedding) at (15.2,3.1)
-  {\textbf{Token embedding $E$}\\$e_{t+1}=E(x_{t+1})$};
+  {\textbf{Token embedding $E$}\\$e_{t+1}=50\,E(x_{t+1})$};
 \node[box,fusionop,text width=7.5cm,minimum height=1.12cm]
   (fusion) at (17.7,6.35)
   {\textbf{Shared concat-linear fusion}\quad $2D\to D$\\
@@ -187,7 +187,7 @@
 \node[note,text=purpleink,text width=2.3cm,anchor=west] at (12.03,8.77)
   {Shift one token:\\seed at $t+1$\\in the next pass};
 \node[note,text width=6.6cm] at (16.9,2.05)
-  {Default jitter: $\xi_t\sim U(-0.0004,0.0004)$.\\Evaluation: $\xi_t=0$.};
+  {Default jitter: $\xi_t\sim U(-0.02,0.02)$.\\Evaluation: $\xi_t=0$.};
 
 % MTP is a connected side branch of the very same fusion tensor.
 \node[box,pkdaop,text width=4.6cm,minimum height=1.2cm]

@@ -1,180 +1,202 @@
-# Scale presets and accounting
+# Scaling and resource accounting
 
-`--scale screen|bridge|flagship|extension` selects geometry and batch settings.
-Explicit geometry or recipe flags override their preset fields. Conditions are `f`,
-`l`, and `fl`; looped depth adds no parameters. The trainer runs one process
-per device; `--ranks` splits each step's rows across them.
-Preset availability does not establish GPU fit or throughput.
+`--scale screen|bridge|flagship|extension` selects geometry and batch settings;
+explicit flags override individual fields. All three conditions have identical
+parameter counts. Loops and feedback reuse weights. Source definitions are
+[`SCALES` and `reference_active`](../delta_feedback_experiment/train.py).
 
 ## Geometry and parameters
+
+All presets share **16 layers in four `[PKDA, PKDA, PKDA, NoPE-GGQA]` cells**,
+a 50,304-row tied embedding/readout, and a global batch of 128 rows × 4,096
+predictions = **524,288 tokens per update**. Each stored row has one extra
+target. `--ranks N` divides the global rows among devices; replay width is
+chosen by the [CUDA planner](operations.md#cuda-execution).
 
 | Field | Screen | Bridge | Flagship | Extension |
 |---|---:|---:|---:|---:|
 | Residual width `D` | 768 | 1,152 | 1,536 | 2,304 |
-| Layers / four-layer cells | 16 / 4 | 16 / 4 | 16 / 4 | 16 / 4 |
-| Columns per position on rolled steps, mean / maximum (`l`, `fl`) | 2.12 / 3 | 2.12 / 3 | 2.12 / 3 | 2.12 / 3 |
-| Default evaluation / decode columns per position | 2 | 2 | 2 | 2 |
-| Executed trunk layers per pass, rolled mean / evaluation / maximum | 33.9 / 32 / 48 | 33.9 / 32 / 48 | 33.9 / 32 / 48 | 33.9 / 32 / 48 |
-| Trunk and MTP per-expert width `h` | 832 | 832 | 832 | 832 |
-| Shared + selected / routed experts | 1 + 3 / 15 | 1 + 5 / 23 | 1 + 7 / 31 | 1 + 11 / 47 |
-| Active FFN width `H = (k+1)h` | 3,328 | 4,992 | 6,656 | 9,984 |
-| Stored FFN width `(n+1)h` | 13,312 | 19,968 | 26,624 | 39,936 |
+| Shared + selected / routed experts, width 832 | 1 + 3 / 15 | 1 + 5 / 23 | 1 + 7 / 31 | 1 + 11 / 47 |
+| Active / stored FFN width | 3,328 / 13,312 | 4,992 / 19,968 | 6,656 / 26,624 | 9,984 / 39,936 |
 | GQA query / KV heads, width 256 | 4 / 2 | 6 / 3 | 8 / 4 | 12 / 6 |
-| GQA query projection width `4D/3` | 1,024 | 1,536 | 2,048 | 3,072 |
-| GQA K/V projection width, each `2D/3` | 512 | 768 | 1,024 | 1,536 |
 | MHDB groups, width 384 | 2 | 3 | 4 | 6 |
 | PKDA heads, width 128 | 8 | 12 | 16 | 24 |
-| PKDA projection width `4D/3` | 1,024 | 1,536 | 2,048 | 3,072 |
-| Total parameters, every condition | 621,389,088 | 1,364,464,240 | 2,395,794,368 | 5,323,219,552 |
+| Total parameters | 621,389,088 | 1,364,464,240 | 2,395,794,368 | 5,323,219,552 |
 | Training-active non-embedding parameters | 191,702,304 | 426,644,080 | 754,314,176 | 1,687,839,328 |
-| Included auxiliary MTP total parameters | 34,321,312 | 76,867,376 | 136,337,088 | 306,047,456 |
-| Included auxiliary MTP active parameters | 11,318,176 | 25,110,320 | 44,324,544 | 99,019,232 |
+| Included MTP total / active parameters | 34,321,312 / 11,318,176 | 76,867,376 / 25,110,320 | 136,337,088 / 44,324,544 | 306,047,456 / 99,019,232 |
 
-Every scale has a 50,304-row tied embedding/readout, 4,096 predictions per
-row, and 128 rows per update: 524,288 predicted tokens per step. The replay
-planner packs multiple rows into each microbatch when memory permits.
-Each stored row includes one additional target. Width multipliers
-and optimizer ownership are in [architecture.md](architecture.md#nadam-parameters).
-The muP reference stays at the flagship width 1,536. Extension's `1536/D`
-multiplier is `2/3` for NAdam width rates and readout scaling. Expert
-NorMuonH rates use the separate factors below.
+GQA query and PKDA projection widths are `4D/3`; each GQA K/V projection is
+`2D/3`. Every trunk and MTP expert bank stores one shared plus `n` routed
+experts, selects `k` routed experts per token, and uses intermediate width
+`h=832`. Its active/stored widths are `(k+1)h` and `(n+1)h`: every preset
+executes one quarter of its expert matrices per token.
 
-Each trunk and MTP FFN stores one shared plus `n` routed experts, with `k`
-routed experts selected per token. `expert_intermediate` is the actual
-per-expert width `h`; the active dense-equivalent width `H = (k+1)h` is derived.
-The presets keep `(k+1)/(n+1) = 1/4`, so a quarter of the stored expert
-matrices run per token. Active counts include those experts and the full router
-in every bank, plus all mixer, payload-writer, and fusion parameters. Only
-the raw tied embedding weight is excluded from non-embedding counts.
-A microbatch can touch all experts; all parameters, gradients, and optimizer
-state occupy memory. Per-bank selection biases are buffers, excluded from
-parameter counts. Training's transient assignment counts have shape
-`[layers+1,n]`, with MTP last; column-only counts are `[layers,n]`.
+Active counts include the selected experts and every router, mixer, payload,
+and fusion parameter, excluding only idle experts and the tied embedding
+matrix. They are a per-token accounting convention: a batch can touch all
+experts, and training must store all weights, gradients, and optimizer state.
+Selection biases are buffers, excluded from parameter counts.
 
-The auxiliary block adds `P_PKDA + 3D(n+1)h + (n+2)D` parameters:
-its PKDA mixer, expert matrices, expert router, and two RMSNorm scales.
-Its active count replaces `(n+1)` with `(k+1)` in the expert term. It runs
-once per executed training column over `seq_len` positions, of
-which `seq_len-1` are supervised, and shares the embedding/final norm/readout
-with the main head, including that column's single vocabulary-loss call.
-It does not execute in generation. MTP and feedback share a concat-linear
-entry containing one `2D -> D` matrix, or `2D^2` parameters. Token embeddings
-enter through the fixed lookup multiplier `1/BASE_NORMAL_INIT_STD`; the
-payload receives a learned RMSNorm at its writer, then training jitter in
-payload units. The fusion matrix is counted once outside the auxiliary
-block, and the lookup multiplier adds no parameters. Every condition retains the payload writer and
-shared entry, so `f`, `l`, and `fl` have identical parameter counts.
-MTP trains the shared entry
-even on single-pass batches; `f` selects its consumption by the trunk.
-The entire fusion matrix uses ordinary NorMuonH; the payload writer's norm
-uses base NAdam.
+The auxiliary block contributes `P_PKDA + 3D(n+1)h + (n+2)D` parameters;
+replace `n+1` with `k+1` only in the expert-matrix term for its active count.
+This covers its mixer, experts, router, and two norms. The shared `2D -> D`
+fusion contributes `2D²` parameters once, outside MTP; output norm and tied
+readout are shared with the trunk. MTP runs once per training column and is
+absent from generation. Its supervision does not add recorded input tokens.
 
-## Expert learning rates
+## Width and expert learning rates
 
-Shared and routed experts in the trunk and MTP use the same NorMuonH
-operator-step budget for their gate/up and down groups:
+Let `r_mu=1536/D`, with flagship as the fixed width reference, and
+`r_expert=sqrt(8/(k+1))`. Peak rates follow optimizer ownership:
 
-```text
-gate/up peak LR = lr_normuonh * sqrt(8 / (k+1))
-down peak LR    = lr_normuonh * sqrt(8 / (k+1))
-```
+| Parameter group | Peak learning rate |
+|---|---|
+| Ordinary NorMuonH matrices | `lr_normuonh` |
+| Expert gate/up and down matrices, including shared and MTP experts | `lr_normuonh * r_expert` |
+| Full-residual-width NAdam matrices: GQA gates, PKDA controls, expert routers | `lr_nadam * r_mu` |
+| Other NAdam parameters | `lr_nadam` |
 
-`k+1` counts the shared plus selected routed experts. The count factor
-offsets coherent aggregation of expert changes after the bank's `1/sqrt(k+1)`
-forward normalization. Both groups retain this factor under overrides;
-per-matrix spectral normalization handles residual/expert width separately.
-With the default `lr_normuonh = 0.006`:
-
-| Scale | Gate/up factor | Down factor | Peak expert LR, both groups |
+| Scale | `r_mu` | `r_expert` | Expert peak LR at base `0.006` |
 |---|---:|---:|---:|
-| Screen | 1.414214 | 1.414214 | 0.00848528 |
-| Bridge | 1.154701 | 1.154701 | 0.00692820 |
-| Flagship | 1.000000 | 1.000000 | 0.00600000 |
-| Extension | 0.816497 | 0.816497 | 0.00489898 |
+| Screen | 2 | 1.414214 | 0.00848528 |
+| Bridge | 4/3 | 1.154701 | 0.00692820 |
+| Flagship | 1 | 1 | 0.00600000 |
+| Extension | 2/3 | 0.816497 | 0.00489898 |
 
-All five groups share the schedule multiplier. Ordinary NorMuonH retains
-the base rate; NAdam uses its base or `1536/D` rate. The expert factors
-change optimizer updates only: forward normalization and initialization
-retain their own contracts. This is an implemented scaling candidate,
-without demonstrated full-model hyperparameter transfer across scales.
+Both expert projection groups use the same count factor; NorMuonH handles
+matrix aspect ratio separately. All five groups share the recipe's schedule
+multiplier. `r_mu` also scales normalized hidden states before the tied
+readout. [Architecture](architecture.md) defines initialization and optimizer
+mechanics. These are implemented scaling rules, not demonstrated
+hyperparameter transfer across widths.
 
 ## Token budgets
 
-`--tokens-per-param R` derives steps from the current flat `f` training-active
-non-embedding count, including MTP:
+`--tokens-per-param R` uses the flat `f` training-active non-embedding count
+`A`, including MTP, for every condition at the selected geometry:
 
 ```text
-steps = ceil(R * reference_active / (batch_rows * seq_len))
+steps = ceil(R * A / (batch_rows * seq_len))
+predicted_tokens = steps * batch_rows * seq_len
+stored_tokens = ceil((steps * batch_rows * (seq_len+1) + val_tokens) / 1e9) * 1e9
 ```
 
-Every condition at a geometry shares that schedule. Auxiliary second-token
-targets add supervision on the same rows without increasing the recorded
-ordinary predicted-token count. `--steps` sets a length directly. The default
-ratio is 25; larger ratios are supported arithmetic scenarios.
-See [runtime estimates](runtime.md) for GH200 and eight-H100 durations.
+The default is `R=25`. Alternatively, `--steps` specifies a length directly;
+the two flags are mutually exclusive. The store formula is used by `delta tokenize --scale S --tokens-per-param R`. These values use
+the default 30M validation tokens:
 
-| Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
-|---|---:|---:|---:|---:|
-| Screen | 9,142 | 4,793,040,896 | 146,258 | 76,681,314,304 |
-| Bridge | 20,344 | 10,666,115,072 | 325,504 | 170,657,841,152 |
-| Flagship | 35,969 | 18,858,115,072 | 575,497 | 301,726,171,136 |
-| Extension | 80,483 | 42,196,271,104 | 1,287,720 | 675,136,143,360 |
+| Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens | 400x store |
+|---|---:|---:|---:|---:|---:|
+| Screen | 9,142 | 4,793,040,896 | 146,258 | 76,681,314,304 | 77B |
+| Bridge | 20,344 | 10,666,115,072 | 325,504 | 170,657,841,152 | 171B |
+| Flagship | 35,969 | 18,858,115,072 | 575,497 | 301,726,171,136 | 302B |
+| Extension | 80,483 | 42,196,271,104 | 1,287,720 | 675,136,143,360 | 676B |
 
-Warmup is 2% of the shorter of the run and its 25x length: 183, 407, 719,
-and 1,610 steps at or above 25x. Cooldown occupies 20%. Feedback begins at 75%;
-the default mixture costs about 1.28 pass-tokens per prediction. See
-[design.md](design.md#schedule).
-
-`--continue TAG` extends a finished run by restoring the last snapshot the
-longer schedule reproduces.
-Token stores include validation and each row's extra target.
-`delta tokenize --scale S --tokens-per-param R` computes that requirement and
-rounds up to the next billion stored tokens. Screen 100x needs 20B, screen
-400x needs 77B, bridge 400x needs 171B, flagship 400x needs 302B, and extension
-400x needs 676B. The canonical corpus retains its fixed 85B-token identity.
-Full DCLM supports larger stores. Its stream and held-out slice differ from
-the publisher's DCLM-100B subset, preventing paired per-token comparisons.
+The canonical store target is 85B tokens. Larger budgets can use full DCLM;
+changing the source changes the stream and validation slice, so it breaks
+per-token pairing. The [recipe](design.md#data) defines stream identity, and
+[operations](operations.md#tokenize) covers build storage and commands.
 
 ## Loop compute and decode state
 
-With `C` unique cells, a pass of `r` columns executes `Cr` cells. Every
-preset has `C=4`, so a column is 16 layers and a pass `16r`. Every scale
-uses the same recurrence roll, defined in
-[design.md](design.md#the-recurrence-roll); on rolled steps it gives:
+A step with `p` passes and `r` columns per pass executes `pr` columns,
+`4pr` cells, and `16pr` trunk layers per token position. The
+[recurrence roll](design.md#the-recurrence-roll) gives these expectations:
 
-| Step shape (passes x columns) | 3 x 2 | 2 x 3 | 2 x 2 |
+| Quantity | `f` | `l` | `fl` |
 |---|---:|---:|---:|
-| Probability | 12% | 12% | 76% |
-| Columns per position, `f` / `l` / `fl` | 3 / 2 / 6 | 2 / 3 / 6 | 2 / 2 / 4 |
+| Mean columns per position on rolled steps | 2.12 | 2.12 | 4.48 |
+| Maximum columns per position on rolled steps | 3 | 3 | 6 |
+| Mean columns per position over the default schedule | 1.28 | 1.28 | 1.87 |
+| Columns per pass in evaluation/decode | 1 | 2 | 2 |
 
-On rolled steps `f` and `l` each average 2.12 columns per position and `fl`
-4.48; the maximum is six columns, or 96 layers, and `l` alone peaks at three
-columns, or 48 layers. Evaluation and decode default to two columns, or 32
-layers. `--loop-iterations` overrides only their fixed count within `1..3`;
-scale and geometry overrides do not change the roll. Without `l`, every
-scale executes its 16 unique layers once per pass.
+For `l`/`fl`, a rolled pass averages 33.92 executed trunk layers; fixed
+evaluation/decode uses 32, and a three-column pass uses 48.
+`--loop-iterations` changes only the evaluation/decode count within `1..3`.
+Feedback evaluation additionally runs a second pass. Decode carries feedback
+sequentially between positions and does not replay full-prefix Jacobi passes.
 
-Resumes and continuations inherit the saved evaluation count unless
-explicitly pinned; conflicting overrides are rejected. `--scale` pins
-geometry and batch settings, while the roll and the evaluation-count default
-are common to every scale. The roll's arguments and the evaluation-count
-argument are part of the checkpoint v42 contract.
+Predicted-token counters count data once, pass-tokens multiply by `p`, and
+cell-tokens multiply by `4pr`. Report all three plus device time: MTP and
+vocabulary loss add work beyond these trunk counters. The full `fl` mean
+uses the joint roll, not a product of independent pass/column means.
 
-Report predicted tokens, pass-tokens, and cell-tokens together.
-These counters describe the trunk; total compute also includes MTP and its
-vocabulary loss. Measured device time includes routing and execution overhead.
+Each column has separate mixer caches at every layer. For one sequence and
+4,096 cached positions, BF16 GQA K/V and convolution histories plus FP32
+PKDA matrix/diagonal states require:
 
-For 4,096 cached positions, BF16 GQA K/V and convolution histories plus FP32
-PKDA matrix/diagonal states cost:
+| Scale | One column | Default loop depth, 2 columns | Maximum loop depth, 3 columns |
+|---|---:|---:|---:|
+| Screen | 38.26 MiB | 76.52 MiB | 114.77 MiB |
+| Bridge | 57.39 MiB | 114.77 MiB | 172.16 MiB |
+| Flagship | 76.52 MiB | 153.03 MiB | 229.55 MiB |
+| Extension | 114.77 MiB | 229.55 MiB | 344.32 MiB |
 
-| Scale | One cell | Flat / `r=1` | Default evaluation `r=2` | Maximum `r=3` |
-|---|---:|---:|---:|---:|
-| Screen | 9.56 MiB | 38.26 MiB | 76.52 MiB | 114.77 MiB |
-| Bridge | 14.35 MiB | 57.39 MiB | 114.77 MiB | 172.16 MiB |
-| Flagship | 19.13 MiB | 76.52 MiB | 153.03 MiB | 229.55 MiB |
-| Extension | 28.69 MiB | 114.77 MiB | 229.55 MiB | 344.32 MiB |
+For cache length `T`, GQA KV-head count `Hkv`, PKDA head count `Hp`, and PKDA
+head width `d=128`, one cell costs
+`4*T*Hkv*256 + 3*(4*Hp*(d²+d) + 18*Hp*d)` bytes: two BF16 K/V arrays and
+three PKDA layers, each with FP32 matrix/diagonal state and three BF16
+convolution histories of length three. Multiply by four cells, column count,
+and batch size. Payload, logits, allocator overhead, and serving metadata
+are excluded. This is decode-state arithmetic, not training-memory usage.
 
-Each column keeps its own mixer cache at every layer. These per-sequence state
-counts exclude payload, logits, allocator overhead, and serving metadata.
-Training also holds activations, gradients, optimizer state, and CUDA graph
-pools; decode-state arithmetic is not a training-memory estimate.
+## Runtime estimates
+
+The following are **planning assumptions**, conditional on model construction,
+calibration, and graph capture fitting. They model the default recurrence
+schedule and global batch above under the FP8/BF16-head CUDA recipe. Mean
+update times are schedule averages, not measured full-run throughput.
+
+The eight-GPU scenario is an **8×80 GB H100 SXM node with NVSwitch**, using
+`--ranks 8` and optimizer ownership sharding. Assumed speedups relative to
+one GH200 are 6.5× for screen/bridge/flagship and 7× for extension. These
+are modeling inputs, not node benchmarks.
+
+| Scale | GH200 mean update, `fl` / `f` | GH200 at 25x, `fl` / `f` | 8×H100 at 25x, `fl` / `f` |
+|---|---:|---:|---:|
+| Screen | 10.5 / 7.1 s | 1.2 d / 19.8 h | 4.5 / 3.1 h |
+| Bridge | 17.0 / 11.6 s | 4.4 / 3.0 d | 16.3 / 11.1 h |
+| Flagship | 27.0 / 18.3 s | 12.4 / 8.4 d | 1.9 / 1.3 d |
+| Extension | 55.0 / 37.0 s | 56.4 / 37.9 d | 8.1 / 5.4 d |
+
+```text
+GH200 seconds = steps * modeled_mean_update_seconds * 1.10
+H100 node seconds = GH200 seconds / assumed_node_speedup
+```
+
+The table includes 10% for evaluation/checkpointing. At 100x or 400x,
+durations are approximately 4× or 16× the 25x values; use the formula to
+avoid multiplying rounded table entries. Add 0.5–2 hours for cold setup and
+compilation, potentially more for extension. Data preparation, queueing,
+failures, and offline downstream evaluation are excluded.
+
+Allow approximately ±20%, ±25%, and ±30% on GH200 for screen, bridge, and
+flagship; extension spans roughly 0.6–1.6× the point estimate, conditional on
+fit. H100 node estimates span roughly 0.7–1.5×, wider for extension. These
+are judgment ranges, not confidence intervals. Replace these inputs with
+complete schedule-weighted device measurements before using them for a rental
+budget; see the [node workflow](operations.md#hopper-and-node-workflow).
+
+### Training memory boundary
+
+NorMuonH matrices keep replicated BF16 working weights and FP32 gradients;
+FP8 additionally keeps quantized matrices and transposes. Only FP32 masters,
+BF16 momentum, and small optimizer statistics are partitioned among ranks.
+NAdam weights, gradients, and moments remain replicated. Thus eight ranks do
+not divide the complete training footprint by eight.
+
+With `N` NorMuonH elements, `A` NAdam elements, and `R` ranks, a leading-order
+FP8 persistent-state estimate is `8N + 6N/R + 16A` bytes per rank. Add working
+copies for NAdam-owned GEMM operands, classifier shadows, optimizer vectors,
+rank padding, and allocation overhead. Initialization also holds the full
+FP32 NorMuonH parameters before adopting the working views, adding about `4N`.
+Activations, temporary tensors, graph pools, and communication buffers are
+additional.
+
+For extension this gives approximately **70 GiB persistent / 89 GiB during
+initialization** on one GPU and **45 / 64 GiB per GPU** on eight ranks,
+before activations and transient allocations. A GH200 scenario with about
+94.5 GiB usable HBM therefore has a narrow initialization margin; the
+marketing product name is not the usable CUDA allocation budget. An 80 GB
+H100 needs the existing ownership sharding for this extension scenario.
+Only target-hardware capture and complete training steps establish fit.

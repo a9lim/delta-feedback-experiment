@@ -1,718 +1,442 @@
 # Architecture
 
-`DeltaModel` has one core architecture: PKDA/GQA token mixers, Multi-Head Delta
-Block (MHDB) routing, shared and routed SwiGLU experts, and auxiliary two-token
-prediction. Conditions select cross-column feedback (`f`), looped depth (`l`),
-or both (`fl`); the default is `f`. Both recurrences are one operator: a
-column writes a payload, and the shared DeepSeek-style concat-linear fusion
-seeds the next column from that payload and a raw token embedding. Feedback
-fuses the payload with the next position's token, the Full-Bandwidth
-Transformer (FBT) recurrence with Jacobi training; the loop fuses it with the
-same position's token and re-runs the whole column, in the Ouro style. The
-payload is normalized once at its writer with a learned gain, and a token
-lookup is the tied embedding row times the fixed `1/BASE_NORMAL_INIT_STD`,
-so both fusion inputs are unit RMS at initialization and the seed enters the
-residual stream at unit scale. There is no empty condition.
+The full `fl` model combines two differentiable recurrences around one shared
+causal decoder: feedback (`f`) passes a predictive payload to the next token
+position, and looping (`l`) re-enters the decoder at the same position. A
+**column** is one execution of the entire trunk; a **pass** runs the requested
+columns over a sequence. Columns share all parameters, but keep separate
+mixer-state tracks across token positions.
 
-[Scaling](scaling.md) owns geometry and accounting, [design](design.md) owns
-data and training, and [references](../references/refs.yaml) records sources.
-
-The [TikZ figure](architecture.tex) shows `fl` as one vertical diagram, with
-the shared fusion feeding MTP and both recurrences, a cell-delta source bank,
-and one layer cutaway.
-Build its vector PDF from the repository root with Tectonic:
-
-```bash
-mkdir -p figures/architecture
-tectonic --outdir figures/architecture docs/architecture.tex
-```
-
-The editable source is tracked; generated files in `figures/` are not.
-
-## The column
-
-The pre-norm decoder has tied embedding/readout, a final RMSNorm, and no
-dropout. Every RMSNorm uses epsilon `1e-6`. `ResidualEmbedding` returns raw
-token features, cast to the residual dtype:
+The trunk uses Preconditioned Kimi Delta Attention (PKDA), gated global grouped
+query attention (GQA), shared and routed SwiGLU experts, and Multi-Head Delta
+Block (MHDB) reads. A routed payload and one shared fusion connect the trunk,
+both recurrences, and auxiliary two-token prediction (MTP):
 
 ```text
-e_t = embed_tokens(x_t) = E(x_t)
+scaled token lookup + incoming or blank payload
+                   │ shared concat-linear fusion
+                   ▼
+                column seed
+                   │
+       four cells of [PKDA, PKDA, PKDA, gated GQA]
+       each layer: MHDB read → mixer → MHDB read → experts
+                   │
+                top state ───────────────→ tied next-token readout
+                   │ + MHDB read of seed and completed cell deltas
+                   ▼
+             payload RMSNorm
+                   │ + one training jitter draw
+                   ├─ fuse with same token ─→ next column at this position (l)
+                   └─ fuse with next token ─┬→ next position's first column (f)
+                                           └→ independent PKDA/expert block
+                                              → tied second-token readout
 ```
 
-The tied classifier uses the same raw `embed_tokens.weight = E` matrix.
-CUDA lookups cast to BF16 and accumulate tied embedding gradients in FP32;
-there is no input token normalization.
-Layers form four-layer cells `[PKDA, PKDA, PKDA, NoPE-GGQA]`.
-Each trunk FFN uses one shared expert
-and a configurable number of selected routed experts. All presets have four
-cells. Under `l` the whole column runs `r` times per position, each run
-seeded by the preceding run's payload.
+[Scaling](scaling.md) owns preset sizes, parameter/compute accounting, and
+width-dependent rates; the [training recipe](design.md) owns conditions,
+sampling, schedules, and objective coefficients; [operations](operations.md)
+owns execution and precision. [Mechanism references](../references/refs.yaml)
+and the editable [architecture diagram](architecture.tex) accompany this
+specification. The implementation is in
+[model.py](../delta_feedback_experiment/model.py),
+[pkda.py](../delta_feedback_experiment/pkda.py),
+[moe.py](../delta_feedback_experiment/moe.py), and
+[optim.py](../delta_feedback_experiment/optim.py).
+
+## Column and residual decomposition
+
+A column is a pre-norm decoder with `L` unique layers, tied embedding/readout,
+a shared final RMSNorm, and no dropout or positional embeddings. The presets
+use four four-layer cells. All RMSNorms use epsilon `1e-6`. Linear maps are
+bias-free except PKDA's output-gate expansion.
+
+Let `E` be the tied vocabulary table, `D` the residual width, and
+`s₀ = BASE_NORMAL_INIT_STD = 0.02`. Token input and classifier use different
+scalings of the same table:
 
 ```text
-token embedding + incoming payload (f), the preceding column's own
-payload (l), or the learned blank payload
-  -> shared concat-linear fusion -> column seed
-  -> four cells
-  -> top state -> tied readout -> next-token logits
-       + routed block deltas -> learned RMSNorm -> payload
-                                  (+ shared jitter in training)
-                                  + same-token embedding
-                                  -> shared concat-linear fusion
-                                     -> next column seed at this position (l)
-                                  + raw next-token embedding
-                                  -> shared concat-linear fusion
-                                     -> next column seed at the next position (f)
-                                     -> independent auxiliary PKDA/expert block
-                                        -> tied readout -> second-token logits
+e_t          = E[x_t] / s₀
+logits(h_t)  = (1536/D) · RMSNorm_final(h_t) · Eᵀ
 ```
 
-Each cell has four residual layers, each with its own token mixer and expert
-FFN. An MHDB read enriches each branch's input with the seed and cell deltas.
-Linear maps are bias-free except PKDA's output-gate expansion.
+The lookup is unnormalized: learned token magnitudes survive the fixed
+multiplier. `E` initializes with standard deviation `s₀`, so lookup features
+begin at approximately unit RMS. Both prediction heads share `E`, the final
+norm, and the readout multiplier.
 
-Every column seed is the shared fusion of the token embedding `e_t` with
-a payload. Pass 1, plain-prefix positions, and Standard decoding, which have
-no incoming payload, fuse the learned blank payload `p_0` instead. The readout applies
-`final_norm(h_top) * 1536 / D` before the tied classifier.
-PKDA and GQA caches carry additional state along tokens; the payload carries
-feedback between positions, between Jacobi passes, and between the looped
-columns of one position.
-
-### Residual shell and sources
-
-For `L` unique layers, every mixer and FFN branch scales by `1/sqrt(2L)`:
+Each layer has two residual branches. MHDB enriches their temporary inputs;
+only the branch outputs enter the residual stream:
 
 ```text
-a_l = mixer_l(rmsnorm(h_l + route_l(sources))) / sqrt(2L)
-h'_l = h_l + a_l
-m_l = ffn_l(rmsnorm(h'_l + route'_l(sources'))) / sqrt(2L)
-h_(l+1) = h'_l + m_l
+a_l       = Mixer_l(RMSNorm_attn,l(h_l + Route_attn,l(bank))) / sqrt(2L)
+h'_l      = h_l + a_l
+m_l       = Experts_l(RMSNorm_ffn,l(h'_l + Route_ffn,l(bank'))) / sqrt(2L)
+h_(l+1)   = h'_l + m_l
 ```
 
-Routing changes only the temporary input read. It never replaces the residual.
-For seed `s`, the top therefore telescopes as
-`h_top = s + sum_l(a_l + m_l) = s + sum(completed cell deltas)`.
-
-A cell delta is its residual contribution. While a cell runs, that contribution
-is the current partial; at cell exit it becomes a completed source. A site's
-bank contains its own learned null, the column seed, completed cell deltas,
-and the current partial when present. At the first attention entry the partial
-is absent. The FFN site sees the newly added attention contribution. Branch
-deltas never become individually addressable sources.
-
-## PKDA and gated global GQA
-
-### PKDA mixer
-
-Each PKDA layer combines Kimi Delta Attention with the stable diagonal
-apply-to-key preconditioner from Preconditioned DeltaNet. Key/value head width
-is 128; projection width is four thirds of residual width at the presets.
-Bias-free Q/K/V projections pass through separate causal width-4 depthwise
-convolutions and SiLU. Q and K receive per-head L2 normalization, and Q scales
-by `1/sqrt(128)`.
-
-A packed projection produces disjoint slices for the rank-128 main decay,
-per-head delta update, preconditioner decay and gain, and rank-128 output gate.
-Packing preserves independent parameter ownership. Main and preconditioner
-controls are not tied. The preconditioner uses squash bound 1.5, epsilon
-`1e-6`, learned log-space center initialized to `-0.2`, decay rates sampled
-on `[1,16]`, and softplus time constants sampled log-uniformly on `[.001,.1]`.
-Negative-eigenvalue and safe-gate modes are disabled.
-
-For a head's key-by-value matrix `S_t` and nonnegative diagonal state `A_t`,
-both initially zero:
+For seed `s` and cell deltas `Δ_c`, this gives the exact algebraic decomposition
+(up to floating-point arithmetic):
 
 ```text
-alpha_t      = exp(-exp(A) * softplus(decay_t + b))
-beta_t       = sigmoid(update_t)
-alphaP_t     = exp(-exp(A_P) * softplus(decayP_t + b_P))
-betaP_t      = sigmoid(updateP_t)
-A_t          = alphaP_t A_(t-1) + betaP_t (k_t ⊙ k_t)
-r_t          = log(A_t + 1e-6) - center
-B_t          = exp(-log(1.5) * r_t / (1 + abs(r_t)))
-k_write_t    = B_t ⊙ k_t
-S_tilde_t    = Diag(alpha_t) S_(t-1)
-S_t          = (I - beta_t k_write_t k_t^T) S_tilde_t
-               + beta_t k_write_t v_t^T
-o_t          = S_t^T q_t
+Δ_c   = residual_at_cell_exit − residual_at_cell_entry
+h_top = s + Σ_l(a_l + m_l) = s + Σ_c Δ_c
 ```
 
-Each coordinate of `B_t` lies in `[2/3,3/2]`. The output receives head-wise
-normalization, a rank-128 sigmoid output gate, and a bias-free output
-projection. The output-gate expansion bias initializes to zero.
-
-CUDA training/prefill uses the workspace FLA chunk operator at chunk size 64;
-decode uses its recurrent operator. Training's backward relaunches the gate
-cumsum and, in a graph whose plan runs the recurrences lean, rebuilds their
-WY representation and chunk states from the retained intra-chunk products
-and preconditioner scan, bitwise identically to keeping them; a graph with
-room keeps them and skips the rebuild. CPU/MPS use the literal recurrence.
-Convolution, SiLU, and Q/K normalization stay FP32 until the final activation
-cast. Decode retains the FP32 matrix and diagonal states plus three BF16
-projected convolution histories of length 3. Each Jacobi pass restarts those
-states; only the payload crosses passes. The final prefill's caches then
-advance normally during generation.
-
-### Gated global GQA
-
-The fourth layer of each cell uses causal NoPE GQA, head width 256. At every
-preset, the query/output-gate projection width is `4D/3` and each K/V projection
-width is `2D/3`; the output projection returns to residual width `D`:
-
-```text
-q, k, v = split(W_qkv x)
-q, k    = rmsnorm_q(q), rmsnorm_k(k)
-z       = concat(GQA(q, k, v))
-o       = W_o(sigmoid(W_g x) * z)
-```
-
-The output gate acts before projection and residual scaling. It changes
-neither attention logits nor softmax weights. CUDA full rows use native
-cuDNN SDPA first with Flash fallback for BF16/FP16, and math SDPA for FP32
-diagnostics. Cached decoding
-stores BF16 K/V and uses FlexAttention over the valid prefix. Only the single
-GQA layer in each trunk cell owns K/V storage.
-
-## Shared and routed experts
-
-Every trunk and auxiliary FFN holds one shared SwiGLU `S` and `n` routed
-SwiGLUs `E_0..E_(n-1)`, selecting `k` routed experts per token. Each reads and
-writes residual width `D` and uses actual intermediate width `h`.
-`ModelConfig` names these fields `expert_intermediate`, `num_routed_experts`,
-and `experts_per_token`; their CLI flags are `--expert-intermediate`,
-`--num-routed-experts`, and `--experts-per-token`. Width and bank size must be
-positive and `1 <= k <= n`. Presets fix `h=832` and use `(k,n)` of `(3,15)`,
-`(5,23)`, `(7,31)`, and `(11,47)`. For normalized input:
-
-```text
-s = sigmoid(W_router x)
-J = topk(s + b)
-w_j = s_j / sum_(i in J) s_i  if j in J, else 0
-ffn(x) = (S(x) + k * sum_j w_j E_j(x)) / sqrt(k+1)
-```
-
-Router scores are FP32. The persistent bias `b` affects selection only. The
-selected scores remain differentiable; the discrete choice does not. There
-is no capacity limit or token dropping. CUDA dispatches every token's `k`
-assignments in expert-major order, stable in token and slot, through a
-counting sort, and each expert's rows form one tile range of the grouped
-GEMMs; the outputs are gathered back per token and mixed in FP32.
-Multiplying by `k` gives unit selected coefficients at equal scores; division
-by `sqrt(k+1)` matches the variance of `k+1` independent equal-variance
-expert outputs to one expert output at initialization. This does not
-guarantee learned variance.
-
-The active dense-equivalent width is derived as `H=(k+1)h`: expert matrices
-perform `3DH` multiply-accumulates per token and store `3D(n+1)h` parameters.
-The presets store four times the active expert matrix parameters. The router
-adds `nD` parameters per bank. The shared expert accounts for `1/(k+1)` of
-active expert width: 25%, 16.7%, 12.5%, and 8.3% across the presets. Fixed expert
-intermediate width does not fix each expert's parameter count as `D` grows.
-Memory and dispatch overhead still matter. Near-tied expert rankings can amplify numerical differences between cached
-and full-row evaluation.
-
-### Load balancing
-
-Each physical bank's `expert_bias[n]` starts at zero and stays outside the
-optimizer groups. Training sums actual integer assignment counts `C_j` over
-all microbatches, passes, and invocations, then updates once after the step:
-
-```text
-b_j += 0.001 * sign(sum_i C_i - n * C_j)
-```
-
-Evaluation and recomputation leave it fixed. Counts are returned values, so
-activation checkpointing cannot double-count.
-
-A separate sequence regularizer uses unbiased top-`k` preferences:
-
-```text
-q_j = s_j / sum_i s_i
-U = topk(s)
-P_j = mean_tokens(q_j)
-F_j = stop_gradient(count_tokens(j in U) / (kT))
-aux_layer = mean_sequences(n * sum_j P_j F_j)
-aux_column = (sum_trunk_layers(aux_layer) + aux_mtp) / (N_trunk + 1)
-aux = mean_executed_columns(aux_column)
-training_loss += 1e-4 * aux
-```
-
-Layer/column averaging keeps the
-coefficient independent of depth and pass count. The auxiliary bank contributes
-once per executed column, with its own `T` positions, including the padded last
-one whose cross-entropy is unweighted: it still selects experts, so it enters that bank's
-counts and sequence balance as a one-in-`T` perturbation. The bank's
-within-sequence gradient coupling does not change causal forward activations.
-Cross-entropy excludes it.
-
-`ColumnOutput.expert_aux_loss` holds the trunk layer mean and `expert_counts`
-holds transient `[L,n]` counts summed over physical-bank invocations.
-`LossOutput.expert_aux_loss` includes the auxiliary bank using the averaging
-above; its `[L+1,n]` counts place that bank last. Bias updates include every
-bank once per optimizer step. With `want_weights=True`, column `expert_weights`
-maps each trunk invocation to `[B,T,n]` sparse normalized weights, distinct
-from MHDB's source weights. `forward_mtp` can return the auxiliary block's
-weights over its `T` positions.
+A read's source bank contains its own learned null, the column seed, completed
+cell deltas, and the current cell's partial delta when one exists. At a cell's
+first mixer read there is no partial. Its FFN read adds the new mixer delta
+to that partial; subsequent reads see the accumulated contribution of the
+cell so far. Branch outputs are never separate persistent source addresses.
+With `C` cells, a bank has at most `C+2` sources.
 
 ## Multi-Head Delta Block routing
 
-Each site owns a zero-initialized width-`D` query `q`, a learned RMS key scale
-`g` initialized to one, and a zero-initialized learned null value. For
-`H = kv_heads` contiguous feature groups and raw source values `v_i`
-(384 features per group at every preset):
+MHDB lets a branch choose which earlier cell contributions to emphasize
+without changing the residual decomposition. Each site owns a width-`D`
+query `q`, learned RMS key gain `g`, and learned null value. The query and
+null start at zero; the key gain starts at one. For raw source values `v_i`
+and `H = kv_heads` contiguous feature groups:
 
 ```text
-k_i       = g * v_i / sqrt(mean(v_i^2) + eps)
-score_i,h = dot(q_h, k_i,h)
-weight_i,h = softmax_i(score_i,h)
-route_h   = sum_i weight_i,h * v_i,h
+key_i       = g ⊙ v_i / sqrt(mean_D(v_i²) + ε)
+score_i,h   = dot(q_h, key_i,h)
+weight_i,h  = softmax_over_sources(score_i,h)
+route_h     = Σ_i weight_i,h · v_i,h
+route       = concatenate_h(route_h)
 ```
 
-The RMS statistic spans the full width; each group's softmax mixes only its
-own raw feature slice. There is no head-dimension score factor or output
-projection. The site prepends its own null, whose learned value must be
-considered alongside its mass when interpreting routes.
+Keys normalize over the entire residual width; each group's softmax mixes
+only that group's raw value slice. There is no score divisor or output
+projection. Routing groups partition the residual features, independently
+of the token mixers' projected heads.
 
-The non-null bank reconstructs the current residual. At initialization the
-zero query makes the mixture uniform and collinear with that residual, so
-the following RMSNorm makes pass-1 routed reads inert up to epsilon. With
-`C` cells, at most `C+2` sources appear: null, seed, and completed/partial
-cell deltas. MHDB uses the source-selection idea of multi-head Delta Attention
-Residuals with cell-level addresses.
+The zero query initially makes every source weight uniform. The null is
+zero and the remaining sources sum to the current residual, so routing
+initially adds a scalar multiple of that residual. The following RMSNorm
+makes this enrichment inert up to epsilon. Learned queries then select
+content-dependent mixtures. A learned null can itself carry content, so
+its weight alone does not measure an absence of routing.
 
-## Payload and letter f: feedback
+The payload writer uses the same primitive with its own parameters, over
+its null, the seed, and every completed cell delta. MHDB source weights
+are distinct from the expert-selection weights described below.
 
-At a feedback position, fusion concatenates the token embedding `e_t`
-with incoming payload `p_(t-1)` and projects back to width `D`. The payload
-was normalized once at its writer. With jitter disabled,
-the same fusion used by MTP gives the column seed:
+## Token mixers
+
+### Preconditioned Kimi Delta Attention
+
+PKDA mixes tokens through a recurrent key-by-value matrix instead of storing
+all previous K/V rows. Each head has width 128 at the presets. Separate Q/K/V
+projections pass through causal width-4 depthwise convolutions and SiLU.
+Queries and keys receive per-head L2 normalization; queries additionally
+scale by `1/sqrt(128)`. Values remain unnormalized.
+
+One packed control projection has five disjoint slices: a rank-128 main
+decay input, per-head update logits, preconditioner decay logits,
+preconditioner update logits, and a rank-128 output-gate input. The two
+rank-128 inputs expand to all head channels through separate learned maps.
+Main decay and preconditioner controls have independent parameters.
+
+For one head, let `S_t` be its key-by-value matrix and `A_t` its nonnegative
+diagonal second-moment state. Both start at zero. Main decay `α_t` is a
+vector over key channels; `αP_t`, `β_t`, and `βP_t` are scalars:
 
 ```text
-seed_t = fuse_proj(concat(e_t, p_(t-1)))
+α_t      = exp(−exp(a)  · softplus(decay_t  + b))
+β_t      = sigmoid(update_t)
+αP_t     = exp(−exp(aP) · softplus(decayP_t + bP))
+βP_t     = sigmoid(updateP_t)
+
+A_t      = αP_t A_(t−1) + βP_t (k_t ⊙ k_t)
+r_t      = log(A_t + 1e−6) − center
+B_t      = exp(−log(1.5) · r_t / (1 + |r_t|))
+k_write  = B_t ⊙ k_t
+
+S_decay  = Diag(α_t) S_(t−1)
+error_t  = v_t − S_decayᵀ k_t
+S_t      = S_decay + β_t k_write error_tᵀ
+o_t      = S_tᵀ q_t
 ```
 
-The bias-free `fuse_proj: 2D -> D` is shared by MTP and feedback. Fusion is
-only concatenation and projection: it applies no normalization, activation,
-or extra scaling. Splitting its matrix into two width-`D` blocks gives
-`W_e e_t + W_p p_(t-1)`, so both inputs contribute directly to the seed. This adapts
-[DeepSeek-V3's MTP entry, Equation 21](https://arxiv.org/html/2412.19437v2#S2.SS2):
-the routed payload replaces its preceding hidden state and is normalized at
-the writer before training jitter, the token input is the scaled lookup
-without normalization, and the result is shared with cross-column feedback. Plain-prefix, pass-1,
-and Standard-decoding positions use the same product with the learned blank
-payload `p_0` in place of `p_(t-1)`:
+The delta update writes the error between the current value and the memory's
+prediction of it. Its diagonal preconditioner tracks key-coordinate activity
+and rescales only the **write key**: the prediction still reads with `k_t`.
+Low-activity coordinates receive larger writes and high-activity coordinates
+smaller ones, relative to the learned log-space center. The squash confines
+each coordinate of `B_t` to `[2/3, 3/2]`, preventing unbounded inverse-moment
+amplification. This bounds the preconditioner, not the complete recurrent
+operator.
+
+Each head's output receives learned RMS normalization and a sigmoid gate,
+then the concatenated heads project back to residual width:
 
 ```text
-seed_t = fuse_proj(concat(e_t, p_0))          (no incoming payload)
+PKDA(x)_t = W_o concat_heads(RMSNorm_head(o_t) ⊙ sigmoid(gate_t))
 ```
 
-`p_0` is a width-`D` vector in payload units, zero-initialized and
-present in every condition, so every seed passes through `fuse_proj` and a
-feedback position differs from a plain one only by `W_p (p_(t-1) - p_0)`.
-Neither the blank nor its fusion receives jitter. The actual seed is both residual
-origin and MHDB source. Every condition has a dedicated payload router that reads its
-null, seed, and every completed cell delta:
+The head norm shares its channel gain across heads. The output gate acts on
+retrieved content, independently of the gates controlling memory retention
+and writing. Matrix and diagonal states accumulate in FP32. Cached execution
+also retains the three projected convolution histories, each of length 3.
+The literal portable recurrence and CUDA chunk/recurrent operators implement
+this same state transition.
+
+### Gated global GQA
+
+The fourth layer of each cell supplies direct attention over the causal
+prefix, including the current position. It has no positional encoding (NoPE), uses
+head width 256 at the presets, and shares each K/V head between query heads:
 
 ```text
-r_payload = route(null, seed, Delta_0 .. Delta_(C-1))
-payload_norm(z) = BASE_NORMAL_INIT_STD * RMSNorm_g(z)
-p_t = payload_norm(h_top + r_payload)
+q, k, v = split(W_qkv x)
+q, k    = RMSNorm_q(q), RMSNorm_k(k)
+z       = concat_heads(softmax(q kᵀ / sqrt(d_head) + causal_mask) v)
+GQA(x)  = W_o(sigmoid(W_gate x) ⊙ z)
 ```
 
-The writer's `payload_norm` is a learned RMSNorm whose gain `g` starts at one.
-Its fixed output multiplier is `payload_norm.scale = BASE_NORMAL_INIT_STD`,
-currently `0.02`. The same constant sets raw token embedding initialization
-and the reference amplitude for training jitter. Initially the payload has
-RMS approximately `0.02`; its learned gain can change that amplitude during
-training. The direct `h_top` term remains alongside routed enrichment.
-Initially the uniform enrichment is
-`h_top/(C+2)`, making the payload equal to `0.02` times a normalized top state
-up to epsilon. Payload routing is not conditioned on the next token; that
-token enters through the shared fusion at the next column.
-Every supervised column constructs this payload for MTP, including
-single-pass batches, `l` without `f`, and the final feedback pass. The `f`
-letter controls consumption by the next position's column and the `l` letter
-by the same position's next column. Generation can skip payload construction
-when no feedback, loop, or auxiliary read needs it.
+Q/K normalization is per head. The sigmoid gate acts after attention and
+before the output projection; it does not alter logits or softmax weights.
+Unlike PKDA's fixed-size memory, this layer stores K/V for every position
+in its cache track. Interleaving the two mixers combines compressed
+recurrent memory with direct retrieval of earlier token representations.
 
-Every training column adds its keyed jitter, already in payload units,
-to the undetached payload and fuses it with the raw next-token embedding
-once.
-There is no second payload normalization after jitter. MTP consumes the
-resulting tensor directly. If another Jacobi pass follows, it shifts that
-same tensor right and restores the per-row plain prefix. If another looped
-column follows at the same position, the same jittered payload is fused once
-more with the position's own raw embedding to seed it. Mixer states restart
-inside each pass.
-Sequential generation instead retains the preceding payload and advances all
-mixer caches once per new token, computing one fusion with that token's
-raw embedding and no jitter, and under `l` running the evaluation column
-count before the caches advance; Standard decoding fuses the blank payload.
+## Shared and routed experts
 
-## Letter l: the looped column
-
-Under `l`, every position runs the whole column `r` times per pass. The
-first column is seeded as in the flat model. Each later column is seeded by
-the same shared fusion feedback uses, with the preceding column's payload in
-the payload slot and the position's own raw embedding in the token slot:
+Every trunk FFN and the auxiliary FFN has one shared expert `S` and `n`
+routed experts, selecting `k` per token. Each expert maps `D → h → D`:
 
 ```text
-seed_t^(1)   = fuse_proj(concat(e_t, p_(t-1)))            (or p_0)
-p_t^(i)      = payload_norm(h_top,t^(i) + r_payload,t^(i))
-seed_t^(i+1) = fuse_proj(concat(e_t, p_t^(i) + jitter_t^(i)))
+Expert(x) = W_down(SiLU(W_gate x) ⊙ W_up x)
 ```
 
-The loop adds no parameters, and every column is a plain column: the same
-bank of null, seed, and cell deltas at every site, the same telescoping
-`h_top = seed + sum(cell deltas)` within each column, and a fresh residual
-origin at every column. Feedback and the loop are one operator applied at
-different positions: `f` fuses the payload with the next position's token,
-`l` with the same position's token. A position's payload slot therefore
-always holds the most recent payload for that position, whether it came
-from the left neighbor or from the preceding column, and under `fl` a later
-column carries the cross-column payload through its seed. At one column,
-`fl` equals `f` in values, routes, losses, and gradients. A column never
-depends on the columns after it, so the first column of a looped run is the
-single-column model exactly, and reading out after every column is one
-trajectory.
-
-Every column is read out and supervised, and every column's payload feeds
-MTP. Contraction is not established by construction: the payload writer's
-normalization and fixed scale bound every column's seed, but the column's
-own contribution is unconstrained. [Ouro](../references/refs.yaml) loops
-the whole transformer stack with an exit at every step; this model re-enters
-through the shared fusion, so the raw token embedding is re-injected and the
-state crosses the boundary as a normalized payload rather than a raw
-residual.
-
-### Depth, caches, and training
-
-The recurrence roll draws once per optimizer step, and every pass, column,
-and microbatch of the step shares the result;
-[design](design.md#the-recurrence-roll) defines it. `f` reads its pass
-component, `l` its column component, and `fl` both, so a step has the same
-shape in every condition that shares the roll. Evaluation and decode hold
-`r = r_eval` fixed for the request, defaulting to two columns.
-`--loop-iterations` sets this fixed count within `1..3` and does not change
-the training distribution.
-Each column has its own mixer cache track at every layer and reads earlier
-token positions' writes at the same column index. Every current prefill pass
-starts those tracks from zero, and sequential decode advances the shared
-position once per token, after its last column. A pass executes `4r` cells.
-
-All passes and columns remain differentiable. Readout occurs after every
-column, and auxiliary prediction runs once per column. On CUDA the
-per-column epilogues around the compiled blocks (the payload's routed add,
-norm, and scale, the shared jittered fusions, feedback shift/prefix
-selection, and both heads' readout) compile as their own small regions. The
-compiled blocks carry an Inductor activation memory budget of 0.9, the
-partitioner tier that recomputes cheap fused tensors in backward and never a
-custom operator. CUDA captures one training graph per reachable
-`(pass count,r)` shape and no-grad evaluation graphs at the fixed count. Every
-graph, the optimizer step, and the periodic monitors share one private memory
-pool: the eager work runs on the capture stream inside it, so nothing between
-replays grows memory outside the pool, which needs the allocator's expandable
-segments. At
-start-up the trainer measures, from three eager forwards, the activation
-bytes one block invocation retains with the recurrences keeping or rebuilding
-their intermediates and the bytes one recomputed block releases, takes the
-device memory still free once the static footprint and the graphs' inputs
-exist less a 2 GiB default margin for backward workspaces, recomputation,
-allocator rounding, and graph instantiation, and plans each graph: the
-widest replay whose raw activations fit, its recurrences keeping their
-intermediates when that fits too and rebuilding them otherwise (measured
-worth 0.4 ms per two-row replay on the 4090, so never a narrower replay);
-and when even the smallest replay does not fit raw, the first PKDA and
-auxiliary block invocations of the logical forward, as many as the shortfall
-needs, recompute in backward. Global-attention blocks are always retained.
-Checkpoint wrappers remain outside compiled blocks. The compilation the
-calibration and the optimizer warm-up cause runs before the free memory is
-read, and on several ranks the main rank compiles first so the others read
-its caches.
-
-`multipass` returns `[pass][column]` outputs, and `forward_iterations` runs
-every column of one position range. `depth_trace` runs the maximum count
-and reads out after every column, reporting each column's held-out loss and
-top-state update norm. The depth telemetry labels the fixed evaluation
-count `r_eval` and its held-out loss `loss_eval`, beside `loss_one` for the
-first column and `loss_max` for the last. The payload self-composition
-trace holds the count fixed. Paired `f`/`fl` runs share initialization,
-rows, schedule, the roll, and the feedback draws; the loop's own jitter is
-drawn after them. Equal steps match data; compute comparisons need
-cell-tokens and auxiliary work or device time.
-
-## Two-token prediction
-
-One independent auxiliary prediction block runs after every column.
-Its input is computed by the model's shared concat-linear fusion:
+A token-local FP32 router computes sigmoid affinities. A persistent
+non-gradient bias changes selection but does not enter the mixture weights:
 
 ```text
-e_(t+1) = embed_tokens(x_(t+1))
-p_t = payload_norm(h_top,t + r_payload,t)
-jitter_t ~ Uniform(-BASE_NORMAL_INIT_STD * jitter, BASE_NORMAL_INIT_STD * jitter)
-u_t = fuse_proj(concat(e_(t+1), p_t + jitter_t))
-v = PKDAExpertBlock(u)
-logits_mtp,t = (final_norm(v_t) * 1536 / D) @ embed_tokens.weight.T
+s_j       = sigmoid((W_router x)_j)
+J         = topk_j(s_j + b_j)
+w_j       = s_j / Σ_(i∈J) s_i               for j ∈ J
+Experts(x)= (S(x) + k Σ_(j∈J) w_j E_j(x)) / sqrt(k+1)
 ```
 
-`fuse_proj` is the exact projection used by feedback, present in every
-condition. The two inputs each have width `D`, and the concatenation places
-the token first and payload second. One `embed_tokens` call looks up the whole
-stored row before slicing; those raw embeddings serve the blank-fused plain
-seeds, MTP, feedback, and the loop across all passes. Each column adds
-jitter after the writer's payload normalization and fixed scale, then
-computes `u` once for MTP and the next pass; a following looped column
-fuses the same jittered payload with the position's own embedding.
-Fusion accepts these inputs directly, with no normalization or second scaling.
+All selected assignments execute; there is no capacity limit or token
+dropping. The selected affinities remain differentiable through their
+normalization, while top-`k` membership is discrete. At equal affinities,
+`k w_j = 1`, so the shared and selected branches have equal coefficients.
+The final divisor preserves one expert's variance when the `k+1` outputs
+are independent with equal variance; it does not fix learned variance.
 
-The auxiliary block has its own PKDA mixer and one shared plus top-`k`-of-`n`
-routed SwiGLU experts, using the trunk's residual width, expert intermediate
-width, expert counts, output normalization, and `1/sqrt(2L)` branch scale.
-It shares the final norm and embedding/readout.
-It has no MHDB read or tied loop. Its independent matrix, diagonal, and
-convolution states start from zero for each row and pass.
+Two mechanisms balance utilization at different levels:
 
-`--jitter` is a half-width in payload units, which are unit RMS at
-initialization, with default `0.02`. Training samples the buffer directly
-in those units: uniform `[-jitter, jitter]`. This draw happens for every supervised
-column, including the final or only pass and `l` without `f`. MTP, the next
-looped column, and the next feedback pass use the same realization. For the
-latter, `u_t` becomes the seed at position `t+1`, with positions inside the
-selected plain prefix restored to their blank-fused seeds. The auxiliary block's output `v`
-is used only for MTP; it is not an early trunk readout or an extra feedback layer.
-Evaluation and diagnostics set jitter to zero.
+- **Step-level controller:** aggregate actual integer assignment counts
+  `C_j` for each physical bank across all microbatches, passes, columns, and
+  ranks, then update once after the optimizer step:
+  `b_j ← b_j + η_bias sign(Σ_i C_i − n C_j)`.
+  Biases start at zero, remain outside optimizer groups, and stay fixed in
+  evaluation and backward recomputation.
+- **Sequence regularizer:** let `q_j = s_j / Σ_i s_i`,
+  `P_j = mean_tokens(q_j)`, and
+  `F_j = stop_gradient(count_tokens(j ∈ topk(s)) / (kT))`.
+  The bank's auxiliary loss is `mean_sequences(n Σ_j P_j F_j)`.
+  These preferences omit the selection bias, so the regularizer acts on
+  learned affinities independently of the controller.
 
-For a stored row of `T+1` tokens, ordinary inputs/targets are
-`tokens[:,:-1]` / `tokens[:,1:]`. Auxiliary inputs fuse the whole `payload`
-and the raw embeddings for `tokens[:,1:]`, with targets `tokens[:,2:]`
-plus one dummy target: `T-1` supervised positions and a padded last one,
-whose second token lies past the end of the stored row and which therefore
-carries no loss weight. That row
-is causally last in the auxiliary recurrence, so the supervised rows are the
-same ones the cropped geometry produced. One lookup of the whole stored row
-serves both heads, the blank-fused plain seed taking positions `0..T-1` and the
-payload fusion taking next-token features at `1..T`.
-Both inputs and the reused fused tensor remain differentiable, so the
-auxiliary objective trains the payload router, payload normalization, trunk,
-shared fusion, and token embedding.
-The causal PKDA recurrence never sees the second-token target. The auxiliary
-block's output never feeds into the column or payload.
-`multipass` exposes each column's shared tensor as `ColumnOutput.fused_input`.
-`DeltaModel.forward_mtp_fused` runs the block on this tensor;
-`forward_mtp(payload, next_tokens)` embeds and fuses supplied next-token IDs
-as a convenience. Both return balancing loss, assignment counts, and optional
-expert weights.
+The model averages the regularizer over trunk and auxiliary banks, then
+over executed columns. Actual counts sum instead of averaging. Returned
+counts describe logical forwards, so activation recomputation cannot count
+a dispatch twice. The last padded MTP position still selects experts and
+enters balancing, although it has no prediction-loss weight. Sequence
+regularization couples gradients within a row; forward activations remain
+causal. Coefficients live in the [training recipe](design.md).
 
-Each head averages over its own valid positions, and both heads' rows go
-through one unreduced vocabulary pass per column: their readout rows are
-concatenated into a single cut cross-entropy request, and the column scalars
-are weighted sums of the returned rows. For either head, `combine` applies
-FBT's first-plus-mean rule along both recurrence axes: each column's series
-is combined along passes, `ell_1 + mean(ell_2,...,ell_k)`, or `ell_1` alone
-at one pass, and the per-column results are combined the same way along
-columns. At `k` passes and `r` columns the plain first column, pass 1's
-later columns, later passes' first columns, and the remaining block each
-carry unit weight, spread evenly inside the block, so with one axis absent
-the rule is the other axis's own combine:
+## Payload and shared fusion
+
+Every supervised column writes a width-`D` predictive payload:
 
 ```text
-loss = combine(CE_ntp) + z_coef * combine(z_ntp)
-     + mtp_weight * (combine(CE_mtp) + z_coef * combine(z_mtp))
-     + 1e-4 * expert_balance
+r_t = MHDB_payload(null, seed_t, Δ_0,t, …, Δ_(C−1),t)
+p_t = RMSNorm_payload(h_top,t + r_t)
 ```
 
-The cooldown z-loss is the mean squared log-partition. `--mtp-weight` is a
-finite nonnegative constant, default 0.3. `ntp` and `mtp` report cross-entropies
-before coefficients/z-loss, `pass1` is the first column's ordinary CE, and
-`loss` is the optimized objective. `val_mtp` and feedback's `val_mtp_fused` remain
-separate from ordinary validation. Generation does not run the auxiliary
-block or allocate its cache; speculative decoding is not implemented.
+The direct top-state term preserves access to the complete residual;
+routing can emphasize particular cell contributions. The writer does not
+see the next token. Its learned norm gain begins at one, so payload RMS
+starts near one and can change with training. Normalization alone does not
+guarantee contraction of the column-to-column map.
 
-## Precision and initialization
-
-NorMuonH matrices initialize from `Normal(0,1/sqrt(fan_in))`. The shared
-`BASE_NORMAL_INIT_STD=0.02` sets NAdam matrix standard deviations. GGQA gates,
-expert routers, and PKDA's packed control projection multiply
-it by `sqrt(1536/D)`. Embeddings and PKDA fixed-head-width expansions use
-0.02 directly. This preserves initial control-logit variance across widths.
-`MUP_BASE_DIM` stays at the flagship width 1,536: extension uses a width ratio
-of `1536/2304 = 2/3` for NAdam rates and readout scaling, and its square root
-for the specified initialization scales. The reference does not depend on
-the largest configured preset. Expert optimizer rates have their own factors
-below; they do not change initialization or forward computation.
-The fusion projection uses NorMuonH initialization with fan-in `2D`, hence
-standard deviation `1/sqrt(2D)`. The same `BASE_NORMAL_INIT_STD` supplies the
-payload RMSNorm's fixed output scale and the jitter generator's reference
-amplitude; it does not change fusion projection initialization. Depthwise
-convolutions retain Kaiming-uniform initialization. Learned RMSNorm gains
-start at one; MHDB queries and nulls and the blank payload start at zero.
-
-Shared parameters pair byte-identically across conditions for a given seed.
-Experts are constructed directly as part of the common model initialization.
-Attention gates, the fusion matrix, and the auxiliary module use separate
-deterministic streams. Fusion initialization does not advance shared draws.
-Feedback/depth recipe draws are separately keyed.
-
-Weights, accumulated gradients, and optimizer state are FP32, except
-NorMuonH's momentum, which CUDA stores in BF16 rounded to nearest with its
-update computed in FP32. CUDA residuals, routed values, payloads, and mixer
-caches use BF16, except PKDA matrix/diagonal boundaries.
-
-CUDA training GEMMs run on FP8 tensor cores by default (`--precision fp8`;
-`bf16` keeps every GEMM in BF16). Every projection site's forward and
-activation-gradient GEMMs and the routed experts' two forward and two
-activation-gradient GEMMs take e4m3 operands with one FP32 scale per row of
-each operand and accumulate in FP32; the scale of a row is its largest
-magnitude over the format's, computed from the tensor itself (current
-scaling), so the same values quantize the same way every time, a recomputed
-forward included, and nothing about quantization is state. Each site keeps
-an FP8 copy of its BF16 working copy, the matrix with a scale per output
-row and its transpose with a scale per input row, rewritten on every rank
-after every gather, so each GEMM reads an operand contiguous along its
-reduction. Activations and incoming gradients are quantized per token as
-they enter a GEMM, the SwiGLU output by the kernel that produces it, and
-the experts' gate/up gradient by the epilogue that produces it with one
-scale per row of each column tile, which the input-gradient GEMM applies
-block by block. Weight gradients keep BF16 operands into the FP32 sinks,
-routers stay FP32, the head reads the BF16 classifier shadow (the fork can
-run it on FP8 behind `DeltaModel.fp8_classifier`, a measured loss on the
-4090; [hopper](hopper.md)), and evaluation, decoding, and the portable
-path read the BF16 copies. FP8 changes the training numerics: a run under
-it is not paired with one under BF16.
-
-Under the trainer every parameter belongs to one site: the three PKDA
-projections behind one GEMM, a dense layer's QKV projection with its
-attention gate, an expert bank's stacked gate/up or down matrices with the
-shared expert first, the fusion matrix, and one flat arena for everything
-NAdam owns. A site holds a working copy in the activation dtype that the
-kernels read and an FP32 gradient sink the backward accumulates into, and
-each parameter is a view of both. A NorMuonH matrix's FP32 weight is the
-optimizer's master, packed per shape bucket on the rank that owns the
-matrix; after each update the master is rewritten into the working copy, so
-on CUDA the model holds each such matrix once in BF16 and its owner holds
-the FP32 master. The NAdam parameters keep FP32 masters on every rank and
-the mixers read BF16 working copies refreshed after each update; the tied
-embedding's classifier readout is one of them. Working copies are runtime
-state, excluded from snapshots, which record the FP32 masters.
-
-Packed projection backpropagation writes into the persistent FP32 sinks.
-PKDA Q/K/V row views share an allocation, as do dense QKV and gate
-gradients; each parameter is updated once. The routed experts' backward
-keeps the SwiGLU derivative in FP32 inside the epilogue of the
-activation-gradient GEMM and recomputes the activation there, so the forward
-retains only the pre-activation; expert weight gradients accumulate in the
-bank's FP32 sink, and an expert without assignments leaves its rows
-untouched. Every head call accumulates its classifier gradient straight into
-the tied embedding's FP32 sink, tile by tile in FP32, so the number of rows
-a call spans never changes its precision. Each column makes one head call,
-covering both prediction depths.
-
-## NorMuonH and NAdam
-
-Five disjoint parameter groups across two optimizers share the
-warmup-stable-cooldown multiplier with no weight decay:
-
-| Group | Parameters | Peak learning rate |
-|---|---|---|
-| `normuonh` | Ordinary NorMuonH matrices outside experts | `lr_normuonh` |
-| `normuonh_expert_in` | Shared and routed expert gate/up matrices | `lr_normuonh * sqrt(8/(k+1))` |
-| `normuonh_expert_out` | Shared and routed expert down matrices | `lr_normuonh * sqrt(8/(k+1))` |
-| `nadam` | Base NAdam parameters | `lr_nadam` |
-| `nadam_width` | NAdam matrices with residual-width fan-in | `lr_nadam * 1536/D` |
-
-Here `k` is the selected routed expert count, so `k+1` includes the shared
-expert. Both expert groups include every trunk bank and the auxiliary MTP
-bank. Both expert groups use the same active-count factor, anchored at
-flagship's eight active experts. Coherently aligned branch changes add as
-`sqrt(k+1)` after the bank's forward normalization; the count factor offsets
-that growth. Each matrix's spectral normalization separately handles its
-fan-in/fan-out, including geometry overrides. No extra `sqrt(1536/D)` expert
-input factor is applied.
-
-### NorMuonH matrices
-
-NorMuonH owns ordinary 2D hidden matrices: token-mixer projections, expert and
-auxiliary FFNs, and the entire shared `D x 2D` fusion projection. Every matrix
-keeps its initial FP32 Frobenius radius `R`, stored in the checkpoint:
+One bias-free projection implements every entry to a column and to MTP:
 
 ```text
-M_t = .95 M_(t-1) + .05 G_t
-N_t = .05 G_t + .95 M_t
-U = five_Newton_Schulz_steps(N_t)          # BF16 on CUDA, FP32 elsewhere
-U = row_second_moment_normalize(U, beta=.95, eps=1e-8)
-U = Normalize_F(U)
-T = U - <W,U>_F / <W,W>_F * W
-T = Normalize_F(T)
-sigma_hat, v_next = three_power_iterations_with_restart(T, v)
-eta_t = schedule_multiplier(t) * group_peak_lr
-W_next = R * Normalize_F(W - eta_t * sqrt(fan_out/fan_in) * T / sigma_hat)
+F(e, p) = W_fuse concatenate(e, p) = W_e e + W_p p
 ```
 
-The default base rate is `6e-3`, an estimated RMS-to-RMS operator budget for
-the tangent trial step; the expert groups apply the factors above. The
-spectral estimate follows row adaptation and removal of the radial component.
-Each update compares the image of the saved right vector with the image of
-the normalized largest-energy row, then performs three paired power
-iterations from the better start and one final norm evaluation. The restart
-can recover a newly rotated direction orthogonal to the saved vector and
-consumes no RNG. The right vector is FP32 optimizer state, saved alongside
-momentum, row moments, and radius for exact resume.
+The concatenation places the token first. Fusion adds no normalization,
+activation, gate, or scaling: learned token magnitudes and payload gains
+reach its output directly. A learned width-`D` blank payload `p₀`, initialized
+to zero, supplies positions with no incoming payload. Their seed is
+`F(e_t,p₀)`; replacing the blank with a payload changes it by
+`W_p(p − p₀)`.
 
-Zero and numerically radial directions produce no weight movement; after
-normalizing `U`, tangent norms at or below `32 * finfo(dtype).eps` are treated
-as cancellation residue. Zero-rate updates also preserve weights exactly.
-An exact spectral norm would set the trial's RMS-to-RMS norm to the group
-rate. Power iteration can underestimate it, and the sphere retraction changes
-the finite displacement, so this is not a strict final-step bound. Full-model transfer of these rates across scales remains unmeasured.
-[Scaling](scaling.md#expert-learning-rates) lists the preset rates.
-CUDA compiles the update arithmetic by shape bucket within each group and
-runs the five Newton-Schulz iterations on a BF16 copy of the normalized
-direction, as reference Muon implementations do. CUDA also stores each
-bucket's momentum in BF16: the EMA and the Nesterov direction are computed in
-FP32 and only the writeback rounds to nearest, so a snapshot carries a BF16
-momentum and resumes exactly. The result returns to FP32
-before row adaptation, the spectral/tangent step, and the retraction; CPU and
-MPS stay FP32 throughout.
+During training, each column adds one keyed perturbation `ξ_t` **after**
+payload normalization. Its amplitude is specified directly in payload units
+by the [recipe](design.md). The same jittered payload
+serves all consumers of that column: the next looped column, MTP, and,
+for the pass's last column, the next feedback pass. There is no detach or
+second normalization. The blank receives no jitter; evaluation and decoding
+use zero jitter.
 
-Bucket membership is fixed at construction from device, dtype, shape, and a
-packing bound of 33,554,432 matrix elements (128 MiB per FP32 tensor), except
-larger individual matrices remain whole. Each bucket holds its momenta, row
-moments, radii, and right vectors in one packed tensor per state kind, and
-each parameter's state entries are views into them, so a step packs only the
-parameters and gradients, which are separate tensors owned elsewhere.
-The saved schema stays per-parameter, and a restored state is copied into
-the packed storage rather than replacing the views. A step that reaches only
-some members of a bucket gathers the active rows and scatters the results
-back, leaving absent members' weights and state untouched. All results
-materialize before state and parameter writebacks outside the compiled
-boundary, preserving reads of the previous momentum.
+## Feedback passes, looping, and decoding
 
-### NAdam parameters
-
-The width-scaled group owns matrices with fan-in `D`: GGQA gates,
-expert routers, and PKDA packed controls. It uses `lr_nadam * 1536/D`; the
-base group uses `lr_nadam`, default `3e-4`. The base group owns the tied
-embedding/readout, fixed-head-width PKDA expansions, and every non-matrix
-parameter, including the payload-writer RMSNorm gain.
-The readout also multiplies by `1536/D`, while embedding lookup keeps its
-base rate.
-
-NAdam uses betas `(.9,.95)`, momentum decay `psi=.004`, epsilon `1e-8`:
+Let `p_t^(a,i)` denote the payload at position `t`, pass `a`, column `i`,
+and `R` the number of columns per pass. The first column of pass 1 uses
+`F(e_t,p₀)`. Later columns of any pass use the same token embedding:
 
 ```text
-m_t = beta1*m_(t-1) + (1-beta1)*G_t
-v_t = beta2*v_(t-1) + (1-beta2)*G_t^2
-mu_t = beta1*(1-.5*.96^(t*psi))
-P_t = product_(i=1..t) mu_i
-U_t = ((1-mu_t)*G_t/(1-P_t) + mu_(t+1)*m_t/(1-P_t*mu_(t+1)))
-      / (sqrt(v_t/(1-beta2^t)) + eps)
-theta_t = theta_(t-1) - lr*U_t
+seed_t^(a,i+1) = F(e_t, p_t^(a,i) + ξ_t^(a,i))
 ```
 
-CUDA NAdam and the global FP32 gradient norm, reduced across ranks, run
-outside forward/backward graphs. The scalar step and momentum-product state remain on CPU; moments
-and parameters remain FP32 on-device. Before both optimizers, the complete
-accumulated gradient's L2 norm is measured and reported; a non-finite norm
-stops the run. Nothing is clipped: NorMuonH's spectral step is scale-free,
-NAdam's nearly so, and with the residual stream entering at unit scale the
-graph shapes' norms sit within a factor of two of each other.
+Later feedback passes instead take the preceding position's final-column
+payload from the previous pass:
+
+```text
+seed_t^(a+1,1) = F(e_t, p_(t−1)^(a,R) + ξ_(t−1)^(a,R))
+```
+
+A per-row plain prefix overrides that equation with `F(e_t,p₀)`; position 0
+is always plain. This is Jacobi execution: all positions in one pass use
+the preceding pass's payloads, allowing parallel processing of the row.
+Each pass starts its mixer states afresh, while gradients remain connected
+through every payload and fusion.
+
+Every loop iteration is a complete column with a fresh seed and source bank;
+no cell delta is carried across its boundary as a separate source. Looping
+adds no parameters. Its first column does not depend on later columns, and
+setting `R=1` makes `fl` equal to `f` in values, routes, losses, and gradients
+for matched inputs and randomness. Every executed column is supervised.
+
+For sequential decoding, the first column at position `t` consumes the
+final payload from `t−1`; later columns loop at `t`. Each layer owns one
+cache track per column index: column `i` reads earlier positions' column-`i`
+writes. All tracks share a token position counter, which advances only after
+the last column. PKDA tracks hold matrix, diagonal, and convolution states;
+GQA tracks hold K/V rows. Standard decoding supplies the blank instead of
+the preceding position's payload, while retaining the configured loop.
+MTP is unnecessary for generation and has no decode cache.
+
+The [analysis guide](interpretability.md#checkpoint-and-tensor-apis) lists
+execution APIs; the [recipe](design.md#the-recurrence-roll) defines training
+shapes and evaluation/decode depth.
+
+## Auxiliary two-token prediction
+
+Each column predicts `x_(t+1)` from its top state. Its independent auxiliary
+block predicts `x_(t+2)` after conditioning the payload on `x_(t+1)`:
+
+```text
+u_t          = F(e_(t+1), p_t + ξ_t)
+v            = AuxiliaryPKDAExpertBlock(u)
+logits_mtp,t = logits(v_t)
+```
+
+The auxiliary block has its own PKDA mixer and expert bank with the trunk's
+geometry and `1/sqrt(2L)` branch scaling. It shares the fusion, final norm,
+and classifier, but has no MHDB reads or loop. Its causal recurrent states
+start from zero for each row and invocation. It can see next-token inputs
+through position `t+1`, never its `t+2` target. Its output serves only the
+auxiliary readout and never feeds the trunk or payload.
+
+For a stored row of `T+1` tokens, the trunk executes `T` positions and
+predicts tokens `1..T`. MTP executes those same `T` positions, conditioning
+on tokens `1..T` and supervising targets `2..T`. Its final position has a
+dummy target and zero prediction-loss weight. This causally last padding
+leaves all earlier auxiliary states unchanged. Each head averages over its
+own valid targets.
+
+The next-token fusion `u` is computed once per column and exposed as
+`ColumnOutput.fused_input`. MTP reads it directly. After the pass's last
+column, feedback shifts that same tensor right and restores the plain
+prefix. A later looped column reuses the jittered payload but fuses it with
+the current token instead. The auxiliary objective therefore trains the
+trunk, payload router and gain, fusion, embedding, and auxiliary block,
+including on a single-pass batch or the final pass.
+
+The [training objective](design.md) defines how the main and auxiliary
+cross-entropies, squared-log-partition z-losses, and expert balancing combine
+across the supervised passes and columns.
+
+## Initialization and optimization
+
+Initialization follows parameter ownership rather than applying one normal
+scale to every matrix. Write `ρ = 1536/D`:
+
+| Parameters | Initialization |
+|---|---|
+| NorMuonH matrices: Q/K/V and mixer output projections, expert gate/up and down maps, shared fusion | `Normal(0, 1/sqrt(fan_in))`; fusion has `fan_in=2D` |
+| NAdam matrices with residual-width fan-in: GQA gates, expert routers, PKDA packed controls | `Normal(0, 0.02 sqrt(ρ))` |
+| Tied embedding/readout, PKDA decay and output-gate expansions | `Normal(0, 0.02)` |
+| RMSNorm gains, including payload and PKDA output norms | One |
+| MHDB queries/nulls, blank payload, linear biases, main PKDA decay bias | Zero |
+| PKDA depthwise convolutions | Kaiming-uniform |
+
+PKDA's main and preconditioner decay-rate parameters initialize independently
+with `exp(a), exp(aP) ~ Uniform(1,16)`. Its preconditioner bias satisfies
+`softplus(bP) ~ LogUniform(0.001,0.1)`, and the learned log-space center starts
+at `−0.2`.
+
+A payload-bearing fusion combines two approximately unit-RMS inputs with
+fan-in `2D`, giving an order-one seed. The zero-blank seed has only the token
+contribution and expected RMS near `1/sqrt(2)`. These are initialization
+scales, not restrictions on learned magnitudes. Shared parameters initialize
+byte-identically across `f`, `l`, and `fl` for a given seed. Attention gates,
+fusion, and the auxiliary module use separate deterministic streams;
+training recurrence and jitter draws are keyed separately.
+
+### NorMuonH
+
+Ordinary hidden matrices use NorMuonH: Nesterov momentum, approximate
+orthogonalization, row-wise second-moment adaptation, and a spectral tangent
+step on a fixed Frobenius sphere. Each matrix retains its initial FP32 radius
+`R = ‖W_initial‖_F`. With gradient `G`, momentum coefficient `μ`, and row
+second-moment coefficient `β`:
+
+```text
+M       ← μM + (1−μ)G
+N        = (1−μ)G + μM
+U        = NewtonSchulz_5(N)
+V       ← βV + (1−β) mean_columns(U²)
+U        = Normalize_F(U / (sqrt(V) + ε))
+T        = Normalize_F(U − ⟨W,U⟩_F W / ‖W‖_F²)
+σ̂, v'   = spectral_estimate(T, saved_right_vector)
+W_next   = R Normalize_F(W − η sqrt(fan_out/fan_in) T / σ̂)
+```
+
+Newton-Schulz works on the smaller Gram matrix, transposing tall matrices
+and restoring their orientation afterward. The spectral estimate chooses
+between the saved right vector and a restart from the largest-energy row,
+then runs three paired power iterations. This deterministic restart can
+recover a direction orthogonal to the previous estimate without consuming
+randomness. Momentum, row moments, radius, and right vector are checkpointed.
+
+The tangent projection removes radial movement; retraction restores the
+fixed radius. Zero-rate, zero, and numerically radial updates preserve the
+weights exactly. The matrix aspect ratio converts spectral scale to an
+RMS-to-RMS trial-step scale. Power iteration can underestimate the spectral
+norm, and retraction changes finite displacement, so the group rate is an
+estimated trial-step budget rather than a certified final-step bound.
+
+### NAdam and parameter ownership
+
+NAdam owns parameters whose magnitudes remain learnable: the tied table,
+GQA gates, expert routers, PKDA controls/expansions, and all non-matrix
+parameters. It applies elementwise second-moment normalization to a
+bias-corrected, time-varying Nesterov momentum update. Expert-selection
+biases are buffers controlled by dispatch counts, outside both optimizers.
+Neither optimizer uses weight decay.
+
+There are five disjoint rate groups: ordinary NorMuonH matrices, expert
+input maps, expert output maps, base NAdam parameters, and residual-width
+NAdam matrices. The two expert groups include shared, routed, and MTP
+experts. Their width/count factors are specified in [scaling](scaling.md),
+and optimizer hyperparameters and the common learning-rate schedule in the
+[recipe](design.md). [Operations](operations.md) describes FP32 masters and
+gradient accumulation, CUDA working precision, and distributed ownership.

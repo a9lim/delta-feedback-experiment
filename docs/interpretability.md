@@ -1,95 +1,121 @@
 # Inspecting the model
 
-Delta exposes its computation for checkpoint analysis and interventions.
-General capture and readout tooling belongs to the sibling
+This guide covers checkpoint APIs, diagnostics, and interventions.
+[Architecture](architecture.md) defines the tensors and recurrence;
+[the recipe](design.md#evaluation) defines evaluation metrics. General
+capture and readout tooling belongs to the sibling
 `interpretability-experiments` workspace; training does not depend on it.
 
-## State and traces
+## Checkpoint and tensor APIs
 
-| Axis | State | Conditions |
-|---|---|---|
-| Token position | PKDA matrix/diagonal/convolution state and GQA prefix K/V | All |
-| Latent feedback | Previous column's payload is fused with the next token's embedding | `f`, `fl` |
-| Looped depth | The whole column re-runs from its own payload | `l`, `fl` |
+[analysis.py](../delta_feedback_experiment/analysis.py) provides the common
+entry points:
 
-A Jacobi pass recomputes mixer state from zero and consumes the prior pass's
-shifted payload. Sequential feedback decode advances mixer caches and carries
-the previous token's payload. Looped columns have separate mixer-cache
-tracks at every layer. Label token, pass, and column coordinates when
-comparing states.
-
-`embed_tokens(tokens)` returns token features in the residual dtype, the
-tied row times `1/BASE_NORMAL_INIT_STD`, so unit RMS at initialization;
-they enter the column only through the shared fusion. `plain_seed(e)` is the
-seed of pass 1, plain-prefix positions, and Standard decoding: the fusion of
-`e` with the learned blank payload `blank_payload`, so a feedback position
-differs from a plain one only by `W_p (p_(t-1) - p_0)`. Replacing a payload
-with the blank is therefore an in-distribution ablation, and patches to plain
-seeds act either on `e` before fusion or on the projected seed.
-`embed_tokens.weight` is the tied embedding/classifier matrix, read raw by
-the classifier. Payloads are `payload_norm(h_top + routed)`: unit RMS times
-a learned gain initialized to one.
-
-`DeltaModel.forward_column` returns `ColumnOutput`: top residual, payload,
-source bank and labels, expert balance loss/counts, and optional route/expert
-weights. The sources obey `h_top = seed + sum(completed cell deltas)`.
-`want_weights=True` exposes MHDB source weights separately from sparse routed
-expert weights `[B,T,n]`; the always-active shared expert is outside that axis.
-`forward_iterations` runs every column of one position range and returns
-them in order; `multipass` returns `[pass][column]`.
-Outputs from `multipass` also expose `fused_input`: the shared projected tensor
-supplied to MTP and the following feedback pass; a following looped column's
-seed is the same jittered payload fused with the position's own embedding.
-`forward_mtp_fused`
-runs the independent auxiliary block directly on that tensor; `forward_mtp`
-accepts payloads and next-token IDs and computes their fusion with token
-embeddings first. The
-auxiliary block's last row has no second token and carries no training weight.
-
-## Tools
-
-| Script | Output |
+| API | Contract |
 |---|---|
-| `scripts/route_report.py` | Plain/fused source mass and entropy by site/group, source/null scale, query geometry |
-| `scripts/payload_swap.py` | Trained, top-only, uniform, and forced-source payload enrichment; optional single-group intervention |
-| `scripts/depth_trace.py` | Held-out loss, top-state updates, and route mass after every column, default `1..3` |
-| `scripts/downstream_eval.py` | Workspace zero-shot tasks in Standard, Soft, or Fused mode |
-| `scripts/training_curves.py` | Main/auxiliary training and validation CE, gradient norm, and throughput from current logs |
+| `load_checkpoint(path, device=None)` | Load a current snapshot into an evaluation-mode model; return `(model, saved_args)` with cumulative `step`. Prepare working readout copies and discard optimizer state. |
+| `autocast(device)` | Match trainer evaluation numerics: BF16 activations on CUDA, ordinary execution elsewhere. |
+| `logprob_chunks(model, h_top, chunk=256)` | Yield `(start, log_softmax)` over position chunks, avoiding a full `[B,T,V]` allocation. |
+| `token_ce(model, h_top, targets)` | Return main-head per-token CE `[B,T]`. |
+| `fused_inputs(model, e, payload, prefix=1)` | Build the next feedback pass's seeds from prior-pass payloads, shifting them right and restoring the blank-fused prefix. `e` is the output of `model.embed_tokens`. |
 
-Checkpoint scripts use `delta_feedback_experiment.analysis` to load current
-snapshots with trainer numerics, including CUDA BF16. Commands are in
-[operations.md](operations.md#inspect-a-checkpoint). JSON records and figures
-under `figures/` can be regenerated from snapshots or logs.
+Use model entry points to preserve the trained fusion and readout conventions:
 
-The trainer also records fixed-token payload self-composition and per-column
-depth summaries in `delta watch`. A small update indicates little state movement;
-loss and interventions are needed to determine why.
+| API | Result |
+|---|---|
+| `embed_tokens(tokens)`, `plain_seed(e)` | Token features and their blank-payload fusion, respectively; the embedding's `.weight` is the tied classifier parameter. |
+| `forward_column(x, want_weights=True)` | One `ColumnOutput` with top residual, payload, source bank, routing data, expert balance, and assignment counts. |
+| `forward_iterations(x, token_embedding, iterations=...)` | Every looped column for one position range, returned in order. |
+| `multipass(model, tokens, n_passes, ...)` | Outputs indexed `[pass][column]`; `tokens` has shape `[B,T+1]` and the trunk executes `T` positions. |
+| `forward_mtp_fused(fused_input)` | The auxiliary block on an already projected fusion tensor. `forward_mtp(payload, next_tokens)` computes that fusion first. |
 
-## Interpreting results
+`ColumnOutput.h_top` is the pre-final-norm residual; `payload` may be absent
+only when explicitly skipped. `sources` contains the seed and completed
+cell deltas, with labels in `source_names`. With `want_weights=True`,
+`route_weights[site]` has shape `[sources,B,T,groups]`, and
+`route_source_names[site]` labels that exact axis, including the learned null
+and any partial-cell source. The labels vary by site; align by name, not by
+column index. Sparse `expert_weights[site]` has shape `[B,T,routed_experts]`;
+the always-active shared expert is outside that axis.
 
-A route weight is a mixing coefficient. Account for source values and learned
-null magnitude before assigning importance. Top-only payload ablation removes
-routed enrichment while retaining `h_top`. Expert gate mass and selection
-frequency alone do not establish specialization.
+`multipass` attaches each column's `fused_input`, consumed by MTP and, for
+the last column of a pass, the following feedback pass. A bare
+`forward_column` leaves it unset. To patch a payload, distinguish its
+post-writer value from the projected fusion tensor: those interventions
+affect different interfaces. Replacing an incoming payload with
+`blank_payload` restores the plain seed at that position; top-only payload
+ablation instead removes routed enrichment and retains the normalized top
+residual. They test different hypotheses.
 
-Match tokens, rows, positions, pass/depth choices, precision, and cache history
-for replay. Keep expert-selection biases fixed. Use an identity patch to
-check execution, and matched donor/magnitude controls to distinguish a
-specific effect from generic damage. Donors must contain no future information
-relative to the patched position. Autoregressive comparisons allow text to
-diverge and measure that additional feedback as part of the outcome.
+## Diagnostics and tools
 
-MTP predicts a second token using the same concat-linear fusion of payload
-and raw ground-truth next-token embedding that feedback consumes.
-The payload receives its learned RMSNorm at the writer. Training jitter is
-sampled directly in payload units, with default range `[-0.02,0.02]`; fusion
-adds it without another scale factor.
-Training shares the fused tensor between
-both consumers; diagnostics and evaluation disable jitter. The auxiliary
-block retains its own PKDA memory, so its
-accuracy measures that auxiliary predictor. Sharing the fusion aligns the
-input interface but does not establish useful feedback. Compare ordinary
-next-token behavior and payload interventions to assess usefulness for
-generation; recoverability from the payload alone does not show how the main
-column uses it. The projection can supply token-derived features even when
-the payload contribution vanishes, so assess payload use through interventions.
+| Tool | Output and scope |
+|---|---|
+| [`route_report.py`](../scripts/route_report.py) | Plain/fused routing at the configured final column: source mass, per-token and mean-distribution entropy, cross-group divergence, source/null magnitudes, and query geometry. |
+| [`payload_swap.py`](../scripts/payload_swap.py) | Fused CE with trained, top-only, uniform, or forced-source payload enrichment. `--head` restricts forced-source cases to one routing group; top-only and uniform still replace all groups. Choose `--rows` divisible by `--micro-rows`, because the script averages microbatch means equally. |
+| [`depth_trace.py`](../scripts/depth_trace.py) | Held-out loss and top-state update at every column, default `1..3`, in plain and eligible fused modes. Route mass is sampled from the first microbatch in plain mode. |
+| [`downstream_eval.py`](../scripts/downstream_eval.py) | Workspace zero-shot tasks with Standard, Soft, or Fused teacher-forced continuation scoring. |
+| [`training_curves.py`](../scripts/training_curves.py) | Main/auxiliary CE, gradient norm, and throughput from logs; repeated steps retain their final record. |
+
+[Operations](operations.md#inspect-a-checkpoint) gives commands. Checkpoint
+tools use the loader and evaluation numerics above. JSON and figures under
+`figures/` are generated outputs and remain untracked.
+
+The payload sweep overrides the writer wherever it runs, including loop
+seeds under `fl`; its loss measures that combined intervention rather than
+one isolated feedback edge.
+
+Two model-level diagnostics also appear in trainer telemetry:
+
+- `iterate_fused` keeps tokens fixed, starts from a plain pass, and repeatedly
+  composes feedback with prefix length 1. It reports main-head CE and mean
+  tokenwise `||h_new-h_old||_2` after each composition, at the requested
+  fixed loop depth.
+- `depth_trace` reports main-head CE and the same top-state update norm at
+  each column; column 1 compares against the input seed. In fused mode its
+  first pass uses the requested column cap, then its second pass is read
+  after every column. Changing the cap also changes the donor payload, so
+  fused traces from different caps are not the same depth sweep.
+
+Downstream **Soft** scoring keeps each item's context plain and applies
+Jacobi feedback to the scored continuation. **Fused** scoring uses prefix
+length 1. `--passes k` means `k` feedback passes after the initial plain
+pass; it scores the last pass. These use fixed ground-truth tokens, so
+finite-pass Soft scores are not a full sequential feedback decode. Their
+causal results agree with sequential Soft on the first `k` continuation
+tokens after `k` feedback passes. Each pass uses the snapshot's configured
+loop count.
+
+Training curves need the objective's [recurrence weighting](design.md#objective).
+The plotted `ntp - pass1` remainder includes loop-only and joint terms under
+`fl`, even though the plot labels it feedback. Combined training CE has a
+different total weight across recurrence shapes; compare matching `(k,r)`
+or use per-head held-out CE. The plotted gradient norm is the full norm;
+training does not clip it.
+
+## Interpreting interventions
+
+A route weight is a mixing coefficient, not a causal importance score.
+Read it alongside source values and learned null magnitude. Entropy of the
+mean route distribution can hide sharp routing that changes across tokens;
+per-token entropy distinguishes that from diffuse routing at every token.
+Expert gate mass and selection frequency alone do not establish specialization.
+
+Label token position, feedback pass, and loop column in every comparison.
+Match tokens, rows, precision, and cache history; keep expert-selection
+biases fixed. Full passes restart mixer state, while sequential decode
+advances it on a separate track for each loop column. An identity patch
+checks the intervention path. Matched donor and magnitude controls help
+separate a specific effect from generic disruption; donors must contain
+no information from the patched position's future. Generated text may
+diverge after a patch, and that downstream divergence is part of the effect.
+
+A small update norm establishes little movement on the measured inputs;
+it does not establish useful computation, convergence on other inputs, or
+a contraction bound. Read loss and interventions alongside the update.
+Likewise, MTP accuracy measures an auxiliary predictor with its own PKDA
+memory and a ground-truth next-token input. Its shared fusion interface
+does not establish that the main column uses payload information. Compare
+ordinary next-token behavior with payload ablations, swaps, and controls;
+the fusion can carry token-derived features even when its payload
+contribution is absent.

@@ -1,36 +1,41 @@
 # Operations
 
+This guide covers setup, data preparation, run lifecycle, execution, and
+inspection. Model mechanisms are in [architecture](architecture.md), the
+training recipe in [design](design.md), and capacity/runtime planning in
+[scaling](scaling.md).
+
 Before using Jobe, inspect `delta status`, the active log, and `nvidia-smi`.
 Keep GPU jobs serial and preserve active training and data builds.
 
 ## Install and check
 
-Use the shared Python 3.13 environment. Install the workspace before Delta:
+Use the shared Python 3.13 environment and the machine's constraints:
 
 ```bash
 cd /path/to/transformer-experiments
-uv pip install -e .
+uv pip install -e . -e delta-feedback-experiment
+uv pip check
 cd delta-feedback-experiment
-uv pip install -e .
+python -m pytest
 ```
 
-CUDA uses the workspace's editable FLA and CCE forks; tokenization needs the
-`data-build` extra. Machine constraints own Jobe's PyTorch/CUDA versions.
+For CUDA and tokenization, install the declared extras and editable workspace
+forks; the parent repository's submodule pointers select FLA and CCE:
 
 ```bash
 git -C .. submodule update --init vendor/flash-linear-attention vendor/ml-cross-entropy
-uv pip install -e '.[cuda,data-build]'
+uv pip install -e '../vendor/flash-linear-attention[cuda]' \
+  -e ../vendor/ml-cross-entropy -e '.[cuda,data-build]'
 uv pip check
-python -m pytest
 delta probe
 ```
 
-The default tests cover small portable model, training, and lifecycle cases.
-`delta probe` requires CUDA and runs small one-pass and two-pass training
-graphs plus evaluation and decode, exercising kernels, shared fusion, and
-graph replay. First-use kernel JIT adds startup
-time. Neither command measures production throughput or memory fit. The
-queue starts training directly without running tests or a probe.
+The default tests cover portable numerical, state, and lifecycle contracts.
+`delta probe` exercises small CUDA train/eval/decode graphs, recomputation,
+shared fusion, and replay; `--ranks N` adds the step's collectives on N devices.
+Neither is a production memory or throughput measurement. The queue starts
+training directly. Kernel compilation and graph capture add startup time.
 
 ## Tokenize
 
@@ -41,116 +46,290 @@ delta tokenize --source dclm-100b --data-root /data/delta \
 delta verify /data/delta/dclm-100b
 ```
 
-`--data-root ROOT` writes `ROOT/SOURCE`; `--out` overrides the path.
+`--data-root ROOT` writes `ROOT/SOURCE`; `--out` overrides that path.
+`--scale` and `--tokens-per-param` derive a schedule-sized target, while
+`--target` sets stored tokens directly. Interrupted builds resume;
 `--continue` extends a finished store with matching build settings.
 `--shuffle` / `--no-shuffle` override source ordering. Use full `dclm` for
-stores beyond the 100B subset.
+stores beyond the 100B subset. See [data](design.md#data) for source identity,
+row layout, and validation semantics.
 
-`scripts/publish_store.sh --disk DISK` builds the whole dclm-100b stream on a
-box with fast cores and a fast uplink (100e9 stored tokens, about 400 GB, a
-few hours on the rental's Grace CPUs), verifies it, checks every full shard
-and the held-out slice against a reference manifest, writes the dataset
-card, and uploads it as the public dataset `a9lim/dclm-100b-neox`. Any box
-then pulls a prefix with `hf download` instead of copying from Jobe. Source identity, row layout, and temporary
-storage requirements are in [design.md](design.md#data).
+Allow roughly twice the final store size while tokenized parts and the
+assembled output coexist, plus source downloads and sidecars. `--scratch`
+relocates downloaded parquet files, not tokenized parts. `--workers` controls
+concurrent files; `RAYON_NUM_THREADS` controls tokenizer threads per worker;
+`--readers` controls document reads during shuffled assembly. Published-order
+builds do not need shuffled reads. Scratch downloads are removed on success.
+
+`scripts/publish_store.sh --disk DISK` builds 100B stored tokens by default,
+verifies the store, writes checksums and a dataset card, and publishes
+`a9lim/dclm-100b-neox`. Use `--reference MANIFEST` to compare held-out files
+and complete prefix shards with an existing build; without a reference,
+cross-build prefix identity is unchecked. `--skip-upload` keeps the result
+local. Other machines can download a training-shard prefix together with the
+metadata, validation files, and document sidecars.
 
 ## Runs
 
 ```bash
-delta train example-f-s1 --condition f --seed 1 --data-seed 0 \
-  --data-root /data/delta --source dclm-100b
-delta queue example-fl-s1 --condition fl --seed 1 --data-seed 0 \
+delta train example-fl-s1 --condition fl --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
 delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 \
   --data-root /data/delta --source dclm-100b
-delta train example-f-s1 --resume
-delta queue example-f-s1-50x --continue example-f-s1 --tokens-per-param 50
+delta train example-fl-s1 --resume
+delta queue example-fl-s1-50x --continue example-fl-s1 --tokens-per-param 50
 
 delta status
 delta watch
-delta stop TAG --at STEP
-delta stop live
-delta stop queue
-delta stop all
-delta clear TAG
-delta move old-tag new-tag
+delta stop live --at 10k
 ```
 
-`--ranks N` runs `N` processes, one per CUDA device, through `torchrun`:
-`delta train` replaces itself with the launcher, so the spool keeps the
-process it started. Each rank takes `batch-rows/ranks` rows of every step,
-which must divide evenly. The rank count is per invocation, never inherited
-by a resume, and a snapshot written by any rank count resumes under any
-other. `stop live` preserves pending jobs; `stop queue` preserves the active
-job. Stopping sends SIGINT, which the launcher forwards to every rank; the
-ranks finish the step they are on, agree to stop, snapshot it, and exit. A
-second SIGINT aborts without a snapshot. `stop TAG --at STEP` signals once,
-on the record of the step before `STEP`, so the ranks read the request
-inside `STEP` and snapshot it. The launcher gives its ranks 110 seconds to
-snapshot before it kills them, inside the spool's 120-second grace, and a
-kill by the spool reaches the ranks' own sessions. `delta probe --ranks N`
-runs the CUDA smoke on `N` devices with the collectives a step makes. `--max-steps` caps one
-invocation without shortening the schedule. `clear` moves an idle run's artifacts into timestamped recovery. `move` renames idle snapshots, logs, and standard analysis paths;
-both tags must have no active or queued references and the destination must
-be free. Use `--out-dir` for snapshots outside `runs/`; custom outputs are
-not renamed. Existing figures retain their labels until regenerated.
+The queue stores arguments and refreshes the worker from the checkout before
+each job; edits do not stop an active child. `delta queue FILE` reads one
+`TAG FLAGS` job per line. `--max-steps` limits additional steps in one
+invocation without shortening the schedule. `delta train --help` lists the
+recipe and runtime controls.
 
-Resume and continuation accept only [v42 snapshots](design.md#checkpoints-and-queue).
-The queue stores arguments and refreshes the checkout before each job.
-Use `delta train --help` for recipe and runtime overrides.
+| Command | Effect |
+|---|---|
+| `stop TAG` | Remove that pending job or interrupt its active child; later jobs remain |
+| `stop live` | Interrupt the active job and preserve pending jobs |
+| `stop queue` | Remove pending jobs and preserve the active job |
+| `stop all` | Remove pending jobs and interrupt the active job |
+| `stop TAG\|live --at STEP` | Arm a cooperative stop after an absolute optimizer step |
+| `clear TAG\|all` | Move idle snapshots and logs into timestamped `tmp/cleared` recovery |
+| `move OLD NEW` | Rename idle snapshots, logs, and standard analysis paths |
+
+A cooperative stop sends SIGINT; all ranks finish a step, agree to stop,
+snapshot, and exit. A second SIGINT aborts immediately. An armed stop signals
+after the preceding step's record so the request is read inside the target
+step. Multi-rank jobs receive 110 seconds to exit within the spool's
+120-second grace period. `watch` exits when the queue is idle; Ctrl-C stops
+watching without stopping training.
+
+`move` requires both tags to have no active or queued references and the
+destination to be free. Supply `--out-dir DIR` for a custom snapshot root.
+Arbitrary custom analysis outputs are not renamed, and existing figures keep
+their labels until regenerated.
+
+## Checkpoints
+
+Only **v42** snapshots with the current tokenizer identity are accepted.
+Each contains model FP32 masters, both optimizers, arguments, step, RNG state,
+expert-selection biases, and NorMuonH radius/spectral state. Rank zero
+assembles one whole snapshot; transient counts and working copies are rebuilt
+on load. Any supported rank count can resume it.
+
+`--resume` loads the latest snapshot for the tag and inherits state-defining
+settings; explicit conflicts are rejected. Paths, device, evaluation/snapshot
+cadence, evaluation rows, replay minimum, memory margin, and precision are
+inherited unless overridden. `--ranks` always describes the new invocation
+and defaults to one. Changing precision changes subsequent training numerics.
+
+Snapshots are written under `runs/TAG.pt.STEP` unless `--out-dir` is supplied.
+The trainer retains the latest two plus the recurrence boundary, cooldown
+boundary, and final step. Writes stage immutable state before background
+atomic serialization; cooperative exits wait for the writer.
+
+`--continue SOURCE` starts a longer schedule under a new tag, keeping all
+other state-defining settings. It restores the latest source snapshot before
+the schedules diverge in recurrence or cooldown, rather than appending after
+the source's final step. Short source schedules can have a different warmup;
+the `fork` record's `exact` field reports whether warmup lengths match.
+
+## CUDA execution
+
+`--precision fp8` is the default CUDA GEMM recipe; `bf16` disables FP8
+operands. The precision boundaries are:
+
+| State or operation | CUDA precision |
+|---|---|
+| Model masters, accumulated gradients, NAdam state | FP32 |
+| Working weights, activations, classifier, evaluation | BF16; RMSNorm computes in FP32 and casts back |
+| Projection/expert forward and input-gradient GEMMs | Rowwise FP8 under `fp8`; BF16 under `bf16` |
+| Weight-gradient GEMMs | BF16 operands, FP32 accumulation |
+| PKDA recurrent boundaries | FP32 |
+| NorMuonH momentum storage and Newton–Schulz iterations | BF16 |
+| Momentum EMA, Nesterov direction, row moments, radii, spectral/tangent update and retraction | FP32 |
+
+CCE accumulates the classifier gradient directly into the tied embedding's
+FP32 sink. Causal GQA prefers cuDNN with Flash fallback; cached prefixes use
+FlexAttention. CPU/MPS use FP32 eager attention, literal PKDA, chunked
+tied-head loss, and FP32 optimizer arithmetic.
+
+### Data parallelism
+
+`--ranks N` launches one process per device through `torchrun`; one rank uses
+the same training path. `batch-rows` must be divisible by `ranks × micro-rows`.
+Working weights and gradient slabs are replicated. Expert banks are padded
+and split along the expert axis; dense NorMuonH sites have one owner each;
+NAdam state is replicated. A step reduces FP32 gradients to owners, updates
+owned matrices, gathers working weights, and refreshes local FP8 copies.
+Expert counts are summed globally before selection-bias updates. CUDA uses
+NCCL, other devices gloo.
+
+### Replay planning and memory
+
+Training compiles blocks and captures fixed-address graphs for reachable
+pass/column shapes. After allocating optimizer state and communication
+buffers, calibration measures retained activation bytes per block and the
+bytes released by recomputation. The planner reserves persistent graph inputs
+and `--checkpoint-margin-gib` (default **2 GiB**) from available device memory,
+using the smallest rank budget for every rank.
+
+For each shape it tries divisors of the rank's rows from widest to narrowest,
+never below `--micro-rows`. At each width it first retains recurrence
+intermediates, then tries rebuilding them. If the smallest replay still does
+not fit, it recomputes leading PKDA and auxiliary block invocations during
+backward; global-attention blocks stay retained. Replay width does not change
+the keyed per-row draws. `--micro-rows` also sets evaluation microbatch size.
+
+| Record | What to inspect |
+|---|---|
+| `memory_plan` | Rank-local static and cached memory, persistent inputs, activation budget, full/lean bytes per block, bytes released per recomputed block |
+| `plan` | Shape `k:r`, replay rows, `saved=full\|lean`, recomputed/eligible blocks, retained-activation estimate |
+| `capture` | Graph whose capture is starting |
+| `execution` | Rank count/rows, graph counts, plan measurements, peak allocation through startup, post-capture reserved/free memory |
+| Step `mem` | Peak allocated CUDA memory since startup capture ended |
+
+The margin covers backward workspaces, recomputation, allocator rounding,
+CUDA context growth, and graph instantiation beyond retained-forward
+estimates. Raise it after a warm-up/capture OOM and inspect the resulting
+plan. Optimizer updates and periodic diagnostics reuse the graphs' private
+memory pool; collectives and evaluation replays stay outside that allocation
+scope. Expandable allocator segments are required: the package sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` unless already configured.
+Keep cyclic Python garbage collection outside train/eval capture.
+
+Compiler caches persist at `~/.cache/delta-feedback/torchinductor`;
+`DELTA_INDUCTOR_CACHE_DIR` relocates them. Keep caches consistent with the
+installed runtime and forks. Resume still reconstructs graphs and may compile
+new kernels. Inspect process activity, cache writes, and subsequent
+capture/step records before treating a quiet startup as stalled.
 
 ## Telemetry
 
 | Field | Meaning |
 |---|---|
 | `loss` | Full optimized objective |
-| `ntp`, `mtp` | Combined main / auxiliary CE before weights and z-loss |
-| `pass1` | Main CE of the first column; `ntp - pass1` is the mean over the other columns on rolled steps |
-| `k`, `r` | The step's passes and columns per pass; `r` appears under `l` |
-| `val`, `val_fused` | Main plain / fused validation CE at the evaluation column count |
-| `val_one` | Main plain validation CE after the first column, under `l` |
-| `val_mtp`, `val_mtp_fused` | Auxiliary plain / fused validation CE |
-| `expert_balance` | Unweighted mean sequence balance loss |
+| `ntp`, `mtp` | Main / auxiliary CE combined with the [objective's recurrence weighting](design.md#objective), before prediction weights and z-loss |
+| `pass1` | Main CE of the plain first column: pass 1, column 1 |
+| `k`, `r` | Passes and columns per pass; `r` appears for looped conditions |
+| `val*` | Validation metrics defined by the [evaluation recipe](design.md#evaluation) |
+| `gnorm` | Unclipped global L2 gradient norm |
+| `expert_balance` | Unweighted mean sequence-balance loss |
 | `expert_max_violation` | Worst bank's whole-update `max(load)/mean(load)-1` |
-| `expert_bias_max` | Maximum absolute post-update selection bias |
+| `expert_bias_max` | Largest absolute post-update selection bias |
+| `tok_s`, `pass_tok_s`, `cell_tok_s` | Predicted-token, pass-token, and cell-token rates; their counts exclude MTP |
 
-`delta watch` streams run milestones. The browser monitor groups raw learning
-curves, layer anatomy, optimization, and recurrence. The overview holds progress,
-pace, cumulative token counts, and the host's current GPU reading; configuration
-and non-step logs expand on demand. Token totals require the complete addressed
-step history, including inherited fork steps, and exclude the MTP branch.
+The [Jobe monitor](https://runs.a9l.im/delta-feedback/) and
+[rental monitor](https://rentalruns.a9l.im/delta-feedback/) use separate
+Cloudflare Access tunnels. Rental provisioning is owned by
+`~/Work/meta/bootstrap/rental.sh --only monitor` and its `bootstrap/MANUAL.md`.
+The overview shows progress, pace, token totals, and the host's GPU reading;
+configuration and non-step logs expand on demand. Exact token totals require
+complete addressed step history, including inherited fork steps.
 
-The hosted monitors are [Jobe](https://runs.a9l.im/delta-feedback/) and the
-[rental](https://rentalruns.a9l.im/delta-feedback/), each behind Cloudflare Access
-and its own tunnel. On rentals, `~/Work/meta/bootstrap/rental.sh --only monitor`
-installs the persistent monitor and connects the tunnel when its credential is
-present; the full rental bootstrap includes this step. Provisioning details are
-in the meta workspace's `bootstrap/MANUAL.md`.
+The **Eval step** slider synchronizes layer profiles and expert heatmaps;
+arrows select recorded evaluations, and **Follow latest** resumes tracking.
+A selection stays pinned through refresh. Switching runs selects the latest
+evaluation; a resume that removes the selection clamps it to a surviving
+earlier evaluation. Overlays use the exact selected step, leaving missing
+data blank. Heatmaps show the selected run with stable color ranges; hover
+or keyboard focus exposes assignment share, coverage, entropy, and bias.
 
-The **Eval step** slider moves all layer profiles and expert heatmaps together.
-Arrow buttons and keyboard arrows select recorded evals. A selection stays pinned
-while the log refreshes; **Follow latest** resumes tracking new evals. Switching
-runs resets to the latest eval. A resume that removes a selected eval clamps the
-selection to the nearest surviving earlier eval (or the first remaining eval).
-Routing overlays use the exact selected step; absent sites or evals remain blank.
-The heatmaps show the selected run. Assignment colors use multiples of uniform
-load; bias colors and null-RMS axes keep a fixed range across recorded evals.
+Routing profiles show null/seed/previous-cell mass, maximum weight against
+`1/n`, head divergence, and learned-null RMS. They sample up to two validation
+rows from the final column of the fused pass when feedback is enabled. Expert
+profiles use the first column of pass 1 and the teacher-forced MTP block.
+Both disable jitter. These are sample diagnostics, not whole-corpus loads.
+The recurrence view shows per-column depth readouts; training feedback gain
+appears only on single-column steps, where the combined CE isolates it.
 
-Routing profiles expose null, seed and previous-cell mass, maximum weight with
-its `1/n` reference, head divergence, and learned-null RMS. Expert assignment
-heatmaps show each executed site's share per expert; hovering or focusing a cell
-also reports expert coverage and gate entropy. Bias heatmaps show each bank's
-signed selection biases. Both diagnostics use up to two validation rows:
-routing uses the fused pass at its last column with feedback, while expert
-loads use pass-1 and the teacher-forced MTP block. Both diagnostics disable
-payload jitter. These are sample diagnostics. The looped-column section
-plots the per-column depth readout, and the training feedback gain is shown
-only on single-column steps, since looped steps fold the loop blocks into
-the combined CE.
+For monitor changes, run `node --test tests/monitor.test.cjs` from this
+checkout and check slider, overlays, refresh, heatmaps, and responsive layout
+in the browser.
 
-Portable monitor data/lifecycle checks run with `node --test tests/monitor.test.cjs`
-from this checkout in the parent workspace. Browser checks cover slider input,
-overlays, refresh, heatmap inspection, and responsive layout.
+## Hopper and node workflow
+
+On a provisioned Hopper host, inventory CUDA-visible HBM, runtime/fork
+versions, and device topology; product names can include memory outside GPU
+HBM. Kernel choices are automatic:
+
+| Kernel | Hopper choice |
+|---|---|
+| Routed expert weight gradients | `(BM, BN, BK, warps, stages) = (64, 128, 128, 4, 3)` |
+| BF16 classifier | `(B, V, D, warps, stages) = (256, 128, 64, 8, 3)` |
+| PKDA ATK inter-chunk scan at head width 128 | `BK=128`, four warps |
+
+For a single GPU, run the lifecycle script with a fresh tag:
+
+```bash
+scripts/first_hour.sh --data-root /data/delta --tag first-hour \
+  --scale screen --condition fl --precision fp8 --steps 12
+```
+
+It inventories the host, runs the CUDA probe, trains with recurrence from
+step zero and frequent evaluation/snapshots, resumes, requests a cooperative
+stop, and reads the final checkpoint before writing success. Results go to
+`logs/first-hour/TAG/`, including per-shape timing summaries; snapshots use
+`runs/`. This checks lifecycle behavior on the selected geometry.
+
+For a multi-GPU node:
+
+1. Confirm distinct devices, usable memory, and NVSwitch/peer topology; run
+   `delta probe --ranks N`.
+2. Measure reductions and gathers on production slabs; check gradient sums,
+   gathered weights, and expert-bias agreement across ranks.
+3. Capture the deepest screen and target-scale graphs; inspect every rank's
+   plan, peak allocation, and reserved/free memory.
+4. Exercise evaluation, snapshots, cooperative stop, and resume across the
+   intended rank counts.
+5. Measure complete warm steps across schedule shapes, including startup and
+   monitoring when estimating total run time. See [scaling](scaling.md).
+
+Shared caches reduce compilation work but do not eliminate per-process graph
+reconstruction. Choose further sharding or communication overlap from node
+measurements. Generated data, logs, traces, snapshots, and figures stay
+untracked.
+
+## Benchmarks
+
+`python scripts/replay_bench.py --data-root /data/delta` times the production
+trainer's captured graphs. `--replay-rows N` fixes actual width;
+`--condition f --specs 1:1` isolates a single-column trial. `--trace` groups
+kernel time, while `--train-steps N` adds full-batch optimizer updates for
+one selected graph. The latter does not exercise evaluation or checkpoints.
+Use `--attention-backend`, `--expert-tiles`, `--cce-config`, and `--fp8-head`
+for process-local comparisons.
+
+| Script | Measurement |
+|---|---|
+| `attention_bench.py` | Attention backend, outputs/gradients, graph capture |
+| `pkda_bench.py` | PKDA head counts, recurrence saving modes, input gradients |
+| `moe_bench.py` | Balanced/skewed routing and expert GEMM tiles |
+| `cce_bench.py` | Classifier configurations; use twice the replay rows for paired NTP/MTP |
+| `dense_fp8_bench.py` | Dense FP8 scaling, quantization, weight refresh |
+
+All are under `scripts/`; use `--help` for dimensions and output controls.
+Component timing and numerical agreement bound execution choices; assess
+learning behavior with the training/evaluation recipe.
+
+## Inspect a checkpoint
+
+```bash
+python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
+python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
+python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
+python scripts/downstream_eval.py runs/TAG.pt.STEP --mode standard
+python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused
+python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
+```
+
+Checkpoint tools use `delta_feedback_experiment.analysis` and trainer
+evaluation numerics. Figures are regenerable; plotting uses Matplotlib from
+the shared analysis environment. The [analysis guide](interpretability.md)
+defines each tool's measurement.
 
 ## Conversation formatting
 
@@ -169,92 +348,6 @@ token_ids = tokenizer.apply_chat_template(
 )
 ```
 
-Roles remain as supplied, including repeated names. The default next role is
-`self`. `<|im_end|>` ends a message; `<|endoftext|>` ends a pretraining document.
-Web pretraining does not apply ChatML.
-
-## Inspect a checkpoint
-
-```bash
-python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
-python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
-python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
-python scripts/downstream_eval.py runs/TAG.pt.STEP --mode standard
-python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused
-python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
-```
-
-Checkpoint tools use `delta_feedback_experiment.analysis` and the trainer's
-numerics. Outputs under `figures/` are regenerable. Plotting uses Matplotlib
-from the shared analysis environment. The [analysis guide](interpretability.md)
-defines each retained tool's measurement.
-
-## CUDA execution
-
-CUDA uses BF16 activations with FP32 masters, accumulated gradients,
-optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native
-fused SDPA handles full-row attention and FlexAttention handles cached
-prefixes. CCE reads the classifier working copy and accumulates its gradient
-straight into the tied embedding's FP32 sink on every call. A column makes
-one head call, covering both prediction depths. The projection and expert
-GEMMs run on FP8 tensor cores under the default `--precision fp8` recipe
-([architecture](architecture.md#precision-and-initialization)): each site
-carries an FP8 copy of its working copy, both layouts with per-row scales,
-about one byte per element beyond the BF16 copy; `--precision bf16` keeps
-every GEMM in BF16. The recipe is a runtime setting: a resume keeps the
-checkpoint's unless retyped, and it is recorded in the `run` record.
-
-Every parameter is a view of its site's two slabs, a working copy the
-kernels read and an FP32 gradient sink ([architecture](architecture.md#precision-and-initialization)).
-With several ranks, an expert bank is chunked along its expert axis so each
-rank owns a contiguous run of experts, every other NorMuonH site is owned
-whole by one rank, and the NAdam parameters are replicated. A step reduces
-the sinks onto their owners in place (reduce-scatter for banks, reduce for
-dense sites, all-reduce for the replicated arena), each rank steps the
-matrices it owns against their FP32 masters, and the updated working copies
-gather back. Per rank a NorMuonH matrix costs two bytes per element for the
-working copy, two for its FP8 copies under the FP8 recipe, and four for its
-gradient on every rank, plus four for the master and two for the momentum
-on its owner; the static footprint the `execution` record reports is
-therefore this rank's. The communicator's
-buffers are allocated before that footprint is measured, and the activation
-budget is the smallest across ranks, so every rank replays the same plan.
-
-Training compiles blocks and captures fixed-address graphs for reachable
-pass/column shapes. Inductor caches persist at
-`~/.cache/delta-feedback/torchinductor`; `DELTA_INDUCTOR_CACHE_DIR` relocates
-them. Before capture the trainer measures, from eager one-pass, one-column
-forwards, the activation bytes one block invocation retains and the bytes
-one recomputed block releases, and plans each graph against the device memory still free
-once the static footprint exists minus `--checkpoint-margin-gib` (default
-2): the largest divisor of the rank's rows that fits raw, at least
-`--micro-rows`, otherwise the smallest replay with as many leading PKDA and
-auxiliary block invocations recomputing in backward as the shortfall needs.
-The `execution` record reports the rank count and rows per rank, the static
-footprint, the budget, the bytes per block, the bytes per recomputed block,
-the peak bytes allocated through calibration, warm-up, and capture, and the
-bytes reserved and free once capture ends; the peak minus the static
-footprint and the deepest graph's retained activations is the transient the
-margin covered. These measurements also appear in `memory_plan` before
-warm-up, with `cached_gib`, the memory the allocator still holds beyond the
-static footprint when the budget is read, `inputs_gib`, the graphs'
-persistent inputs set aside before the activation budget (planned to a fixed
-point, since the inputs follow the replay widths), and the bytes per
-block with the recurrences keeping (`block_full_mib`) or rebuilding
-(`block_mib`) their intermediates; each `plan` record precedes its graph's
-warm-up and reports its rows, whether its recurrences keep (`saved=full`) or
-rebuild (`saved=lean`) their intermediates, and its recomputed block count,
-and `capture` identifies each graph before capture starts. The margin covers backward workspaces, checkpoint
-recomputation, allocator rounding, and graph instantiation that the
-retained-forward measurements do not include, and the CUDA context grows as
-kernels compile after the budget is measured. On the 24 GiB card a 1 GiB
-margin ran out of memory in the eager warm-up backward of the deepest screen
-fl graph and 3.5 GiB ran; raise the margin if warm-up or capture runs out of
-memory. The optimizer step and the periodic monitors run inside the graphs'
-memory pool on the capture stream, which requires the allocator's expandable
-segments: the package sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
-on import, and the trainer refuses to run without them. The collectives and
-the evaluation replays stay outside the pool. Keep cyclic Python garbage
-collection outside train/eval capture.
-CPU/MPS use eager attention, literal PKDA, and chunked tied-head loss with
-the same sites and, under gloo, the same collectives.
+Role names and repeated speakers are preserved; the default next role is
+`self`. `<|im_end|>` ends a message and `<|endoftext|>` ends a pretraining
+document. Web pretraining does not apply this chat template.

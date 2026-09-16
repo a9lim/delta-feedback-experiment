@@ -969,12 +969,10 @@ class DeltaModel(nn.Module):
         self.register_buffer("_classifier_shadow", None, persistent=False)
         self._classifier_fp8: Fp8Weights | None = None
         self.fp8_classifier = False
-        """Runtime switch: whether the CUDA head trains on an FP8 copy of the
-        classifier readout through the fork's FP8 kernels. Off in the recipe:
-        the head's backward is bound by the lock-added partial-gradient
-        traffic that FP8 does not reduce, and on sm_89 the 8-bit fragments
-        force tiles that double it ([hopper](../docs/hopper.md)). The switch
-        is the Hopper measurement's hook."""
+        """Benchmark switch for training with an FP8 classifier copy.
+        The training recipe keeps the head BF16; comparison commands are in
+        docs/operations.md#benchmarks. This switch changes no checkpoint state.
+        """
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)

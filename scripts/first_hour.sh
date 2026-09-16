@@ -3,7 +3,7 @@
 # GPU-minute: inventory, the CUDA probe, a short run that captures every
 # graph, a resume, a cooperative stop, then a summary (memory plan, peak,
 # seconds per step by graph) next to the logs. Nothing here is a benchmark;
-# the lever measurements in docs/hopper.md come after this passes.
+# the benchmarks in docs/operations.md follow this lifecycle check.
 #
 #   scripts/first_hour.sh --data-root /data/delta [--tag first-hour] [--steps 12]
 #       [--source dclm-100b] [--scale screen] [--condition fl] [--precision fp8]
