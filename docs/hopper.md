@@ -93,7 +93,7 @@ Reductions of mean node step time; the ranges overlap and do not add.
 
 | # | Lever | Screen | Flagship | Needs Hopper to build? |
 |---|---|---:|---:|---|
-| 1 | FP8 GEMM class (landed: dense sites, experts, head; measured on the 4090 below) | 4–13% (+4–8% CCE) | 8–28% (+3–6%) | No; to measure, yes |
+| 1 | FP8 GEMM class (landed: dense sites and experts; the head measured as a loss on the 4090, below) | 4–13% | 8–28% | No; to measure, yes |
 | 2 | FLA retune of the preconditioned-KDA chain | 4–10% | 3–8% | Yes |
 | 3 | Expert grouped-GEMM retile | 2–5% | 3–7% | Yes |
 | 4 | CCE fixed-configuration retune | 3–6% | 2–5% | Yes |
@@ -106,10 +106,12 @@ Reductions of mean node step time; the ranges overlap and do not add.
 1. **FP8 for the GEMM class** (landed, `--precision fp8`, the default;
    [architecture](architecture.md#precision-and-initialization)). Forward
    and dX GEMMs of the dense sites through `torch._scaled_mm` with rowwise
-   scales, the experts' two forward and two activation-gradient GEMMs in
-   Triton `fp8e4nv`, and every GEMM of the CCE head in the fork. dW stays a
-   BF16 → FP32 accumulation (the `rowwise_with_gw_hp` shape): the FP32
-   gradient contract is untouched and no dY^T transposes are materialized.
+   scales and the experts' two forward and two activation-gradient GEMMs in
+   Triton `fp8e4nv`; the CCE fork can run the head on FP8 too
+   (`CCEParams.fp8_classifier`, reached through `DeltaModel.fp8_classifier`)
+   but the recipe leaves it in BF16, below. dW stays a BF16 → FP32
+   accumulation (the `rowwise_with_gw_hp` shape): the FP32 gradient
+   contract is untouched and no dY^T transposes are materialized.
    Every rank rewrites each site's FP8 copies (the matrix and its
    transpose, a scale per row of each) from the BF16 working copy after
    the gather, so nothing FP8 is communicated and the working copy the
@@ -128,19 +130,23 @@ Reductions of mean node step time; the ranges overlap and do not add.
    screen geometry (8,192 tokens, top-3): forward 0.75 → 0.51 ms (1.46×),
    backward without the weight gradients 0.79 → 0.66 ms (1.20×); the two
    BF16 dW GEMMs are now the larger half of the expert backward. Per-GEMM
-   relative error 3.7e-2, expert output 6.5e-2. The head at 8,192 rows:
-   forward 4.08 → 4.13 ms, backward 7.45 → 6.48 ms (1.09× together);
-   its 8-bit MMA fragments and the in-register quantization of the
-   probability tile are register-bound on sm_89, so the FP8 halves carry
-   their own tile shapes (256 × 64 × 64 with eight warps and 64 × 64 × 32
-   with four), sharing only the vocabulary tile, and every other shape
-   tried spilled to 2–30× the BF16 time; the loss and log-partition move by
-   2e-3 relative, the gradients by 2.7e-2. A paired eight-step screen run
-   (`f`, one row per replay, BF16 head) tracked the BF16 recipe's loss to
-   four digits at 25.4 against 26.9 s per k = 2 step (5.6%) and 38.8
-   against 40.4 at k = 3. FP8 changes training numerics: runs paired
-   against the BF16 recipe cannot mix it in, and Hopper's own choices
-   (blockwise scaling is sm_90-only; the head's tiles under wgmma) are
+   relative error 3.7e-2, expert output 6.5e-2. A paired eight-step screen
+   run (`f`, one row per replay) tracked the BF16 recipe's loss to four
+   digits at 25.4 against 26.9 s per k = 2 step (5.6%) and 38.8 against
+   40.4 at k = 3. The head is the exception: its FP8 kernels are right
+   (loss and log-partition within 2e-3 relative, gradients 2.7e-2) but its
+   backward is bound by the lock-added partial gradients, dE per vocabulary
+   tile and dC per token tile, whose bytes FP8 does not touch, and on sm_89
+   the 8-bit MMA fragments and the in-register quantization of the
+   probability tile spill at the 128 × 128 tile: the shapes that fit
+   (256 × 64 × 64 forward, 64 × 64 × 32 backward) double that traffic. In
+   the model's own head at 8,192 rows the backward took 77.6 ms against
+   23.4 in BF16, and the eight-step run 39.3 s per k = 2 step against 25.4,
+   so the recipe keeps the head in BF16; `DeltaModel.fp8_classifier` is the
+   one-line hook for trying it on Hopper, where wgmma keeps the operands in
+   shared memory and 128-wide tiles may hold. FP8 changes training
+   numerics: runs paired against the BF16 recipe cannot mix it in, and
+   Hopper's own choices (blockwise scaling is sm_90-only; the head) are
    first-hour measurements against this rowwise recipe.
 2. **FLA retune.** The fork already carries Hopper tables (`IS_NVIDIA_HOPPER`
    warp lists and the 128-wide `CONST_TILING` in `precond_kda/chunk_bwd.py`)
@@ -221,7 +227,7 @@ for the first node hour.
 
 | Work | Where it can be verified now |
 |---|---|
-| FP8 dense sites, expert GEMMs, head (landed) | Jobe: numerics (paired steps), 4090 throughput as an Ada signal |
+| FP8 dense sites and expert GEMMs (landed); FP8 head (built, off) | Jobe: numerics (paired steps), 4090 throughput as an Ada signal |
 | Attention backend selection by architecture | Jobe: correctness with cuDNN forced; speed only on the node |
 | Per-graph saved set in the planner (landed) | Jobe: memory and time, fully |
 | Communication grouping and gather overlap | Mac/Jobe: gloo two-rank tests; bandwidth only on the node |

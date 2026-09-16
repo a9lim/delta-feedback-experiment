@@ -461,10 +461,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("fp8", "bf16"),
         default="fp8",
         help="CUDA training GEMM recipe: fp8 runs the projections' forward and "
-        "activation-gradient GEMMs, the routed expert GEMMs, and the head on "
-        "FP8 tensor cores with per-row scales; bf16 keeps every GEMM in BF16. "
-        "Weight gradients, masters, and evaluation are the same under both "
-        "(default: fp8; other devices ignore it)",
+        "activation-gradient GEMMs and the routed experts' forward and "
+        "activation-gradient GEMMs on FP8 tensor cores with per-row scales; "
+        "bf16 keeps every GEMM in BF16. Weight gradients, the head, masters, "
+        "and evaluation are the same under both (default: fp8; other devices "
+        "ignore it)",
     )
     runtime.add_argument(
         "--checkpoint-margin-gib",
@@ -903,9 +904,6 @@ class Trainer:
         self.rank_rows = args.batch_rows // topology.world
         if not sites.allocated:
             sites.allocate()
-        # The head follows the sites' recipe: an FP8 copy of the classifier
-        # readout beside its BF16 shadow, refreshed with it.
-        self.model.fp8_classifier = sites.fp8 and self.device.type == "cuda"
         self.model.refresh_shadows()
         sites.requantize()
         self.gradients = sites.gradients()

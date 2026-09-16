@@ -969,8 +969,12 @@ class DeltaModel(nn.Module):
         self.register_buffer("_classifier_shadow", None, persistent=False)
         self._classifier_fp8: Fp8Weights | None = None
         self.fp8_classifier = False
-        """Runtime switch: whether the CUDA head trains on the FP8 copy of the
-        classifier readout; the trainer sets it from the recipe."""
+        """Runtime switch: whether the CUDA head trains on an FP8 copy of the
+        classifier readout through the fork's FP8 kernels. Off in the recipe:
+        the head's backward is bound by the lock-added partial-gradient
+        traffic that FP8 does not reduce, and on sm_89 the 8-bit fragments
+        force tiles that double it ([hopper](../docs/hopper.md)). The switch
+        is the Hopper measurement's hook."""
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -1373,12 +1377,12 @@ class DeltaModel(nn.Module):
         the shadow over plainly and names the sink: CCE's backward accumulates
         the classifier gradient straight into it in FP32, whatever the number
         of rows in the call, and the classifier receives no autograd gradient;
-        under the FP8 recipe that training call also gets the classifier in
-        FP8, both layouts with per-row scales, and runs every GEMM of the head
-        on it. Without a sink the shadow is read through the shared operand,
-        whose backward widens the gradient into the master's autograd
-        gradient. The portable path reads the FP32 master through ordinary
-        autograd. Evaluation and the portable path never see FP8.
+        with ``fp8_classifier`` set that training call also gets the
+        classifier in FP8, both layouts with per-row scales, and runs every
+        GEMM of the head on it. Without a sink the shadow is read through the
+        shared operand, whose backward widens the gradient into the master's
+        autograd gradient. The portable path reads the FP32 master through
+        ordinary autograd. Evaluation and the portable path never see FP8.
         """
         master = self.embed_tokens.weight
         if not master.is_cuda:

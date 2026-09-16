@@ -182,8 +182,8 @@ optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native
 fused SDPA handles full-row attention and FlexAttention handles cached
 prefixes. CCE reads the classifier working copy and accumulates its gradient
 straight into the tied embedding's FP32 sink on every call. A column makes
-one head call, covering both prediction depths. Training GEMMs run on FP8
-tensor cores under the default `--precision fp8` recipe
+one head call, covering both prediction depths. The projection and expert
+GEMMs run on FP8 tensor cores under the default `--precision fp8` recipe
 ([architecture](architecture.md#precision-and-initialization)): each site
 carries an FP8 copy of its working copy, both layouts with per-row scales,
 about one byte per element beyond the BF16 copy; `--precision bf16` keeps
