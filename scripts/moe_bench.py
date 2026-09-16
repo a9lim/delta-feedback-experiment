@@ -381,7 +381,7 @@ def check_cpu(torch, kernels, baseline, geometries):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--scale", nargs="+", choices=SCALE_NAMES, default=["screen"])
-    parser.add_argument("--rows", nargs="+", type=int, choices=(2, 4, 16), default=[2])
+    parser.add_argument("--rows", nargs="+", type=int, choices=(1, 2, 4, 8, 16), default=[2])
     parser.add_argument(
         "--routing",
         nargs="+",
