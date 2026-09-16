@@ -705,14 +705,15 @@ def plan_replay(
     more than the average (the global-attention blocks retain less and are
     never recomputed).
 
-    Candidates in order of measured cost per row: any replay wider than the
-    smallest with the recurrences keeping their intermediates, then wider
-    than the smallest rebuilding them (a rebuilt backward costs about as much
-    per row as a lean two-row replay gains over a one-row one, and width
-    beyond that buys nothing by itself); then the smallest replay keeping,
-    then rebuilding; and when even that does not fit raw, the first blocks
-    of the logical forward recompute in backward, as many as the shortfall
-    needs. The keyed draws are per row, so the width changes no value.
+    Candidates from the widest replay down: at each width the recurrences
+    keeping their intermediates, then rebuilding them; and when even the
+    smallest replay does not fit raw, the first blocks of the logical forward
+    recompute in backward, as many as the shortfall needs. Width comes first
+    because the one-row replay measurably costs occupancy and wider replays
+    may pay on a card with more SMs, while keeping the intermediates was
+    measured worth 0.4 ms per two-row replay on the 4090: free where it
+    fits, never worth a narrower replay. The keyed draws are per row, so the
+    width changes no value.
     """
     blocks, eligible = block_invocations(cfg, spec)
     if rank_rows is None:
@@ -722,18 +723,13 @@ def plan_replay(
     def needed(rows: int, per_block: float) -> float:
         return (rows / args.micro_rows) * blocks * per_block
 
-    def plan(rows: int, lean: bool, per_block: float) -> ReplayPlan:
-        return ReplayPlan(rows, 0, eligible, needed(rows, per_block) / 2**30, lean)
-
-    widths = replay_widths(rank_rows, args.micro_rows)
-    for lean, per_block in variants:
-        for rows in widths:
-            if rows > args.micro_rows and needed(rows, per_block) <= budget_bytes:
-                return plan(rows, lean, per_block)
+    for rows in replay_widths(rank_rows, args.micro_rows):
+        for lean, per_block in variants:
+            if needed(rows, per_block) <= budget_bytes:
+                return ReplayPlan(
+                    rows, 0, eligible, needed(rows, per_block) / 2**30, lean
+                )
     rows = args.micro_rows
-    for lean, per_block in variants:
-        if needed(rows, per_block) <= budget_bytes:
-            return plan(rows, lean, per_block)
     shortfall = needed(rows, calibration.lean_block) - budget_bytes
     count = min(eligible, math.ceil(shortfall / max(calibration.checkpoint, 1.0)))
     return ReplayPlan(

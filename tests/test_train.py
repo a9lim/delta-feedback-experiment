@@ -487,18 +487,18 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
     assert replay_widths(12, 2) == [12, 6, 4, 2]
     with pytest.raises(ValueError, match="multiple"):
         replay_widths(6, 4)
-    # Keeping the intermediates at a narrower replay beats rebuilding them at
-    # a wider one; the one-row replay is the last resort either way.
-    assert chosen(plan(flat, budget(8, flat))) == (4, "full")
+    # The widest replay that fits comes first; at that width the recurrences
+    # keep their intermediates when that fits too, else rebuild them.
+    assert chosen(plan(flat, budget(8, flat))) == (8, "lean")
     assert chosen(plan(flat, budget(7, flat))) == (4, "full")
     assert chosen(plan(flat, budget(2, flat))) == (2, "lean")
     assert chosen(plan(flat, budget(2, flat) - 1)) == (1, "full")
     assert chosen(plan(flat, budget(1, flat))) == (1, "lean")
     looped = GraphSpec(1, 2)
-    assert chosen(plan(looped, budget(8, looped))) == (4, "full")
+    assert chosen(plan(looped, budget(8, looped))) == (8, "lean")
     two = GraphSpec(2, 1)
     generous = plan(two, budget(8, two))
-    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (4, 0)
+    assert (generous.rows_per_replay, generous.checkpoint_blocks) == (8, 0)
     # A rank's rows bound the width: sixteen rows of a step never replay more.
     sixteen = plan_replay(cfg, args, flat, calibration, budget(128, flat), 16)
     assert chosen(sixteen) == (16, "full")

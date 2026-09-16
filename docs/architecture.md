@@ -417,9 +417,10 @@ their intermediates and the bytes one recomputed block releases, takes the
 device memory still free once the static footprint and the graphs' inputs
 exist less a 2 GiB default margin for backward workspaces, recomputation,
 allocator rounding, and graph instantiation, and plans each graph: the
-widest replay above the smallest whose raw activations fit with the
-recurrences keeping their intermediates, else rebuilding them; then the
-smallest replay keeping, else rebuilding; and otherwise the first PKDA and
+widest replay whose raw activations fit, its recurrences keeping their
+intermediates when that fits too and rebuilding them otherwise (measured
+worth 0.4 ms per two-row replay on the 4090, so never a narrower replay);
+and when even the smallest replay does not fit raw, the first PKDA and
 auxiliary block invocations of the logical forward, as many as the shortfall
 needs, recompute in backward. Global-attention blocks are always retained.
 Checkpoint wrappers remain outside compiled blocks. The compilation the
