@@ -606,13 +606,16 @@ class CapturedMicro:
     active: frozenset[torch.nn.Parameter] = frozenset()
 
 
-DEFAULT_CHECKPOINT_MARGIN_GIB = 3.5
+DEFAULT_CHECKPOINT_MARGIN_GIB = 2.0
 """Free device memory, measured after the static footprint exists, that the
 retained-forward activation budget leaves untouched. Backward workspaces,
-checkpoint recomputation, allocator rounding, and graph instantiation also
-need memory; a 1 GiB margin OOMs during screen fl capture on the 24 GiB card.
-The optimizer step and periodic monitors reuse the graphs' pool
-(``pool_scope``)."""
+checkpoint recomputation, allocator rounding, CUDA context growth from
+kernels compiled after the budget is measured, and graph instantiation also
+need memory. On the 24 GiB card a 1 GiB margin OOMs in the eager warm-up
+backward of the deepest screen fl graph and 3.5 GiB runs; the ``execution``
+record's peak allocated bytes show what a run actually needed above its
+static footprint and retained activations. The optimizer step and periodic
+monitors reuse the graphs' pool (``pool_scope``)."""
 
 ROW_MULTIPLES = (2, 1)
 """Rows-per-replay multiples of ``micro_rows`` a single-column graph may use. Two
@@ -1347,8 +1350,15 @@ class CudaEvalRunner:
         return result
 
 
-def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
-    """Production CUDA telemetry without assuming a packed mixer layout."""
+def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, float]:
+    """Production CUDA telemetry without assuming a packed mixer layout.
+
+    ``peak_allocated_gib`` is the most memory live at once through
+    calibration, warm-up, and capture, so minus the static footprint and the
+    deepest graph's retained activations it is the transient the margin has
+    to cover; ``reserved_gib`` and ``free_gib`` describe the device once
+    capture ends. Read before the peak statistics reset for the step field.
+    """
     has_global_attention = any(not block.is_pkda for block in model.blocks)
     return {
         "flash_sdpa": int(has_global_attention),
@@ -1360,6 +1370,9 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, int]:
         "activation_budget_gib": round(graph_runner.budget_bytes / 2**30, 2),
         "block_mib": round(graph_runner.bytes_per_block / 2**20, 1),
         "checkpoint_mib": round(graph_runner.bytes_per_checkpoint / 2**20, 1),
+        "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        "reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 2),
+        "free_gib": round(torch.cuda.mem_get_info()[0] / 2**30, 2),
     }
 
 
@@ -1912,11 +1925,11 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
         graph_runner = CudaGraphTrainer(model, optimizers, args, schedule)
         eval_graph_runner = CudaEvalRunner(model, args, graph_runner.pool)
         eager_scope = graph_runner.pool_scope
-        torch.cuda.reset_peak_memory_stats()
         telemetry.log(
             "execution",
             **execution_fields(model, graph_runner, eval_graph_runner),
         )
+        torch.cuda.reset_peak_memory_stats()
     process_start = time.monotonic()
     window_start, window_tokens, window_pass_tokens = process_start, 0, 0
     window_cell_tokens = 0.0

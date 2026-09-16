@@ -179,16 +179,22 @@ them. Before capture the trainer measures, from two eager forwards, the
 activation bytes one block invocation retains and the bytes one recomputed
 block releases, and plans each graph against the device memory still free
 once the static footprint exists minus `--checkpoint-margin-gib` (default
-3.5): rows per replay for single-column graphs, otherwise how many leading PKDA
+2): rows per replay for single-column graphs, otherwise how many leading PKDA
 and auxiliary block invocations recompute in backward. The `execution`
-record reports the static footprint, the budget, the bytes per block, and
-the bytes per recomputed block. These measurements also appear in
+record reports the static footprint, the budget, the bytes per block, the
+bytes per recomputed block, the peak bytes allocated through calibration,
+warm-up, and capture, and the bytes reserved and free once capture ends; the
+peak minus the static footprint and the deepest graph's retained activations
+is the transient the margin covered. These measurements also appear in
 `memory_plan` before warm-up; each `plan` record precedes its graph's warm-up
 and reports its rows and recomputed block count, and `capture` identifies
 each graph before capture starts. The margin covers backward workspaces,
 checkpoint recomputation, allocator rounding, and graph instantiation that
-the retained-forward measurements do not include. Raise the margin if
-warm-up or capture runs out of memory. The optimizer step and the periodic
+the retained-forward measurements do not include, and the CUDA context grows
+as kernels compile after the budget is measured. On the 24 GiB card a 1 GiB
+margin ran out of memory in the eager warm-up backward of the deepest screen
+fl graph and 3.5 GiB ran; raise the margin if warm-up or capture runs out of
+memory. The optimizer step and the periodic
 monitors run inside the graphs' memory pool on the capture stream, which
 requires the allocator's expandable segments: the package sets
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on import, and the trainer
