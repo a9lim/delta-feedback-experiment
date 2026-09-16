@@ -120,6 +120,13 @@ pace, cumulative token counts, and the host's current GPU reading; configuration
 and non-step logs expand on demand. Token totals require the complete addressed
 step history, including inherited fork steps, and exclude the MTP branch.
 
+The hosted monitors are [Jobe](https://runs.a9l.im/delta-feedback/) and the
+[rental](https://rentalruns.a9l.im/delta-feedback/), each behind Cloudflare Access
+and its own tunnel. On rentals, `~/Work/meta/bootstrap/rental.sh --only monitor`
+installs the persistent monitor and connects the tunnel when its credential is
+present; the full rental bootstrap includes this step. Provisioning details are
+in the meta workspace's `bootstrap/MANUAL.md`.
+
 The **Eval step** slider moves all layer profiles and expert heatmaps together.
 Arrow buttons and keyboard arrows select recorded evals. A selection stays pinned
 while the log refreshes; **Follow latest** resumes tracking new evals. Switching
