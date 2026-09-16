@@ -1,8 +1,8 @@
 """Compare a small set of PKDA launch configurations on projected BF16 inputs.
 
     python scripts/pkda_bench.py --heads 8,12,16 --rows 2 --candidates baseline,state16
-    python scripts/pkda_bench.py --heads 15,20 --rows 2,4 --candidates baseline,intra64,wy128
-    python scripts/pkda_bench.py --heads 10 --rows 16 --candidates baseline,state16+intra64 --trace
+    python scripts/pkda_bench.py --heads 12,16 --rows 2,4 --candidates baseline,intra64,wy128
+    python scripts/pkda_bench.py --heads 8 --rows 16 --candidates baseline,state16+intra64 --trace
 
 Uses the production custom operator, its gate activation, and all ten input
 gradients. Q/K arrive normalized just as they do after the fused convolution.
