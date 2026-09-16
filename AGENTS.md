@@ -32,7 +32,7 @@ Before using Jobe, inspect `delta status`, the active log, and GPU ownership.
 Keep GPU jobs serial and preserve active data builds. Run focused tests while
 editing, the fast default `pytest` suite for a final portable check, and
 `delta probe` for changes that need CUDA execution. The probe is a small CUDA
-smoke. Queue startup runs training directly. Keep cyclic Python garbage
+smoke; `--ranks N` runs it on N devices. Queue startup runs training directly. Keep cyclic Python garbage
 collection outside train/eval graph capture.
 
 The queue stores arguments and refreshes the checkout before each job;

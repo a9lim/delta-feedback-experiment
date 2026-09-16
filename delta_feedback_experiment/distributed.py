@@ -17,11 +17,13 @@ from __future__ import annotations
 
 import os
 import signal
+import sys
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from transformer_experiments.spool import STOP_GRACE
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,39 @@ class Topology:
 
     def padded(self, count: int) -> int:
         return self.chunk(count) * self.world
+
+
+LAUNCHER = "torch.distributed.run"
+LAUNCHER_SHUTDOWN_SECONDS = int(STOP_GRACE) - 10
+"""Seconds the launcher gives its ranks to finish their step, snapshot, and
+exit after it forwards a stop signal, before it kills them. The launcher's
+default is 30, shorter than a deep step with its snapshot; this stays inside
+the spool's grace so the launcher reaps its own ranks and the spool never has
+to reach past it."""
+
+
+def relaunch(module: str, argv: list[str], ranks: int) -> None:
+    """Replace this process with the launcher when several ranks are asked for.
+
+    Returns at once under the launcher or for one rank; otherwise ``exec``
+    never returns. The launcher starts one process per device running
+    ``module`` with the same arguments, keeps the process id the spool
+    started, forwards a stop signal to every rank, and waits
+    :data:`LAUNCHER_SHUTDOWN_SECONDS` for them.
+    """
+    if ranks <= 1 or "WORLD_SIZE" in os.environ:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(
+        sys.executable,
+        [
+            sys.executable, "-m", LAUNCHER, "--standalone",
+            f"--nproc-per-node={ranks}",
+            f"--shutdown-timeout={LAUNCHER_SHUTDOWN_SECONDS}",
+            "-m", module, *argv,
+        ],
+    )
 
 
 def initialize(topology: Topology, device: torch.device) -> None:

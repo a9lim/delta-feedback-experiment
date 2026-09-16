@@ -295,9 +295,9 @@ def main() -> None:
     if command == "_worker":
         SPOOL.worker()
     elif command == "train":
-        from .train import train
+        from .train import main as train_main
 
-        train(rest)
+        train_main(rest)
     elif command == "tokenize":
         tokenize_command(rest)
     elif command == "verify":

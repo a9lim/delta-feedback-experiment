@@ -502,3 +502,53 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
     assert plan(two, budget(1, two) - 5 * release - 1).checkpoint_blocks == 6
     starved = plan(GraphSpec(1, 3), 0)
     assert starved.checkpoint_blocks == starved.eligible_blocks == 39
+
+
+def test_mode_activity_keeps_replicated_parameters_with_zero_gradients():
+    """Warm-up decides sharded activity from the sinks, but a replicated
+    parameter whose warm-up gradient is exactly zero (a routing site's
+    key-norm gain behind a zero-initialized query) stays active."""
+    from delta_feedback_experiment.train import mode_activity
+
+    gain = torch.nn.Parameter(torch.ones(4))
+    query = torch.nn.Parameter(torch.zeros(4))
+    dense = torch.nn.Parameter(torch.ones(4, 4))
+    idle = torch.nn.Parameter(torch.ones(4, 4))
+    expert = torch.nn.Parameter(torch.ones(4, 4))
+
+    class Bank(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.matrix = expert
+
+    gradients = {
+        gain: torch.zeros(4),
+        query: torch.ones(4),
+        dense: torch.ones(4, 4),
+        idle: torch.zeros(4, 4),
+        expert: torch.zeros(4, 4),
+    }
+    active = mode_activity(gradients, frozenset({dense, idle, expert}), [Bank()])
+    assert active == {gain, query, dense, expert}
+
+
+def test_pick_device_refuses_a_foreign_index_under_several_ranks():
+    from delta_feedback_experiment.distributed import Topology
+    from delta_feedback_experiment.train import pick_device
+
+    with pytest.raises(ValueError, match="own local device"):
+        pick_device("cuda:0", Topology(rank=3, world=8, local_rank=3))
+    assert pick_device("cpu", Topology(rank=3, world=8, local_rank=3)).type == "cpu"
+
+
+def test_input_bytes_counts_tokens_prefix_and_both_jitters():
+    from types import SimpleNamespace
+
+    from delta_feedback_experiment.train import GraphSpec, input_bytes
+
+    args = SimpleNamespace(seq_len=8, dim=4)
+    columns = 9
+    assert input_bytes(args, GraphSpec(1, 1), 2) == 2 * columns * 8 + 2 * columns * 4 * 2
+    assert input_bytes(args, GraphSpec(3, 2), 2) == (
+        2 * columns * 8 + 2 * 2 * 8 + 3 * 2 * 2 * columns * 4 * 2
+    )

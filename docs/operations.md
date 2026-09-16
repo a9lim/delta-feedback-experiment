@@ -77,8 +77,12 @@ by a resume, and a snapshot written by any rank count resumes under any
 other. `stop live` preserves pending jobs; `stop queue` preserves the active
 job. Stopping sends SIGINT, which the launcher forwards to every rank; the
 ranks finish the step they are on, agree to stop, snapshot it, and exit. A
-second SIGINT aborts without a snapshot. A child that does not exit within
-120 seconds is killed. `--max-steps` caps one
+second SIGINT aborts without a snapshot. `stop TAG --at STEP` signals once,
+on the record of the step before `STEP`, so the ranks read the request
+inside `STEP` and snapshot it. The launcher gives its ranks 110 seconds to
+snapshot before it kills them, inside the spool's 120-second grace, and a
+kill by the spool reaches the ranks' own sessions. `delta probe --ranks N`
+runs the CUDA smoke on `N` devices with the collectives a step makes. `--max-steps` caps one
 invocation without shortening the schedule. `clear` moves an idle run's artifacts into timestamped recovery. `move` renames idle snapshots, logs, and standard analysis paths;
 both tags must have no active or queued references and the destination must
 be free. Use `--out-dir` for snapshots outside `runs/`; custom outputs are
@@ -212,7 +216,8 @@ bytes reserved and free once capture ends; the peak minus the static
 footprint and the deepest graph's retained activations is the transient the
 margin covered. These measurements also appear in `memory_plan` before
 warm-up, with `cached_gib`, the memory the allocator still holds beyond the
-static footprint when the budget is read; each `plan` record precedes its graph's warm-up and reports its
+static footprint when the budget is read, and `reserved_gib`, the graphs'
+persistent inputs set aside before the activation budget; each `plan` record precedes its graph's warm-up and reports its
 rows and recomputed block count, and `capture` identifies each graph before
 capture starts. The margin covers backward workspaces, checkpoint
 recomputation, allocator rounding, and graph instantiation that the

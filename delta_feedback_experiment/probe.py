@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import sys
 import time
 import warnings
 from dataclasses import replace
@@ -23,11 +24,14 @@ def cuda_probe() -> None:
         build_schedule,
         model_fields,
         parse_run_args,
+        pick_device,
     )
 
+    topology = distributed.Topology.from_environment()
     # Three four-layer cells exercise both mixers; the loop repeats the whole
     # column. Both mixers keep their production head widths; experts and rows
-    # stay tiny.
+    # stay tiny: one row per rank, so a multi-rank probe runs the same
+    # collectives a training step does.
     args = parse_run_args(
         [
             "probe",
@@ -40,7 +44,7 @@ def cuda_probe() -> None:
             "--three-rate",
             "0",
             "--batch-rows",
-            "2",
+            str(max(2, topology.world)),
             "--micro-rows",
             "1",
             "--eval-rows",
@@ -90,15 +94,28 @@ def cuda_probe() -> None:
         def batch(self, first, count, device=None):
             return self.rows[first : first + count].to(device=device)
 
+    def agreed(*values: torch.Tensor) -> bool:
+        """Whether every rank holds these exact bytes."""
+        digest = torch.stack(
+            [value.detach().view(torch.int32 if value.element_size() == 4 else torch.int16)
+             .to(torch.int64).sum() for value in values]
+        )
+        low, high = -digest.clone(), digest.clone()
+        distributed.all_reduce_(low, maximum=True)
+        distributed.all_reduce_(high, maximum=True)
+        return torch.equal(-low, high)
+
     torch.manual_seed(7)
     torch.set_float32_matmul_precision("high")
     started = time.monotonic()
-    topology = distributed.Topology()
-    model = DeltaModel(condition_config(args.condition, **model_fields(args))).cuda()
+    device = pick_device(None, topology)
+    distributed.initialize(topology, device)
+    model = DeltaModel(condition_config(args.condition, **model_fields(args))).to(device)
     sites = ParameterSites(model, topology)
     optimizers = build_optimizers(model, owned=sites.owned)
     schedule = build_schedule(args)
-    print("cuda probe | train graph", flush=True)
+    if topology.main:
+        print(f"cuda probe | train graph on {topology.world} rank(s)", flush=True)
     runner = ProbeTrainer(model, optimizers, args, schedule, topology)
     data = Rows()
     initial = model.embed_tokens.weight.detach().clone()
@@ -137,45 +154,73 @@ def cuda_probe() -> None:
                 for expert in model.blocks[0].mlp.experts
             ]
             assert sum(gradient.abs().sum() for gradient in routed) > 0
-            # Every sharded matrix is its BF16 working copy; the optimizer
-            # holds its FP32 master and writes both.
+            # Every sharded matrix is its BF16 working copy; its owner's
+            # optimizer holds the FP32 master and writes both.
             matrix = parameters["blocks.3.attn.o_proj.weight"]
             assert matrix.dtype == torch.bfloat16
-            master = normuonh.master_of(matrix)
-            assert master.dtype == torch.float32
-            assert torch.equal(matrix, master.to(torch.bfloat16))
+            owned = matrix in sites.owned
+            if owned:
+                master = normuonh.master_of(matrix)
+                assert master.dtype == torch.float32
+                assert torch.equal(matrix, master.to(torch.bfloat16))
             with runner.pool_scope():
                 for optimizer in optimizers:
                     optimizer.step()
                 model.update_expert_bias(state.expert_counts)
             sites.gather_weights()
             model.refresh_shadows()
-            assert torch.equal(matrix, normuonh.master_of(matrix).to(torch.bfloat16))
+            if owned:
+                assert torch.equal(
+                    matrix, normuonh.master_of(matrix).to(torch.bfloat16)
+                )
+            # After the gather every rank holds the same replicated masters,
+            # the same working copies, and the same expert biases.
+            assert agreed(
+                model.embed_tokens.weight, matrix, model.blocks[0].mlp.expert_bias
+            )
     assert not torch.equal(initial, model.embed_tokens.weight)
     runner.zero_grad()
 
-    print("cuda probe | eval graph and cached decode", flush=True)
+    if topology.main:
+        print("cuda probe | eval graph and cached decode", flush=True)
     evaluator = CudaEvalRunner(model, args, runner.pool, topology)
     assert all(math.isfinite(value) for value in evaluator.run(data).values())
     model.eval()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-        tokens = data.rows[:1, :4].cuda()
-        cache = KVCache(model.cfg, batch=1, device="cuda", dtype=torch.bfloat16)
+        tokens = data.rows[:1, :4].to(device)
+        cache = KVCache(model.cfg, batch=1, device=device, dtype=torch.bfloat16)
         e = model.embed_tokens(tokens[:, :3])
         prefill = model.forward_iterations(model.plain_seed(e), e, cache=cache)[-1]
         decoded = model.step(tokens[:, 3:], prefill.payload[:, -1:], cache)
         assert cache.pos == 4 and decoded.h_top.shape == (1, 1, args.dim)
         assert torch.isfinite(decoded.h_top).all()
     torch.cuda.synchronize()
-    print(f"cuda probe passed | {time.monotonic() - started:.1f}s")
+    distributed.shutdown()
+    if topology.main:
+        print(f"cuda probe passed | {time.monotonic() - started:.1f}s")
 
 
 def main(argv: list[str] | None = None) -> None:
-    argparse.ArgumentParser("delta probe", description=__doc__).parse_args(argv)
+    parser = argparse.ArgumentParser("delta probe", description=__doc__)
+    parser.add_argument(
+        "--ranks",
+        type=int,
+        default=1,
+        help="probe on this many CUDA devices at once through the launcher, "
+        "one rank per device, with the same collectives a training step "
+        "makes (default: 1)",
+    )
+    argv = list(sys.argv[1:] if argv is None else argv)
+    ranks = parser.parse_args(argv).ranks
+    if ranks < 1:
+        raise SystemExit("--ranks must be positive")
     import torch
 
     if not torch.cuda.is_available():
         raise SystemExit("delta probe requires CUDA; run pytest for portable tests")
+    from . import distributed
+
+    distributed.relaunch(__spec__.name, argv, ranks)
     # Exercise real CUDA kernels and graph replay without compiling a matrix
     # of Inductor specializations. Cached FlexAttention uses its reference.
     with torch.compiler.set_stance("force_eager"), warnings.catch_warnings():

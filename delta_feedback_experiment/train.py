@@ -653,6 +653,16 @@ def replay_widths(rank_rows: int, micro_rows: int) -> list[int]:
     ]
 
 
+def input_bytes(args, spec: GraphSpec, rows: int) -> int:
+    """Bytes of one captured graph's persistent inputs at ``rows`` per replay:
+    the token rows, the prefix lengths, and the pass and loop jitter."""
+    columns = args.seq_len + 1
+    tokens = rows * columns * 8
+    prefix = (spec.n_passes - 1) * rows * 8
+    jitter = spec.n_passes * spec.iterations * rows * columns * args.dim * 2
+    return tokens + prefix + jitter
+
+
 def block_invocations(cfg, spec: GraphSpec) -> tuple[int, int]:
     """(all, checkpoint-eligible) block invocations of one logical forward.
 
@@ -775,6 +785,29 @@ class StepSums:
             self.expert_balance_sum, self.expert_counts,
         ):
             total.zero_()
+
+
+def mode_activity(
+    gradients: dict[torch.nn.Parameter, torch.Tensor],
+    sharded: frozenset[torch.nn.Parameter],
+    banks,
+) -> set[torch.nn.Parameter]:
+    """The parameters one graph mode updates, decided after its warm-up.
+
+    A sharded matrix is active when warm-up left anything in its sink: the
+    projections behind a GEMM either run or do not. Every replicated
+    parameter is active in every mode, whatever its warm-up gradient holds:
+    autograd reaches all of them on every column, and a reached gradient can
+    be exactly zero (a routing site's key-norm gain multiplies its
+    zero-initialized query), which must not read as absence. Warm-up rows
+    can select only a few experts, and replay data changes those choices,
+    so activity is structural for the entire bank.
+    """
+    active = {parameter for parameter in gradients if parameter not in sharded}
+    active.update(p for p in sharded if bool(gradients[p].any()))
+    for bank in banks:
+        active.update(bank.parameters())
+    return active
 
 
 class Trainer:
@@ -969,20 +1002,28 @@ class CudaGraphTrainer(Trainer):
         # sit between live allocations, so only whole free pages return.
         self.cached_bytes = torch.cuda.memory_reserved() - self.static_bytes
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
+        specs = self._reachable_specs(schedule)
+        # Every graph's persistent inputs are allocated once the plans exist
+        # and stay live together, so the budget sets them aside first, at the
+        # widest replay a plan can choose; a narrower plan leaves the
+        # difference free.
+        self.reserved_bytes = sum(
+            input_bytes(args, spec, self.rank_rows) for spec in specs
+        )
         budget = torch.tensor(
-            [-(free_bytes - args.checkpoint_margin_gib * 2**30)],
+            [-(free_bytes - self.reserved_bytes - args.checkpoint_margin_gib * 2**30)],
             dtype=torch.float64,
             device=self.device,
         )
         # The smallest budget across ranks plans every rank.
         self.budget_bytes = -distributed.all_reduce_(budget, maximum=True).item()
-        specs = self._reachable_specs(schedule)
         base = min(specs, key=lambda spec: (spec.n_passes, spec.iterations))
         self.bytes_per_block, self.bytes_per_checkpoint = self._calibrate(base)
         telemetry.log(
             "memory_plan",
             static_gib=round(self.static_bytes / 2**30, 2),
             cached_gib=round(self.cached_bytes / 2**30, 2),
+            reserved_gib=round(self.reserved_bytes / 2**30, 2),
             activation_budget_gib=round(self.budget_bytes / 2**30, 2),
             checkpoint_margin_gib=args.checkpoint_margin_gib,
             block_mib=round(self.bytes_per_block / 2**20, 1),
@@ -1225,16 +1266,7 @@ class CudaGraphTrainer(Trainer):
                 self._body(state)
         torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
-        # Warm-up decides which parameters a mode touches from its slabs.
-        active = {p for p, g in self.gradients.items() if bool(g.any())}
-        # Warm-up rows can select only a few experts. Replay data changes
-        # those choices, so activity is structural for the entire bank.
-        active.update(
-            parameter
-            for bank in self.model.expert_banks
-            for parameter in bank.parameters()
-        )
-        return active
+        return mode_activity(self.gradients, self.sharded, self.model.expert_banks)
 
     def _capture(self, state: CapturedMicro, pool) -> None:
         self.zero_grad()
@@ -1493,16 +1525,24 @@ def evaluate(
     keys = ("val", "val_fused", "val_mtp", "val_mtp_fused", "val_one")
     sums = dict.fromkeys(keys, 0.0)
     start, count = eval_slice(args, topology)
+    # CUDA evaluates under the captured graphs' activation precision, whose
+    # head reads the BF16 classifier shadow.
+    autocast = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device.type == "cuda"
+        else contextlib.nullcontext()
+    )
     for offset in range(0, count, args.micro_rows):
         rows = data_val.batch(
             start + offset, min(args.micro_rows, count - offset), device
         )
         n_passes = 2 if model.cfg.feedback else 1
         prefix = torch.ones((1, rows.shape[0]), dtype=torch.long, device=device)
-        outs = multipass(
-            model, rows, n_passes, prefix_lens=prefix if n_passes > 1 else None
-        )
-        result = multipass_loss(model, rows, outs, mtp_weight=args.mtp_weight)
+        with autocast:
+            outs = multipass(
+                model, rows, n_passes, prefix_lens=prefix if n_passes > 1 else None
+            )
+            result = multipass_loss(model, rows, outs, mtp_weight=args.mtp_weight)
         losses = result.ntp
         weight = rows.shape[0]
         sums["val"] += losses[0][-1].item() * weight
@@ -1877,6 +1917,12 @@ def pick_device(
     if device.type == "cuda":
         if device.index is None:
             device = torch.device("cuda", topology.local_rank)
+        elif topology.world > 1 and device.index != topology.local_rank:
+            raise ValueError(
+                f"--device {name} names one CUDA device, but a {topology.world}-rank "
+                "invocation places each rank on its own local device; give a bare "
+                "'cuda' or leave --device unset"
+            )
         torch.cuda.set_device(device)
     return device
 
@@ -2240,7 +2286,10 @@ def _train(
                 )
                 window_cell_tokens = 0.0
 
-                if step % args.eval_every == 0 or step == total:
+                # A stop agreed this step snapshots first: the launcher and the
+                # spool give the ranks a bounded grace, and the monitors are
+                # not part of the state.
+                if (step % args.eval_every == 0 or step == total) and not stop:
                     address = telemetry.step_address(step, total)
                     scores = evaluate(
                         model, data_val, args, device,
@@ -2335,29 +2384,15 @@ def _train(
     return summary
 
 
-LAUNCHER = "torch.distributed.run"
+def main(argv: list[str] | None = None) -> None:
+    """Run one invocation, under the launcher when it asks for several ranks.
 
-
-def main() -> None:
-    """Run one invocation, under ``torchrun`` when it asks for several ranks.
-
-    A direct ``--ranks N`` invocation replaces itself with the launcher, which
-    starts one process per device running this same module with the same
-    arguments; the spool keeps the process id it started, and a stop signal
-    reaches every rank through the launcher.
+    Both ``delta train`` and ``python -m delta_feedback_experiment.train``
+    enter here: a direct ``--ranks N`` invocation replaces itself with the
+    launcher, which runs this module once per device with the same arguments.
     """
-    argv = sys.argv[1:]
-    ranks = parse_run_args(argv).ranks
-    if ranks > 1 and "WORLD_SIZE" not in os.environ:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.execv(
-            sys.executable,
-            [
-                sys.executable, "-m", LAUNCHER, "--standalone",
-                f"--nproc-per-node={ranks}", "-m", __spec__.name, *argv,
-            ],
-        )
+    argv = list(sys.argv[1:] if argv is None else argv)
+    distributed.relaunch(__spec__.name, argv, parse_run_args(argv).ranks)
     train(argv)
 
 
