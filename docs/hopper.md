@@ -87,6 +87,36 @@ Startup: every rank compiles the same Inductor and Triton kernels; a shared
 one, and eight compiling processes contend for the host CPUs. At 0.6 s
 steps ten minutes of cold compilation is ~10% of a screen 25× run.
 
+## A single GH200 first
+
+A rented GH200 (the H100 die with 132 SMs and 96 GB of HBM3 at 4.0 TB/s, on
+an aarch64 Grace host) is one H100 SXM's throughput at about half the
+node's price per GPU-hour, and it runs the single-process path Jobe has been
+running, so it is where the Hopper qualification starts: everything in the
+rental session below except the collectives is a single-GPU measurement.
+The machine profile lives in the meta repository's `bootstrap/rental.sh`
+(aarch64 CUDA 13.2 lock, workspace, the token store from the private
+bucket); `scripts/first_hour.sh` runs the session's first hour and writes
+`logs/first-hour/<tag>/summary.json`.
+
+Unsharded, with the FP8 copies, the static footprint is 8.5 GiB at screen,
+18.6 bridge, 32.5 flagship, and 72.1 extension. Against about 94.5 GiB
+usable, the widest raw replay per graph (rows; 128 rows per step) from the
+same block ledger as the table above:
+
+| Scale | k=1 | k=2 | k=3 | (2,2) | (3,2) |
+|---|---:|---:|---:|---:|---:|
+| Screen | 16 | 8 | 4 | 4 | 4 |
+| Bridge | 8 | 4 | 4 | 2 | 2 |
+| Flagship | 8 | 4 | 2 | 2 | 1 |
+| Extension | 1 | 1, 4 of 26 recomputed | 1, 21 of 39 | 1, 38 of 52 | 1, 72 of 78 |
+
+Screen through flagship run raw with every intermediate kept; extension
+wants the 144 GB variant or BF16 (about 10 GiB of static back). At the H100
+factor of 3.0 the 25x schedules take about 14 h (screen f), 21 (screen fl),
+58 / 85 (bridge), 160 / 234 (flagship) on the one card; the faster HBM and
+FP8 make these slightly conservative.
+
 ## Levers, ranked
 
 Reductions of mean node step time; the ranges overlap and do not add.
@@ -291,3 +321,8 @@ clock starts. Ordered by information per GPU-hour:
 
 Stop debugging performance if collective correctness or restart fails;
 that evidence is what the session is for.
+
+On one card, `scripts/first_hour.sh` covers items 1, 3, and 4 without the
+collectives: inventory, probe, a short `fl` run from the recurrence roll's
+start with an eval and snapshot midway, a resume, a SIGINT stop, and the
+summary (memory plan, peak, seconds per step by graph).
