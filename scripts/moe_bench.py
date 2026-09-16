@@ -74,6 +74,10 @@ CANDIDATES = {
         "TILE_DW_GATE": (64, 128, 128, 4, 3),
         "TILE_DW_DOWN": (64, 128, 128, 4, 3),
     },
+    "dw_n128": {
+        "TILE_DW_GATE": (64, 128, 64, 4, 3),
+        "TILE_DW_DOWN": (64, 128, 64, 4, 3),
+    },
     "wide128": {
         "TILE_GATE_UP": (128, 128, 32, 8, 3),
         "TILE_DOWN": (128, 128, 32, 8, 3),
