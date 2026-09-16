@@ -211,7 +211,8 @@ the peak bytes allocated through calibration, warm-up, and capture, and the
 bytes reserved and free once capture ends; the peak minus the static
 footprint and the deepest graph's retained activations is the transient the
 margin covered. These measurements also appear in `memory_plan` before
-warm-up; each `plan` record precedes its graph's warm-up and reports its
+warm-up, with `cached_gib`, the memory the allocator still holds beyond the
+static footprint when the budget is read; each `plan` record precedes its graph's warm-up and reports its
 rows and recomputed block count, and `capture` identifies each graph before
 capture starts. The margin covers backward workspaces, checkpoint
 recomputation, allocator rounding, and graph instantiation that the

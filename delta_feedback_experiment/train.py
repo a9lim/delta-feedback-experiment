@@ -964,6 +964,10 @@ class CudaGraphTrainer(Trainer):
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         self.static_bytes = torch.cuda.memory_allocated()
+        # Cached but unallocated memory at this point is fragmentation the
+        # budget cannot use: the replicated FP32 copies released by adoption
+        # sit between live allocations, so only whole free pages return.
+        self.cached_bytes = torch.cuda.memory_reserved() - self.static_bytes
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
         budget = torch.tensor(
             [-(free_bytes - args.checkpoint_margin_gib * 2**30)],
@@ -978,6 +982,7 @@ class CudaGraphTrainer(Trainer):
         telemetry.log(
             "memory_plan",
             static_gib=round(self.static_bytes / 2**30, 2),
+            cached_gib=round(self.cached_bytes / 2**30, 2),
             activation_budget_gib=round(self.budget_bytes / 2**30, 2),
             checkpoint_margin_gib=args.checkpoint_margin_gib,
             block_mib=round(self.bytes_per_block / 2**20, 1),
