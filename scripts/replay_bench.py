@@ -5,6 +5,7 @@ by kernel class: the baseline the Hopper levers are scored against.
         [--condition fl] [--scale screen] [--specs 1:1,2:2,3:2] [--trace]
         [--replay-rows 2] [--attention-backend cudnn|flash] [--fp8-head]
         [--cce-config bf16-base] [--expert-tiles default|ada]
+        [--train-steps 4]  # optional optimizer check; requires one captured spec
         [--warm 3] [--repeat 10] [-- --precision bf16 --micro-rows 2 ...]
 
 Builds the trainer exactly as ``delta train`` does (same planner, same
@@ -22,16 +23,22 @@ attention, pointwise, ...) with the top kernels by time. Writes
 ``logs/replay-bench/<tag>.json``. Run from the experiment directory.
 CCE/expert overrides affect only this benchmark process; omitted controls
 use the production configuration. FP8 CCE candidates require --fp8-head.
+``--train-steps N`` then performs N full-batch optimizer updates from the
+same initialization, using production schedules and keyed row draws with
+one fixed captured graph. This paired check does not exercise the full
+recurrence schedule, evaluation, or checkpoint lifecycle.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import statistics
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -80,6 +87,8 @@ def main() -> None:
     parser.add_argument("--specs", default=None, help="k:r list; default every graph the schedule reaches")
     parser.add_argument("--warm", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=10)
+    parser.add_argument("--train-steps", type=int, default=0,
+                        help="full-batch optimizer steps after timing; requires exactly one captured graph (default 0)")
     parser.add_argument("--trace", action="store_true", help="profile one replay per graph by kernel class")
     parser.add_argument("--replay-rows", type=int, help="force this replay width; reject graphs that cannot fit it")
     parser.add_argument("--attention-backend", choices=("default", "cudnn", "flash"), default="default",
@@ -94,6 +103,8 @@ def main() -> None:
     opts = parser.parse_args()
     if opts.warm < 0 or opts.repeat < 1:
         parser.error("--warm must be nonnegative and --repeat must be positive")
+    if opts.train_steps < 0:
+        parser.error("--train-steps must be nonnegative")
     if opts.cce_config is not None:
         candidate = CCE_CANDIDATES[opts.cce_config]
         if candidate.precision == "fp8" and not opts.fp8_head:
@@ -117,7 +128,7 @@ def main() -> None:
         moe_kernels.TILE_DW_DOWN_HOPPER = moe_kernels.TILE_DW_DOWN
     from delta_feedback_experiment.data import TokenData
     from delta_feedback_experiment.model import DeltaModel, condition_config
-    from delta_feedback_experiment.optim import build_optimizers
+    from delta_feedback_experiment.optim import apply_schedule, build_optimizers
     from delta_feedback_experiment.sites import ParameterSites
     from delta_feedback_experiment.train import (
         CudaGraphTrainer,
@@ -155,6 +166,10 @@ def main() -> None:
         model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam, owned=sites.owned
     )
     schedule = build_schedule(args)
+    if opts.train_steps > schedule.total:
+        parser.error("--train-steps cannot exceed the training schedule length")
+    if opts.train_steps * args.batch_rows > data.rows:
+        parser.error("--train-steps needs more rows than the training stream contains")
     model.train()
 
     wanted = None
@@ -166,7 +181,10 @@ def main() -> None:
             specs = super()._reachable_specs(schedule)
             if wanted and any(spec not in specs for spec in wanted):
                 raise ValueError(f"requested graphs {wanted} are not all reachable: {specs}")
-            return [s for s in specs if s in wanted] if wanted else specs
+            specs = [s for s in specs if s in wanted] if wanted else specs
+            if opts.train_steps and len(specs) != 1:
+                raise ValueError("--train-steps requires exactly one captured graph; select it with --specs k:r")
+            return specs
 
         def _plan(self, spec, calibration, budget_bytes):
             if opts.replay_rows is None:
@@ -299,6 +317,65 @@ def main() -> None:
         print(f"schedule-weighted mean step {result['mean_step_ms']:.0f} ms over {result['mean_step_share_covered']:.1%} of the schedule", flush=True)
     out = Path(opts.out) if opts.out else Path("logs/replay-bench") / f"{opts.tag}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
+    if opts.train_steps:
+        spec = next(iter(trainer.states))
+        result["training"] = {
+            "scope": "fixed-graph paired optimizer check",
+            "fixed_spec": {"n_passes": spec.n_passes, "iterations": spec.iterations},
+            "requested_steps": opts.train_steps,
+            "batch_rows": args.batch_rows,
+            "seed": args.seed,
+            "data_seed": args.data_seed,
+            "steps": [],
+        }
+        out.write_text(json.dumps(result, indent=2) + "\n")
+        # Warmup, timing, and profiling accumulate into the same FP32 sinks.
+        trainer.zero_grad()
+        torch.cuda.synchronize()
+        for step in range(1, opts.train_steps + 1):
+            started = time.perf_counter()
+            learning_rates = apply_schedule(optimizers, schedule, step)
+            phase = schedule.phase(step)[0]
+            z_coef = args.zloss if phase == "cooldown" else 0.0
+            state = trainer.begin(spec, z_coef)
+            trainer.replay_batch(state, data, step, (step - 1) * args.batch_rows)
+            sites.reduce_gradients()
+            floats = torch.stack([
+                state.loss_sum, state.pass1_sum, state.ntp_sum,
+                state.mtp_sum, state.expert_balance_sum,
+            ])
+            expert_counts = state.expert_counts.clone()
+            distributed.all_reduce_(floats)
+            distributed.all_reduce_(expert_counts)
+            loss, pass1, ntp, mtp, expert_balance = floats.tolist()
+            trainer.prepare_optimizer(state)
+            grad_norm = sites.gradient_norm()
+            if not all(math.isfinite(value) for value in (
+                loss, pass1, ntp, mtp, expert_balance, grad_norm, *learning_rates.values()
+            )):
+                raise RuntimeError(f"optimizer check step {step} has non-finite metrics or learning rates")
+            with trainer.pool_scope():
+                for optimizer in optimizers:
+                    optimizer.step()
+                model.update_expert_bias(expert_counts)
+            sites.gather_weights()
+            model.refresh_shadows()
+            sites.requantize()
+            trainer.zero_grad()
+            torch.cuda.synchronize()
+            seconds = time.perf_counter() - started
+            result["training"]["steps"].append({
+                "step": step, "phase": phase, "loss": loss, "pass1": pass1,
+                "ntp": ntp, "mtp": mtp, "expert_balance": expert_balance,
+                "grad_norm": grad_norm, "lr": learning_rates, "seconds": seconds,
+            })
+            out.write_text(json.dumps(result, indent=2) + "\n")
+            print(
+                f"optimizer check {step}/{opts.train_steps} k={spec.n_passes} r={spec.iterations}: "
+                f"loss {loss:.6f}, ntp {ntp:.6f}, mtp {mtp:.6f}, "
+                f"grad_norm {grad_norm:.6g}, lr {learning_rates}, {seconds:.2f}s",
+                flush=True,
+            )
     out.write_text(json.dumps(result, indent=2) + "\n")
     print(f"wrote {out}", flush=True)
 
