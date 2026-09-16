@@ -5,7 +5,7 @@
 # seconds per step by graph) next to the logs. Nothing here is a benchmark;
 # the lever measurements in docs/hopper.md come after this passes.
 #
-#   scripts/first_hour.sh --data-root /data/delta [--tag first-hour] [--steps 30]
+#   scripts/first_hour.sh --data-root /data/delta [--tag first-hour] [--steps 12]
 #       [--source dclm-100b] [--scale screen] [--condition fl] [--precision fp8]
 #       [--seed 1] [--data-seed 0]
 #
@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-DATA_ROOT="" SOURCE=dclm-100b TAG=first-hour STEPS=30
+DATA_ROOT="" SOURCE=dclm-100b TAG=first-hour STEPS=12
 SCALE=screen CONDITION=fl PRECISION=fp8 SEED=1 DATA_SEED=0
 
 usage() {

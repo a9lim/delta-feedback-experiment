@@ -37,6 +37,5 @@ if _configured_path is None or any(
     _configured_path = Path.home() / ".cache" / "delta-feedback" / "torchinductor"
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(_configured_path)
 INDUCTOR_CACHE_DIR = _configured_path
-INDUCTOR_MODE = "max-autotune-no-cudagraphs"
 
 __version__ = "0.4.0"

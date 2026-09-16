@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.nn.attention.flex_attention import flex_attention
 
-from . import INDUCTOR_MODE
+from .inductor import INDUCTOR_MODE
 
 
 def _causal_attention(query, key, value):

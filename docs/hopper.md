@@ -293,6 +293,14 @@ for the first node hour.
   1.41× (blockwise) to 1.69× (delayed) on a 5B dense model on H200; grouped
   FP8 GEMMs on Hopper.
 - No public FP8 cross-entropy head results.
+- Found on the GH200 (2026-09-16): Inductor's split-scan kernels record
+  their workspace's block minimum as `min_split_scan_rblock` while the
+  coordinate-descent tuner and the spill halving floor `R0_BLOCK` on
+  `min_rblock`, so the tuner can pick a block whose extra programs write
+  past the workspace. The 4090 never crossed the bound; the GH200 faulted in
+  the routers' rank scan under every recipe. `inductor.py` records the
+  minimum under the key the tuner reads; a 15 x 12,288 `cumsum` under
+  max-autotune with coordinate descent reproduces it upstream.
 
 ## The first rental session
 

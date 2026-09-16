@@ -43,7 +43,7 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import Tensor, nn
 
-from . import INDUCTOR_MODE
+from .inductor import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import (
     Fp8Weights,
