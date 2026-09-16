@@ -11,7 +11,7 @@ Update affected code, CLI help, tests, and docs together.
 - `delta_feedback_experiment/`: model, training, data, analysis, and CLI.
 - `tests/`: small portable numerical, causal, state, and lifecycle contracts.
 - `scripts/`: current checkpoint analysis and training plots.
-- `docs/`: architecture, recipe, scaling, operations, and analysis.
+- `docs/`: architecture, recipe, scaling, operations, the Hopper node plan, and analysis.
 - `references/refs.yaml`: concise mechanism sources.
 
 ## Contracts
