@@ -54,6 +54,6 @@ delta watch
 - [Recipe](docs/design.md): data, schedules, snapshots, and evaluation.
 - [Scaling](docs/scaling.md): geometry, parameter/token counts, and decode state.
 - [Operations](docs/operations.md): installation, tokenization, and run control.
-- [Hopper node](docs/hopper.md): the 8×H100 projection, ranked levers, what needs the card, and the first rental session.
+- [Hopper execution](docs/hopper.md): measured GH200 recipe and component results, lifecycle checks, and node validation.
 - [Analysis](docs/interpretability.md): checkpoint tools and measurement boundaries.
 - [Sources](references/refs.yaml): mechanisms used by the model.

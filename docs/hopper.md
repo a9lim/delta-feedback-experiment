@@ -1,368 +1,273 @@
-# Hopper node
+# Hopper execution
 
-What changes when training moves from the 4090 to an 8×H100 SXM node, what
-is worth doing about it, and which of that can be built and tested before a
-node is rented. Numbers are from the 2026-09-16 audit; the 4090 ledgers it
-extrapolates from are in [operations](operations.md#cuda-execution) and the
-journal. Nothing here has run on Hopper yet: every H100 figure is a
-projection until the first rental session replaces it.
+The single GH200 at `ssh rental1` is the reference machine for Hopper work.
+The canonical geometry uses GQA head width 256 with query/KV head
+counts 4/2, 6/3, 8/4, and 12/6 at screen, bridge, flagship, and extension;
+PKDA uses 8, 12, 16, and 24 heads of width 128. MHDB uses one group per KV
+head. The complete geometry and accounting are in [scaling](scaling.md).
 
-## The card and the node
+Revision `3a66a5f` selects cuDNN attention first, with Flash fallback. The
+initialized screen replay improved from 825.91 to 707.97 ms at the same
+replay width, about 16.7% higher throughput. Attention pilots support the
+backend choice at screen, bridge, and flagship. These measurements do not
+establish model quality equivalence or whole-training throughput.
 
-| | RTX 4090 | H100 SXM | Ratio |
+## Execution choices
+
+| Path | Choice | Measurement boundary |
+|---|---|---|
+| Dense projections | Rowwise FP8 forward/dX; BF16 operands into FP32 dW | The blockwise pilot did not improve the complete path consistently |
+| Routed experts | FP8 forward/dX; Hopper dW tiles `(64,128,128,4,3)` | Component gains at screen and bridge; effectively flat at flagship, one row |
+| Classifier | BF16; Hopper `B=256,V=128,D=64`, eight warps, three stages | Faster at all three measured widths; tile filtering changes gradients slightly |
+| Causal GQA | cuDNN first, Flash fallback; head width 256 | Screen, bridge, and flagship pass numerical/capture checks and favor cuDNN |
+| PKDA | Hopper ATK inter-chunk scan `BK=128`, four warps | About 1% faster complete recurrence with the earlier head counts |
+| Replay planning | Widest fitting replay; retain intermediates when they fit | Actual fit and timing require the complete captured graph |
+
+The kernel retunes preserve Ada choices. FP8 scaling remains stateless and
+rowwise, accumulated gradients remain FP32, and the classifier remains BF16
+even under `--precision fp8`. Checkpoint v42 and the canonical token-store
+identity are unchanged. Geometry changes affect model capacity and derived
+fresh-run schedules; performance measurements alone do not establish equal
+learning behavior.
+
+## Current-geometry measurements
+
+All measurements here use 4,096-token rows on the GH200. The attention pilot
+covers forward, backward, and warm CUDA graph replay on initialized BF16
+inputs, with output/input-gradient checks against Flash.
+
+| Scale | Rows | Flash, ms | cuDNN, ms |
 |---|---:|---:|---:|
-| SMs | 128 | 132 | 1.03 |
-| BF16 dense tensor peak | 165 TF | 989 TF | 6.0 (realistic GEMM ~4.5) |
-| HBM | 1.0 TB/s | 3.35 TB/s | 3.35 |
-| Memory | 24 GiB | 80 GiB | 3.3 |
-| Boost clock | 2.5 GHz | 1.98 GHz | 0.8 |
-| Inter-GPU | none | NVSwitch, ~350–450 GB/s bus | |
+| Screen | 4 | 2.3026 | 1.4215 |
+| Bridge | 2 | 1.8069 | 1.1154 |
+| Flagship | 1 | 1.3041 | 0.8137 |
 
-The profile does not scale uniformly. GEMMs gain the most, memory-bound
-kernels about 3×, and latency-bound kernels (the sub-8 µs tail, serial
-scans) little, since the SM count is the same and the clock lower. So the
-H100 profile is less GEMM-dominated than the 4090 census, and anything that
-speeds only GEMMs caps out lower than the 4090 split suggests.
+cuDNN reduces attention time by 37.6–38.3% against Flash at the same new
+geometry.
+The largest output/input-gradient relative L2 difference is 0.196%; captured
+gradients pass the same checks. Results:
+`logs/hopper-tuning/attention-geometry-{scale}.json`.
+The earlier bridge geometry (12 query / 6 KV heads, width 192) took 2.4515 ms
+with Flash at two rows. That comparison also changes head counts and
+projection widths;
+it combines an architecture change with a backend change. The installed
+Torch/cuDNN path rejects backward at head width 192.
 
-Class-wise projection of the round-11 census (one 2-row k=1 screen replay,
-181.4 ms on the 4090). Two independent sets of assumed ratios bracket the
-uncertainty; the rental's first trace replaces both.
+### Full-model screen result
 
-| Class | 4090 ms | Share | Ratio A / B | H100 ms A / B |
-|---|---:|---:|---:|---:|
-| Dense + expert GEMMs | 70.5 | 39% | 4.5 / 3.5–4.5 | 15.7 / 18.6 |
-| CCE head | 34.1 | 19% | 3.5 / 2.5 | 9.7 / 13.6 |
-| FLA recurrence | 35.4 | 20% | 3.0 / 1.8 | 11.8 / 19.7 |
-| Dense attention (head 192) | 12.5 | 7% | 3.5 / 2.5 | 3.6 / 5.0 |
-| Pointwise + conv/norm | 19.0 | 10% | 3.3 / 2.0 | 5.8 / 9.5 |
-| Routers (FP32) | 5.5 | 3% | 3.0 / 1.5 | 1.8 / 3.7 |
-| Tail (<8 µs kernels) | 4.4 | 2% | 1.5 / 1.2 | 2.9 / 3.7 |
-| Total | 181.4 | | 3.5 / 2.5 | 51 / 74 |
+The complete `fl` graph used two passes, two loops, four rows per replay,
+and the production rowwise FP8/BF16-head recipe. Five warm samples gave:
 
-A is the audit's own derivation, B the Codex thread's more pessimistic one;
-the earlier flat 3.0× sits between them. Under A the H100 GEMM share is 31%
-(dense + expert) plus 19% CCE; under B, 25% and 18%. Flagship (D = 1536)
-roughly doubles the D-linear classes and quadruples the D² classes, so its
-GEMM share is ~40–50%.
+| Geometry / kernels | Median replay, ms | Replay-derived 128-row step, s |
+|---|---:|---:|
+| Earlier geometry, previous tiles | 844.35 | 27.02 |
+| Earlier geometry, Hopper tiles | 825.91 | 26.43 |
+| Current geometry, Hopper tiles and cuDNN | 707.97 | 22.66 |
 
-Per-rank step time at 16 rows per rank, k = r = 1, from the two brackets:
-screen ~0.4–0.6 s, flagship ~1.5–2.1 s; mean f steps under the default roll
-(~0.75 k=1 + 0.22 k=2 + 0.03 k=3) about 0.5–0.8 s and 2.0–2.9 s, fl about
-40% more. The screen 25× schedule is 9,975 steps at the live preset.
+The geometry/backend change reduces replay time by 14.3%, or increases
+throughput by 16.7%, relative to the retuned earlier geometry. The combined
+change is 19.3% higher throughput than the pre-retune baseline. All three
+use retained recurrence intermediates and zero recomputed blocks. The
+current planner estimate is 59.11 GiB, down from 67.90 GiB; static allocation
+is 8.33 GiB. These estimates are not peak-allocation measurements.
 
-## Execution on the node
+The trace confirms cuDNN forward/backward kernels. Attention falls from
+49.28 to 22.80 ms and recurrence from 224.65 to 173.14 ms. The classifier is
+effectively unchanged at 243.69 ms. Architecture changes also change keyed
+initialization and expert assignments, so component differences are not
+isolated kernel comparisons. This common graph covers about 76% of the
+schedule; a complete schedule-weighted training speedup was not measured.
 
-Every rank runs the same graphs on 16 of the step's 128 rows and meets the
-others only in the per-site collectives ([design](design.md#training)).
-Sharded masters and optimizer state put the static footprint per rank at
-about 4.3 GiB screen, 9.2 bridge, 16.1 flagship, 35.5 extension, before
-the graphs' persistent inputs, which the budget sets aside at the planned
-widths (`inputs_gib` in `memory_plan`). With ~70 GiB of activation budget the
-largest raw replay per graph is about:
+Four full 128-row optimizer updates then completed in 22.74–22.78 seconds
+each, with finite losses and pre-clip gradient norms (6.80–7.50). They use
+the same fixed graph; this is an execution check, not a learning-quality
+comparison or a repeat of the complete checkpoint lifecycle. The new-geometry
+CUDA probe also passed, including evaluation capture and cached decode.
+The final portable suite passed 113 tests, with seven hardware-dependent skips.
+Six CUDA routing tests then passed: all four 384-wide group counts, the
+maximum source bank, and repeated BF16 graph replay with gradient accumulation.
+They also exposed and fixed shared return storage in the FP32 routing backward;
+the BF16 dtype conversion already produced independent outputs.
 
-| Columns per logical forward | 1 | 2 | 3 | 4 | 6 |
-|---|---:|---:|---:|---:|---:|
-| Screen rows per replay | 16 | 8 | 4 | 4 | 2 |
-| Flagship rows per replay | 8 | 4 | 2 | 2 | 1 |
+Results: `logs/replay-bench/gh200-screen-geometry.json`, alongside the
+earlier `gh200-screen-{before,final}.json` comparisons. Bridge, flagship,
+and extension have no new-geometry full-model measurement.
 
-These are fit estimates from 209.7 MiB per block invocation per row at
-screen scaled with D, not captured plans. The per-row cost of a wider
-replay is not expected to fall much: the 4090 measured no gain from 2 to 4
-rows, only a ~4% penalty at one row, and the SM count is the same. The FLA
-scan kernels launch B × H CTAs (20 at screen B = 2, 160 at B = 16), so
-their occupancy is the one place a wider replay could pay; it is a
-measurement, not a projection.
+## Component selection evidence
 
-Communication per step, per rank, ring-equivalent: about 5.25 S + 7 R
-bytes for S sharded and R replicated parameters (FP32 reduce-scatter plus
-BF16 all-gather of the sites, FP32 all-reduce of the arena): 3.4 GB at
-screen, 13.1 GB at flagship, i.e. about 14 ms and 53 ms at 250 GB/s
-effective, 1.7% and 2.6% of a mean step. Nothing overlaps today. On a PCIe
-box without NVSwitch (30–50 GB/s) the same traffic is 10–20% of a step: the
-rental has to be SXM with NVSwitch, and the first-hour check measures the
-actual reduce-scatter and all-gather bandwidth on the production slabs.
+These measurements selected the retained kernel choices before the geometry
+change. They used GQA query/KV counts 8/4, 12/6, and 16/8 at width 192, and
+PKDA counts 10, 15, and 20 at width 128 for screen, bridge, and flagship.
+Residual widths, experts, and the classifier match the current scales.
+Component times are warm captured synthetic forward/backward comparisons;
+they are not complete training steps. Ignored JSON artifacts retain source
+revisions, configurations, numerical checks, and timing samples.
 
-Startup: every rank compiles the same Inductor and Triton kernels; a shared
-`TORCHINDUCTOR_CACHE_DIR` deduplicates across runs, not within the first
-one, and eight compiling processes contend for the host CPUs. At 0.6 s
-steps ten minutes of cold compilation is ~10% of a screen 25× run.
+### Experts
 
-## A single GH200 first
+The two BF16 weight-gradient GEMMs use
+`(BM,BN,BK,warps,stages) = (64,128,128,4,3)` on sm90, replacing
+`(64,64,64,4,3)`. FP8 activation tiles and their scale granularity stay fixed.
+Complete six-GEMM path timings were:
 
-A rented GH200 (the H100 die with 132 SMs and 96 GB of HBM3 at 4.0 TB/s, on
-an aarch64 Grace host) is one H100 SXM's throughput at about half the
-node's price per GPU-hour, and it runs the single-process path Jobe has been
-running, so it is where the Hopper qualification starts: everything in the
-rental session below except the collectives is a single-GPU measurement.
-The machine profile lives in the meta repository's `bootstrap/rental.sh`
-(aarch64 CUDA 13.2 lock, workspace, the token store from the private
-bucket); `scripts/first_hour.sh` runs the session's first hour and writes
-`logs/first-hour/<tag>/summary.json`. `scripts/replay_bench.py` is the
-baseline the levers below are scored against: every captured graph replayed
-warm at its production width, seconds per replay, row, and row-column, the
-schedule-weighted step, a loss fingerprint at initialization, and with
-`--trace` one replay's kernel time by class. The Grace cores are also where the
-whole dclm-100b stream gets built and published (`scripts/publish_store.sh`,
-[operations](operations.md#tokenize)), overlapping the GPU work.
+| Scale / replay rows | Routing | Previous tiles, ms | Hopper tiles, ms |
+|---|---|---:|---:|
+| Screen / 4 | Balanced | 1.746 | 1.639 |
+| Screen / 4 | Skewed | 1.711 | 1.632 |
+| Bridge / 2 | Balanced | 2.014 | 1.923 |
+| Bridge / 2 | Skewed | 2.004 | 1.943 |
+| Flagship / 1 | Balanced | 1.941 | 1.945 |
+| Flagship / 1 | Skewed | 1.931 | 1.932 |
 
-Unsharded, with the FP8 copies, the static footprint is 8.5 GiB at screen,
-18.6 bridge, 32.5 flagship, and 72.1 extension. Against about 94.5 GiB
-usable, the widest raw replay per graph (rows; 128 rows per step) from the
-same block ledger as the table above:
+Outputs, input gradients, and weight gradients matched the comparison tiles
+exactly. Dispatch, external quantization, and sink reset are excluded.
+Results: `logs/hopper-tuning/moe-{scale}.json` and `moe-short-*.json`.
 
-| Scale | k=1 | k=2 | k=3 | (2,2) | (3,2) |
-|---|---:|---:|---:|---:|---:|
-| Screen | 16 | 8 | 4 | 4 | 4 |
-| Bridge | 8 | 4 | 4 | 2 | 2 |
-| Flagship | 8 | 4 | 2 | 2 | 1 |
-| Extension | 1 | 1, 4 of 26 recomputed | 1, 21 of 39 | 1, 38 of 52 | 1, 72 of 78 |
+### Classifier
 
-Screen through flagship run raw with every intermediate kept; extension
-wants the 144 GB variant or BF16 (about 10 GiB of static back). At the H100
-factor of 3.0 the 25x schedules take about 14 h (screen f), 21 (screen fl),
-58 / 85 (bridge), 160 / 234 (flagship) on the one card; the faster HBM and
-FP8 make these slightly conservative.
+Both BF16 directions changed from `B=128,V=128,D=32`, four warps/four stages,
+to `B=256,V=128,D=64`, eight warps/three stages. Vocabulary filtering and
+FP32 classifier-gradient accumulation remain enabled.
 
-## Levers, ranked
+| Scale | CCE input rows | Previous BF16, ms | Hopper BF16, ms |
+|---|---:|---:|---:|
+| Screen | 8 | 63.513 | 61.062 |
+| Bridge | 4 | 43.226 | 41.568 |
+| Flagship | 2 | 26.698 | 26.387 |
 
-Reductions of mean node step time; the ranges overlap and do not add.
-These are hypotheses for prioritizing work, not measured Hopper gains.
-Retunes cover screen, bridge, and flagship: a screen-only win does not set
-the larger models' configuration.
+CCE combines NTP and MTP, so these approximate four, two, and one training
+replay rows respectively, without the small boundary crop. Timings include
+forward, backward, and vocabulary ordering; classifier refresh and sink
+reset are separate. Inputs model initialized normalized readouts, not a
+trained checkpoint's filtering distribution.
 
-The short measurement tools run on an idle GPU and write ignored JSON under
-`logs/`. Their tile overrides affect only the benchmark process. Start with
-the small default candidate lists, then measure promising combinations in
-the model; do not expand every tile axis into a grid.
+At flagship, changed token partitions produced relative L2 differences of
+**0.216% for dE** and **0.137% for dC** against the previous filtered BF16
+configuration. Numerical and captured-replay checks passed; trajectories
+are not bitwise identical. The fastest tested FP8 heads took 263.474,
+193.916, and 123.350 ms respectively, so the classifier stays BF16.
+Results: `logs/hopper-tuning/head-{scale}.json`.
 
-| Tool | Comparison |
+Focused CUDA validation passed eight accumulator cases in 5.90 seconds;
+twelve tile-metadata cases passed separately. FP32 sinks may accumulate
+inside the MMA dot operation, so a repeated random contribution need not
+match adding two independently rounded gradients bit for bit. The tests
+retain exact first-write coverage and exact repeated accumulation with
+representable inputs.
+
+### PKDA and dense FP8
+
+The ATK inter-chunk forward scan now traverses a 128-channel head once with
+`BK=128`, replacing four `BK=32` traversals. Complete PKDA forward/backward
+at two rows changed from 2.024 to 2.002 ms at ten heads, 2.869 to 2.836 ms at
+fifteen, and 3.705 to 3.668 ms at twenty. Other intra-chunk, state, WY, and
+gate-scan candidates were flat or slower. All ten recurrence input gradients
+and captured replay were checked; the two focused old/new scan tests passed
+with exact outputs and gradients. Results: `logs/hopper-tuning/atk.json`,
+`atk-wide.json`, and `pkda.json`.
+
+At ten heads, increasing from two to sixteen rows reduced recurrence time
+per row from 1.012 to 0.853 ms. This is component occupancy evidence, not
+proof that a sixteen-row model replay fits or improves a complete step.
+Results: `logs/hopper-tuning/pkda-width.json`.
+
+For the earlier flagship packed QKV projection at 8,192 tokens, combined
+forward/dX and unchanged BF16-to-FP32 dW took 0.7655 ms in BF16, 0.6567 ms
+with rowwise FP8, 0.6629 ms with activation `1×128` / weight `128×128`
+scales, and 0.7535 ms with `1×128` scales on both operands. Per-call
+activation/gradient quantization is included; weight refresh was measured
+separately. Other blockwise cases were slower or failed the numerical check.
+This limited pilot supports retaining rowwise scaling.
+Results: `logs/hopper-tuning/dense.json`.
+
+## Earlier integrated replay and lifecycle
+
+The earlier width-192 screen `fl` graph, two passes/two loops/four rows,
+fell from **844.35 to 825.91 ms** with the component retunes: 2.18% less
+replay time. Five warm samples used retained recurrence intermediates,
+zero recomputed blocks, and a 67.90 GiB planner estimate. The corresponding
+retuned bridge graph at two rows measured **656.44 ms**. These are the
+comparison points for the new geometry, not its results. The common graph
+covers 76.04% of the configured recurrence roll; these times exclude a
+schedule-weighted mean and full training-job overhead.
+
+Screen trace totals attributed the main reductions to the classifier
+(253.23 to 243.79 ms) and experts (146.60 to 139.74 ms); recurrence was
+224.86 versus 224.65 ms. Before/after FLA revisions were `f208d549` and
+`9a1c09bd`, with the latter adding the ATK change. Both used Flash and
+rowwise FP8. Results: `logs/replay-bench/gh200-screen-before.json` and
+`gh200-screen-final.json`.
+
+The earlier-geometry screen `fl` lifecycle completed steps 1–12 with
+evaluation/snapshots, resumed through steps 13–15, and stopped cooperatively
+at step 18. The v42 reader loaded the final checkpoint. It reported 60.1 GiB
+peak allocation, 61.21 GiB reserved, and 8.57 GiB static allocation. Captured
+plans retained recurrence intermediates and recomputed zero blocks:
+
+| Passes | Loops | Rows per replay |
+|---:|---:|---:|
+| 2 | 2 | 4 |
+| 2 | 3 | 2 |
+| 3 | 2 | 2 |
+
+This establishes the launcher/evaluation/snapshot/resume/stop path at its
+measured geometry. It preceded the final retunes and does not certify the
+new geometry. `scripts/first_hour.sh` checks the expected lifecycle records
+and final checkpoint before writing success.
+
+## Machine and operation
+
+The rental reports `NVIDIA GH200 480GB`, compute capability 9.0, with
+**94.50 GiB CUDA-visible GPU memory** on an aarch64 Grace host. Observed
+runtime versions were Torch 2.14.0+cu132, CUDA 13.2, Triton 3.8.0, cuDNN
+9.24, and NCCL 2.30.7. The product name does not describe available GPU HBM.
+
+The GH200 exposed an Inductor split-scan workspace mismatch:
+`min_split_scan_rblock` metadata did not bound `R0_BLOCK` in the tuner,
+which reads `min_rblock`. `inductor.py` supplies that key. The lifecycle ran
+after removing faulty caches and applying the correction. Old cache entries
+cannot establish correctness of the corrected launcher.
+
+Warmup can generate pointwise/reduction kernels on resume despite cached
+GEMM tuning, and allocation warnings can precede successful capture. Inspect
+process activity, cache writes, and subsequent capture/step records before
+calling startup stalled. Keep cyclic garbage collection outside capture and
+GPU jobs serial.
+
+Use `scripts/replay_bench.py --replay-rows N` to fix actual replay width;
+`--micro-rows` is a minimum. `--condition f --specs 1:1` isolates a
+single-column width trial. `--expert-tiles ada`, `--cce-config bf16-base`,
+`--attention-backend`, and `--fp8-head` support scoped comparisons.
+Component tools override configurations only in their own process:
+
+| Tool | Scope |
 |---|---|
-| `scripts/attention_bench.py --scales screen,bridge,flagship --rows 2,4` | Forced flash and cuDNN forward/backward in the compiled wrapper, with gradient checks |
-| `scripts/pkda_bench.py --heads 10,15,20 --rows 2` | Production PKDA operator, all recurrence input gradients, state-kernel tile shortlist |
-| `scripts/moe_bench.py --scale bridge flagship --rows 2 --candidates dw128 k128` | Full six-GEMM expert path under balanced and skewed routing |
-| `scripts/cce_bench.py --dim 1152 --rows 4` | BF16 and FP8 head tiles for a two-row training replay's combined NTP/MTP head; activation quantization included, classifier refresh reported separately |
-| `scripts/dense_fp8_bench.py --scales flagship,bridge --rows 2` | Rowwise versus blockwise dense FP8, with forward, dX, unchanged FP32 dW, and weight refresh measured separately |
+| `scripts/attention_bench.py` | Attention backend, output/gradients, graph capture |
+| `scripts/pkda_bench.py --heads 8,12,16 --rows 2` | Current PKDA head counts and all input gradients |
+| `scripts/moe_bench.py` | Balanced/skewed expert routing and GEMM tiles |
+| `scripts/cce_bench.py --dim 1152 --rows 4 --candidates bf16-base,bf16-b256` | Paired head for a two-row bridge replay |
+| `scripts/dense_fp8_bench.py` | Dense FP8 scaling, quantization, weight refresh |
 
-`scripts/replay_bench.py` accepts `--replay-rows N` to fix the actual replay
-width, `--attention-backend cudnn|flash` to force a backend, and `--fp8-head`
-to exercise the classifier hook before its shadows are prepared. The
-trainer's ordinary `--micro-rows` is a minimum, not a width override. Use
-`--condition f --specs 1:1` for a single-column width comparison; `fl` with
-recurrence starting at step zero reaches `(2,2)`, `(2,3)`, and `(3,2)`.
-Compare the complete captured replay, and include a paired short train for
-changes to the FP8 recipe. A trace identifies the selected attention
-backend; forced A/B measurements establish which one is faster.
+Generated logs, traces, snapshots, and figures remain untracked. Each JSON's
+source revisions and geometry bound its claims; a later fork or different
+shape needs its own evidence.
 
-| # | Lever | Screen | Flagship | Needs Hopper to build? |
-|---|---|---:|---:|---|
-| 1 | FP8 GEMM class (landed: dense sites and experts; the head measured as a loss on the 4090, below) | 4–13% | 8–28% | No; to measure, yes |
-| 2 | FLA retune of the preconditioned-KDA chain | 4–10% | 3–8% | Yes |
-| 3 | Expert grouped-GEMM retile | 2–5% | 3–7% | Yes |
-| 4 | CCE fixed-configuration retune | 3–6% | 2–5% | Yes |
-| 5 | Attention backend at head width 192 (landed: cuDNN first, flash fallback) | 2–4% | 1.5–3% | No; to measure, yes |
-| 6 | Replay width and per-graph saved set (landed; retaining measured ~0.2% on the 4090) | 0–10% | 0–8% | Partly |
-| 7 | Communication layout and overlap | 0.5–2% | 1–3% | No |
-| 8 | Pointwise, MHDB, dispatch, tail | 1–5% | 1–4% | Yes |
-| 9 | Optimizer step, host gaps | <1% | <1% | No |
+## Multi-GPU node verification
 
-1. **FP8 for the GEMM class** (landed, `--precision fp8`, the default;
-   [architecture](architecture.md#precision-and-initialization)). Forward
-   and dX GEMMs of the dense sites through `torch._scaled_mm` with rowwise
-   scales and the experts' two forward and two activation-gradient GEMMs in
-   Triton `fp8e4nv`; the CCE fork can run the head on FP8 too
-   (`CCEParams.fp8_classifier`, reached through `DeltaModel.fp8_classifier`)
-   but the recipe leaves it in BF16, below. dW stays a BF16 → FP32
-   accumulation (the `rowwise_with_gw_hp` shape): the FP32 gradient
-   contract is untouched and no dY^T transposes are materialized.
-   Every rank rewrites each site's FP8 copies (the matrix and its
-   transpose, a scale per row of each) from the BF16 working copy after
-   the gather, so nothing FP8 is communicated and the working copy the
-   optimizer writes is unchanged; the FP8 copies cost one byte per element
-   beyond it (screen static footprint 7.4 → 8.6 GiB on the 4090). Scaling
-   is current and stateless (a row's scale is its own amax), so a
-   recomputed forward quantizes identically and the v42 checkpoint carries
-   nothing new; the recipe is a runtime field a resume inherits. The
-   router GEMMs stay FP32. On the 4090 the quantization overhead costs
-   most of the small-shape gain: forward + dX of the dense sites at
-   M = 8,192 (two screen rows) 2.19 → 1.84 ms (1.19×; 1.29× at one row),
-   1.11× per site once the BF16 dW is counted; at flagship shapes 8.78 →
-   5.92 ms (1.48×, 1.26× with dW). Tensorwise scaling was slower than
-   rowwise at every screen shape (1.06× against 1.19×) and worse
-   numerically, so it is not offered. The routed expert kernels at the
-   screen geometry (8,192 tokens, top-3): forward 0.75 → 0.51 ms (1.46×),
-   backward without the weight gradients 0.79 → 0.66 ms (1.20×); the two
-   BF16 dW GEMMs are now the larger half of the expert backward. Per-GEMM
-   relative error 3.7e-2, expert output 6.5e-2. A paired eight-step screen
-   run (`f`, one row per replay) tracked the BF16 recipe's loss to four
-   digits at 25.4 against 26.9 s per k = 2 step (5.6%) and 38.8 against
-   40.4 at k = 3. The head is the exception: its FP8 kernels are right
-   (loss and log-partition within 2e-3 relative, gradients 2.7e-2) but its
-   backward is bound by the lock-added partial gradients, dE per vocabulary
-   tile and dC per token tile, whose bytes FP8 does not touch, and on sm_89
-   the 8-bit MMA fragments and the in-register quantization of the
-   probability tile spill at the 128 × 128 tile: the shapes that fit
-   (256 × 64 × 64 forward, 64 × 64 × 32 backward) double that traffic. In
-   the model's own head at 8,192 rows the backward took 77.6 ms against
-   23.4 in BF16, and the eight-step run 39.3 s per k = 2 step against 25.4,
-   so the recipe keeps the head in BF16; `DeltaModel.fp8_classifier` is the
-   one-line hook for trying it on Hopper, where wgmma keeps the operands in
-   shared memory and 128-wide tiles may hold. FP8 changes training
-   numerics: runs paired against the BF16 recipe cannot mix it in, and
-   Hopper's own choices (blockwise scaling is sm_90-only; the head) are
-   first-hour measurements against this rowwise recipe.
-2. **FLA retune.** The fork already carries Hopper tables (`IS_NVIDIA_HOPPER`
-   warp lists and the 128-wide `CONST_TILING` in `precond_kda/chunk_bwd.py`)
-   and the Triton #984 guard in `delta_rule/wy_fast.py` (`num_warps=4`
-   miscompiles on sm_90). Ada-tuned constants remain in
-   `precond_kda/chunk_intra.py` (`BWD_INTRA_BK=32`),
-   `precond_kda/wy_fast.py` (BK = BV = 64), the `chunk_delta_h` state kernels,
-   the ATK scans, and the fused conv / L2-norm kernels. Several autotune keys
-   omit the batch, so a choice made at calibration width is reused at B = 16.
-   Sweep with `pkda_bench.py` at H = 10 and 20 on real projected tensors,
-   requiring gradients for gates, beta, the preconditioner scale, and
-   `dt_bias`, not q/k/v agreement alone. Do not enable `safe_gate`, round
-   `dg2`, or revisit the tensor-core diagonal.
-3. **Expert retile.** `moe_kernels.py`'s `TILE_*` are Ada measurements
-   (BK = 32, four warps). Tune all six GEMMs together on one real bank at
-   production B under balanced and skewed routing; a faster forward that
-   loses the fused SwiGLU backward is not a win.
-4. **CCE retune.** `CCE_AUTOTUNE` cannot be used with the persistent
-   classifier accumulator (the fork rejects it), so this is a fixed
-   forward/backward configuration swept in the fork with disposable sinks.
-   The BF16 halves share the 128 × 128 token/vocabulary partition; the FP8
-   halves (`_cce_best_config_fp8` and its backward twin in
-   `tl_autotune.py`) are 4090 measurements that need only agree on the
-   vocabulary tile, and Hopper's wgmma wants larger ones.
-5. **Attention backend.** `attention.py` now asks for cuDNN attention first
-   and the flash kernel second; on the 4090 cuDNN has no kernel at head
-   width 192 and the fallback is bitwise flash, on sm_90 torch 2.14 serves
-   head 192 forward and backward with GQA through cuDNN and reports up to
-   1.75× over the flash backend. Whether it wins there is a first-hour
-   measurement (forward + backward under the compiled wrapper and a graph);
-   if it loses, the order flips. FA3 has abi3 wheels at
-   download.pytorch.org (torch ≥ 2.9), head 192 both directions, FP8 forward
-   only.
-6. **Replay geometry.** `plan_replay` takes the widest replay that fits,
-   its recurrences keeping their WY representation and chunk states when
-   that fits too, else rebuilding them, then block recomputation. Measured
-   on the 4090 (screen f, k = 1, two-row replays, eight 128-row steps):
-   keeping 108.9 s, rebuilding 109.1 s, losses identical to four digits, so
-   the rebuild costs ~0.4 ms per two-row replay, not the 2.9 ms per row-pass
-   round 11 measured before the fork's upstream sync; the choice is free
-   where it fits and worth nothing else. With it, screen f k = 3 fits raw
-   with every intermediate kept (12.7 of 13.5 GiB on the 4090). What remains
-   to measure is whether width beyond the smallest replay buys anything on
-   Hopper (the FLA scans), and where the 106 ms per row of a fresh run
-   comes from against the ledger's 94.4 after twenty steps (an untrained
-   head filters no CCE tiles; the head sink is now FP32).
-7. **Communication.** Grouped launches that keep the site-major storage,
-   then the weight all-gather overlapping later optimizer buckets after the
-   finite-norm check. Gradient overlap needs last-use events or graph
-   segmentation and is not worth it at the ceiling above. NCCL symmetric
-   memory (torch 2.14, NCCL ≥ 2.27) covers all-gather, float all-reduce and
-   reduce-scatter but not the dense `reduce`/`broadcast` or integer counts,
-   and needs its own registered pool, not the activation pool.
+A single GH200 establishes neither multi-GPU throughput nor communication
+cost. Before relying on an eight-H100 node:
 
-Non-levers for the node, with the reason: FlashKDA (forward-only, K = V = 128,
-no released backward; the fork's operator has an asymmetric preconditioned
-update it does not implement); FA4 first (beta, no cp313 wheel, no compile
-custom op); blind torchao conversion (the custom sink and grouped operators
-are the paths that matter); BF16 or FP8 gradient communication (breaks the
-FP32 contract for ~2%); more sharding or offload (memory is not the binding
-constraint below extension); rank-0 monitor and snapshot restructuring
-(measured 2.2 s per eval and ~2.5 s per screen snapshot on the 4090, under
-1% at the default cadences); vocab-parallel CCE; `max-autotune` (already
-on).
+1. Confirm distinct devices, usable GPU memory, NVSwitch/peer topology,
+   runtime and fork revisions; run `delta probe --ranks 8`.
+2. Measure reduce-scatter and all-gather on production slabs. Verify
+   gradient sums, gathered weights, and expert-bias agreement across ranks.
+3. Capture the deepest screen and target-scale graphs. Record each rank's
+   plan, peak allocation, reserved memory, and free memory.
+4. Exercise evaluation, snapshots, cooperative stop, and resume across the
+   intended rank counts.
+5. Measure complete warm replays and schedule-weighted step time. Include
+   startup compilation and monitoring in complete-run estimates.
 
-## What can be built without a Hopper card
-
-The 4090 has FP8 tensor cores (sm_89) and runs cuDNN attention, so the
-code paths of levers 1, 5, 6, 7, and 9 can be built, tested for numerics,
-and even timed on Jobe; only their Hopper throughput is unknown.
-Tensorwise and rowwise `_scaled_mm` work on sm_89; DeepSeek-style
-1 × 128 / 128 × 128 blockwise scaling is sm_90-only, so the landed recipe is
-rowwise and the node measures whether blockwise pays. Levers 2, 3, 4, and 8
-are tile constants and traces that only mean something on the target
-architecture. NCCL multi-rank execution cannot run on one GPU: the plumbing
-is covered by the two-rank gloo tests and `delta probe --ranks N` exists
-for the first node hour.
-
-| Work | Where it can be verified now |
-|---|---|
-| FP8 dense sites and expert GEMMs (landed); FP8 head (built, off) | Jobe: numerics (paired steps), 4090 throughput as an Ada signal |
-| Attention backend selection by architecture | Jobe: correctness with cuDNN forced; speed only on the node |
-| Per-graph saved set in the planner (landed) | Jobe: memory and time, fully |
-| Communication grouping and gather overlap | Mac/Jobe: gloo two-rank tests; bandwidth only on the node |
-| Compile-cache prewarm across ranks, snapshot gather batching | Mac/Jobe |
-| FLA, expert, CCE retunes; FA3; NVLS/symmetric memory; the real profile | Node only |
-
-## Kernel stack state (2026-09-16)
-
-- flash-linear-attention upstream v0.5.2 (2026-07-27); the fork at 05ba6d83
-  is synced with it and keeps the PKDA kernel patches. No FP8 anywhere in
-  the KDA or gated-delta chains.
-- FlashKDA (MoonshotAI): CUTLASS, sm_90a and Blackwell, forward only,
-  K = V = 128, dispatched by FLA's `chunk_kda` under `use_qk_l2norm_in_kernel`.
-  NVIDIA cudnn-frontend PR #1061 is the first sm90 KDA backward, unmerged.
-- FlashAttention: FA4 4.0.0b30 (Hopper + Blackwell, beta, Python ≤ 3.12
-  wheels, compile through `flex_attention(kernel_options={"BACKEND": "FLASH"})`
-  only); FA3 3.0.0 abi3 wheels for CUDA 12.6–13.0.
-- torch 2.14: cuDNN 9.24 with SDPA head 256 on sm_90; cuDNN attention
-  default-selected on sm_90; GQA on every SDPA backend; blockwise
-  `_scaled_mm` on sm_90 (CUDA ≥ 12.9); cuBLASLt grouped GEMM backend
-  (default for FP16 on Hopper with CUDA ≥ 13.3); NVGEMM CuTeDSL templates in
-  Inductor; symmetric memory for the standard collectives; an in-tree
-  `nccl2` preview backend.
-- torchao float8: recipes `tensorwise`, `rowwise`, `rowwise_with_gw_hp`;
-  `mxfp8` Blackwell-only; `moe_training._scaled_grouped_mm` (rowwise on
-  sm_89+); reported 1.25–1.5× end to end on Llama-3 8B with FSDP2.
-- DeepGEMM: sm_90/sm_100, CUDA ≥ 12.9, dense `fp8_gemm_{nt,nn,tn,tt}`,
-  m-grouped (MoE forward) and k-grouped (weight gradient) kernels; contiguous
-  segment layouts, not our unpadded stable permutation.
-- Transformer Engine 2.x: recommends blockwise scaling on Hopper; reports
-  1.41× (blockwise) to 1.69× (delayed) on a 5B dense model on H200; grouped
-  FP8 GEMMs on Hopper.
-- No public FP8 cross-entropy head results.
-- Found on the GH200 (2026-09-16): Inductor's split-scan kernels record
-  their workspace's block minimum as `min_split_scan_rblock` while the
-  coordinate-descent tuner and the spill halving floor `R0_BLOCK` on
-  `min_rblock`, so the tuner can pick a block whose extra programs write
-  past the workspace. The 4090 never crossed the bound; the GH200 faulted in
-  the routers' rank scan under every recipe. `inductor.py` records the
-  minimum under the key the tuner reads; a 15 x 12,288 `cumsum` under
-  max-autotune with coordinate descent reproduces it upstream.
-
-## The first rental session
-
-An eight-GPU node costs eight GPU-hours per hour even when one card is
-busy: scripts, reference tensors, constraints, and data go on before the
-clock starts. Ordered by information per GPU-hour:
-
-1. **First ten minutes.** Eight distinct H100 SXM devices, NVSwitch topology
-   and peer access, no MIG or sharing, exact driver / torch / Triton / NCCL /
-   fork / data revisions.
-2. **Minutes 10–20.** `delta probe --ranks 8`: NCCL through the real
-   collectives, both graphs, the cross-rank digest of gathered weights.
-   Then the production slabs' reduce-scatter and all-gather bandwidth.
-3. **Minutes 20–40.** A short screen `fl` run on eight ranks reaching the
-   `(2,2)` and `(3,2)` graphs; every rank's `memory_plan`, peak, reserved and
-   free; gradient sums (not averages); finite gradients on every PKDA
-   control and preconditioner parameter; replicated masters and expert
-   biases identical across ranks after the gather.
-4. **Minutes 40–60.** Save on eight ranks, restore on one and two, then the
-   reverse; a forced eval, monitors, and snapshot; `delta stop` through the
-   spool, the snapshot landing inside the launcher's 110 s.
-5. **Then.** Warm screen and flagship traces per kernel class (replaces the
-   table above); replay-width sweep with C versus A retention; the FLA,
-   expert, CCE, and attention comparisons; one FP8 dense or expert pilot
-   with real scales and backward; finally the integrated candidate on a
-   paired short train and the deepest captures. Score candidates with the
-   roll's weights, about 0.75 t₁ + 0.22 t₂ + 0.03 t₃ for f.
-
-Stop debugging performance if collective correctness or restart fails;
-that evidence is what the session is for.
-
-On one card, `scripts/first_hour.sh` covers items 1, 3, and 4 without the
-collectives: inventory, probe, a short `fl` run from the recurrence roll's
-start with an eval and snapshot midway, a resume, a SIGINT stop, and the
-summary (memory plan, peak, seconds per step by graph).
+Shared compiler caches can reduce startup work but do not eliminate graph
+reconstruction or duplicate compilation by cold processes. Choose overlap
+or further sharding from node measurements.
