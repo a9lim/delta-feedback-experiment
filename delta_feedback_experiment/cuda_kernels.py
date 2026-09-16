@@ -1049,7 +1049,13 @@ def _route_backward_impl(
         num_warps=num_warps,
     )
     summed = partials.sum(dim=1)
-    return summed[0].to(projected.dtype), summed[1].to(null.dtype), source_grads
+    # Custom-op outputs must own distinct storage even when FP32 needs no
+    # cast. BF16 already copies here as part of its dtype conversion.
+    return (
+        summed[0].to(projected.dtype, copy=True),
+        summed[1].to(null.dtype, copy=True),
+        source_grads,
+    )
 
 
 if triton is not None:
