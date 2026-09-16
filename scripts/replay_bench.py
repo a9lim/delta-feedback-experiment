@@ -4,6 +4,7 @@ by kernel class: the baseline the Hopper levers are scored against.
     python scripts/replay_bench.py --data-root /data/delta [--tag gh200-base]
         [--condition fl] [--scale screen] [--specs 1:1,2:2,3:2] [--trace]
         [--replay-rows 2] [--attention-backend cudnn|flash] [--fp8-head]
+        [--cce-config bf16-base] [--expert-tiles default|ada]
         [--warm 3] [--repeat 10] [-- --precision bf16 --micro-rows 2 ...]
 
 Builds the trainer exactly as ``delta train`` does (same planner, same
@@ -19,6 +20,8 @@ rows). ``--trace`` profiles one replay per graph
 and sums kernel time by class (GEMM, FLA recurrence, CCE head, experts,
 attention, pointwise, ...) with the top kernels by time. Writes
 ``logs/replay-bench/<tag>.json``. Run from the experiment directory.
+CCE/expert overrides affect only this benchmark process; omitted controls
+use the production configuration. FP8 CCE candidates require --fp8-head.
 """
 
 from __future__ import annotations
@@ -66,6 +69,8 @@ def git_rev(path: str) -> str:
 
 
 def main() -> None:
+    from cce_bench import CANDIDATES as CCE_CANDIDATES, select as select_cce
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--tag", default="replay-bench")
     parser.add_argument("--condition", default="fl")
@@ -80,21 +85,36 @@ def main() -> None:
     parser.add_argument("--attention-backend", choices=("default", "cudnn", "flash"), default="default",
                         help="force a single attention backend for an A/B comparison")
     parser.add_argument("--fp8-head", action="store_true", help="try the FP8 classifier as well as the selected site precision")
+    parser.add_argument("--cce-config", choices=tuple(CCE_CANDIDATES), default=None,
+                        help="use this fixed CCE benchmark configuration; omitted uses production")
+    parser.add_argument("--expert-tiles", choices=("default", "ada"), default="default",
+                        help="use production expert tiles or restore Ada dW tiles for a paired comparison")
     parser.add_argument("--out", default=None, help="default logs/replay-bench/<tag>.json")
     parser.add_argument("extra", nargs="*", help="further delta train flags after --")
     opts = parser.parse_args()
     if opts.warm < 0 or opts.repeat < 1:
         parser.error("--warm must be nonnegative and --repeat must be positive")
+    if opts.cce_config is not None:
+        candidate = CCE_CANDIDATES[opts.cce_config]
+        if candidate.precision == "fp8" and not opts.fp8_head:
+            parser.error("an FP8 --cce-config requires --fp8-head")
+        if candidate.precision == "bf16" and opts.fp8_head:
+            parser.error("a BF16 --cce-config cannot be used with --fp8-head")
 
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from delta_feedback_experiment import attention, distributed
+    from delta_feedback_experiment import attention, distributed, moe_kernels
     from torch.nn.attention import SDPBackend
 
     if opts.attention_backend != "default":
         attention.FUSED_BACKENDS = [{"cudnn": SDPBackend.CUDNN_ATTENTION,
                                     "flash": SDPBackend.FLASH_ATTENTION}[opts.attention_backend]]
+    if opts.cce_config is not None:
+        select_cce(CCE_CANDIDATES[opts.cce_config])
+    if opts.expert_tiles == "ada":
+        moe_kernels.TILE_DW_GATE_HOPPER = moe_kernels.TILE_DW_GATE
+        moe_kernels.TILE_DW_DOWN_HOPPER = moe_kernels.TILE_DW_DOWN
     from delta_feedback_experiment.data import TokenData
     from delta_feedback_experiment.model import DeltaModel, condition_config
     from delta_feedback_experiment.optim import build_optimizers
@@ -171,6 +191,8 @@ def main() -> None:
         "scale": args.scale,
         "precision": args.precision,
         "fp8_head": opts.fp8_head,
+        "cce_config": opts.cce_config,
+        "expert_tiles": opts.expert_tiles,
         "attention_backend": opts.attention_backend,
         "requested_replay_rows": opts.replay_rows,
         "device": torch.cuda.get_device_name(),

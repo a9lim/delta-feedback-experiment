@@ -34,6 +34,7 @@ CANDIDATES = {
     "state16": "Forward/backward state BV=16, 2 warps, 2 stages; increases CTA count.",
     "state32": "Forward/backward state BV=32, 2 warps, 2 stages; fixed narrow baseline.",
     "scan128": "Gate forward scan BS=128, 4 warps; one K tile per chunk/head.",
+    "atk-scan128": "ATK inter-chunk forward scan BK=128, 4 warps; one sweep through the chunks.",
 }
 INPUT_NAMES = (
     "q", "k", "v", "g", "g_atk", "beta_atk", "beta", "A_log", "dt_bias", "log_atk_scale",
@@ -61,7 +62,13 @@ class FixedLaunch:
 
     def __getitem__(self, grid):
         def launch(*args, **kwargs):
-            return self.kernel[grid](*args, **(kwargs | self.meta))
+            args = list(args)
+            meta = self.meta.copy()
+            # ATK passes its tile width positionally; the PKDA kernels name it.
+            for index, name in enumerate(self.kernel.arg_names[:len(args)]):
+                if name in meta:
+                    args[index] = meta.pop(name)
+            return self.kernel[grid](*args, **(kwargs | meta))
         return launch
 
 
@@ -96,6 +103,8 @@ def candidate_launches(name):
                           BV=int(part.removeprefix("state")), num_warps=2, num_stages=2)
             elif part == "scan128":
                 fixed("fla.ops.kda.gate", "kda_gate_chunk_cumsum_vector_kernel", BS=128, num_warps=4)
+            elif part == "atk-scan128":
+                fixed("fla.ops.atk.chunk_atk_fwd", "_forward_pass_chunks", BK=128, num_warps=4)
             else:
                 raise ValueError(f"Unknown candidate {part!r}")
         yield
