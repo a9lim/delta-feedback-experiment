@@ -140,7 +140,8 @@ the model; do not expand every tile axis into a grid.
 | `scripts/attention_bench.py --scales screen,bridge,flagship --rows 2,4` | Forced flash and cuDNN forward/backward in the compiled wrapper, with gradient checks |
 | `scripts/pkda_bench.py --heads 10,15,20 --rows 2` | Production PKDA operator, all recurrence input gradients, state-kernel tile shortlist |
 | `scripts/moe_bench.py --scale bridge flagship --rows 2 --candidates dw128 k128` | Full six-GEMM expert path under balanced and skewed routing |
-| `scripts/cce_bench.py --dim 1152 --rows 2` | BF16 and FP8 head tiles; activation quantization included, classifier refresh reported separately |
+| `scripts/cce_bench.py --dim 1152 --rows 4` | BF16 and FP8 head tiles for a two-row training replay's combined NTP/MTP head; activation quantization included, classifier refresh reported separately |
+| `scripts/dense_fp8_bench.py --scales flagship,bridge --rows 2` | Rowwise versus blockwise dense FP8, with forward, dX, unchanged FP32 dW, and weight refresh measured separately |
 
 `scripts/replay_bench.py` accepts `--replay-rows N` to fix the actual replay
 width, `--attention-backend cudnn|flash` to force a backend, and `--fp8-head`

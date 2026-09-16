@@ -5,6 +5,8 @@
     python scripts/cce_bench.py --dim 768 --rows 2 --candidates bf16-base,fp8-v128
 
 Rows count 4096-token CCE input rows, including any concatenated MTP head.
+For the paired NTP/MTP head, use twice the training replay's row count;
+this benchmark does not model the small token crop at the sequence boundary.
 This measures the head and its vocabulary ordering, not a whole training step.
 Classifier FP8 refresh is measured separately: production pays it once per
 optimizer step, whereas activation quantization runs inside every FP8 call.
@@ -385,7 +387,19 @@ def main() -> None:
                 entry["timing"] = elapsed(
                     graph.replay, sink.zero_, args.warm, args.repeat
                 )
-                entry["status"] = "ok"
+                # elapsed leaves exactly the last replay's contribution in
+                # the sink. Compare the captured outputs with this same
+                # candidate's ordinary call, not a different precision/tile.
+                parity = compare((graph_loss, graph_grad, sink), full)
+                entry["capture_parity"] = parity
+                entry["capture_pass"] = (
+                    all(metric["finite"] for metric in parity.values())
+                    and parity["loss"]["relative_l2"] < 2e-5
+                    and parity["input_grad"]["relative_l2"] < 0.02
+                    and parity["classifier_grad"]["relative_l2"] < 1e-3
+                )
+                entry["status"] = "ok" if entry["capture_pass"] else "capture_failed"
+                entry["numerics_pass"] &= entry["capture_pass"]
                 del graph, graph_loss, graph_grad
             del full
         except Exception as exc:  # noqa: BLE001 -- report failed candidates, then check CUDA health.
