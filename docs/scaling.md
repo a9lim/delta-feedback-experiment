@@ -31,8 +31,9 @@ Preset availability does not establish GPU fit or throughput.
 | Included auxiliary MTP active parameters | 11,318,176 | 25,110,320 | 44,324,544 | 99,019,232 |
 
 Every scale has a 50,304-row tied embedding/readout, 4,096 predictions per
-row, and 128 rows per update in one-row microbatches: 524,288 predicted tokens
-per step. Each stored row includes one additional target. Width multipliers
+row, and 128 rows per update: 524,288 predicted tokens per step. The replay
+planner packs multiple rows into each microbatch when memory permits.
+Each stored row includes one additional target. Width multipliers
 and optimizer ownership are in [architecture.md](architecture.md#nadam-parameters).
 The muP reference stays at the flagship width 1,536. Extension's `1536/D`
 multiplier is `2/3` for NAdam width rates and readout scaling. Expert
@@ -53,9 +54,9 @@ parameter counts. Training's transient assignment counts have shape
 The auxiliary block adds `P_PKDA + 3D(n+1)h + (n+2)D` parameters:
 its PKDA mixer, expert matrices, expert router, and two RMSNorm scales.
 Its active count replaces `(n+1)` with `(k+1)` in the expert term. It runs
-once per training pass over `seq_len` positions, of
+once per executed training column over `seq_len` positions, of
 which `seq_len-1` are supervised, and shares the embedding/final norm/readout
-with the main head, including that pass's single vocabulary-loss call.
+with the main head, including that column's single vocabulary-loss call.
 It does not execute in generation. MTP and feedback share a concat-linear
 entry containing one `2D -> D` matrix, or `2D^2` parameters. Token embeddings
 enter through the fixed lookup multiplier `1/BASE_NORMAL_INIT_STD`; the
@@ -110,6 +111,7 @@ Every condition at a geometry shares that schedule. Auxiliary second-token
 targets add supervision on the same rows without increasing the recorded
 ordinary predicted-token count. `--steps` sets a length directly. The default
 ratio is 25; larger ratios are supported arithmetic scenarios.
+See [runtime estimates](runtime.md) for GH200 and eight-H100 durations.
 
 | Scale | 25x steps | 25x predicted tokens | 400x steps | 400x predicted tokens |
 |---|---:|---:|---:|---:|

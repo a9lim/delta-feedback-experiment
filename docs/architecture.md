@@ -232,15 +232,15 @@ U = topk(s)
 P_j = mean_tokens(q_j)
 F_j = stop_gradient(count_tokens(j in U) / (kT))
 aux_layer = mean_sequences(n * sum_j P_j F_j)
-aux_pass = (sum_executed_trunk_layers(aux_layer) + aux_mtp) / (N_trunk + 1)
-aux = mean_passes(aux_pass)
+aux_column = (sum_trunk_layers(aux_layer) + aux_mtp) / (N_trunk + 1)
+aux = mean_executed_columns(aux_column)
 training_loss += 1e-4 * aux
 ```
 
-Layer/pass averaging keeps the
+Layer/column averaging keeps the
 coefficient independent of depth and pass count. The auxiliary bank contributes
-once per pass, with its own `T` positions, including the padded last one whose
-cross-entropy is unweighted: it still selects experts, so it enters that bank's
+once per executed column, with its own `T` positions, including the padded last
+one whose cross-entropy is unweighted: it still selects experts, so it enters that bank's
 counts and sequence balance as a one-in-`T` perturbation. The bank's
 within-sequence gradient coupling does not change causal forward activations.
 Cross-entropy excludes it.
