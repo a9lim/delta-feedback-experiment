@@ -1,11 +1,18 @@
-"""Compare forced attention backends in the production compiled wrapper.
+"""Compare forced attention backends and optional padding in compiled wrappers.
 
     python scripts/attention_bench.py --scales screen,bridge,flagship --rows 2,4
+    python scripts/attention_bench.py --scales bridge --rows 2 --head-dim 256 --backends cudnn
+    python scripts/attention_bench.py --scales bridge --rows 2 --heads 6 --kv-heads 3 --head-dim 256 --backends cudnn
+    python scripts/attention_bench.py --scales bridge --rows 2 --head-dim 192 --pad-to 256 --backends cudnn
 
 Five warm graph timings per shape are enough to shortlist a backend. Both
 the output and all input gradients are compared with eager flash attention
-on identical BF16 inputs. This measures attention forward and backward,
-not projections or a whole model step.
+on identical BF16 inputs at the original head width. Padding preserves that
+width's attention scale and slices the output back to it. This measures
+attention forward and backward, including padding when requested, not
+projections or a whole model step. No production architecture is changed.
+Head-count overrides apply to every selected scale; use one scale when
+testing a particular proposed geometry.
 """
 
 from __future__ import annotations
@@ -22,12 +29,23 @@ def main():
     parser.add_argument("--scales", default="screen,bridge,flagship")
     parser.add_argument("--rows", default="2,4")
     parser.add_argument("--seq-len", type=int, default=4096)
+    parser.add_argument("--head-dim", type=int, default=192, help="original Q/K/V head width")
+    parser.add_argument("--heads", type=int, default=None, help="query heads, overriding every selected scale")
+    parser.add_argument("--kv-heads", type=int, default=None, help="KV heads, overriding every selected scale")
+    parser.add_argument("--pad-to", type=int, default=None,
+                        help="zero-pad Q/K/V to this width, retaining the original attention scale")
     parser.add_argument("--backends", default="flash,cudnn")
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--out", type=Path, default=Path("logs/attention-bench/gh200.json"))
     opts = parser.parse_args()
-    if opts.repeat < 1 or opts.seq_len < 1:
-        parser.error("repeat and sequence length must be positive")
+    if min(opts.repeat, opts.seq_len, opts.head_dim) < 1:
+        parser.error("repeat, sequence length and head dimension must be positive")
+    if opts.pad_to is not None and opts.pad_to < opts.head_dim:
+        parser.error("--pad-to must be at least --head-dim")
+    if any(count is not None and count < 1 for count in (opts.heads, opts.kv_heads)):
+        parser.error("head counts must be positive")
+    if opts.heads is not None and opts.kv_heads is not None and opts.heads % opts.kv_heads:
+        parser.error("query heads must be divisible by KV heads")
 
     import torch
     from torch.nn import functional as F
@@ -36,8 +54,32 @@ def main():
     from delta_feedback_experiment import attention
     from delta_feedback_experiment.train import SCALES, _capture_without_gc
 
+    shapes = []
+    for scale in opts.scales.split(","):
+        cfg = SCALES[scale]
+        heads = opts.heads if opts.heads is not None else cfg["heads"]
+        kv_heads = opts.kv_heads if opts.kv_heads is not None else cfg["kv_heads"]
+        if heads % kv_heads:
+            parser.error(f"{scale}: query heads ({heads}) must be divisible by KV heads ({kv_heads})")
+        shapes.append((scale, heads, kv_heads))
+
+    attend = attention.causal_attention
+    if opts.pad_to is not None:
+        def padded_attention(query, key, value):
+            padding = (0, opts.pad_to - opts.head_dim)
+            with sdpa_kernel(attention.FUSED_BACKENDS, set_priority=len(attention.FUSED_BACKENDS) > 1):
+                output = F.scaled_dot_product_attention(
+                    F.pad(query, padding), F.pad(key, padding), F.pad(value, padding),
+                    scale=opts.head_dim**-0.5, is_causal=True, enable_gqa=True,
+                )
+            return output[..., :opts.head_dim]
+
+        attend = torch.compile(padded_attention, fullgraph=True, dynamic=False, mode=attention.INDUCTOR_MODE)
+
     backends = {"flash": SDPBackend.FLASH_ATTENTION, "cudnn": SDPBackend.CUDNN_ATTENTION}
-    result = {"device": torch.cuda.get_device_name(), "torch": torch.__version__, "cases": []}
+    result = {"device": torch.cuda.get_device_name(), "torch": torch.__version__,
+              "head_dim": opts.head_dim, "pad_to": opts.pad_to,
+              "heads_override": opts.heads, "kv_heads_override": opts.kv_heads, "cases": []}
     opts.out.parent.mkdir(parents=True, exist_ok=True)
 
     def save():
@@ -52,19 +94,18 @@ def main():
     def body(inputs, upstream):
         for value in inputs:
             value.grad.zero_()
-        attention.causal_attention(*inputs).backward(upstream)
+        attend(*inputs).backward(upstream)
 
-    for scale in opts.scales.split(","):
-        cfg = SCALES[scale]
+    for scale, heads, kv_heads in shapes:
         for rows in map(int, opts.rows.split(",")):
             if rows < 1:
                 parser.error("rows must be positive")
             torch.manual_seed(1)
             # Production Q/K/V are transposed [B,T,H,D] projection views.
             inputs = tuple(
-                torch.randn(rows, opts.seq_len, heads, 192, device="cuda", dtype=torch.bfloat16)
+                torch.randn(rows, opts.seq_len, count, opts.head_dim, device="cuda", dtype=torch.bfloat16)
                 .transpose(1, 2).detach().requires_grad_()
-                for heads in (cfg["heads"], cfg["kv_heads"], cfg["kv_heads"])
+                for count in (heads, kv_heads, kv_heads)
             )
             upstream = torch.randn_like(inputs[0])
             with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
@@ -73,12 +114,14 @@ def main():
             reference = reference.detach()
 
             for backend in opts.backends.split(","):
-                entry = {"scale": scale, "rows": rows, "seq_len": opts.seq_len, "backend": backend}
+                entry = {"scale": scale, "rows": rows, "seq_len": opts.seq_len,
+                         "heads": heads, "kv_heads": kv_heads,
+                         "head_dim": opts.head_dim, "pad_to": opts.pad_to, "backend": backend}
                 attention.FUSED_BACKENDS = [backends[backend]]
                 try:
                     for value in inputs:
                         value.grad = None
-                    output = attention.causal_attention(*inputs)
+                    output = attend(*inputs)
                     output.backward(upstream)
                     errors = {"output": error(output, reference)}
                     errors.update({name: error(value.grad, ref) for name, value, ref in zip(
