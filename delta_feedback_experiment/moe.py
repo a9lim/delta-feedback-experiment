@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .cuda_kernels import sink_linear
+from .cuda_kernels import Fp8Weights, sink_linear
 from .moe_kernels import sparse_experts
 from .sites import Binding, SlabSpec
 
@@ -58,16 +58,23 @@ class Expert(nn.Module):
         self.down_sink: Tensor | None = None
         self.gate_up_shadow: Tensor | None = None
         self.down_shadow: Tensor | None = None
+        self.gate_up_fp8: Fp8Weights | None = None
+        self.down_fp8: Fp8Weights | None = None
 
     def forward(self, x: Tensor) -> Tensor:
         gate, up = sink_linear(
-            x, (self.gate_up_proj.weight,), (self.gate_up_sink,), self.gate_up_shadow
+            x,
+            (self.gate_up_proj.weight,),
+            (self.gate_up_sink,),
+            self.gate_up_shadow,
+            fp8=self.gate_up_fp8,
         ).chunk(2, dim=-1)
         return sink_linear(
             F.silu(gate) * up,
             (self.down_proj.weight,),
             (self.down_sink,),
             self.down_shadow,
+            fp8=self.down_fp8,
         )
 
 
@@ -105,6 +112,8 @@ class MixtureOfExperts(nn.Module):
         self.register_buffer("expert_bias", torch.zeros(self.num_routed_experts))
         self._gate_up_shadow: Tensor | None = None
         self._down_shadow: Tensor | None = None
+        self._gate_up_fp8: Fp8Weights | None = None
+        self._down_fp8: Fp8Weights | None = None
 
     def forward(
         self, x: Tensor, *, want_weights: bool = False
@@ -180,6 +189,8 @@ class MixtureOfExperts(nn.Module):
                 tuple(expert.down_sink for expert in self.experts),
                 self._gate_up_shadow,
                 self._down_shadow,
+                self._gate_up_fp8,
+                self._down_fp8,
             )
             # Gather each token's slot rows and mix them in FP32: one fused
             # read of the dispatched rows instead of a scatter and a second pass.
@@ -248,11 +259,15 @@ class MixtureOfExperts(nn.Module):
                 for expert in experts:
                     setattr(expert, f"{kind}_sink", None)
                     setattr(expert, f"{kind}_shadow", None)
+                    setattr(expert, f"{kind}_fp8", None)
                 setattr(self, f"_{kind}_shadow", None)
+                setattr(self, f"_{kind}_fp8", None)
                 return
             for expert, view in zip(experts, binding.members, strict=True):
                 setattr(expert, f"{kind}_sink", view.grad)
                 setattr(expert, f"{kind}_shadow", view.weight)
+                setattr(expert, f"{kind}_fp8", view.fp8)
             setattr(self, f"_{kind}_shadow", binding.weight[1:])
+            setattr(self, f"_{kind}_fp8", None if binding.fp8 is None else binding.fp8[1:])
 
         return SlabSpec(name, members, bind, kind="stack")

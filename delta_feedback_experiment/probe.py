@@ -170,9 +170,22 @@ def cuda_probe() -> None:
                 model.update_expert_bias(state.expert_counts)
             sites.gather_weights()
             model.refresh_shadows()
+            sites.requantize()
             if owned:
                 assert torch.equal(
                     matrix, normuonh.master_of(matrix).to(torch.bfloat16)
+                )
+            # The FP8 copy the training GEMMs read follows the working copy:
+            # both layouts dequantize back to it within the format's step.
+            fp8 = model.blocks[3].attn.o_fp8
+            assert fp8 is not None
+            for quantized, scale, reference in (
+                (fp8.weight, fp8.scale, matrix),
+                (fp8.transposed, fp8.transposed_scale, matrix.t()),
+            ):
+                dequantized = quantized.float() * scale
+                assert torch.allclose(
+                    dequantized, reference.float(), rtol=2**-3, atol=1e-6
                 )
             # After the gather every rank holds the same replicated masters,
             # the same working copies, and the same expert biases.

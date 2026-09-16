@@ -45,7 +45,13 @@ from torch import Tensor, nn
 
 from . import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
-from .cuda_kernels import ShadowOperand, bespoke_route, sink_linear
+from .cuda_kernels import (
+    Fp8Weights,
+    ShadowOperand,
+    bespoke_route,
+    quantize_weights,
+    sink_linear,
+)
 from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
@@ -61,7 +67,7 @@ _dynamo_config.accumulated_recompile_limit = max(
 
 try:
     from cut_cross_entropy.cce import CCEParams, linear_cross_entropy_apply
-    from cut_cross_entropy.utils import _handle_eps
+    from cut_cross_entropy.utils import CCEFp8Classifier, _handle_eps
 except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
     CCEParams = None
     linear_cross_entropy_apply = None
@@ -463,6 +469,8 @@ class Attention(nn.Module):
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
+        self.qkv_fp8: Fp8Weights | None = None
+        self.o_fp8: Fp8Weights | None = None
 
     def forward(
         self,
@@ -481,6 +489,7 @@ class Attention(nn.Module):
             (self.qkv_sink, self.gate_sink),
             self.qkv_shadow,
             packed_sink=self.packed_qkv_sink,
+            fp8=self.qkv_fp8,
         ).split((self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1)
         q = q.view(batch, length, cfg.heads, cfg.head_dim).transpose(1, 2)
         k = k.view(batch, length, cfg.kv_heads, cfg.head_dim).transpose(1, 2)
@@ -510,7 +519,9 @@ class Attention(nn.Module):
             ).transpose(1, 2)
         out = out.reshape(batch, length, cfg.heads * cfg.head_dim)
         out = out * torch.sigmoid(gate_logits)
-        return sink_linear(out, (self.o_proj.weight,), (self.o_sink,), self.o_shadow)
+        return sink_linear(
+            out, (self.o_proj.weight,), (self.o_sink,), self.o_shadow, fp8=self.o_fp8
+        )
 
 
 def _check_route_geometry(dim: int, num_heads: int) -> int:
@@ -956,6 +967,10 @@ class DeltaModel(nn.Module):
         factor_seed = torch.initial_seed()
         self.embed_tokens = ResidualEmbedding(cfg.vocab_size, cfg.dim)
         self.register_buffer("_classifier_shadow", None, persistent=False)
+        self._classifier_fp8: Fp8Weights | None = None
+        self.fp8_classifier = False
+        """Runtime switch: whether the CUDA head trains on the FP8 copy of the
+        classifier readout; the trainer sets it from the recipe."""
         self.blocks = nn.ModuleList(Block(cfg, i) for i in range(cfg.layers))
         self.final_norm = RMSNorm(cfg.dim, cfg.norm_eps)
         self.payload_norm = RMSNorm(cfg.dim, cfg.norm_eps)
@@ -971,6 +986,7 @@ class DeltaModel(nn.Module):
         )
         self.fuse_proj_sink: Tensor | None = None
         self.fuse_proj_shadow: Tensor | None = None
+        self.fuse_proj_fp8: Fp8Weights | None = None
         self._shadow_refresh: dict[str, tuple[Tensor, Tensor]] = {}
         """Replicated working copies to refresh from their FP32 masters after
         every optimizer update, keyed by the site that bound them."""
@@ -1073,6 +1089,7 @@ class DeltaModel(nn.Module):
             (self.fuse_proj.weight,),
             (self.fuse_proj_sink,),
             self.fuse_proj_shadow,
+            fp8=self.fuse_proj_fp8,
         )
 
     def plain_seed(self, token_embedding: Tensor) -> Tensor:
@@ -1177,11 +1194,12 @@ class DeltaModel(nn.Module):
         def bind(binding: Binding | None) -> None:
             if binding is None:
                 attn.q_sink = attn.k_sink = attn.v_sink = None
-                attn.packed_qkv_sink = attn.qkv_shadow = None
+                attn.packed_qkv_sink = attn.qkv_shadow = attn.qkv_fp8 = None
                 return
             attn.q_sink, attn.k_sink, attn.v_sink = (m.grad for m in binding.members)
             attn.packed_qkv_sink = binding.grad
             attn.qkv_shadow = binding.weight
+            attn.qkv_fp8 = binding.fp8
 
         return bind
 
@@ -1189,12 +1207,13 @@ class DeltaModel(nn.Module):
         def bind(binding: Binding | None) -> None:
             if binding is None:
                 attn.qkv_sink = attn.gate_sink = None
-                attn.packed_qkv_sink = attn.qkv_shadow = None
+                attn.packed_qkv_sink = attn.qkv_shadow = attn.qkv_fp8 = None
                 self._shadow_refresh.pop(name, None)
                 return
             attn.qkv_sink, attn.gate_sink = (m.grad for m in binding.members)
             attn.packed_qkv_sink = binding.grad
             attn.qkv_shadow = binding.weight
+            attn.qkv_fp8 = binding.fp8
             # The NAdam-owned gate keeps its FP32 master; its rows of the
             # packed operand are a replicated working copy.
             self._shadow_refresh[name] = (binding.members[1].weight, gate.detach())
@@ -1205,19 +1224,21 @@ class DeltaModel(nn.Module):
     def _bind_o(attn):
         def bind(binding: Binding | None) -> None:
             if binding is None:
-                attn.o_sink = attn.o_shadow = None
+                attn.o_sink = attn.o_shadow = attn.o_fp8 = None
                 return
             attn.o_sink = binding.members[0].grad
             attn.o_shadow = binding.weight
+            attn.o_fp8 = binding.fp8
 
         return bind
 
     def _bind_fuse(self, binding: Binding | None) -> None:
         if binding is None:
-            self.fuse_proj_sink = self.fuse_proj_shadow = None
+            self.fuse_proj_sink = self.fuse_proj_shadow = self.fuse_proj_fp8 = None
             return
         self.fuse_proj_sink = binding.members[0].grad
         self.fuse_proj_shadow = binding.weight
+        self.fuse_proj_fp8 = binding.fp8
 
     def _bind_arena(self, members: tuple[nn.Parameter, ...]):
         """The replicated parameters: an FP32 gradient view each, and on CUDA
@@ -1311,6 +1332,7 @@ class DeltaModel(nn.Module):
         master = self.embed_tokens.weight
         if not master.is_cuda:
             self._classifier_shadow = None
+            self._classifier_fp8 = None
         else:
             shadow = self._classifier_shadow
             if (
@@ -1321,6 +1343,18 @@ class DeltaModel(nn.Module):
                 shadow = torch.empty_like(master, dtype=torch.bfloat16)
                 self._classifier_shadow = shadow
             shadow.copy_(master)
+            if not self.fp8_classifier:
+                self._classifier_fp8 = None
+            else:
+                fp8 = self._classifier_fp8
+                if (
+                    fp8 is None
+                    or fp8.weight.shape != shadow.shape
+                    or fp8.weight.device != shadow.device
+                ):
+                    fp8 = Fp8Weights.allocate(tuple(shadow.shape), shadow.device)
+                    self._classifier_fp8 = fp8
+                quantize_weights(fp8, shadow)
         # The packed sites hold replicated rows on every device: a dense
         # layer's gate rides in its QKV operand as a copy of the NAdam master.
         if self._shadow_refresh:
@@ -1329,28 +1363,43 @@ class DeltaModel(nn.Module):
                 [copy for copy, _ in pairs], [weight for _, weight in pairs]
             )
 
-    def classifier_for_loss(self) -> tuple[Tensor, Tensor | None]:
-        """The head's classifier operand and the buffer its gradient lands in.
+    def classifier_for_loss(self) -> tuple[Tensor, Tensor | None, CCEFp8Classifier | None]:
+        """The head's classifier operand, the buffer its gradient lands in,
+        and the FP8 copy the training head reads.
 
         One decision, so the operand and the destination cannot disagree. On
         CUDA the operand is always the graph-stable BF16 shadow. With the
         tied embedding's FP32 sink bound and gradients live, the head hands
         the shadow over plainly and names the sink: CCE's backward accumulates
         the classifier gradient straight into it in FP32, whatever the number
-        of rows in the call, and the classifier receives no autograd gradient.
-        Without a sink the shadow is read through the shared operand, whose
-        backward widens the gradient into the master's autograd gradient. The
-        portable path reads the FP32 master through ordinary autograd.
+        of rows in the call, and the classifier receives no autograd gradient;
+        under the FP8 recipe that training call also gets the classifier in
+        FP8, both layouts with per-row scales, and runs every GEMM of the head
+        on it. Without a sink the shadow is read through the shared operand,
+        whose backward widens the gradient into the master's autograd
+        gradient. The portable path reads the FP32 master through ordinary
+        autograd. Evaluation and the portable path never see FP8.
         """
         master = self.embed_tokens.weight
         if not master.is_cuda:
-            return master, None
+            return master, None, None
         if self._classifier_shadow is None:
             raise RuntimeError("CUDA classifier shadow was not prepared")
         sink = self.embed_tokens.grad_sink
         if sink is not None and torch.is_grad_enabled():
-            return self._classifier_shadow, sink
-        return ShadowOperand.apply(master, self._classifier_shadow, None), None
+            fp8 = None
+            if self.fp8_classifier:
+                if self._classifier_fp8 is None:
+                    raise RuntimeError("CUDA classifier FP8 copy was not prepared")
+                copy = self._classifier_fp8
+                fp8 = CCEFp8Classifier(
+                    copy.weight,
+                    copy.scale.squeeze(1),
+                    copy.transposed,
+                    copy.transposed_scale.squeeze(1),
+                )
+            return self._classifier_shadow, sink, fp8
+        return ShadowOperand.apply(master, self._classifier_shadow, None), None, None
 
     # -- one column pass -------------------------------------------------------
 
@@ -1875,6 +1924,7 @@ def _fixed_cce_rows(
     vocab_ordering: Tensor | None = None,
     *,
     c_grad_accum: Tensor | None = None,
+    fp8_classifier: CCEFp8Classifier | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Current CCE with capture-safe preprocessing and differentiable LSE.
 
@@ -1897,6 +1947,11 @@ def _fixed_cce_rows(
     instead of allocating and returning a fresh gradient tensor, and the
     classifier receives no autograd gradient at all; the caller flushes the
     buffer into its FP32 sink and clears it on its own cadence.
+
+    ``fp8_classifier`` is the classifier in FP8 with per-row scales: with it
+    the head quantizes its readout rows per token and per feature and runs
+    every GEMM, the logits of both halves and the two gradients, on FP8
+    tensor cores; the softmax, the filter, and the accumulators are unchanged.
     """
     if CCEParams is None or linear_cross_entropy_apply is None or _handle_eps is None:
         raise RuntimeError("cut-cross-entropy is unavailable")
@@ -1922,6 +1977,7 @@ def _fixed_cce_rows(
         skip_early=True,
         tile_flags=None,
         c_grad_accum=c_grad_accum,
+        fp8_classifier=fp8_classifier,
     )
     nll, lse = linear_cross_entropy_apply(
         embeddings,
@@ -1981,9 +2037,14 @@ def head_row_losses(
         )
         # The call uses the bound accumulator or the per-call FP32 sink.
         # Evaluation has no backward to accumulate.
-        classifier, accum = model.classifier_for_loss()
+        classifier, accum, fp8 = model.classifier_for_loss()
         nll, lse = _fixed_cce_rows(
-            normalized, classifier, torch.cat(targets), ordering, c_grad_accum=accum
+            normalized,
+            classifier,
+            torch.cat(targets),
+            ordering,
+            c_grad_accum=accum,
+            fp8_classifier=fp8,
         )
         shape = (len(hiddens), *targets[0].shape)
         return nll.view(shape), lse.view(shape)

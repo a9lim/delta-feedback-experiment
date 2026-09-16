@@ -122,6 +122,41 @@ def test_resolved_arguments_pin_what_the_operator_fixed(scale):
     assert {"seq_len", "batch_rows"} <= pinned
 
 
+def test_precision_is_a_runtime_recipe_a_resume_keeps_unless_retyped():
+    """The GEMM recipe defaults to FP8, is inherited from a checkpoint like a
+    cadence, never blocks a v42 resume that predates it, and pins when typed."""
+    from transformer_experiments import checkpoints
+
+    from delta_feedback_experiment.train import EXACT_FIELDS, RUNTIME_FIELDS
+
+    parser = build_parser()
+    args, pinned = resolve_run_args(parser, ["x", "--resume"])
+    assert args.precision == "fp8" and "precision" not in pinned
+    assert "precision" in RUNTIME_FIELDS and "precision" not in EXACT_FIELDS
+    saved = {field: getattr(args, field) for field in EXACT_FIELDS}
+    saved["precision"] = "bf16"
+    assert not checkpoints.missing_fields(saved, EXACT_FIELDS)
+    checkpoints.inherit(
+        args, saved, exact_fields=EXACT_FIELDS, runtime_fields=RUNTIME_FIELDS,
+        explicit=pinned,
+    )
+    assert args.precision == "bf16"
+    args, pinned = resolve_run_args(parser, ["x", "--resume", "--precision", "fp8"])
+    assert "precision" in pinned
+    checkpoints.inherit(
+        args, saved, exact_fields=EXACT_FIELDS, runtime_fields=RUNTIME_FIELDS,
+        explicit=pinned,
+    )
+    assert args.precision == "fp8"
+    older = {field: value for field, value in saved.items() if field != "precision"}
+    args, pinned = resolve_run_args(parser, ["x", "--resume"])
+    checkpoints.inherit(
+        args, older, exact_fields=EXACT_FIELDS, runtime_fields=RUNTIME_FIELDS,
+        explicit=pinned,
+    )
+    assert args.precision == "fp8"
+
+
 def test_preset_accounting_counts_shared_and_selected_experts():
     scale, dim, selected, routed, total, active = (
         "screen",

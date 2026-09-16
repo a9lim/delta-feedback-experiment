@@ -195,9 +195,13 @@ RUNTIME_FIELDS = (
     "eval_rows",
     "micro_rows",
     "checkpoint_margin_gib",
+    "precision",
 )
 """Per-invocation settings: inherited unless retyped. ``--ranks`` is neither:
-it describes this invocation's processes alone and is never inherited."""
+it describes this invocation's processes alone and is never inherited.
+``precision`` is the CUDA GEMM recipe: it changes the numerics of every step
+from here on and nothing in the checkpoint, so a resume keeps the recipe it
+was running unless retyped."""
 
 
 def probability(value: str) -> float:
@@ -451,6 +455,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="data-parallel processes, one per device, launched through "
         "torchrun; each takes batch-rows/ranks rows of every step (default: 1; "
         "never inherited by a resume)",
+    )
+    runtime.add_argument(
+        "--precision",
+        choices=("fp8", "bf16"),
+        default="fp8",
+        help="CUDA training GEMM recipe: fp8 runs the projections' forward and "
+        "activation-gradient GEMMs, the routed expert GEMMs, and the head on "
+        "FP8 tensor cores with per-row scales; bf16 keeps every GEMM in BF16. "
+        "Weight gradients, masters, and evaluation are the same under both "
+        "(default: fp8; other devices ignore it)",
     )
     runtime.add_argument(
         "--checkpoint-margin-gib",
@@ -889,7 +903,11 @@ class Trainer:
         self.rank_rows = args.batch_rows // topology.world
         if not sites.allocated:
             sites.allocate()
+        # The head follows the sites' recipe: an FP8 copy of the classifier
+        # readout beside its BF16 shadow, refreshed with it.
+        self.model.fp8_classifier = sites.fp8 and self.device.type == "cuda"
         self.model.refresh_shadows()
+        sites.requantize()
         self.gradients = sites.gradients()
         self.sharded = sites.sharded
         self.replicated = [
@@ -2156,7 +2174,7 @@ def _train(
     model = DeltaModel(condition_config(args.condition, **model_fields(args))).to(
         device
     )
-    sites = ParameterSites(model, topology)
+    sites = ParameterSites(model, topology, fp8=args.precision == "fp8")
     optimizers = build_optimizers(
         model,
         lr_normuonh=args.lr_normuonh,
@@ -2183,6 +2201,7 @@ def _train(
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
             ranks=topology.world,
+            precision=args.precision,
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
             expert_lr_scale=model.cfg.expert_lr_scale,
@@ -2282,6 +2301,7 @@ def _train(
                     model.update_expert_bias(expert_counts)
                 sites.gather_weights()
                 model.refresh_shadows()
+                sites.requantize()
                 trainer.zero_grad()
                 # A pass executes ``iterations`` columns of ``routing_blocks``
                 # cells, so cell-tokens beside pass-tokens keep matched data apart

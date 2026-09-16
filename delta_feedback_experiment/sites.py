@@ -21,6 +21,11 @@ Once the optimizer holds the FP32 masters of the matrices this rank owns,
 working view and the model releases the replicated FP32 copies. On CUDA the
 working dtype is BF16, so a NorMuonH matrix then costs two bytes per element
 on every rank plus four for its master on the owner.
+
+Under the FP8 recipe every CUDA site with a working copy also holds an FP8
+copy of it, the matrix and its transpose with per-row scales, that the
+training GEMMs read instead; :meth:`ParameterSites.requantize` rewrites it
+from the working copy after every gather, on every rank alike.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ import torch
 from torch import Tensor, nn
 
 from . import distributed
+from .cuda_kernels import Fp8Weights, quantize_weights
 
 
 @dataclass(frozen=True)
@@ -41,19 +47,21 @@ class MemberView:
 
     weight: Tensor | None
     grad: Tensor
+    fp8: Fp8Weights | None = None
 
 
 @dataclass(frozen=True)
 class Binding:
     """What a site's owner module receives: the slabs and the member views.
 
-    ``weight`` and ``grad`` cover the real members only; a stacked slab's
-    rank-multiple padding stays outside the views the kernels read.
+    ``weight``, ``grad``, and ``fp8`` cover the real members only; a stacked
+    slab's rank-multiple padding stays outside the views the kernels read.
     """
 
     weight: Tensor | None
     grad: Tensor
     members: tuple[MemberView, ...]
+    fp8: Fp8Weights | None = None
 
 
 @dataclass(frozen=True)
@@ -119,14 +127,24 @@ class Slab:
     """Replicated members' (working view, FP32 master) pairs."""
     grad_real: Tensor | None = None
     """The gradient slab over the real members, padding excluded."""
+    fp8: Fp8Weights | None = None
+    """The FP8 copy of the whole working slab, padding included."""
 
 
 class ParameterSites:
-    """The site table of one model on one rank."""
+    """The site table of one model on one rank.
 
-    def __init__(self, model: nn.Module, topology: distributed.Topology):
+    ``fp8`` selects the FP8 recipe: on CUDA every site with a working copy
+    then carries an FP8 copy the training GEMMs read. Other devices have no
+    FP8 tensor cores and ignore it.
+    """
+
+    def __init__(
+        self, model: nn.Module, topology: distributed.Topology, *, fp8: bool = True
+    ):
         self.model = model
         self.topology = topology
+        self.fp8 = fp8
         self.specs: list[SlabSpec] = list(model.slab_specs())
         self.owner: dict[nn.Parameter, int] = {}
         self.slabs: list[Slab] = []
@@ -198,12 +216,20 @@ class ParameterSites:
         for spec in self.specs:
             self.slabs.append(self._allocate(spec))
         for slab in self.slabs:
-            slab.spec.bind(Binding(self._real(slab.weight, slab), slab.grad_real, slab.views))
+            slab.spec.bind(
+                Binding(
+                    self._real(slab.weight, slab),
+                    slab.grad_real,
+                    slab.views,
+                    self._real(slab.fp8, slab),
+                )
+            )
 
     def _allocate(self, spec: SlabSpec) -> Slab:
         sample = spec.members[0]
         device = sample.device
         working = torch.bfloat16 if device.type == "cuda" else torch.float32
+        quantized = self.fp8 and device.type == "cuda"
         if spec.kind == "arena":
             total = sum(m.numel() for m in spec.members)
             grad = torch.zeros(total, dtype=torch.float32, device=device)
@@ -218,22 +244,30 @@ class ParameterSites:
             shape = (padded, *sample.shape)
             weight = torch.zeros(shape, dtype=working, device=device)
             grad = torch.zeros(shape, dtype=torch.float32, device=device)
+            fp8 = Fp8Weights.allocate(shape, device) if quantized else None
             views = []
             for index, member in enumerate(spec.members):
                 weight[index].copy_(member.detach())
-                views.append(MemberView(weight[index], grad[index]))
+                views.append(
+                    MemberView(
+                        weight[index], grad[index], None if fp8 is None else fp8[index]
+                    )
+                )
             return Slab(
                 spec, weight, grad, tuple(views), chunk=self.topology.chunk(count),
-                grad_real=grad[:count],
+                grad_real=grad[:count], fp8=fp8,
             )
         rows = sum(m.shape[0] for m in spec.members)
         weight = torch.empty((rows, sample.shape[1]), dtype=working, device=device)
         grad = torch.zeros((rows, sample.shape[1]), dtype=torch.float32, device=device)
+        fp8 = Fp8Weights.allocate(tuple(weight.shape), device) if quantized else None
         views, start, sharded_rows = [], 0, 0
         refresh = []
         for member, is_sharded in zip(spec.members, spec.sharded, strict=True):
             stop = start + member.shape[0]
             weight[start:stop].copy_(member.detach())
+            # A row segment is only ever read through the whole packed
+            # operand, so its members carry no FP8 views of their own.
             views.append(MemberView(weight[start:stop], grad[start:stop]))
             if is_sharded:
                 sharded_rows = stop
@@ -243,11 +277,12 @@ class ParameterSites:
         owner = self.owner.get(spec.sharded_members[0]) if spec.sharded_members else None
         return Slab(
             spec, weight, grad, tuple(views), sharded_rows=sharded_rows, owner=owner,
-            refresh=refresh, grad_real=grad,
+            refresh=refresh, grad_real=grad, fp8=fp8,
         )
 
     @staticmethod
-    def _real(weight: Tensor | None, slab: Slab) -> Tensor | None:
+    def _real(weight, slab: Slab):
+        """The working or FP8 slab over the real members, padding excluded."""
         if weight is None:
             return None
         if slab.spec.kind == "stack":
@@ -288,6 +323,18 @@ class ParameterSites:
     def refresh_pairs(self) -> list[tuple[Tensor, Tensor]]:
         """Replicated (working view, FP32 master) pairs to refresh after a step."""
         return [pair for slab in self.slabs for pair in slab.refresh]
+
+    @torch.no_grad()
+    def requantize(self) -> None:
+        """Rewrite every FP8 copy from its working slab.
+
+        Runs after the gather and the replicated refresh, so it sees the
+        updated working copies; every rank quantizes the same bytes to the
+        same bytes, so no FP8 tensor is ever communicated.
+        """
+        for slab in self.slabs:
+            if slab.fp8 is not None:
+                quantize_weights(slab.fp8, slab.weight)
 
     # -- gradients -------------------------------------------------------------
 

@@ -556,6 +556,30 @@ NorMuonH's momentum, which CUDA stores in BF16 rounded to nearest with its
 update computed in FP32. CUDA residuals, routed values, payloads, and mixer
 caches use BF16, except PKDA matrix/diagonal boundaries.
 
+CUDA training GEMMs run on FP8 tensor cores by default (`--precision fp8`;
+`bf16` keeps every GEMM in BF16). Every projection site's forward and
+activation-gradient GEMMs, the routed experts' two forward and two
+activation-gradient GEMMs, and every GEMM of the cut cross-entropy head
+take e4m3 operands with one FP32 scale per row of each operand and
+accumulate in FP32; the scale of a row is its largest magnitude over the
+format's, computed from the tensor itself (current scaling), so the same
+values quantize the same way every time, a recomputed forward included,
+and nothing about quantization is state. Each site keeps an FP8 copy of its
+BF16 working copy, the matrix with a scale per output row and its transpose
+with a scale per input row, rewritten on every rank after every gather, so
+each GEMM reads an operand contiguous along its reduction; the classifier
+readout has the same pair beside its BF16 shadow. Activations and incoming
+gradients are quantized per token as they enter a GEMM, the SwiGLU output
+by the kernel that produces it, and the experts' gate/up gradient by the
+epilogue that produces it with one scale per row of each column tile, which
+the input-gradient GEMM applies block by block. The head quantizes its
+readout rows per token for the logits and per feature for the classifier
+gradient, keeps its logits in scaled FP32 in both halves, and quantizes each
+probability tile in registers, once per gradient. Weight gradients keep
+BF16 operands into the FP32 sinks, routers stay FP32, and evaluation,
+decoding, and the portable path read the BF16 copies. FP8 changes the
+training numerics: a run under it is not paired with one under BF16.
+
 Under the trainer every parameter belongs to one site: the three PKDA
 projections behind one GEMM, a dense layer's QKV projection with its
 attention gate, an expert bank's stacked gate/up or down matrices with the

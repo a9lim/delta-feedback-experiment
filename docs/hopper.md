@@ -93,7 +93,7 @@ Reductions of mean node step time; the ranges overlap and do not add.
 
 | # | Lever | Screen | Flagship | Needs Hopper to build? |
 |---|---|---:|---:|---|
-| 1 | FP8 GEMM class (below) | 4–13% (+4–8% CCE) | 8–28% (+3–6%) | No; to measure, yes |
+| 1 | FP8 GEMM class (landed: dense sites, experts, head; measured on the 4090 below) | 4–13% (+4–8% CCE) | 8–28% (+3–6%) | No; to measure, yes |
 | 2 | FLA retune of the preconditioned-KDA chain | 4–10% | 3–8% | Yes |
 | 3 | Expert grouped-GEMM retile | 2–5% | 3–7% | Yes |
 | 4 | CCE fixed-configuration retune | 3–6% | 2–5% | Yes |
@@ -103,25 +103,45 @@ Reductions of mean node step time; the ranges overlap and do not add.
 | 8 | Pointwise, MHDB, dispatch, tail | 1–5% | 1–4% | Yes |
 | 9 | Optimizer step, host gaps | <1% | <1% | No |
 
-1. **FP8 for the GEMM class.** Forward and dX GEMMs of the dense sites
-   through `torch._scaled_mm`, the six grouped expert GEMMs in Triton
-   `fp8e4nv`, and separately the CCE head. dW stays a BF16 → FP32
-   accumulation in `dw_accum` (the `rowwise_with_gw_hp` shape): the FP32
+1. **FP8 for the GEMM class** (landed, `--precision fp8`, the default;
+   [architecture](architecture.md#precision-and-initialization)). Forward
+   and dX GEMMs of the dense sites through `torch._scaled_mm` with rowwise
+   scales, the experts' two forward and two activation-gradient GEMMs in
+   Triton `fp8e4nv`, and every GEMM of the CCE head in the fork. dW stays a
+   BF16 → FP32 accumulation (the `rowwise_with_gw_hp` shape): the FP32
    gradient contract is untouched and no dY^T transposes are materialized.
-   The weight is quantized once per step by its owner from the FP32 master,
-   so the FP8 bytes and scales are what the gather ships: the working copy
-   becomes FP8 (plus a transposed copy for dX, so no memory is saved). The
-   activation and gradient scales must be reconstructible from the step
-   (stateless current scaling, or scales computed per invocation and kept
-   for that step's recompute); delayed-scaling histories are new state the
-   v42 checkpoint does not carry. The router GEMMs stay FP32. Quantization
-   overhead is the whole design problem: on the 4090 prequantized operands
-   ran 3.78 ms per cell against 6.92 BF16, but naive per-call amax + cast
-   made it 7.20. torchao's own filters reject most of our shapes rowwise
-   (gate/up N = 1664, down K = 832 at every scale; K = 768 at screen), so
-   the pilot is tensorwise or per-block, and a measured 4090 win is the
-   gate for building the rest. FP8 changes training numerics: runs paired
-   against the BF16 recipe cannot mix it in.
+   Every rank rewrites each site's FP8 copies (the matrix and its
+   transpose, a scale per row of each) from the BF16 working copy after
+   the gather, so nothing FP8 is communicated and the working copy the
+   optimizer writes is unchanged; the FP8 copies cost one byte per element
+   beyond it (screen static footprint 7.4 → 8.6 GiB on the 4090). Scaling
+   is current and stateless (a row's scale is its own amax), so a
+   recomputed forward quantizes identically and the v42 checkpoint carries
+   nothing new; the recipe is a runtime field a resume inherits. The
+   router GEMMs stay FP32. On the 4090 the quantization overhead costs
+   most of the small-shape gain: forward + dX of the dense sites at
+   M = 8,192 (two screen rows) 2.19 → 1.84 ms (1.19×; 1.29× at one row),
+   1.11× per site once the BF16 dW is counted; at flagship shapes 8.78 →
+   5.92 ms (1.48×, 1.26× with dW). Tensorwise scaling was slower than
+   rowwise at every screen shape (1.06× against 1.19×) and worse
+   numerically, so it is not offered. The routed expert kernels at the
+   screen geometry (8,192 tokens, top-3): forward 0.75 → 0.51 ms (1.46×),
+   backward without the weight gradients 0.79 → 0.66 ms (1.20×); the two
+   BF16 dW GEMMs are now the larger half of the expert backward. Per-GEMM
+   relative error 3.7e-2, expert output 6.5e-2. The head at 8,192 rows:
+   forward 4.08 → 4.13 ms, backward 7.45 → 6.48 ms (1.09× together);
+   its 8-bit MMA fragments and the in-register quantization of the
+   probability tile are register-bound on sm_89, so the FP8 halves carry
+   their own tile shapes (256 × 64 × 64 with eight warps and 64 × 64 × 32
+   with four), sharing only the vocabulary tile, and every other shape
+   tried spilled to 2–30× the BF16 time; the loss and log-partition move by
+   2e-3 relative, the gradients by 2.7e-2. A paired eight-step screen run
+   (`f`, one row per replay, BF16 head) tracked the BF16 recipe's loss to
+   four digits at 25.4 against 26.9 s per k = 2 step (5.6%) and 38.8
+   against 40.4 at k = 3. FP8 changes training numerics: runs paired
+   against the BF16 recipe cannot mix it in, and Hopper's own choices
+   (blockwise scaling is sm_90-only; the head's tiles under wgmma) are
+   first-hour measurements against this rowwise recipe.
 2. **FLA retune.** The fork already carries Hopper tables (`IS_NVIDIA_HOPPER`
    warp lists and the 128-wide `CONST_TILING` in `precond_kda/chunk_bwd.py`)
    and the Triton #984 guard in `delta_rule/wy_fast.py` (`num_warps=4`
@@ -140,9 +160,11 @@ Reductions of mean node step time; the ranges overlap and do not add.
    loses the fused SwiGLU backward is not a win.
 4. **CCE retune.** `CCE_AUTOTUNE` cannot be used with the persistent
    classifier accumulator (the fork rejects it), so this is a fixed
-   forward/backward configuration swept in the fork with disposable sinks,
-   keeping the 128 × 128 token/vocabulary partition so the tile filter's
-   semantics do not move.
+   forward/backward configuration swept in the fork with disposable sinks.
+   The BF16 halves share the 128 × 128 token/vocabulary partition; the FP8
+   halves (`_cce_best_config_fp8` and its backward twin in
+   `tl_autotune.py`) are 4090 measurements that need only agree on the
+   vocabulary tile, and Hopper's wgmma wants larger ones.
 5. **Attention backend.** `attention.py` now asks for cuDNN attention first
    and the flash kernel second; on the 4090 cuDNN has no kernel at head
    width 192 and the fallback is bitwise flash, on sm_90 torch 2.14 serves
@@ -190,8 +212,8 @@ The 4090 has FP8 tensor cores (sm_89) and runs cuDNN attention, so the
 code paths of levers 1, 5, 6, 7, and 9 can be built, tested for numerics,
 and even timed on Jobe; only their Hopper throughput is unknown.
 Tensorwise and rowwise `_scaled_mm` work on sm_89; DeepSeek-style
-1 × 128 / 128 × 128 blockwise scaling is sm_90-only, so the pilot develops on
-the former and the recipe choice waits for the node. Levers 2, 3, 4, and 8
+1 × 128 / 128 × 128 blockwise scaling is sm_90-only, so the landed recipe is
+rowwise and the node measures whether blockwise pays. Levers 2, 3, 4, and 8
 are tile constants and traces that only mean something on the target
 architecture. NCCL multi-rank execution cannot run on one GPU: the plumbing
 is covered by the two-rank gloo tests and `delta probe --ranks N` exists
@@ -199,7 +221,7 @@ for the first node hour.
 
 | Work | Where it can be verified now |
 |---|---|
-| FP8 dense sites, FP8 working copies, expert GEMMs, CCE | Jobe: numerics (paired steps), 4090 throughput as an Ada signal |
+| FP8 dense sites, expert GEMMs, head (landed) | Jobe: numerics (paired steps), 4090 throughput as an Ada signal |
 | Attention backend selection by architecture | Jobe: correctness with cuDNN forced; speed only on the node |
 | Per-graph saved set in the planner (landed) | Jobe: memory and time, fully |
 | Communication grouping and gather overlap | Mac/Jobe: gloo two-rank tests; bandwidth only on the node |

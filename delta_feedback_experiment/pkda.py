@@ -16,7 +16,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from .cuda_kernels import pack_control_gradients, shadowed_weight, sink_linear
+from .cuda_kernels import (
+    Fp8Weights,
+    pack_control_gradients,
+    shadowed_weight,
+    sink_linear,
+)
 from .fla_ops import fla_ops_available, pkda_norm_gate, pkda_qkv_conv, pkda_recurrence
 
 try:  # Pinned CUDA-only dependency; portable tests use the recurrence below.
@@ -169,6 +174,8 @@ class PreconditionedKDA(nn.Module):
         self.o_sink: Tensor | None = None
         self.qkv_shadow: Tensor | None = None
         self.o_shadow: Tensor | None = None
+        self.qkv_fp8: Fp8Weights | None = None
+        self.o_fp8: Fp8Weights | None = None
         self.control_shadow: Tensor | None = None
         self.decay_up_shadow: Tensor | None = None
         self.output_gate_shadow: Tensor | None = None
@@ -228,6 +235,7 @@ class PreconditionedKDA(nn.Module):
                 (self.q_sink, self.k_sink, self.v_sink),
                 self.qkv_shadow,
                 packed_sink=self.packed_qkv_sink,
+                fp8=self.qkv_fp8,
             )
             history = self.conv_size - 1
             prefix_length = (
@@ -539,7 +547,11 @@ class PreconditionedKDA(nn.Module):
             mixed = normalized.to(output.dtype) * torch.sigmoid(gate_logits)
         return (
             sink_linear(
-                mixed.flatten(-2), (self.o_proj.weight,), (self.o_sink,), self.o_shadow
+                mixed.flatten(-2),
+                (self.o_proj.weight,),
+                (self.o_sink,),
+                self.o_shadow,
+                fp8=self.o_fp8,
             ),
             state,
             a_state,

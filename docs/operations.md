@@ -178,11 +178,17 @@ defines each retained tool's measurement.
 ## CUDA execution
 
 CUDA uses BF16 activations with FP32 masters, accumulated gradients,
-optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native Flash
-SDPA handles full-row attention and FlexAttention handles cached prefixes.
-CCE reads the BF16 classifier working copy and accumulates its gradient
+optimizer state, and PKDA recurrent boundaries. FLA handles PKDA; native
+fused SDPA handles full-row attention and FlexAttention handles cached
+prefixes. CCE reads the classifier working copy and accumulates its gradient
 straight into the tied embedding's FP32 sink on every call. A column makes
-one head call, covering both prediction depths.
+one head call, covering both prediction depths. Training GEMMs run on FP8
+tensor cores under the default `--precision fp8` recipe
+([architecture](architecture.md#precision-and-initialization)): each site
+carries an FP8 copy of its working copy, both layouts with per-row scales,
+about one byte per element beyond the BF16 copy; `--precision bf16` keeps
+every GEMM in BF16. The recipe is a runtime setting: a resume keeps the
+checkpoint's unless retyped, and it is recorded in the `run` record.
 
 Every parameter is a view of its site's two slabs, a working copy the
 kernels read and an FP32 gradient sink ([architecture](architecture.md#precision-and-initialization)).
@@ -193,9 +199,10 @@ the sinks onto their owners in place (reduce-scatter for banks, reduce for
 dense sites, all-reduce for the replicated arena), each rank steps the
 matrices it owns against their FP32 masters, and the updated working copies
 gather back. Per rank a NorMuonH matrix costs two bytes per element for the
-working copy and four for its gradient on every rank, plus four for the
-master and two for the momentum on its owner; the static footprint the
-`execution` record reports is therefore this rank's. The communicator's
+working copy, two for its FP8 copies under the FP8 recipe, and four for its
+gradient on every rank, plus four for the master and two for the momentum
+on its owner; the static footprint the `execution` record reports is
+therefore this rank's. The communicator's
 buffers are allocated before that footprint is measured, and the activation
 budget is the smallest across ranks, so every rank replays the same plan.
 

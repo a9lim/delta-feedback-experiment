@@ -192,6 +192,7 @@ computation without increasing the ordinary predicted-token budget.
 | `--mtp-weight` | Auxiliary prediction weight |
 | `--seq-len`, `--batch-rows` | Batch geometry |
 | `--ranks`, `--micro-rows` | Processes per invocation and the smallest replay; runtime, not state |
+| `--precision` | CUDA GEMM recipe, `fp8` (default) or `bf16`; runtime, inherited by a resume unless retyped |
 | `--resume`, `--continue TAG`, `--max-steps` | Run lifecycle |
 
 ### Checkpoints and queue

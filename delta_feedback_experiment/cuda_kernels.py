@@ -7,6 +7,8 @@ benefits materially from owning the reduction and memory traffic directly.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -1200,6 +1202,112 @@ def _dw_accum_cuda(grad_output: Tensor, activations: Tensor, sink: Tensor) -> Te
     return sink.new_zeros(())
 
 
+# -- FP8 operands ----------------------------------------------------------------
+
+
+FP8_DTYPE = torch.float8_e4m3fn
+"""The GEMM operand format of the FP8 recipe."""
+
+FP8_MAX = torch.finfo(FP8_DTYPE).max
+
+FP8_SCALE_FLOOR = 2.0**-64
+"""The smallest row scale: an all-zero row quantizes to zeros instead of
+dividing by zero, and nothing representable rounds differently for it."""
+
+
+@dataclass(frozen=True)
+class Fp8Weights:
+    """A site's FP8 working copy, refreshed from its BF16 copy after every
+    optimizer step.
+
+    ``weight`` is the matrix as the kernels read it, ``[N, K]``, with one FP32
+    scale per output row; ``transposed`` is ``[K, N]`` with a scale per input
+    row. The forward reads the first, the activation gradient the second, so
+    both GEMMs run on a K-contiguous operand with per-row scales, which is the
+    layout the tensor cores and ``torch._scaled_mm`` take without a copy. A
+    stacked site carries its expert axis in front of all four.
+    """
+
+    weight: Tensor
+    scale: Tensor
+    transposed: Tensor
+    transposed_scale: Tensor
+
+    @classmethod
+    def allocate(cls, shape: tuple[int, ...], device: torch.device) -> Fp8Weights:
+        *lead, rows, cols = shape
+        return cls(
+            torch.empty((*lead, rows, cols), dtype=FP8_DTYPE, device=device),
+            torch.empty((*lead, rows, 1), dtype=torch.float32, device=device),
+            torch.empty((*lead, cols, rows), dtype=FP8_DTYPE, device=device),
+            torch.empty((*lead, cols, 1), dtype=torch.float32, device=device),
+        )
+
+    def __getitem__(self, index) -> Fp8Weights:
+        """The views of one entry, or a range of entries, of a stacked site."""
+        return Fp8Weights(
+            self.weight[index],
+            self.scale[index],
+            self.transposed[index],
+            self.transposed_scale[index],
+        )
+
+
+def quantize_rows(x: Tensor) -> tuple[Tensor, Tensor]:
+    """``x`` in FP8 with one FP32 scale per row of its last axis: ``x ~ q * scale``.
+
+    Current scaling: the scale is the row's largest magnitude over the
+    format's, computed from the tensor itself, so the same values always
+    quantize the same way, a recomputed forward included, and nothing about
+    the quantization is state.
+    """
+    amax = x.detach().abs().amax(dim=-1, keepdim=True).float()
+    scale = (amax * (1.0 / FP8_MAX)).clamp_min(FP8_SCALE_FLOOR)
+    q = (x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+    return q, scale
+
+
+def _quantize_weights(
+    fp8_weight: Tensor,
+    fp8_scale: Tensor,
+    fp8_transposed: Tensor,
+    fp8_transposed_scale: Tensor,
+    weight: Tensor,
+) -> None:
+    q, s = quantize_rows(weight)
+    fp8_weight.copy_(q)
+    fp8_scale.copy_(s)
+    q, s = quantize_rows(weight.transpose(-1, -2))
+    fp8_transposed.copy_(q)
+    fp8_transposed_scale.copy_(s)
+
+
+# One reduction and one cast per layout, fused: an eager pass would spill
+# an FP32 copy of every matrix it quantizes.
+_compiled_quantize_weights = torch.compile(_quantize_weights, fullgraph=True, dynamic=False)
+
+
+@torch.no_grad()
+def quantize_weights(fp8: Fp8Weights, weight: Tensor) -> None:
+    """Refresh a site's FP8 copy from its working copy ``weight``, in place."""
+    quantize = _compiled_quantize_weights if weight.is_cuda else _quantize_weights
+    quantize(fp8.weight, fp8.scale, fp8.transposed, fp8.transposed_scale, weight)
+
+
+def fp8_linear(x: Tensor, weight: Tensor, scale: Tensor) -> Tensor:
+    """``x @ weight^T`` on the FP8 tensor cores.
+
+    ``x`` is quantized per row here; ``weight`` is a prequantized ``[N, K]``
+    matrix with its scale per row. The result comes back in ``x``'s dtype.
+    """
+    flat = x.reshape(-1, x.shape[-1])
+    q, row_scale = quantize_rows(flat)
+    out = torch._scaled_mm(
+        q, weight.t(), scale_a=row_scale, scale_b=scale.t(), out_dtype=x.dtype
+    )
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
 class ShadowOperand(torch.autograd.Function):
     """Read an address-stable activation-dtype shadow of an FP32 master.
 
@@ -1249,6 +1357,12 @@ class _SinkLinear(torch.autograd.Function):
     the GEMM actually reads: the trainer's persistent shadow when one is bound,
     otherwise a fresh cast.  The FP32 parameters stay inputs so the output's
     autograd requirement follows them exactly as it would through ``F.linear``.
+
+    With the site's FP8 copy bound, the forward and the activation gradient
+    run on the FP8 tensor cores instead, the activation and the incoming
+    gradient quantized per row on the way in; the weight gradient still
+    accumulates BF16 operands into the FP32 sink, so the FP32 gradient
+    contract does not move and no transposed activation is ever written.
     """
 
     @staticmethod
@@ -1258,22 +1372,34 @@ class _SinkLinear(torch.autograd.Function):
         splits: tuple[int, ...],
         operand: Tensor,
         packed_sink: Tensor | None,
+        fp8_weight: Tensor | None,
+        fp8_scale: Tensor | None,
+        fp8_transposed: Tensor | None,
+        fp8_transposed_scale: Tensor | None,
         *tensors: Tensor,
     ) -> Tensor:
         count = len(splits)
-        ctx.save_for_backward(x, operand)
         # Sinks are mutated by every backward that reaches them, so they are
         # held as plain attributes rather than version-checked saved tensors.
         ctx.sinks = tensors[count:]
         ctx.packed_sink = packed_sink
         ctx.splits = splits
+        ctx.fp8 = fp8_weight is not None
+        if ctx.fp8:
+            ctx.save_for_backward(x, fp8_transposed, fp8_transposed_scale)
+            return fp8_linear(x, fp8_weight, fp8_scale)
+        ctx.save_for_backward(x, operand)
         return F.linear(x, operand)
 
     @staticmethod
     def backward(ctx, gradient: Tensor):
-        x, weight = ctx.saved_tensors
         sinks = ctx.sinks
-        grad_x = gradient @ weight
+        if ctx.fp8:
+            x, transposed, transposed_scale = ctx.saved_tensors
+            grad_x = fp8_linear(gradient, transposed, transposed_scale)
+        else:
+            x, weight = ctx.saved_tensors
+            grad_x = gradient @ weight
         flat_gradient = gradient.reshape(-1, gradient.shape[-1])
         flat_x = x.reshape(-1, x.shape[-1])
         if ctx.packed_sink is not None:
@@ -1289,7 +1415,9 @@ class _SinkLinear(torch.autograd.Function):
                 start += size
         # The fence is zero; the dependency keeps every accumulation alive.
         grad_x = grad_x + fence.to(grad_x.dtype)
-        return (grad_x, None, None, None) + (None,) * (2 * len(ctx.splits))
+        return (grad_x, None, None, None, None, None, None, None) + (None,) * (
+            2 * len(ctx.splits)
+        )
 
 
 def sink_linear(
@@ -1299,6 +1427,7 @@ def sink_linear(
     shadow: Tensor | None = None,
     *,
     packed_sink: Tensor | None = None,
+    fp8: Fp8Weights | None = None,
 ) -> Tensor:
     """Linear over concatenated weights; bound sinks accumulate dW in place.
 
@@ -1310,6 +1439,11 @@ def sink_linear(
     A bound ``packed_sink`` spans the disjoint row views in ``sinks`` and lets
     their weight gradients accumulate with one GEMM. The model validates the
     storage relationship at binding time, outside compiled execution.
+
+    ``fp8`` is the site's FP8 copy of the same concatenated weights. A BF16
+    training forward through the shadow then runs its forward and activation
+    gradient GEMMs on FP8; forwards without gradients (evaluation, decoding)
+    and every other dtype keep the shadow's precision.
     """
     if shadow is not None and shadow.dtype == x.dtype:
         operand = shadow
@@ -1319,8 +1453,18 @@ def sink_linear(
         )
     if not torch.is_grad_enabled() or any(sink is None for sink in sinks):
         return F.linear(x, operand)
+    if fp8 is not None and operand is shadow and x.dtype == torch.bfloat16:
+        quantized = (fp8.weight, fp8.scale, fp8.transposed, fp8.transposed_scale)
+    else:
+        quantized = (None, None, None, None)
     return _SinkLinear.apply(
-        x, tuple(w.shape[0] for w in weights), operand, packed_sink, *weights, *sinks
+        x,
+        tuple(w.shape[0] for w in weights),
+        operand,
+        packed_sink,
+        *quantized,
+        *weights,
+        *sinks,
     )
 
 
