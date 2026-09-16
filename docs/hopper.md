@@ -126,6 +126,31 @@ FP8 make these slightly conservative.
 ## Levers, ranked
 
 Reductions of mean node step time; the ranges overlap and do not add.
+These are hypotheses for prioritizing work, not measured Hopper gains.
+Retunes cover screen, bridge, and flagship: a screen-only win does not set
+the larger models' configuration.
+
+The short measurement tools run on an idle GPU and write ignored JSON under
+`logs/`. Their tile overrides affect only the benchmark process. Start with
+the small default candidate lists, then measure promising combinations in
+the model; do not expand every tile axis into a grid.
+
+| Tool | Comparison |
+|---|---|
+| `scripts/attention_bench.py --scales screen,bridge,flagship --rows 2,4` | Forced flash and cuDNN forward/backward in the compiled wrapper, with gradient checks |
+| `scripts/pkda_bench.py --heads 10,15,20 --rows 2` | Production PKDA operator, all recurrence input gradients, state-kernel tile shortlist |
+| `scripts/moe_bench.py --scale bridge flagship --rows 2 --candidates dw128 k128` | Full six-GEMM expert path under balanced and skewed routing |
+| `scripts/cce_bench.py --dim 1152 --rows 2` | BF16 and FP8 head tiles; activation quantization included, classifier refresh reported separately |
+
+`scripts/replay_bench.py` accepts `--replay-rows N` to fix the actual replay
+width, `--attention-backend cudnn|flash` to force a backend, and `--fp8-head`
+to exercise the classifier hook before its shadows are prepared. The
+trainer's ordinary `--micro-rows` is a minimum, not a width override. Use
+`--condition f --specs 1:1` for a single-column width comparison; `fl` with
+recurrence starting at step zero reaches `(2,2)`, `(2,3)`, and `(3,2)`.
+Compare the complete captured replay, and include a paired short train for
+changes to the FP8 recipe. A trace identifies the selected attention
+backend; forced A/B measurements establish which one is faster.
 
 | # | Lever | Screen | Flagship | Needs Hopper to build? |
 |---|---|---:|---:|---|

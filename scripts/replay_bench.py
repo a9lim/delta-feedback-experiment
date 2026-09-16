@@ -3,6 +3,7 @@ by kernel class: the baseline the Hopper levers are scored against.
 
     python scripts/replay_bench.py --data-root /data/delta [--tag gh200-base]
         [--condition fl] [--scale screen] [--specs 1:1,2:2,3:2] [--trace]
+        [--replay-rows 2] [--attention-backend cudnn|flash] [--fp8-head]
         [--warm 3] [--repeat 10] [-- --precision bf16 --micro-rows 2 ...]
 
 Builds the trainer exactly as ``delta train`` does (same planner, same
@@ -12,8 +13,9 @@ micro-batch ``--warm`` times untimed and ``--repeat`` times timed. Reports
 milliseconds per replay, per row, and per row-column, the replays a
 128-row step needs, and the step time each graph implies; weights the
 graphs by how often the schedule rolls them for one mean step figure.
-The loss sum of one replay at initialization is the numerics fingerprint
-a kernel retune must reproduce. ``--trace`` profiles one replay per graph
+The loss sum of one replay at initialization is a numerics fingerprint
+for comparisons at the same width (different widths use different corpus
+rows). ``--trace`` profiles one replay per graph
 and sums kernel time by class (GEMM, FLA recurrence, CCE head, experts,
 attention, pointwise, ...) with the top kernels by time. Writes
 ``logs/replay-bench/<tag>.json``. Run from the experiment directory.
@@ -33,10 +35,10 @@ from pathlib import Path
 CATEGORIES = [
     ("cce_head", r"cce|linear_cross_entropy|_lse|_indexed"),
     ("experts", r"_grouped_mm|_grouped_dw|_swiglu|_combine_dx|dact_swiglu|moe_"),
+    ("attention", r"flash|fmha|sdpa|FlashAttn|cudnn|fused_attn"),
     ("fla_recurrence", r"chunk_|fwd_|bwd_|wy_|atk|kda|precond|solve_tril|intra|inter|dhu|prepare|cumsum_kernel|gate_bwd|gate_chunk"),
     ("conv_norm", r"causal_conv1d|conv|layer_norm_gated|rms_norm"),
     ("routers", r"_route_|_pack_control"),
-    ("attention", r"flash|fmha|sdpa|FlashAttn|cudnn|fused_attn"),
     ("gemm", r"cutlass|gemm|Cijk|xmma|sm89|sm90|ampere|hopper|nvjet|cublas|gemv|splitK|scaled_mm|e4m3"),
     ("inductor_template", r"triton_tem_|triton_mm|triton_bmm"),
     ("inductor_pointwise", r"triton_poi_|triton_red_|triton_per_|triton_spl_"),
@@ -74,14 +76,25 @@ def main() -> None:
     parser.add_argument("--warm", type=int, default=3)
     parser.add_argument("--repeat", type=int, default=10)
     parser.add_argument("--trace", action="store_true", help="profile one replay per graph by kernel class")
+    parser.add_argument("--replay-rows", type=int, help="force this replay width; reject graphs that cannot fit it")
+    parser.add_argument("--attention-backend", choices=("default", "cudnn", "flash"), default="default",
+                        help="force a single attention backend for an A/B comparison")
+    parser.add_argument("--fp8-head", action="store_true", help="try the FP8 classifier as well as the selected site precision")
     parser.add_argument("--out", default=None, help="default logs/replay-bench/<tag>.json")
     parser.add_argument("extra", nargs="*", help="further delta train flags after --")
     opts = parser.parse_args()
+    if opts.warm < 0 or opts.repeat < 1:
+        parser.error("--warm must be nonnegative and --repeat must be positive")
 
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    from delta_feedback_experiment import distributed
+    from delta_feedback_experiment import attention, distributed
+    from torch.nn.attention import SDPBackend
+
+    if opts.attention_backend != "default":
+        attention.FUSED_BACKENDS = [{"cudnn": SDPBackend.CUDNN_ATTENTION,
+                                    "flash": SDPBackend.FLASH_ATTENTION}[opts.attention_backend]]
     from delta_feedback_experiment.data import TokenData
     from delta_feedback_experiment.model import DeltaModel, condition_config
     from delta_feedback_experiment.optim import build_optimizers
@@ -93,6 +106,7 @@ def main() -> None:
         model_fields,
         parse_run_args,
         pick_device,
+        plan_replay,
         step_shape,
     )
 
@@ -103,12 +117,19 @@ def main() -> None:
     ]
     args = parse_run_args(argv)
     topology = distributed.Topology.from_environment()
+    if opts.replay_rows is not None and (
+        opts.replay_rows < args.micro_rows
+        or opts.replay_rows % args.micro_rows
+        or (args.batch_rows // topology.world) % opts.replay_rows
+    ):
+        parser.error("--replay-rows must divide rank rows and be a positive multiple of --micro-rows")
     torch.manual_seed(args.seed)
     torch.set_float32_matmul_precision("high")
     device = pick_device(args.device, topology)
     distributed.initialize(topology, device)
     data = TokenData.load(Path(args.data_root) / args.source, "train", args.seq_len)
     model = DeltaModel(condition_config(args.condition, **model_fields(args))).to(device)
+    model.fp8_classifier = opts.fp8_head
     sites = ParameterSites(model, topology, fp8=args.precision == "fp8")
     optimizers = build_optimizers(
         model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam, owned=sites.owned
@@ -123,7 +144,18 @@ def main() -> None:
     class BenchTrainer(CudaGraphTrainer):
         def _reachable_specs(self, schedule):
             specs = super()._reachable_specs(schedule)
+            if wanted and any(spec not in specs for spec in wanted):
+                raise ValueError(f"requested graphs {wanted} are not all reachable: {specs}")
             return [s for s in specs if s in wanted] if wanted else specs
+
+        def _plan(self, spec, calibration, budget_bytes):
+            if opts.replay_rows is None:
+                return super()._plan(spec, calibration, budget_bytes)
+            plan = plan_replay(self.model.cfg, self.args, spec, calibration,
+                               budget_bytes, opts.replay_rows)
+            if plan.rows_per_replay != opts.replay_rows:
+                raise ValueError(f"{spec}: requested {opts.replay_rows} rows do not fit; planner chose {plan.rows_per_replay}")
+            return plan
 
     trainer = BenchTrainer(model, optimizers, sites, args, schedule, topology)
     rolled = Counter(
@@ -138,6 +170,9 @@ def main() -> None:
         "condition": args.condition,
         "scale": args.scale,
         "precision": args.precision,
+        "fp8_head": opts.fp8_head,
+        "attention_backend": opts.attention_backend,
+        "requested_replay_rows": opts.replay_rows,
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "revisions": {
@@ -192,6 +227,7 @@ def main() -> None:
             "tokens_per_s": round(width * args.seq_len / median * 1000),
             "schedule_share": round(rolled.get(spec, 0) / schedule.total, 4),
             "loss_fingerprint": fingerprint,
+            "normalized_loss_fingerprint": fingerprint * replays,
         }
         if opts.trace:
             with profile(activities=[ProfilerActivity.CUDA]) as prof:

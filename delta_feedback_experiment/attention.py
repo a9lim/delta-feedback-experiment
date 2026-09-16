@@ -14,6 +14,8 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from .inductor import INDUCTOR_MODE
 
+FUSED_BACKENDS = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]
+
 
 def _causal_attention(query, key, value):
     # Half precision takes the first fused kernel that serves the geometry:
@@ -21,14 +23,15 @@ def _causal_attention(query, key, value):
     # has no cuDNN kernel at that width and falls to flash bitwise). FP32
     # analysis uses the explicit math path.
     backends = (
-        [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]
+        FUSED_BACKENDS
         if query.dtype in (torch.float16, torch.bfloat16)
         else [SDPBackend.MATH]
     )
     # Dynamo records this scoped backend selection, including restoration, in
     # an enclosing fullgraph block. Training cannot silently select math, and
-    # the caller's process-wide preferences survive.
-    with sdpa_kernel(backends):
+    # the caller's enabled backends are restored. A single forced backend
+    # needs no priority change (including the FP32 diagnostic math path).
+    with sdpa_kernel(backends, set_priority=len(backends) > 1):
         return F.scaled_dot_product_attention(
             query, key, value, is_causal=True, enable_gqa=True
         )

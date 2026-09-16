@@ -12,6 +12,7 @@ def test_causal_gqa_matches_repeated_heads_and_restores_backend():
         torch.randn(1, heads, 7, 192, requires_grad=True) for heads in (4, 2, 2)
     )
     refs = tuple(value.detach().clone().requires_grad_() for value in inputs)
+    priority = torch._C._get_sdp_priority_order()
     with sdpa_kernel(SDPBackend.MATH):
         actual = _causal_attention(*inputs)
         expected = F.scaled_dot_product_attention(
@@ -22,6 +23,7 @@ def test_causal_gqa_matches_repeated_heads_and_restores_backend():
         )
         assert torch.backends.cuda.math_sdp_enabled()
         assert not torch.backends.cuda.flash_sdp_enabled()
+        assert torch._C._get_sdp_priority_order() == priority
     torch.testing.assert_close(actual, expected)
     upstream = torch.randn_like(actual)
     for got, wanted in zip(
