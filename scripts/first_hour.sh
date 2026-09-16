@@ -138,12 +138,19 @@ for r in train:
         ))
 summary["plans"] = [{k: v for k, v in r.items() if k != "event"} for r in train if r["event"] == "plan"]
 steps = [r for r in train if r["event"] == "step"]
-per, prev = {}, None
-for i, r in enumerate(steps):
-    elapsed = float(r["elapsed"])
-    if prev is not None and i >= 3:  # the first steps carry autotune and warm caches
-        per.setdefault((int(r["k"]), int(r.get("r", 1))), []).append(elapsed - prev)
-    prev = elapsed
+# Seconds per step = the difference of consecutive elapsed fields, credited
+# to the later step's graph; skipped for the first steps (autotune, warm
+# caches) and for any step whose gap holds an eval or a snapshot record.
+per, prev, clean, n_steps = {}, None, True, 0
+for r in train:
+    if r["event"] == "step":
+        elapsed = float(r["elapsed"])
+        n_steps += 1
+        if prev is not None and clean and n_steps > 3:
+            per.setdefault((int(r["k"]), int(r.get("r", 1))), []).append(elapsed - prev)
+        prev, clean = elapsed, True
+    elif r["event"] in ("eval", "checkpoint", "route_summary", "expert_summary", "depth_trace"):
+        clean = False
 summary["step_seconds"] = {
     f"k={k} r={r}": {"n": len(v), "mean": round(statistics.mean(v), 2), "median": round(statistics.median(v), 2)}
     for (k, r), v in sorted(per.items())
