@@ -87,6 +87,7 @@ def select(candidate: Candidate) -> None:
     if candidate.precision == "bf16":
         assert candidate.forward == candidate.backward
         ta._cce_best_config = candidate.forward.config
+        ta._cce_best_config_hopper = candidate.forward.config
     else:
         ta._cce_best_config_fp8 = candidate.forward.config
         ta._cce_best_config_fp8_backward = candidate.backward.config
