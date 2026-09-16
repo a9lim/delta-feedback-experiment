@@ -44,7 +44,7 @@ def main():
         opts.out.write_text(json.dumps(result, indent=2) + "\n")
 
     def error(actual, reference):
-        value = float((actual.float() - reference.float()).norm() / reference.float().norm().clamp_min(1e-12))
+        value = float((actual.detach().float() - reference.float()).norm() / reference.float().norm().clamp_min(1e-12))
         if not math.isfinite(value):
             raise RuntimeError("nonfinite attention output or gradient")
         return value
@@ -87,6 +87,9 @@ def main():
                     entry["relative_l2"] = errors
                     if max(errors.values()) > 0.02:
                         raise RuntimeError(f"relative L2 error exceeds 0.02: {errors}")
+                    # Release the default-stream autograd graph before warmup
+                    # creates AccumulateGrad nodes on the capture-side stream.
+                    del output
 
                     stream = torch.cuda.Stream()
                     stream.wait_stream(torch.cuda.current_stream())
@@ -117,7 +120,7 @@ def main():
                         times.append(start.elapsed_time(end))
                     entry.update(ms=statistics.median(times), samples_ms=times)
                     graph.reset()
-                    del graph, output
+                    del graph
                 except (RuntimeError, NotImplementedError) as exc:
                     entry["error"] = str(exc)
                 result["cases"].append(entry)

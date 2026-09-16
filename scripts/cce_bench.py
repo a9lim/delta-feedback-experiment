@@ -27,6 +27,7 @@ import os
 import statistics
 import subprocess
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -238,6 +239,9 @@ def main() -> None:
 
     def call(e, y, fp8, filter_eps):
         ordering = batch_vocab_order(e, classifier)
+        # The low-level CCEParams path takes explicit filter flags. Passing
+        # None alone does not disable the backward's Triton comparisons.
+        filtering = filter_eps is not None
         params = CCEParams(
             targets=y,
             valids=None,
@@ -248,12 +252,13 @@ def main() -> None:
             batch_shape=y.shape,
             accum_e_fp32=False,
             accum_c_fp32=False,
-            filter_e_grad=True,
-            filter_c_grad=True,
+            filter_e_grad=filtering,
+            filter_c_grad=filtering,
             vocab_parallel_options=None,
             return_lse=True,
             vocab_ordering=ordering,
             c_grad_accum=sink,
+            skip_early=filtering,
             fp8_classifier=fp8_classifier if fp8 else None,
         )
         nll, lse = linear_cross_entropy_apply(e, classifier, None, params)
@@ -403,14 +408,19 @@ def main() -> None:
                 del graph, graph_loss, graph_grad
             del full
         except Exception as exc:  # noqa: BLE001 -- report failed candidates, then check CUDA health.
-            entry.update(status="error", error=f"{type(exc).__name__}: {exc}")
-            # A failed compile can be skipped. An illegal access poisons the
-            # CUDA context and must abort rather than manufacture later data.
-            torch.cuda.synchronize()
+            entry.update(
+                status="error",
+                error=f"{type(exc).__name__}: {exc}",
+                traceback=traceback.format_exc(),
+            )
         entry["wall_seconds"] = time.monotonic() - started
         result["results"].append(entry)
         save()
         print(json.dumps(entry), flush=True)
+        if entry["status"] == "error":
+            # Persist the complete chained traceback before checking context
+            # health. Compile failures can be skipped; illegal accesses abort.
+            torch.cuda.synchronize()
 
     eligible = [r for r in result["results"] if r["status"] == "ok"]
     result["ranked"] = [

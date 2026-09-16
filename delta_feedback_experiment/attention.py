@@ -1,8 +1,8 @@
 """Native PyTorch fused SDPA for causal GQA, FlexAttention for cached prefixes.
 
 Every kernel ships with PyTorch. Training takes the fused kernels in a fixed
-priority inside its compiled region: cuDNN attention where the platform
-serves the geometry (Hopper at head width 192), else the flash kernel; FP32
+priority inside its compiled region: Flash attention first, with cuDNN as
+a fallback where it serves the geometry; FP32
 diagnostics use dense math. A single decode query still reads its complete
 valid prefix.
 """
@@ -14,14 +14,13 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from .inductor import INDUCTOR_MODE
 
-FUSED_BACKENDS = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION]
+FUSED_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION]
 
 
 def _causal_attention(query, key, value):
-    # Half precision takes the first fused kernel that serves the geometry:
-    # cuDNN on Hopper at head width 192, the flash kernel elsewhere (the 4090
-    # has no cuDNN kernel at that width and falls to flash bitwise). FP32
-    # analysis uses the explicit math path.
+    # Torch 2.14's cuDNN backend rejects backward at head width 192 on
+    # the GH200. Flash serves the production training geometry;
+    # FP32 analysis uses the explicit math path.
     backends = (
         FUSED_BACKENDS
         if query.dtype in (torch.float16, torch.bfloat16)
