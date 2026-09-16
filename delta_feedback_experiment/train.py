@@ -28,6 +28,7 @@ import gc
 import math
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from fractions import Fraction
@@ -740,6 +741,35 @@ def plan_replay(
     )
 
 
+def plan_graphs(
+    args,
+    specs: list[GraphSpec],
+    budget_for: Callable[[int], float],
+    plan: Callable[[GraphSpec, float], ReplayPlan],
+) -> tuple[dict[GraphSpec, ReplayPlan], int, float]:
+    """Every graph's plan, the bytes their inputs set aside, and the budget.
+
+    ``budget_for(inputs)`` is the activation budget once ``inputs`` bytes of
+    persistent graph inputs are set aside, the smallest across ranks. The
+    inputs depend on the widths the plans choose and the plans on the budget
+    the inputs leave, so this starts from the inputs of the smallest replays,
+    plans, and re-plans with what the plans need until no plan's inputs
+    exceed what was set aside; widths only shrink between rounds, so the
+    loop ends within the number of widths.
+    """
+    reserved = sum(input_bytes(args, spec, args.micro_rows) for spec in specs)
+    while True:
+        budget = budget_for(reserved)
+        plans = {spec: plan(spec, budget) for spec in specs}
+        needed = sum(
+            input_bytes(args, spec, chosen.rows_per_replay)
+            for spec, chosen in plans.items()
+        )
+        if needed <= reserved:
+            return plans, reserved, budget
+        reserved = needed
+
+
 class CudaBatchStager:
     """Reuse one pinned host batch and one device batch on the replay stream.
 
@@ -1041,35 +1071,37 @@ class CudaGraphTrainer(Trainer):
         # sit between live allocations, so only whole free pages return.
         self.cached_bytes = torch.cuda.memory_reserved() - self.static_bytes
         free_bytes = torch.cuda.mem_get_info(self.device)[0]
-        # Every graph's persistent inputs are allocated once the plans exist
-        # and stay live together, so the budget sets them aside first, at the
-        # widest replay a plan can choose; a narrower plan leaves the
-        # difference free.
-        self.reserved_bytes = sum(
-            input_bytes(args, spec, self.rank_rows) for spec in specs
+        margin = args.checkpoint_margin_gib * 2**30
+
+        def budget_for(inputs: int) -> float:
+            # Every graph's persistent inputs are allocated once the plans
+            # exist and stay live together, so they come off the free memory
+            # first; the smallest budget across ranks plans every rank.
+            budget = torch.tensor(
+                [-(free_bytes - inputs - margin)], dtype=torch.float64, device=self.device
+            )
+            return -distributed.all_reduce_(budget, maximum=True).item()
+
+        plans, self.inputs_bytes, self.budget_bytes = plan_graphs(
+            args,
+            specs,
+            budget_for,
+            lambda spec, budget: self._plan(spec, self.calibration, budget),
         )
-        budget = torch.tensor(
-            [-(free_bytes - self.reserved_bytes - args.checkpoint_margin_gib * 2**30)],
-            dtype=torch.float64,
-            device=self.device,
-        )
-        # The smallest budget across ranks plans every rank.
-        self.budget_bytes = -distributed.all_reduce_(budget, maximum=True).item()
         telemetry.log(
             "memory_plan",
             static_gib=round(self.static_bytes / 2**30, 2),
             cached_gib=round(self.cached_bytes / 2**30, 2),
-            reserved_gib=round(self.reserved_bytes / 2**30, 2),
+            inputs_gib=round(self.inputs_bytes / 2**30, 2),
             activation_budget_gib=round(self.budget_bytes / 2**30, 2),
             checkpoint_margin_gib=args.checkpoint_margin_gib,
             block_mib=round(self.calibration.lean_block / 2**20, 1),
             block_full_mib=round(self.calibration.full_block / 2**20, 1),
             checkpoint_mib=round(self.calibration.checkpoint / 2**20, 1),
         )
-        self.states: dict[GraphSpec, CapturedMicro] = {}
-        for spec in specs:
-            plan = self._plan(spec, self.calibration, self.budget_bytes)
-            self.states[spec] = self._allocate(spec, plan)
+        self.states: dict[GraphSpec, CapturedMicro] = {
+            spec: self._allocate(spec, plan) for spec, plan in plans.items()
+        }
 
         # The package sets Dynamo's recompile budget once for the process, so
         # every block and router specialization compiles here and in later
@@ -1532,8 +1564,10 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, float]
         "rank_rows": graph_runner.rank_rows,
         "static_gib": round(graph_runner.static_bytes / 2**30, 2),
         "activation_budget_gib": round(graph_runner.budget_bytes / 2**30, 2),
-        "block_mib": round(graph_runner.bytes_per_block / 2**20, 1),
-        "checkpoint_mib": round(graph_runner.bytes_per_checkpoint / 2**20, 1),
+        "inputs_gib": round(graph_runner.inputs_bytes / 2**30, 2),
+        "block_mib": round(graph_runner.calibration.lean_block / 2**20, 1),
+        "block_full_mib": round(graph_runner.calibration.full_block / 2**20, 1),
+        "checkpoint_mib": round(graph_runner.calibration.checkpoint / 2**20, 1),
         "peak_allocated_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
         "reserved_gib": round(torch.cuda.memory_reserved() / 2**30, 2),
         "free_gib": round(torch.cuda.mem_get_info()[0] / 2**30, 2),

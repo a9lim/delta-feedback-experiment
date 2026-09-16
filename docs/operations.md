@@ -216,8 +216,9 @@ bytes reserved and free once capture ends; the peak minus the static
 footprint and the deepest graph's retained activations is the transient the
 margin covered. These measurements also appear in `memory_plan` before
 warm-up, with `cached_gib`, the memory the allocator still holds beyond the
-static footprint when the budget is read, `reserved_gib`, the graphs'
-persistent inputs set aside before the activation budget, and the bytes per
+static footprint when the budget is read, `inputs_gib`, the graphs'
+persistent inputs set aside before the activation budget (planned to a fixed
+point, since the inputs follow the replay widths), and the bytes per
 block with the recurrences keeping (`block_full_mib`) or rebuilding
 (`block_mib`) their intermediates; each `plan` record precedes its graph's
 warm-up and reports its rows, whether its recurrences keep (`saved=full`) or

@@ -549,6 +549,44 @@ def test_pick_device_refuses_a_foreign_index_under_several_ranks():
     assert pick_device("cpu", Topology(rank=3, world=8, local_rank=3)).type == "cpu"
 
 
+def test_plan_graphs_sets_inputs_aside_at_the_planned_widths():
+    """The inputs follow the widths and the widths the budget: planning
+    settles where no graph's inputs exceed what was set aside, starting from
+    the smallest replays rather than the widest."""
+    from types import SimpleNamespace
+
+    from delta_feedback_experiment.train import (
+        GraphSpec,
+        ReplayPlan,
+        input_bytes,
+        plan_graphs,
+    )
+
+    args = SimpleNamespace(seq_len=8, dim=4, micro_rows=1)
+    specs = [GraphSpec(1, 1), GraphSpec(2, 1)]
+    unit = input_bytes(args, GraphSpec(1, 1), 1)
+    free = 40 * unit
+    budgets = []
+
+    def budget_for(inputs):
+        budgets.append(inputs)
+        return free - inputs
+
+    def plan(spec, budget):
+        # A replay of ``rows`` rows needs rows * columns units of budget.
+        columns = spec.n_passes * spec.iterations
+        rows = next(r for r in (8, 4, 2, 1) if r * columns * unit <= budget)
+        return ReplayPlan(rows, 0, 0, 0.0)
+
+    plans, inputs, budget = plan_graphs(args, specs, budget_for, plan)
+    widths = {spec: plans[spec].rows_per_replay for spec in specs}
+    assert inputs >= sum(input_bytes(args, s, widths[s]) for s in specs)
+    assert budget == free - inputs
+    assert widths[GraphSpec(2, 1)] <= widths[GraphSpec(1, 1)]
+    assert budgets[0] == sum(input_bytes(args, s, 1) for s in specs)
+    assert len(budgets) >= 2
+
+
 def test_input_bytes_counts_tokens_prefix_and_both_jitters():
     from types import SimpleNamespace
 

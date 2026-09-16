@@ -56,8 +56,8 @@ Every rank runs the same graphs on 16 of the step's 128 rows and meets the
 others only in the per-site collectives ([design](design.md#training)).
 Sharded masters and optimizer state put the static footprint per rank at
 about 4.3 GiB screen, 9.2 bridge, 16.1 flagship, 35.5 extension, before
-the working copies of the graphs' inputs, which the budget now sets aside
-(`reserved_gib` in `memory_plan`). With ~70 GiB of activation budget the
+the graphs' persistent inputs, which the budget sets aside at the planned
+widths (`inputs_gib` in `memory_plan`). With ~70 GiB of activation budget the
 largest raw replay per graph is about:
 
 | Columns per logical forward | 1 | 2 | 3 | 4 | 6 |
