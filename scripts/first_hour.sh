@@ -131,11 +131,11 @@ summary = {"tag": tag}
 for r in train:
     if r["event"] == "memory_plan":
         summary["memory_plan"] = {k: v for k, v in r.items() if k != "event"}
-    elif r["event"] == "run":
-        summary["run"] = fields(
-            r, "static_gib", "activation_budget_gib", "inputs_gib", "cuda_graphs",
-            "peak_allocated_gib", "reserved_gib", "free_gib", "precision",
-        )
+    elif r["event"] in ("run", "execution"):
+        summary.setdefault("run", {}).update(fields(
+            r, "precision", "static_gib", "activation_budget_gib", "inputs_gib", "cuda_graphs",
+            "peak_allocated_gib", "reserved_gib", "free_gib",
+        ))
 summary["plans"] = [{k: v for k, v in r.items() if k != "event"} for r in train if r["event"] == "plan"]
 steps = [r for r in train if r["event"] == "step"]
 per, prev = {}, None

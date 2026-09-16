@@ -97,7 +97,9 @@ rental session below except the collectives is a single-GPU measurement.
 The machine profile lives in the meta repository's `bootstrap/rental.sh`
 (aarch64 CUDA 13.2 lock, workspace, the token store from the private
 bucket); `scripts/first_hour.sh` runs the session's first hour and writes
-`logs/first-hour/<tag>/summary.json`.
+`logs/first-hour/<tag>/summary.json`. The Grace cores are also where the
+whole dclm-100b stream gets built and published (`scripts/publish_store.sh`,
+[operations](operations.md#tokenize)), overlapping the GPU work.
 
 Unsharded, with the FP8 copies, the static footprint is 8.5 GiB at screen,
 18.6 bridge, 32.5 flagship, and 72.1 extension. Against about 94.5 GiB

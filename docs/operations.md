@@ -44,7 +44,14 @@ delta verify /data/delta/dclm-100b
 `--data-root ROOT` writes `ROOT/SOURCE`; `--out` overrides the path.
 `--continue` extends a finished store with matching build settings.
 `--shuffle` / `--no-shuffle` override source ordering. Use full `dclm` for
-stores beyond the 100B subset. Source identity, row layout, and temporary
+stores beyond the 100B subset.
+
+`scripts/publish_store.sh --disk DISK` builds the whole dclm-100b stream on a
+box with fast cores and a fast uplink (100e9 stored tokens, about 400 GB, a
+few hours on the rental's Grace CPUs), verifies it, checks every full shard
+and the held-out slice against a reference manifest, writes the dataset
+card, and uploads it as the public dataset `a9lim/dclm-100b-neox`. Any box
+then pulls a prefix with `hf download` instead of copying from Jobe. Source identity, row layout, and temporary
 storage requirements are in [design.md](design.md#data).
 
 ## Runs
