@@ -72,8 +72,8 @@ All presets accumulate 128 one-row microbatches of 4,096 predictions:
 524,288 predicted tokens per optimizer update. A one-pass graph may replay
 several microbatches at once when their raw activations fit; each replay
 enters the step in proportion to its rows, so the arithmetic is unchanged.
-The full FP32 gradient is clipped to L2 norm 10 before NorMuonH and NAdam
-update. Expert-selection biases update once from the whole step's assignment
+The full FP32 gradient's L2 norm is measured, unclipped, before NorMuonH and
+NAdam update; a non-finite norm stops the run. Expert-selection biases update once from the whole step's assignment
 counts.
 
 Every column trains ordinary next-token prediction and MTP. For each head,

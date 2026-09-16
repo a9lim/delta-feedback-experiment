@@ -19,7 +19,7 @@ def cuda_probe() -> None:
         CudaGraphTrainer,
         GraphSpec,
         build_schedule,
-        clip_gradients,
+        gradient_norm,
         model_fields,
         parse_run_args,
     )
@@ -104,7 +104,7 @@ def cuda_probe() -> None:
             runner.replay_batch(state, data, step, 0)
             runner.prepare_optimizer(state)
             assert math.isfinite(state.loss_sum.item())
-            assert math.isfinite(clip_gradients(model.parameters()))
+            assert math.isfinite(gradient_norm(model.parameters()))
             assert runner.head_accum is not None and not runner.head_accum.any()
             parameters = dict(model.named_parameters())
             for name in (

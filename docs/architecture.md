@@ -553,7 +553,7 @@ each optimizer step; it is runtime state, excluded from snapshots.
 
 Packed projection backpropagation writes into persistent FP32 sinks. PKDA
 Q/K/V row views share an allocation, as do dense QKV and gate gradients;
-each parameter is clipped/updated once. The routed experts' backward keeps
+each parameter is updated once. The routed experts' backward keeps
 the SwiGLU derivative in FP32 inside the epilogue of the activation-gradient
 GEMM and recomputes the activation there, so the forward retains only the
 pre-activation; expert weight gradients accumulate in FP32 sinks, and an
@@ -666,8 +666,10 @@ U_t = ((1-mu_t)*G_t/(1-P_t) + mu_(t+1)*m_t/(1-P_t*mu_(t+1)))
 theta_t = theta_(t-1) - lr*U_t
 ```
 
-CUDA NAdam and global FP32 clipping run outside forward/backward graphs.
-The scalar step and momentum-product state remain on CPU; moments and
-parameters remain FP32 on-device. Before both optimizers, the complete
-accumulated gradient is clipped to L2 norm 10. A non-finite norm stops the
-run. Telemetry reports the pre-clip norm.
+CUDA NAdam and the global FP32 gradient norm run outside forward/backward
+graphs. The scalar step and momentum-product state remain on CPU; moments
+and parameters remain FP32 on-device. Before both optimizers, the complete
+accumulated gradient's L2 norm is measured and reported; a non-finite norm
+stops the run. Nothing is clipped: NorMuonH's spectral step is scale-free,
+NAdam's nearly so, and with the residual stream entering at unit scale the
+graph shapes' norms sit within a factor of two of each other.

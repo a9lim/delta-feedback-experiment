@@ -151,7 +151,7 @@
   <div class="section-head"><h3>Optimization &amp; work</h3><p id="work-summary"></p></div>
   <div class="grid three">
     <div class="chart"><h2>Learning rates</h2><p class="caption">Five parameter groups · shared schedule</p><div class="plot" id="p-lr"></div></div>
-    <div class="chart"><h2>Gradient norm</h2><p class="caption">Global FP32 L2 before clipping · dashed clipping threshold</p><div class="plot" id="p-gnorm"></div></div>
+    <div class="chart"><h2>Gradient norm</h2><p class="caption">Global FP32 L2, unclipped</p><div class="plot" id="p-gnorm"></div></div>
     <div class="chart"><h2>Throughput</h2><p class="caption">Predicted / pass / trunk cell tokens per second</p><div class="plot" id="p-tput"></div></div>
     <div class="chart"><h2>Expert sequence penalty</h2><p class="caption">Unweighted · unbiased choices, averaged over layers and passes</p><div class="plot" id="p-expert-balance"></div></div>
     <div class="chart"><h2>Expert load imbalance</h2><p class="caption">Worst bank across the whole update · max / mean − 1</p><div class="plot" id="p-expert-violation"></div></div>
@@ -452,7 +452,7 @@ const CONFIG_GROUPS = [
   ['recurrence roll', null, ['recurrence_start', 'three_rate', 'jitter']],
   ['l · loop', 'l', ['loop_iterations']],
   ['prediction', null, ['mtp_weight']],
-  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_lr_scale', 'grad_clip', 'zloss']],
+  ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_lr_scale', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
 ];
 const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', expert_lr_scale: 'expert LR multiplier', zloss: 'z-loss', recurrence_start: 'roll start', three_rate: 'three rate', loop_iterations: 'r eval', mtp_weight: 'auxiliary weight' };
@@ -509,7 +509,7 @@ function rebuild() {
   // Zero-initialized null vectors must remain visible even with log scale on.
   site('p-site-nullrms', perRun((c, t) => [line(`RMS${t}`, c, points)]), { yScale: { range: nullRange } });
   step('p-lr', perRun((c, t) => [line(`NorMuonH${t}`, c, v3), dashed(`expert in${t}`, c, v3), dotted(`expert out${t}`, c, v3), { ...line(`NAdam width${t}`, c, v3), dash: [8, 3, 2, 3] }, { ...line(`NAdam${t}`, c, v3), dash: [2, 5] }]), { yScale: yLog });
-  step('p-gnorm', [...perRun((c, t) => [line(`L2${t}`, c, v3)]), ref('clip')], { yScale: yLog });
+  step('p-gnorm', perRun((c, t) => [line(`L2${t}`, c, v3)]), { yScale: yLog });
   step('p-tput', perRun((c, t) => [line(`predicted${t}`, c, v0), dashed(`pass${t}`, c, v0), dotted(`cell${t}`, c, v0)]), { yScale: yLog });
   step('p-expert-balance', perRun((c, t) => [line(`penalty${t}`, c, v3)]));
   step('p-expert-violation', perRun((c, t) => [line(`imbalance${t}`, c, v3)]));
@@ -568,7 +568,7 @@ function render(view) {
   const series = views.map(seriesOf);
   for (const id of Object.keys(series[0])) {
     const data = join(series.map((s) => s[id]));
-    const reference = id === 'p-gnorm' ? num(setup.grad_clip) : ['p-gap', 'p-drift'].includes(id) ? 0 : undefined;
+    const reference = ['p-gap', 'p-drift'].includes(id) ? 0 : undefined;
     // Only recorded measurements drive the empty state; references are decoration.
     const observed = data.slice(1).some((col) => col.some(Number.isFinite));
     if (reference !== undefined) spanRefs(data, { [data.length]: reference });

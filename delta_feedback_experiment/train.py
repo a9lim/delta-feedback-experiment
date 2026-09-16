@@ -77,9 +77,6 @@ def read_checkpoint(path: str | Path) -> dict:
     return payload
 
 
-GRAD_CLIP_NORM = 10.0
-"""Global FP32 gradient-norm ceiling shared by every run."""
-
 BATCH_TOKENS = 524_288
 """Predicted tokens per optimizer step at every scale: 2^19, 128 rows of 4,096."""
 
@@ -1715,15 +1712,19 @@ def build_schedule(args) -> Schedule:
     return schedule
 
 
-def clip_gradients(parameters) -> float:
-    """Clip one accumulated global gradient vector and return its pre-clip norm."""
-    total_norm = torch.nn.utils.clip_grad_norm_(
-        parameters,
-        max_norm=GRAD_CLIP_NORM,
-        norm_type=2.0,
-        error_if_nonfinite=True,
-    )
-    return total_norm.item()
+def gradient_norm(parameters) -> float:
+    """L2 norm of the accumulated global gradient vector; non-finite stops the run.
+
+    Nothing is clipped. NorMuonH's spectral step is scale-free and NAdam's
+    nearly so, and with the residual stream entering at unit scale the graph
+    shapes' norms sit within a factor of two of each other, so a ceiling
+    would only re-weight rare spikes inside the momentum. The norm is
+    telemetry and the finite check.
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    return torch.nn.utils.get_total_norm(
+        grads, norm_type=2.0, error_if_nonfinite=True
+    ).item()
 
 
 def train(argv: list[str] | None = None) -> dict:
@@ -1871,7 +1872,6 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
             source=args.source,
             params=sum(p.numel() for p in model.parameters()),
             device=str(device),
-            grad_clip=GRAD_CLIP_NORM,
             routing_block_size=model.cfg.routing_block_size,
             mup_ratio=model.cfg.mup_ratio,
             expert_lr_scale=model.cfg.expert_lr_scale,
@@ -2004,7 +2004,7 @@ def _train(args: argparse.Namespace, pinned: frozenset[str]) -> dict:
                     expert_balance += loss_result.expert_aux_loss.item() / micros
 
             with eager_scope():
-                grad_norm = clip_gradients(model.parameters())
+                grad_norm = gradient_norm(model.parameters())
                 for optimizer in optimizers:
                     optimizer.step()
                 model.update_expert_bias(expert_counts)

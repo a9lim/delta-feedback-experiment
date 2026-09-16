@@ -337,7 +337,7 @@ class ResidualEmbedding(nn.Embedding):
     ``grad_sink`` is the trainer-owned persistent FP32 gradient buffer of the
     tied weight.  When it is set, both the lookup and the tied classifier
     accumulate straight into it and return no autograd gradient; the buffer is
-    the ``.grad`` the clip and optimizer read.  It is never a parameter or a
+    the ``.grad`` the norm and optimizer read.  It is never a parameter or a
     checkpoint entry.
     """
 

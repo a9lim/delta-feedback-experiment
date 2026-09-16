@@ -22,12 +22,11 @@ from delta_feedback_experiment.optim import (
 from delta_feedback_experiment.train import (
     BATCH_TOKENS,
     CONTRACT,
-    GRAD_CLIP_NORM,
     CudaGraphTrainer,
     GraphSpec,
     build_parser,
     build_schedule,
-    clip_gradients,
+    gradient_norm,
     draw_recurrence,
     micro_draws,
     mix,
@@ -63,20 +62,17 @@ def test_normuonh_applies_nesterov_before_orthogonalization():
     assert torch.allclose(optimizer.state[weight]["row_moment"], row_moment)
 
 
-def test_global_gradient_clip_uses_one_accumulated_vector():
+def test_gradient_norm_is_global_unclipped_and_finite_checked():
     first = torch.nn.Parameter(torch.zeros(2))
     second = torch.nn.Parameter(torch.zeros(1))
     first.grad = torch.tensor([3.0, 4.0])
     second.grad = torch.tensor([12.0])
 
-    preclip = clip_gradients([first, second])
-
-    assert preclip == pytest.approx(13.0)
-    clipped = torch.cat([first.grad, second.grad])
-    assert clipped.norm().item() == pytest.approx(GRAD_CLIP_NORM)
-    assert clipped.tolist() == pytest.approx(
-        [3 * GRAD_CLIP_NORM / 13, 4 * GRAD_CLIP_NORM / 13, 12 * GRAD_CLIP_NORM / 13]
-    )
+    assert gradient_norm([first, second]) == pytest.approx(13.0)
+    assert first.grad.tolist() == [3.0, 4.0] and second.grad.tolist() == [12.0]
+    second.grad[0] = float("nan")
+    with pytest.raises(RuntimeError, match="non-finite"):
+        gradient_norm([first, second])
 
 
 def test_optimizer_materialization_restores_fresh_nadam_state():
