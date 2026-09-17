@@ -1,316 +1,466 @@
-% One editable, unified architecture figure. Build from the repository root:
-%   mkdir -p figures/architecture
+% One connected architecture and nested component cutaways.
 %   tectonic --outdir figures/architecture docs/architecture.tex
-% Generated outputs remain untracked in figures/.
-%
-% Source contract: model.py::{Block,DeltaModel.forward_column,
-% DeltaModel.forward_iterations,multipass,_jittered_fused_input,
-% _feedback_entry,KVCache}; pkda.py; moe.py.
-% The outer feedback loop advances token/pass coordinates and the loop
-% re-entry advances the column index at one token. Neither is a same-column
-% algebraic cycle. Dotted cutaway leaders are not data edges.
-\documentclass[tikz,border=10pt]{standalone}
+% Generated PDF/PNG outputs remain untracked.
+% Source: model.py, pkda.py, moe.py. Column-vector matrix convention;
+% attention products use sequence-major Q/K/V. Dotted leaders are not data.
+\documentclass[tikz,border=9pt]{standalone}
 \usepackage[T1]{fontenc}
-\usepackage{tgheros}
-\usepackage{amsmath,amssymb}
+\usepackage{lmodern,tgheros,amsmath,amssymb}
 \renewcommand{\familydefault}{\sfdefault}
 \usetikzlibrary{arrows.meta,calc,positioning,backgrounds}
-
-\definecolor{ink}{HTML}{253044}
-\definecolor{muted}{HTML}{667184}
-\definecolor{line}{HTML}{AAB2BE}
-\definecolor{soft}{HTML}{F7F8FA}
-\definecolor{pink}{HTML}{F4D1E0}
-\definecolor{yellow}{HTML}{F7ECB1}
-\definecolor{blue}{HTML}{D0DFF6}
-\definecolor{teal}{HTML}{BCE6E0}
-\definecolor{coral}{HTML}{F5CFB5}
-\definecolor{gold}{HTML}{F5DC9F}
-\definecolor{mint}{HTML}{D0E9C0}
-\definecolor{purple}{HTML}{DDD0F4}
-\definecolor{purpleink}{HTML}{7B4CB4}
-\definecolor{greenink}{HTML}{67904C}
-\definecolor{tealink}{HTML}{198D91}
-
-\newcommand{\smalltext}{\fontsize{9}{11.5}\selectfont}
-\newcommand{\tinytext}{\fontsize{7.8}{10}\selectfont}
-\newcommand{\cell}[3]{%
-  \node[cellbox] (#1) at (8.2,#2) {};
-  \node[font=\bfseries\smalltext] at (8.2,#2+.88) {#3};
-  \node[strip,gqaop] (#1gqa) at (8.2,#2+.08)
-    {\textbf{NoPE-GGQA + MoE}};
-  \node[strip,pkdaop] (#1pkda) at (8.2,#2-.65)
-    {\textbf{PKDA + MoE}\qquad $\times 3$};
-  \draw[flow,thin] (#1pkda.north) -- (#1gqa.south);
+\definecolor{ink}{HTML}{283342}
+\definecolor{muted}{HTML}{626D7B}
+\definecolor{rule}{HTML}{A2ABB5}
+\definecolor{tokenfill}{HTML}{F5C7D7}
+\definecolor{normfill}{HTML}{F7E69B}
+\definecolor{bankfill}{HTML}{C7E5AE}
+\definecolor{bankink}{HTML}{567F35}
+\definecolor{pkdafill}{HTML}{A9DDD3}
+\definecolor{pkdaink}{HTML}{247E75}
+\definecolor{gqafill}{HTML}{F8CCAB}
+\definecolor{gqaink}{HTML}{B56D36}
+\definecolor{moefill}{HTML}{BBDFF3}
+\definecolor{moeink}{HTML}{347EAD}
+\definecolor{fusionfill}{HTML}{DCC8F0}
+\definecolor{readoutfill}{HTML}{CED4EE}
+\definecolor{loopink}{HTML}{8051B2}
+\definecolor{feedink}{HTML}{B94779}
+\colorlet{stateink}{pkdaink}
+\newcommand{\rms}{\operatorname{RMSNorm}}
+\newcommand{\sig}{\operatorname{sigmoid}}
+\newcommand{\silu}{\operatorname{SiLU}}
+\newcommand{\spx}{\operatorname{softplus}}
+\newcommand{\cat}{\operatorname{concat}}
+\newcommand{\diag}{\operatorname{Diag}}
+\newcommand{\op}[6]{\node[op,text width=#4cm,#5] (#1) at (#2,#3) {#6};}
+% Headings label cutaways; only operations, cells, and repeats have outlines.
+\newcommand{\heading}[5]{%
+  \node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont,text=#5]
+    at (.3,#1-.48) {#2\quad #3};
+  \node[anchor=west,note] at (.3,#1-1.15) {#4};
 }
-
+\newcommand{\cell}[3]{%
+  \node[op,text width=5.3cm,minimum height=3cm,fill=white] (#1) at (9.5,#2) {};
+  \node[font=\bfseries] at (9.5,#2+1.05) {Cell #3};
+  \node[op,splitgqa,text width=4.55cm,minimum height=.7cm] (#1gqa) at (9.5,#2+.13)
+    {GGQA\quad $\to$\quad FFN};
+  \node[op,splitpkda,text width=4.55cm,minimum height=.7cm] (#1pkda) at (9.5,#2-.88)
+    {$3\times$ (PKDA\quad $\to$\quad FFN)};
+  \draw[flow] (#1pkda) -- (#1gqa);
+}
 \begin{document}
 \begin{tikzpicture}[
-  x=1cm,y=1cm,text=ink,font=\smalltext,
-  box/.style={draw=line,fill=white,rounded corners=3pt,line width=.65pt,
-    minimum height=.85cm,inner sep=5pt,align=center},
-  % Semantic colors: use these styles for every occurrence of an operation.
-  tokenop/.style={fill=pink},
-  normop/.style={fill=yellow},
-  mhdbop/.style={fill=mint},
-  pkdaop/.style={fill=teal},
-  gqaop/.style={fill=coral},
-  moeop/.style={fill=gold},
-  fusionop/.style={fill=purple},
-  readoutop/.style={fill=blue},
-  mixertype/.style={path picture={
-    \fill[teal] (path picture bounding box.south west)
-      rectangle (path picture bounding box.north);
-    \fill[coral] (path picture bounding box.south)
-      rectangle (path picture bounding box.north east);
-  }},
-  cellbox/.style={box,minimum width=5.3cm,minimum height=2.65cm},
-  strip/.style={box,text width=4.4cm,minimum height=.53cm,
-    inner sep=3pt,font=\smalltext},
-  flow/.style={-{Stealth[length=2.2mm,width=1.6mm]},draw=ink,line width=.95pt},
-  feedback/.style={flow,draw=purpleink,line width=1.35pt,rounded corners=4pt},
-  bankwire/.style={draw=greenink,dashed,line width=.9pt},
-  bankread/.style={bankwire,-{Stealth[length=2mm]}},
-  state/.style={draw=tealink,line width=1pt,{Stealth[length=1.8mm]}-{Stealth[length=1.8mm]}},
-  note/.style={text=muted,font=\tinytext,align=center},
-  edgeword/.style={font=\tinytext,fill=white,inner sep=2pt},
-  sum/.style={circle,draw=ink,fill=white,minimum size=.46cm,
-    inner sep=0pt,font=\normalsize,line width=.85pt}
+ x=1cm,y=1cm,text=ink,font=\fontsize{9}{11}\selectfont,
+ op/.style={draw=ink!75,fill=white,rounded corners=3pt,line width=.75pt,
+   minimum height=.79cm,inner xsep=5pt,inner ysep=5pt,align=center},
+ norm/.style={fill=normfill},
+ tokenop/.style={fill=tokenfill},
+ bankop/.style={fill=bankfill},
+ pkdaop/.style={fill=pkdafill},
+ gqaop/.style={fill=gqafill},
+ moeop/.style={fill=moefill},
+ fusionop/.style={fill=fusionfill},
+ readoutop/.style={fill=readoutfill},
+ linear/.style={},matmul/.style={},state/.style={fill=pkdafill!50},
+ splitpkda/.style={path picture={
+   \fill[pkdafill] (path picture bounding box.south west) rectangle (path picture bounding box.north);
+   \fill[moefill] (path picture bounding box.south) rectangle (path picture bounding box.north east);}},
+ splitgqa/.style={path picture={
+   \fill[gqafill] (path picture bounding box.south west) rectangle (path picture bounding box.north);
+   \fill[moefill] (path picture bounding box.south) rectangle (path picture bounding box.north east);}},
+ flow/.style={-{Stealth[length=2mm,width=1.5mm]},draw=ink,line width=.85pt,rounded corners=3pt},
+ wire/.style={draw=ink,line width=.85pt,rounded corners=3pt},
+ loopflow/.style={flow,draw=loopink,line width=1.3pt},
+ feedflow/.style={flow,draw=feedink,line width=1.3pt},
+ cacheflow/.style={flow,draw=pkdaink,dashed,line width=.9pt},
+ bankwire/.style={draw=bankink,dashed,line width=.9pt,rounded corners=3pt},
+ bankflow/.style={bankwire,-{Stealth[length=1.8mm]}},
+ leader/.style={draw=rule,densely dotted,line width=1.05pt,rounded corners=3pt},
+ repeat/.style={draw=rule,densely dashed,line width=.9pt,rounded corners=5pt},
+ note/.style={font=\fontsize{8.5}{10.8}\selectfont,text=muted,align=left},
+ edgeword/.style={font=\fontsize{8.3}{10.5}\selectfont,fill=white,inner sep=2pt,align=center},
+ port/.style={font=\fontsize{9}{11}\selectfont,align=center,inner sep=2pt},
+ sum/.style={circle,draw=ink,fill=white,minimum size=.45cm,inner sep=0pt,font=\fontsize{12}{12}\selectfont,line width=.8pt}
 ]
-\path[use as bounding box] (0,-.85) rectangle (23.75,32.2);
-
-\node[font=\bfseries\fontsize{23}{27}\selectfont] at (11.9,31.5)
+\path[use as bounding box] (-.1,-.15) rectangle (42.2,72.8);
+\begin{scope}[shift={(0,3)}]
+\node[font=\bfseries\fontsize{25}{29}\selectfont] at (21,69.05)
   {Delta: feedback + looped depth};
-\node[note,font=\fontsize{10}{13}\selectfont] at (11.9,30.8)
-  {Full \texttt{fl} architecture\quad $\cdot$\quad 16 unique trunk layers\quad $\cdot$\quad four cells};
+\node[note,font=\fontsize{10}{13}\selectfont,align=center] at (21,68.25)
+  {Full \texttt{fl} model\quad $\cdot$\quad one shared 16-layer trunk\quad $\cdot$\quad four cells};
+% One operation-family palette, maintained at every magnification.
+\foreach \x/\kind/\word in {2.5/tokenop/Embedding,7.2/norm/Normalization,12.5/bankop/Depth bank,
+ 17.7/pkdaop/PKDA,21.5/gqaop/GGQA,25.5/moeop/Expert FFN,30.5/fusionop/Fusion,35.5/readoutop/Readout}{
+ \node[op,\kind,minimum width=.3cm,minimum height=.23cm,inner sep=0pt,draw=none] at (\x,67.3) {};
+ \node[note,anchor=west] at (\x+.3,67.3) {\word};
+}
 
-% The main column is the single bottom-to-top spine.
-\draw[draw=line!60,fill=soft,rounded corners=6pt]
-  (5.15,11.05) rectangle (11.25,24.18);
-\cell{cellone}{12.8}{Cell 1}
-\cell{celltwo}{16.1}{Cell 2}
-\cell{cellthree}{19.4}{Cell 3}
-\cell{cellfour}{22.7}{Cell 4}
-
-\node[font=\smalltext] (tokens) at (8.2,3.7) {Input token $x_t$};
-\node[box,tokenop,text width=4.6cm] (embedding) at (8.2,5.05)
-  {\textbf{Token embedding $E$}\\$e_t=50\,E(x_t)$};
-\node[box,fusionop,text width=4.6cm] (seed) at (8.2,9.7)
-  {\textbf{Column seed $s_t$}\\fusion of $e_t$ with $p_{t-1}$ (f), with $p_t^{(i)}$ (l), or with the blank $p_0$};
+% Connected model: recurrence arrows return to the same vertical trunk.
+\node[port] (tokens) at (9.5,35.8) {Input token $x_t$};
+\op{embedding}{9.5}{37.05}{5.0}{tokenop}{\textbf{Token embedding}\quad $E:[V,D]$\\$e_t=50\,E[x_t]$}
+\op{entry}{9.5}{39.05}{5.0}{fusionop}{\textbf{Concat-linear fusion}\\$F(e_t,p_{\rm in})=W_F[e_t;p_{\rm in}]$\\$W_F:[D,2D]$}
 \draw[flow] (tokens) -- (embedding);
-\draw[flow] (embedding) -- (seed);
-\node[note,anchor=east,text width=2.8cm] at (7.95,8.02)
-  {Blank payload $p_0$:\\pass 1 / prefix\\standard decode};
-\draw[flow] (seed) -- (cellone);
-\draw[flow] (cellone) -- (celltwo);
-\draw[flow] (celltwo) -- (cellthree);
-\draw[flow] (cellthree) -- (cellfour);
-
-\coordinate (top) at (8.2,24.72);
-\node[box,normop,text width=4.6cm] (finalnorm) at (8.2,26.15)
-  {\textbf{RMSNorm}\\shared output norm $N_o$};
-\node[box,readoutop,text width=4.6cm] (classifier) at (8.2,27.65)
-  {\textbf{Tied classifier $E^\top$}};
-\node[align=center,font=\bfseries\fontsize{11}{14}\selectfont]
-  (mainoutput) at (8.2,29.15) {Next-token logits\\\normalfont\smalltext predict $x_{t+1}$};
-\draw[flow] (cellfour) -- (finalnorm);
-\fill[ink] (top) circle (1.6pt);
-\node[anchor=west,edgeword] at (8.38,24.72) {$h_{\mathrm{top}}$};
-\draw[flow] (finalnorm) -- node[right,edgeword] {$\times\,1536/D$} (classifier);
-\draw[flow] (classifier) -- (mainoutput);
-
-% One accumulated delta per physical cell; the trunk and cutaway read only
-% causally available contributions. Every MHDB site owns its own null.
-\draw[bankwire,rounded corners=3pt] (4.25,9.7) -- (4.25,30.08)
-  -- (23.3,30.08) -- (23.3,17.22);
-\foreach \name/\y/\value in {seed/9.7/s_t,cellone/12.8/\Delta_1,celltwo/16.1/\Delta_2,cellthree/19.4/\Delta_3,cellfour/22.7/\Delta_4} {
-  \draw[bankwire] (\name.west) -- (4.25,\y);
-  \fill[greenink] (4.25,\y) circle (1.3pt);
-  \node[edgeword,text=greenink] at (4.9,\y+.23) {$\value$};
+\draw[flow] (embedding) -- (entry);
+\coordinate (seed) at (9.5,41.0);
+\draw[wire] (entry) -- (seed);
+\fill[ink] (seed) circle (1.5pt);
+\node[edgeword,anchor=west] at (9.7,41.0) {Column seed $s_t^{(a,i)}$};
+\op{blank}{3.6}{36.6}{2.9}{fusionop}{Learned blank $p_0$}
+\draw[flow] (blank.north) -- (3.6,38.0) -| ($(entry.south)+(-1.6,0)$);
+\node[note,align=center,text width=4.3cm] at (3.6,35.55) {Pass 1 / plain prefix:\\first column ($i=1$)\\$p_{\rm in}=p_0$};
+\cell{c1}{43.4}{1}
+\cell{c2}{47.2}{2}
+\cell{c3}{51.0}{3}
+\cell{c4}{54.8}{4}
+\foreach \a/\b in {seed/c1,c1/c2,c2/c3,c3/c4}{\draw[flow] (\a) -- (\b);}
+\coordinate (top) at (9.5,57.15);
+\fill[ink] (top) circle (1.5pt);
+\node[edgeword,anchor=west] at (9.7,57.15) {$h_{\rm top}$};
+\op{mainnorm}{9.5}{59.0}{5.0}{norm}{Shared output RMSNorm}
+\op{mainhead}{9.5}{60.65}{5.0}{readoutop}{\textbf{Tied classifier}\\$(1536/D)\,E\,\rms(h_{\rm top})$}
+\node[port,font=\bfseries\fontsize{11}{14}\selectfont] (ntp) at (9.5,62.35) {Next-token logits\\\normalfont predict $x_{t+1}$};
+\draw[flow] (c4) -- (mainnorm);
+\draw[flow] (mainnorm) -- (mainhead);
+\draw[flow] (mainhead) -- (ntp);
+\node[note,align=center,text width=5.5cm] at (9.5,64.0)
+ {A column executes all four cells.\\$R$ columns form one pass.};
+% The green rail is a fresh, depth-local bank, never temporal memory.
+\draw[bankwire] (seed) -- (5.8,41.0) -- (5.8,56.8);
+\foreach \c/\y/\n in {c1/43.4/1,c2/47.2/2,c3/51/3,c4/54.8/4}{
+ \draw[bankwire] (\c.west) -- (5.8,\y);
+ \fill[bankink] (5.8,\y) circle (1.2pt);
+ \node[edgeword,text=bankink] at (6.25,\y+.22) {$\Delta_\n$};
 }
-\node[note,text width=2.5cm,text=greenink] at (2.7,19.6)
-  {\textbf{Cell-delta bank}\\[4pt]
-   One delta per cell,\\fresh in every column.};
-\node[edgeword,text=greenink] at (17.8,30.08)
-  {layer reads: seed + completed cell deltas};
-\node[rotate=90,edgeword,text=greenink] at (23.3,24.55)
-  {site-local null + available live partial};
-
-% Payload write retains the direct top-state path, before final readout norm.
-% Its learned RMSNorm writes the payload without an additional fixed scale.
-\node[box,mhdbop,text width=2.7cm] (payloadroute) at (2.5,24.0)
-  {\textbf{MHDB read}\\payload: seed + all deltas\\+ learned null};
-\draw[bankread] (4.25,24.0) -- (payloadroute.east);
-\fill[greenink] (4.25,24.0) circle (1.3pt);
-\node[sum] (payloadadd) at (2.5,26.0) {$+$};
-\draw[flow] (payloadroute) -- (payloadadd);
-\draw[flow,rounded corners=3pt,preaction={draw=white,line width=3.8pt}]
-  (top) -- (4.65,24.72) -- (4.65,26.0) -- (payloadadd.east);
-\node[box,normop,text width=2.7cm] (payloadnorm) at (2.5,27.42)
-  {\textbf{RMSNorm}\\payload norm $N_p$};
-\node[circle,draw=purpleink!50,fusionop,minimum size=.68cm,inner sep=0pt]
-  (payload) at (2.5,28.75) {$p_t$};
+\node[note,text=bankink,text width=3.3cm,align=center] at (3.35,51.0)
+ {\textbf{Depth bank}\\[4pt]Seed + cell deltas\\fresh each column\\[5pt]$\Delta_c=h_{\rm exit}-h_{\rm entry}$};
+\op{payloadread}{3.1}{56.8}{3.4}{bankop}{\textbf{MHDB read}\\seed + all cell deltas\\+ writer's learned null}
+\draw[bankflow] (5.8,56.8) -- (payloadread.east);
+\node[sum] (payloadadd) at (3.1,58.7) {$+$};
+\draw[flow] (payloadread) -- (payloadadd);
+\draw[flow,preaction={draw=white,line width=3.5pt}] (top) -- (5.35,57.15) -- (5.35,58.7) -- (payloadadd);
+\op{payloadnorm}{3.1}{60.25}{3.4}{norm}{Payload RMSNorm}
 \draw[flow] (payloadadd) -- (payloadnorm);
+\node[port] (payload) at (3.1,61.55) {$p_t^{(a,i)}$};
 \draw[flow] (payloadnorm) -- (payload);
+\op{jitter}{3.1}{63.0}{3.4}{fusionop}{Add payload jitter\\$\widetilde p_t^{(a,i)}=p_t^{(a,i)}+\xi_t^{(a,i)}$}
+\draw[flow] (payload) -- (jitter);
+\node[note,align=center,text width=4.8cm] at (3.1,64.55)
+ {$\xi\sim U(-.02,.02)$ in training;\\$\xi=0$ for evaluation / decode.};
+% l returns the jittered payload to fusion with this token's embedding.
+\draw[loopflow] (jitter.west) -- (.2,63.0) -- (.2,39.05) -- (entry.west);
+\node[edgeword,rotate=90,text=loopink,font=\bfseries] at (.2,50.5)
+ {\texttt{l}: same token $t$\quad column $i\to i+1$};
+\node[note,text=loopink,align=center,text width=4.7cm] at (3.25,42.3)
+ {For $i<R$:\\$s_t^{(a,i+1)}=F(e_t,\widetilde p_t^{(a,i)})$};
+% Every column also builds next-token fusion for MTP; final-column feedback
+% reuses this exact tensor, shifted to the next position and Jacobi pass.
+\op{nextembed}{18.2}{36.4}{5.1}{tokenop}{\textbf{Same token table $E$}\\$e_{t+1}=50\,E[x_{t+1}]$}
+\op{nextfusion}{18.2}{39.05}{5.1}{fusionop}{\textbf{Same fusion $W_F$}\\$u_t=F(e_{t+1},\widetilde p_t^{(a,i)})$}
+\draw[flow] (nextembed) -- (nextfusion);
+\draw[wire,draw=loopink,line width=1.1pt] (jitter.east) -- (13.3,63.0) -- (13.3,37.85);
+\draw[flow,draw=loopink,line width=1.1pt] (13.3,37.85) -| ($(nextfusion.south)+(-1.3,0)$);
+\node[edgeword,rotate=90,text=loopink] at (13.3,51.0) {same jittered payload};
+\coordinate (fused) at (18.2,40.6);
+\draw[wire] (nextfusion) -- (fused);
+\fill[feedink] (fused) circle (1.6pt);
+\draw[feedflow,preaction={draw=white,line width=3.5pt}] (fused) -- (9.5,40.6);
+\fill[ink] (9.5,40.6) circle (1.5pt);
+\node[note,text=feedink,align=center,text width=6.6cm] at (18.2,49.35)
+ {\textbf{\texttt{f}: next token, next pass}\\[4pt]
+ Final column only:\\$s_{t+1}^{(a+1,1)}=u_t^{(a,R)}$\\[4pt]
+ Shift one token; restore the plain prefix.};
+\node[edgeword,text=feedink,anchor=south] at (15.8,40.7) {\texttt{f}, $i=R$};
+\op{mtp}{18.2}{42.3}{5.1}{splitpkda}{\textbf{PKDA $\to$ FFN}\\independent MTP block}
+\op{mtpnorm}{18.2}{43.85}{5.1}{norm}{Shared output RMSNorm}
+\op{mtphead}{18.2}{45.4}{5.1}{readoutop}{\textbf{Tied classifier}\\same $E$ and multiplier $1536/D$}
+\node[port] (mtpout) at (18.2,46.95) {Second-token logits\\predict $x_{t+2}$};
+\foreach \a/\b in {fused/mtp,mtp/mtpnorm,mtpnorm/mtphead,mtphead/mtpout}{\draw[flow] (\a) -- (\b);}
+\node[note,align=center,text width=6.3cm] at (18.2,35.0)
+ {MTP runs each column; no MHDB or loop.\\Its output never seeds the trunk.};
+\node[note,align=center,text width=6.7cm] at (18.2,59.2)
+ {\textbf{Shared weights, separate memory}\\[5pt]
+ Each column owns a mixer-cache track.\\Jacobi training resets it each pass;\\decode advances it along tokens.\\[5pt]
+ In decode, \texttt{f} carries $p_t^{(R)}$ to $s_{t+1}^{(1)}$.\\Both recurrence paths are differentiable.};
+\node[note,align=center,text width=7cm] at (18.2,64.3)
+ {$a$: pass\quad $i$: column\quad $t$: token position\\$D$: model width\quad $V$: vocabulary rows};
 
-% The outer feedback path carries p_t to fusion with e_{t+1}=50 E(x_{t+1}).
-% Both token paths share E; one lookup serves the whole row.
-% Fusion is computed once and reused by MTP and shifted feedback.
-\node[box,fusionop,text width=3.3cm] (jitter) at (20.2,3.1)
-  {\textbf{Payload + jitter}\\$p_t+\xi_t$};
-\draw[feedback] (payload.west) -- (.3,28.75) -- (.3,1.55)
-  -- (20.2,1.55) -- (jitter.south);
-\node[rotate=90,text=purpleink,font=\smalltext,fill=white,inner sep=3pt]
-  at (.3,15.6) {Full-bandwidth payload feedback};
-% The loop re-entry: the same jittered payload, fused with this token's own
-% embedding, seeds the next column at the same position.
-\draw[feedback] (.3,9.45) -- (seed.west |- 0,9.45);
-\fill[purpleink] (.3,9.45) circle (1.4pt);
-\node[note,text=purpleink,text width=3.5cm,anchor=north] at (3.1,9.28)
-  {Looped depth (l): $p_t^{(i)}+\xi_t^{(i)}$ with $e_t$\\
-   seeds column $i{+}1$ at $t$;\\$r$ columns, same weights};
-\node[box,tokenop,text width=3.3cm] (nextembedding) at (15.2,3.1)
-  {\textbf{Token embedding $E$}\\$e_{t+1}=50\,E(x_{t+1})$};
-\node[box,fusionop,text width=7.5cm,minimum height=1.12cm]
-  (fusion) at (17.7,6.35)
-  {\textbf{Shared concat-linear fusion}\quad $2D\to D$\\
-   $u_t=W_f\,[e_{t+1};\,p_t+\xi_t]$};
-\draw[flow,rounded corners=3pt] (nextembedding.north) -- (15.2,5.5)
-  -| ($(fusion.south)+(-1.5,0)$);
-\draw[flow,rounded corners=3pt] (jitter.north) -- (20.2,5.5)
-  -| ($(fusion.south)+(1.5,0)$);
-\coordinate (fused) at (17.7,7.6);
-\draw[draw=ink,line width=.95pt] (fusion.north) -- (fused);
-\fill[purpleink] (fused) circle (1.6pt);
-\node[edgeword,anchor=west,text=purpleink] at (17.88,7.6) {$u_t$};
-\draw[feedback] (fused) -- (11.8,7.6) -- (11.8,9.7) -- (seed.east);
-\node[note,text=purpleink,text width=2.3cm,anchor=west] at (12.03,8.77)
-  {Shift one token:\\seed at $t+1$\\in the next pass};
-\node[note,text width=6.6cm] at (16.9,2.05)
-  {Default jitter: $\xi_t\sim U(-0.02,0.02)$.\\Evaluation: $\xi_t=0$.};
-
-% MTP is a connected side branch of the very same fusion tensor.
-\node[box,pkdaop,text width=4.6cm,minimum height=1.2cm]
-  (mtp) at (17.7,9.43)
-  {\textbf{PKDA + MoE}\\independent auxiliary block\\\tinytext no MHDB read or looped depth};
-\draw[flow] (fused) -- (mtp.south);
-\node[box,normop,text width=4.6cm] (mtpnorm) at (17.7,11.17)
-  {\textbf{RMSNorm}\\shared output norm $N_o$};
-\node[box,readoutop,text width=4.6cm] (mtpclassifier) at (17.7,12.65)
-  {\textbf{Tied classifier $E^\top$}};
-\node[align=center,font=\bfseries\fontsize{11}{14}\selectfont]
-  (mtpoutput) at (17.7,14.1)
-  {Second-token logits\\\normalfont\smalltext predict $x_{t+2}$};
-\draw[flow] (mtp) -- (mtpnorm);
-\draw[flow] (mtpnorm) -- node[right,edgeword] {$\times\,1536/D$} (mtpclassifier);
-\draw[flow] (mtpclassifier) -- (mtpoutput);
-\node[note,text width=8.2cm] at (17.8,15.05)
-  {MTP runs once per column; its output does not feed the trunk.};
-
-% One attached cutaway, not a second architecture or a separate panel.
-\draw[draw=line,densely dotted,line width=1pt,fill=soft,rounded corners=5pt]
-  (13.25,15.95) rectangle (22.8,29.65);
-\draw[draw=line,densely dotted,line width=.95pt]
-  (cellfourgqa.east) -- (13.25,23.65);
-\node[edgeword,rotate=20,text=muted] at (11.85,23.27) {cutaway};
-\node[font=\bfseries\fontsize{11}{14}\selectfont] at (18.02,29.13)
-  {Inside one residual layer};
-\node[note] at (18.02,28.61)
-  {Per cell: 3 PKDA + 1 NoPE-GGQA\qquad $\alpha=1/\sqrt{2L},\ L=16$};
-\node (layerout) at (17.7,28.0) {$h_{\mathrm{next}}=h+a+m$};
-\node[sum] (addm) at (17.7,27.27) {$+$};
-\node[box,moeop,text width=6.0cm,minimum height=.9cm]
-  (mixexperts) at (17.7,26.0)
-  {\textbf{MoE}\\$\displaystyle
-    \frac{S(x_m)+k\sum_{j\in J}w_jE_j(x_m)}{\sqrt{k+1}}$};
-\node[box,moeop,text width=2.65cm,minimum height=1.0cm]
-  (sharedexpert) at (15.9,24.6)
-  {\textbf{Shared SwiGLU}\\$S(x_m)$};
-\node[box,moeop,text width=2.65cm,minimum height=1.0cm]
-  (routedexperts) at (20.0,24.6)
-  {\textbf{Routed SwiGLUs}\\router: top-$k$ of $n$};
-
-% Every branch has the same explicit read -> add -> norm structure as the
-% payload writer. A learned MHDB query reads the bank, not the live residual;
-% h or h' joins that read at + and also follows its untouched residual bypass.
-\node[box,normop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
-  (normm) at (17.7,23.43)
-  {\textbf{RMSNorm}\quad $x_m=N_m(h'+r_m)$};
-\node[sum] (readaddm) at (17.7,22.65) {$+$};
-\node[box,mhdbop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
-  (readm) at (17.7,21.85)
-  {\textbf{MHDB read}\quad $r_m=R_m(\mathcal B_m)$};
-\node[sum] (adda) at (17.7,21.0) {$+$};
-\node[box,mixertype,text width=4.5cm,minimum height=1.0cm]
-  (tokenmixer) at (17.7,19.95)
-  {\textbf{PKDA or NoPE-GGQA}\\token mixer};
-\node[box,normop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
-  (norma) at (17.7,18.8)
-  {\textbf{RMSNorm}\quad $x_a=N_a(h+r_a)$};
-\node[sum] (readadda) at (17.7,18.02) {$+$};
-\node[box,mhdbop,text width=5.4cm,minimum height=.7cm,inner sep=3pt]
-  (reada) at (17.7,17.22)
-  {\textbf{MHDB read}\quad $r_a=R_a(\mathcal B_a)$};
-\node (layerin) at (14.02,17.0) {$h$};
-
-\draw[flow] (reada) -- (readadda);
-\draw[flow] (readadda) -- (norma);
-\draw[flow] (norma) -- (tokenmixer);
-\draw[flow] (tokenmixer) -- node[right,edgeword]
-  {$a=\alpha\,\mathrm{mixer}(x_a)$} (adda);
-\draw[flow] (readm) -- (readaddm);
-\draw[flow] (readaddm) -- (normm);
-\draw[flow,rounded corners=1pt] (normm.north) -- (17.7,23.88)
-  -- (15.9,23.88) -- (sharedexpert.south);
-\draw[flow,rounded corners=1pt] (17.7,23.88) -- (20.0,23.88)
-  -- (routedexperts.south);
-\fill[ink] (17.7,23.88) circle (1.3pt);
-\draw[flow] (sharedexpert.north) -- (mixexperts.south -| sharedexpert.north);
-\draw[flow] (routedexperts.north) -- (mixexperts.south -| routedexperts.north);
-\draw[flow] (mixexperts) -- node[right,edgeword]
-  {$m=\alpha\,\mathrm{MoE}(x_m)$} (addm);
-\draw[flow] (addm) -- (layerout);
-
-% The lower and upper residual rails each feed both their pre-norm sum and
-% their post-sublayer sum. They never pass through the MHDB read itself.
-\draw[flow,rounded corners=3pt] (layerin.north) -- (14.02,21.0) -- (adda.west);
-\draw[flow] (14.02,18.02) -- (readadda.west);
-\fill[ink] (14.02,18.02) circle (1.3pt);
-\draw[flow,rounded corners=3pt] (adda.north) -- (17.7,21.4)
-  -- (14.02,21.4) |- (addm.west);
-\draw[flow] (14.02,22.65) -- (readaddm.west);
-\fill[ink] (14.02,22.65) circle (1.3pt);
-\node[edgeword,anchor=west] at (18.02,21.1) {$h'=h+a$};
-\draw[bankread] (23.3,17.22) -- (reada.east);
-\fill[greenink] (23.3,17.22) circle (1.3pt);
-\draw[bankread] (23.3,21.85) -- (readm.east);
-\fill[greenink] (23.3,21.85) circle (1.3pt);
-\node[box,fill=white,draw=tealink!60,text width=1.35cm,font=\tinytext,inner sep=3pt]
-  (history) at (21.75,19.95) {Token\\history};
-\draw[state] (tokenmixer.east) -- (history.west);
-\node[note,text width=8.8cm] at (18.0,16.36)
-  {Read the live partial when present.\\
-   Cache per column; reset in Jacobi, retain in decode.};
-
-% Small labels stay adjacent to their mechanisms rather than becoming panels.
-\node[note,text width=4.8cm] at (8.2,2.48)
-  {All looped columns and feedback passes remain differentiable.};
-\draw[flow] (1.0,.6) -- (1.85,.6);
-\node[anchor=west,note] at (2.0,.6) {computation};
-\draw[feedback] (5.55,.6) -- (6.4,.6);
-\node[anchor=west,note] at (6.55,.6) {feedback / looped depth};
-\draw[bankread] (12.2,.6) -- (13.05,.6);
-\node[anchor=west,note] at (13.2,.6) {MHDB sources};
-\draw[state] (18.3,.6) -- (19.15,.6);
-\node[anchor=west,note] at (19.3,.6) {token history};
-% Color and wire legends use the same styles as the diagram.
-\foreach \x/\kind/\label in {
-  1.0/tokenop/Embedding,3.95/normop/RMSNorm,6.9/mhdbop/MHDB,
-  9.45/pkdaop/PKDA,11.9/gqaop/NoPE-GGQA,15.15/moeop/MoE,
-  17.55/readoutop/Readout,20.25/fusionop/Entry + payload} {
-  \node[box,\kind,minimum width=.28cm,minimum height=.22cm,
-    inner sep=0pt,rounded corners=1pt] at (\x,-.35) {};
-  \node[note,anchor=west] at (\x+.24,-.35) {\label};
+% C. Actual cell module: three PKDA/FFN layers, then one GGQA/FFN layer.
+% The only enclosing outlines are this cell and its repeated submodule.
+\draw[draw=rule,line width=.9pt,rounded corners=6pt] (24.65,41.7) rectangle (40.6,64.2);
+\node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont] at (24.9,65.7) {C\quad Inside one four-layer cell};
+\node[anchor=west,note] at (24.9,64.95) {Each attention and FFN branch contributes $\gamma=1/\sqrt{2L}$, $L=16$.};
+\draw[leader] (c4.east) -- (24.65,54.8);
+\node[edgeword,text=muted] at (22.8,54.8) {expand cell};
+\node[port] (cellinput) at (29.5,42.35) {$h_{\rm entry}$};
+\node[port] (celloutput) at (29.5,63.3) {$h_{\rm exit}$};
+\draw[repeat] (25.15,43.0) rectangle (39.95,52.5);
+\node[edgeword,font=\bfseries] at (26.0,52.5) {$\times3$};
+\node[edgeword] at (34.8,52.5) {Distinct layer weights};
+% Each layer has two explicit pre-norm reads and two untouched residual rails.
+\foreach \base/\key/\mixstyle/\mixlabel in {43.25/p/pkdaop/{\textbf{F}\quad PKDA},53.25/g/gqaop/{\textbf{E}\quad GGQA}}{
+ \coordinate (\key in) at (29.5,\base);
+ \node[sum] (\key readadd) at (29.5,\base+.6) {$+$};
+ \op{\key norm}{29.5}{\base+1.65}{4.5}{norm}{RMSNorm}
+ \op{\key mixer}{29.5}{\base+2.95}{4.5}{\mixstyle}{\mixlabel}
+ \node[sum] (\key add) at (29.5,\base+4.1) {$+$};
+ \node[sum] (\key ffreadadd) at (29.5,\base+4.9) {$+$};
+ \op{\key ffnorm}{29.5}{\base+5.95}{4.5}{norm}{RMSNorm}
+ \op{\key ff}{29.5}{\base+7.25}{4.5}{moeop}{\textbf{D}\quad Shared + routed FFN}
+ \node[sum] (\key ffadd) at (29.5,\base+8.5) {$+$};
+ \op{\key read}{36.25}{\base+.6}{4.1}{bankop}{MHDB read $r_a$}
+ \op{\key ffread}{36.25}{\base+4.9}{4.1}{bankop}{MHDB read $r_m$}
+ \draw[flow] (\key in) -- (\key readadd);
+ \draw[flow] (\key readadd) -- (\key norm);
+ \draw[flow] (\key norm) -- (\key mixer);
+ \draw[flow] (\key mixer) -- node[edgeword,anchor=west] {$\times\gamma$} (\key add);
+ \draw[flow] (\key add) -- (\key ffreadadd);
+ \draw[flow] (\key ffreadadd) -- (\key ffnorm);
+ \draw[flow] (\key ffnorm) -- (\key ff);
+ \draw[flow] (\key ff) -- node[edgeword,anchor=west] {$\times\gamma$} (\key ffadd);
+ \draw[flow] (\key read) -- (\key readadd);
+ \draw[flow] (\key ffread) -- (\key ffreadadd);
+ \draw[flow] (\key in) -- (26.25,\base) -- (26.25,\base+4.1) -- (\key add);
+ \draw[flow] (29.5,\base+4.5) -- (26.25,\base+4.5) -- (26.25,\base+8.5) -- (\key ffadd);
+ \fill[ink] (29.5,\base+4.5) circle (1.3pt);
+ \draw[bankflow] (39.2,\base+.6) -- (\key read.east);
+ \draw[bankflow] (39.2,\base+4.9) -- (\key ffread.east);
 }
+\draw[flow] (cellinput) -- (pin);
+\draw[flow] (pffadd) -- (gin);
+\draw[flow] (gffadd) -- (celloutput);
+\draw[bankwire] (39.2,43.85) -- (39.2,61.7);
+\node[note,text=bankink,text width=5.6cm,align=center] at (36.0,61.25)
+ {Available bank at each read:\\null + seed + completed deltas\\+ live partial when present};
+\node[note,align=center,text width=5.1cm] at (36.25,50.7)
+ {Reads enrich branch inputs.\\Only scaled branch outputs\\enter the residual stream.};
+\node[note,align=center,text width=5.1cm] at (36.25,63.2)
+ {$\Delta_c=h_{\rm exit}-h_{\rm entry}$\\after all four layers};
+% A compact bank-read expansion belongs to the cell cutaway.
+\node[anchor=west,font=\bfseries,text=bankink] at (25.0,40.55) {Every MHDB read};
+\node[note,anchor=west] at (25.0,39.95) {Independent query, key gain, and null at each site.};
+\op{banksources}{26.8}{36.0}{3.1}{bankop}{Raw sources\\$\mathcal B$}
+\op{bankkeys}{26.8}{37.6}{3.1}{norm}{RMS keys\\over $D$}
+\op{bankscores}{31.5}{37.6}{4.2}{bankop}{Grouped dot product\\$q_h^\top K_h$}
+\op{banksoftmax}{36.9}{37.6}{4.2}{bankop}{Softmax\\over sources}
+\op{bankvalues}{36.9}{35.95}{4.2}{bankop}{Mix raw values\\$r_h=\sum_j w_{j,h}v_{j,h}$}
+\draw[flow] (banksources) -- (bankkeys);
+\draw[flow] (bankkeys) -- (bankscores);
+\draw[flow] (bankscores) -- (banksoftmax);
+\draw[flow] (banksoftmax) -- (bankvalues);
+\draw[flow] (banksources.east) -- (bankvalues.west);
+\node[edgeword] at (31.6,36.0) {raw values};
+\node[note,text=bankink] at (36.9,34.9) {Concatenate groups $\to r$};
+% Leaders attach D/E/F to the modules actually expanded, not to page frames.
+\draw[leader] (gff.west) -- (23.15,60.5) -- (23.15,34.0) -- (8.2,34.0);
+\draw[leader] (gmixer.east) -- (41.15,56.2) -- (41.15,33.7) -- (31.2,33.7);
+\draw[leader] (pmixer.east) -- (41.8,46.2) -- (41.8,19.75) -- (17.0,19.75);
+
+\end{scope}
+
+% D. The shared and selected expert branches use the same SwiGLU anatomy.
+\begin{scope}[shift={(0,23.5)}]
+\heading{13.9}{D}{Shared + routed FFN}{One shared expert and $k$ of $n$ routed experts; $h=832$.}{moeink}
+\tikzset{op/.append style={fill=moefill!45},linear/.append style={fill=moefill},norm/.append style={fill=normfill}}
+\node[port] (ffinput) at (8.2,.62) {Normalized input $x\in\mathbb R^D$};
+\coordinate (ffbus) at (8.2,1.26);
+\draw[wire] (ffinput) -- (ffbus);
+\draw[wire] (3.4,1.26) -- (13.8,1.26);
+\foreach \x/\branchname in {3.4/S,8.7/j}{
+ \op{gu\branchname}{\x}{2.38}{4.3}{linear}{$W_{gu,\branchname}:[2h,D]$\\split into gate $g$ and value $u$}
+ \node[port] (g\branchname) at (\x-1.08,3.6) {$g$};
+ \node[port] (u\branchname) at (\x+1.08,3.6) {$u$};
+ \op{silu\branchname}{\x-1.08}{4.72}{1.7}{}{SiLU}
+ \node[sum] (mul\branchname) at (\x,5.84) {$\cdot$};
+ \op{down\branchname}{\x}{7.05}{4.3}{linear}{$W_{d,\branchname}:[D,h]$}
+ \draw[flow] (\x,1.26) -- (gu\branchname);
+ \draw[flow] (gu\branchname.north) -- (\x,3.05) -| (g\branchname.south);
+ \draw[flow] (\x,3.05) -| (u\branchname.south);
+ \draw[flow] (g\branchname) -- (silu\branchname);
+ \draw[flow] (silu\branchname.north) |- (mul\branchname.west);
+ \draw[flow] (u\branchname.north) |- (mul\branchname.east);
+ \draw[flow] (mul\branchname) -- (down\branchname);
+}
+\draw[repeat] (6.0,1.65) rectangle (11.4,7.65);
+\node[edgeword,text=moeink] at (8.7,7.65) {$j\in J$};
+\node[port] (sharedout) at (3.4,8.34) {$S(x)$};
+\node[sum] (expertweight) at (8.7,8.34) {$\times$};
+\draw[flow] (downS) -- (sharedout);
+\draw[flow] (downj) -- (expertweight);
+\op{router}{13.8}{2.38}{3.0}{linear}{$W_r:[n,D]$}
+\op{affinity}{13.8}{3.7}{3.0}{}{$s=\sig(W_rx)$}
+\op{select}{13.8}{5.05}{3.0}{}{$J=\operatorname{topk}(s+b)$}
+\op{weights}{13.8}{6.6}{3.0}{}{$w_j=\dfrac{s_j}{\sum_{v\in J}s_v}$}
+\draw[flow] (13.8,1.26) -- (router);
+\draw[flow] (router) -- (affinity);
+\draw[flow] (affinity) -- (select);
+\draw[flow] (select) -- (weights);
+\draw[flow] (affinity.east) -- (15.92,3.7) -- (15.92,6.6) -- (weights.east);
+\draw[flow] (weights.north) |- node[edgeword,pos=.65] {$k\,w_j$} (expertweight.east);
+\op{ffcombine}{8.2}{10.25}{14.0}{}{\textbf{Sum shared and selected expert outputs; scale}\\
+ $\displaystyle y=\frac{S(x)+k\sum_{j\in J}w_jE_j(x)}{\sqrt{k+1}}\in\mathbb R^D$}
+\draw[flow] (sharedout.north) -- (3.4,9.05) -| ($(ffcombine.south)+(-3.3,0)$);
+\draw[flow] (expertweight.north) -- ($(ffcombine.south)+(.5,0)$);
+\node[note,text width=4.7cm,align=center] at (3.4,11.5) {Shared branch: always active.};
+\node[note,text width=5.0cm,align=center] at (8.7,11.5) {Selected experts: same anatomy.};
+\node[note,text width=14.5cm,align=center] at (8.2,.05)
+  {Independent weights per expert. Bias $b$ affects selection only; all selected assignments execute.};
+\end{scope}
+
+
+% E. GQA: separate boxes for learned projections and both attention products.
+\begin{scope}[shift={(23.3,23.5)}]
+\heading{13.9}{E}{Gated global GQA}{No positional encoding; 2 query heads per KV head.}{gqaink}
+\tikzset{op/.append style={fill=gqafill!45},linear/.append style={fill=gqafill},matmul/.append style={fill=gqafill},norm/.append style={fill=normfill}}
+\node[port] (gqain) at (8.1,.62) {$x\in\mathbb R^D$};
+\coordinate (gqabus) at (8.1,1.24);
+\draw[wire] (gqain) -- (gqabus);
+\draw[wire] (6.7,1.24) -- (13.7,1.24);
+\op{qkv}{6.7}{2.32}{10.0}{linear}{$W_{qkv}:[Q+2K,D]$\\$Q=4D/3,\ K=2D/3$; split Q, K, V}
+\op{ggate}{13.7}{2.32}{3.1}{linear}{$W_g:[Q,D]$}
+\draw[flow] (6.7,1.24) -- (qkv);
+\draw[flow] (13.7,1.24) -- (ggate);
+\node[port] (gq) at (2.5,3.57) {Q heads};
+\node[port] (gk) at (6.1,3.57) {K heads};
+\node[port] (gv) at (9.7,3.57) {V heads};
+\draw[wire] (qkv.north) -- (6.7,3.05);
+\foreach \n in {gq,gk,gv}{\draw[flow] (6.7,3.05) -| (\n.south);}
+\op{qnorm}{2.5}{4.72}{2.8}{norm}{Head RMSNorm}
+\op{knorm}{6.1}{4.72}{2.8}{norm}{Head RMSNorm}
+\draw[flow] (gq) -- (qnorm);
+\draw[flow] (gk) -- (knorm);
+\op{scores}{4.3}{6.15}{6.2}{matmul}{Attention scores\\$Q_hK_h^\top/\sqrt{256}$}
+\draw[flow] (qnorm.north) -- (2.5,5.47) -| ($(scores.south)+(-1.5,0)$);
+\draw[flow] (knorm.north) -- (6.1,5.47) -| ($(scores.south)+(1.5,0)$);
+\op{probs}{4.3}{7.59}{6.2}{}{Causal mask + row softmax\\$P_h=\operatorname{softmax}(\mathrm{scores}+M)$}
+\draw[flow] (scores) -- (probs);
+\op{av}{7.3}{9.04}{6.3}{matmul}{Retrieve values\quad $P_hV_h$}
+\draw[flow] (probs.north) -- (4.3,8.4) -| ($(av.south)+(-1.7,0)$);
+\draw[flow] (gv.north) -- (9.7,8.2) -| ($(av.south)+(1.7,0)$);
+\node[edgeword,rotate=90] at (9.7,6.45) {shared KV prefix};
+\op{gatesig}{13.7}{6.15}{3.1}{}{Sigmoid}
+\draw[flow] (ggate) -- (gatesig);
+\op{gateproduct}{9.1}{10.45}{6.4}{}{Concatenate heads, then $\odot\sig(W_gx)$}
+\draw[flow] (av.north) -- (7.3,9.8) -| (gateproduct.south);
+\draw[flow] (gatesig.north) |- (gateproduct.east);
+\op{gout}{9.1}{11.78}{6.4}{linear}{$W_o:[D,Q]\quad\to\quad y\in\mathbb R^D$}
+\draw[flow] (gateproduct) -- (gout);
+\node[note,text width=14.6cm,align=center] at (8.2,.05)
+  {Head width 256. QKV and gate are separate parameters, packed into one execution GEMM.};
+\end{scope}
+
+
+\node[note,align=center] at (19.8,25.1) {Dotted leaders: cutaways\\Dashed teal arrows: token memory};
+
+% F. PKDA: all learned matrices, content transforms, and matrix-state products.
+\begin{scope}[shift={(3.5,-.1)}]
+\heading{22.5}{F}{Preconditioned Kimi Delta Attention}{Per head: $d=128$, $H$ heads, projection width $P=Hd=4D/3$. Named ports connect projections to memory.}{pkdaink}
+\tikzset{op/.append style={fill=pkdafill!35},linear/.append style={fill=pkdafill},matmul/.append style={fill=pkdafill},norm/.append style={fill=normfill}}
+\node[port] (pkdain) at (17.0,.65) {Normalized input $x\in\mathbb R^D$};
+\draw[wire] (pkdain) -- (17.0,1.3);
+\draw[wire] (2.25,1.3) -- (23.0,1.3);
+\foreach \x/\branchname/\branchlabel in {2.25/q/Q,5.75/k/K,9.25/v/V}{
+ \op{p\branchname}{\x}{2.42}{2.8}{linear}{$W_\branchname:[P,D]$}
+ \op{conv\branchname}{\x}{3.63}{2.8}{linear}{Depthwise conv\\$C_\branchname:[P,4]$}
+ \op{act\branchname}{\x}{4.76}{2.8}{}{SiLU}
+ \draw[flow] (\x,1.3) -- (p\branchname);
+ \draw[flow] (p\branchname) -- (conv\branchname);
+ \draw[flow] (conv\branchname) -- (act\branchname);
+}
+\op{pqn}{2.25}{5.93}{2.8}{norm}{Head L2 norm\\$\times 1/\sqrt d$}
+\op{pkn}{5.75}{5.93}{2.8}{norm}{Head L2 norm}
+\node[port] (pvn) at (9.25,5.93) {No value norm};
+\draw[flow] (actq) -- (pqn);
+\draw[flow] (actk) -- (pkn);
+\draw[flow] (actv) -- (pvn);
+\foreach \x/\branchname in {2.25/q,5.75/k,9.25/v}{
+ \node[port] (port\branchname) at (\x,7.14) {$\branchname_t\in\mathbb R^d$};
+}
+\draw[flow] (pqn) -- (portq);
+\draw[flow] (pkn) -- (portk);
+\draw[flow] (pvn) -- (portv);
+\op{control}{22.7}{2.42}{20.2}{linear}{$W_{\rm control}:[2d+3H,D]$\quad /\quad five disjoint row slices}
+\draw[flow] (23.0,1.3) -- (control.south -| 23.0,0);
+\foreach \x/\branchname/\branchlabel in {14.0/decay/$d$,18.0/beta/$H$,22.0/ap/$H$,26.0/bp/$H$,30.0/gate/$d$}{
+ \node[port] (slice\branchname) at (\x,3.58) {\branchlabel};
+ \draw[flow] (control.north -| \x,0) -- (slice\branchname);
+}
+\op{decayup}{14}{4.85}{3.15}{linear}{$W_{\alpha}:[P,d]$}
+\op{pbeta}{18}{4.85}{3.15}{}{Sigmoid}
+\op{pap}{22}{4.85}{3.15}{}{Independent\\decay transform}
+\op{pbp}{26}{4.85}{3.15}{}{Sigmoid}
+\op{gateup}{30}{4.85}{3.15}{linear}{$W_g:[P,d]+b_g$}
+\foreach \a/\b in {slicedecay/decayup,slicebeta/pbeta,sliceap/pap,slicebp/pbp,slicegate/gateup}{\draw[flow] (\a) -- (\b);}
+\op{alphatransform}{14}{6.28}{3.15}{}{Channelwise\\decay transform}
+\op{gatesigpk}{30}{6.28}{3.15}{}{Sigmoid}
+\draw[flow] (decayup) -- (alphatransform);
+\draw[flow] (gateup) -- (gatesigpk);
+\node[port] (alphaport) at (14,7.41) {$\alpha_t\in\mathbb R^d$};
+\node[port] (betaport) at (18,6.65) {$\beta_t$};
+\node[port] (apport) at (22,6.65) {$\alpha_t^P$};
+\node[port] (bpport) at (26,6.65) {$\beta_t^P$};
+\node[port] (gateport) at (30,7.41) {$g_t\in(0,1)^d$};
+\foreach \a/\b in {alphatransform/alphaport,pbeta/betaport,pap/apport,pbp/bpport,gatesigpk/gateport}{\draw[flow] (\a) -- (\b);}
+\node[note,text width=11.5cm,align=center] at (22.3,7.7)
+  {Decay transform: $\exp[-\exp(a)\,\spx(z+b)]$.\\Main and preconditioner decay use independent $a,b$.};
+
+\node[anchor=west,font=\bfseries] at (.5,8.93) {One token's update / each head and cache track};
+% Diagonal preconditioner: squared normalized keys, bounded write-key rescaling.
+\op{aprev}{2.0}{10.62}{2.7}{state}{$A_{t-1}\in\mathbb R^d$}
+\op{aupdate}{7.15}{10.62}{5.5}{}{$A_t=\alpha_t^P A_{t-1}+\beta_t^P(k_t\odot k_t)$}
+\op{bounded}{13.45}{10.62}{5.7}{}{$r=\log(A_t+10^{-6})-c$\\$B_t=\exp\!\left[-\log(1.5)\frac{r}{1+|r|}\right]$}
+\op{writekey}{18.8}{12.03}{3.8}{}{$k_w=B_t\odot k_t$}
+\draw[flow] (aprev) -- (aupdate);
+\draw[flow] (aupdate) -- (bounded);
+\draw[flow] (bounded.east) -| (writekey.south);
+\draw[cacheflow] (aupdate.north) -- (7.15,12.07) -- (2.0,12.07) -- (aprev.north);
+\node[edgeword,text=stateink] at (4.4,12.07) {next token's $A$};
+% Main delta memory: prediction uses k, write uses k_w, read uses updated S.
+\op{sprev}{2.0}{14.33}{2.7}{state}{$S_{t-1}\in\mathbb R^{d\times d}$}
+\op{sdecay}{6.0}{14.33}{3.7}{matmul}{Decay memory\\$\bar S_t=\diag(\alpha_t)S_{t-1}$}
+\op{predict}{10.3}{14.33}{3.4}{matmul}{Predict value\\$\widehat v_t=\bar S_t^\top k_t$}
+\op{error}{14.5}{14.33}{3.2}{}{Prediction error\\$\varepsilon_t=v_t-\widehat v_t$}
+\op{outer}{18.8}{14.33}{3.8}{matmul}{Outer-product write\\$\beta_t k_w\varepsilon_t^\top$}
+\node[sum] (sadd) at (22.0,14.33) {$+$};
+\op{snew}{25.0}{14.33}{3.2}{state}{$S_t$}
+\op{read}{30.0}{14.33}{4.1}{matmul}{Read updated memory\\$o_t=S_t^\top q_t$}
+\foreach \a/\b in {sprev/sdecay,sdecay/predict,predict/error,error/outer,outer/sadd,sadd/snew,snew/read}{\draw[flow] (\a) -- (\b);}
+\draw[flow] (writekey) -- (outer);
+% Repeated named ports make every recurrent operand explicit without long wires.
+\node[port] (ainputs) at (7.15,9.55) {$(\alpha_t^P,\beta_t^P,k_t)$};
+\draw[flow] (ainputs) -- (aupdate.south);
+\node[port] (keyinput) at (22.0,12.03) {$k_t$};
+\draw[flow] (keyinput) -- (writekey.east);
+\node[port] (alphainput) at (6.0,13.03) {$\alpha_t$};
+\draw[flow] (alphainput) -- (sdecay.south);
+\node[port] (predictkey) at (10.3,13.03) {$k_t$};
+\draw[flow] (predictkey) -- (predict.south);
+\node[port] (valueinput) at (14.5,13.03) {$v_t$};
+\draw[flow] (valueinput) -- (error.south);
+\node[port] (betainput) at (18.8,15.48) {$\beta_t$};
+\draw[flow] (betainput) -- (outer.north);
+\node[port] (queryinput) at (30.0,12.9) {$q_t$};
+\draw[flow] (queryinput) -- (read.south);
+\node[note] at (13.45,9.43) {$c$: learned log-space center};
+\draw[flow] (sdecay.north) -- (6.0,16.0) -- (22.0,16.0) -- (sadd.north);
+\node[edgeword] at (14.0,16.0) {retain decayed memory $\bar S_t$};
+\draw[cacheflow] (snew.north) -- (25.0,17.25) -- (2.0,17.25) -- (sprev.north);
+\node[edgeword,text=stateink] at (13.7,17.25) {next token's $S$};
+% Output: normalized heads, separate output gate, concatenate, project.
+\op{pkoutnorm}{30.0}{15.88}{4.1}{norm}{Per-head RMSNorm}
+\node[sum] (pkoutgate) at (30.0,17.23) {$\cdot$};
+\node[port] (gport) at (33.0,17.23) {$g_t$};
+\op{pkcat}{30.0}{18.38}{4.1}{}{Concatenate $H$ heads}
+\op{pkout}{30.0}{19.73}{4.1}{linear}{$W_o:[D,P]\to y\in\mathbb R^D$}
+\draw[flow] (read) -- (pkoutnorm);
+\draw[flow] (pkoutnorm) -- (pkoutgate);
+\draw[flow] (gport) -- (pkoutgate);
+\draw[flow] (pkoutgate) -- (pkcat);
+\draw[flow] (pkcat) -- (pkout);
+\node[note,text width=23.0cm] at (12.7,18.6)
+  {\textbf{Memory semantics.} $S$ and $A$ accumulate in FP32. $B_t\in[2/3,3/2]$ rescales only the write key; prediction uses $k_t$.\\[5pt]
+   Each loop column retains its own $S,A$ and three convolution histories along tokens. Jacobi passes reset them.\\[5pt]
+   Q/K/V projections are independent matrices packed into one GEMM. The output-gate expansion alone has a linear bias.};
+
+\end{scope}
 \end{tikzpicture}
 \end{document}

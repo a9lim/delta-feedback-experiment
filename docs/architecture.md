@@ -36,8 +36,9 @@ scaled token lookup + incoming or blank payload
 width-dependent rates; the [training recipe](design.md) owns conditions,
 sampling, schedules, and objective coefficients; [operations](operations.md)
 owns execution and precision. [Mechanism references](../references/refs.yaml)
-and the editable [architecture diagram](architecture.tex) accompany this
-specification. The implementation is in
+and the editable [architecture diagram](architecture.tex), with recurrence
+paths and matrix-level component cutaways, accompany this specification. The
+implementation is in
 [model.py](../delta_feedback_experiment/model.py),
 [pkda.py](../delta_feedback_experiment/pkda.py),
 [moe.py](../delta_feedback_experiment/moe.py), and
