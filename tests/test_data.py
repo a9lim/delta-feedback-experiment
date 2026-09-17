@@ -174,6 +174,33 @@ def test_tokenized_documents_match_their_source(tmp_path):
     assert 45 not in seen  # file 1 row 5, the empty text, is never written
 
 
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_whole_source_preserves_every_document_across_holdout_sizes(tmp_path, shuffle):
+    source = parquet_source(tmp_path / "source")
+    streams = []
+    for val_tokens in (200, 400):
+        out = tmp_path / str(val_tokens)
+        meta = build(out, source, target_tokens=None, val_tokens=val_tokens, shuffle=shuffle)
+        assert meta["target_tokens"] is None
+        assert meta["selected_docs"] == meta["universe_docs"] == 120
+        assert meta["unused_selected"] == 0
+        assert meta["train_docs"] + meta["val_docs"] == 119  # one empty text
+        docs = np.concatenate([
+            np.load(out / f"{split}.docs.npy")["source"] for split in ("val", "train")
+        ])
+        assert sorted(docs.tolist()) == [i for i in range(120) if i != 45]
+        assert verify(out)["val"]["tokens"] <= val_tokens
+        streams.append(np.concatenate([stream(out, split) for split in ("val", "train")]))
+        assert build(
+            out, source, target_tokens=None, val_tokens=val_tokens,
+            shuffle=shuffle, extend=True,
+        ) == meta
+        with pytest.raises(ValueError, match="val_target"):
+            build(out, source, target_tokens=None, val_tokens=val_tokens + 1,
+                  shuffle=shuffle, extend=True)
+    assert np.array_equal(*streams)
+
+
 @dataclass
 class FlakySource:
     """A local source whose second fetch fails once."""
@@ -274,7 +301,8 @@ def test_verify_catches_a_broken_document_boundary(tmp_path):
         verify(tmp_path)
 
 
-def test_tokenize_continue_recovers_an_interrupted_append(tmp_path, monkeypatch):
+@pytest.mark.parametrize("target", [900, None])
+def test_tokenize_continue_recovers_an_interrupted_append(tmp_path, monkeypatch, target):
     shuffle = False
     source = parquet_source(tmp_path / "source")
     monkeypatch.setattr(data_module, "SHARD_TOKENS", 71)
@@ -293,21 +321,21 @@ def test_tokenize_continue_recovers_an_interrupted_append(tmp_path, monkeypatch)
     with monkeypatch.context() as patch:
         patch.setattr(data_module._ShardWriter, "write", append_then_fail)
         with pytest.raises(OSError, match="simulated append"):
-            build(out, source, target_tokens=900, extend=True, shuffle=shuffle)
+            build(out, source, target_tokens=target, extend=True, shuffle=shuffle)
     assert sum(p.stat().st_size for p in out.glob("train.*.bin")) > before
     assert data_module.read_meta(out)["train_tokens"] == initial["train_tokens"]
-    build(out, source, target_tokens=900, extend=True, shuffle=shuffle)
+    build(out, source, target_tokens=target, extend=True, shuffle=shuffle)
 
     # Match every byte against an uninterrupted extension, including metadata.
     control = tmp_path / "control"
     build(control, source, shuffle=shuffle)
-    build(control, source, target_tokens=900, extend=True, shuffle=shuffle)
+    build(control, source, target_tokens=target, extend=True, shuffle=shuffle)
     assert {p.name: p.read_bytes() for p in out.iterdir()} == {
         p.name: p.read_bytes() for p in control.iterdir()
     }
     # Its shards, sidecars, and source index also match a fresh larger build.
     fresh = tmp_path / "fresh"
-    build(fresh, source, target_tokens=900, shuffle=shuffle)
+    build(fresh, source, target_tokens=target, shuffle=shuffle)
     assert {p.name: p.read_bytes() for p in out.iterdir() if p.name != "meta.json"} == {
         p.name: p.read_bytes() for p in fresh.iterdir() if p.name != "meta.json"
     }

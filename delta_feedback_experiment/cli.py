@@ -129,7 +129,7 @@ def tokenize_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         "delta tokenize",
         description=(
-            "Build a reproducible prefix of --source: index "
+            "Build a reproducible prefix of --source, or the whole source with --all: index "
             "the pinned parquet files, select and tokenize the documents "
             "whose stream position falls below --target / --tokens-per-doc, "
             "then write the held-out slice, the train shards, and the document "
@@ -159,7 +159,14 @@ def tokenize_command(argv: list[str]) -> None:
         help="shuffle documents across the source; default off for dclm-100b, "
         "on for other sources; --no-shuffle keeps published file/row order",
     )
-    parser.add_argument(
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument(
+        "--all",
+        dest="all_documents",
+        action="store_true",
+        help="tokenize every source document, with no stored-token cap",
+    )
+    budget.add_argument(
         "--target",
         type=float,
         default=None,
@@ -167,7 +174,7 @@ def tokenize_command(argv: list[str]) -> None:
         f"{CANONICAL_TARGET_TOKENS / 1e9:g}B; use --scale with "
         "--tokens-per-param for a schedule-derived target)",
     )
-    parser.add_argument(
+    budget.add_argument(
         "--scale",
         choices=tuple(SCALES),
         help="derive --target from this scale's schedule at --tokens-per-param: "
@@ -227,9 +234,9 @@ def tokenize_command(argv: list[str]) -> None:
     args = parser.parse_args(argv)
     if (args.scale is None) != (args.tokens_per_param is None):
         parser.error("--scale and --tokens-per-param go together")
-    if args.scale is not None:
-        if args.target is not None:
-            parser.error("--target and --scale name the target two ways")
+    if args.all_documents:
+        target = None
+    elif args.scale is not None:
         target = stream_target(args.scale, args.tokens_per_param, int(args.val))
     else:
         target = int(CANONICAL_TARGET_TOKENS if args.target is None else args.target)

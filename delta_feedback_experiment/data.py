@@ -589,7 +589,7 @@ def _write(
     parts: Path,
     n_files: int,
     *,
-    target_tokens: int,
+    target_tokens: int | None,
     val_tokens: int,
     shuffle: Shuffle,
     extend: bool,
@@ -599,7 +599,8 @@ def _write(
 
     The held-out slice is the stream's first documents up to ``val_tokens``;
     training then runs until it holds ``target_tokens - val_tokens`` tokens,
-    ending on a document boundary. Extending appends to a finished store's
+    ending on a document boundary; ``None`` consumes the entire selection.
+    Extending appends to a finished store's
     train shards and sidecar under the same rule, so it lands on the bytes a
     fresh build at the larger target would.
     """
@@ -651,7 +652,7 @@ def _write(
             "train": _ShardWriter(out, "train", SHARD_TOKENS),
         }
         split, val_docs = "val", None
-    train_target = target_tokens - val_tokens
+    train_target = None if target_tokens is None else target_tokens - val_tokens
     doc_start = np.empty(index.size, dtype=np.int64)
     doc_position = np.empty(index.size, dtype=np.int64)
     count = 0
@@ -688,7 +689,11 @@ def _write(
                 writers["val"].close()
                 split = "train"
                 val_docs = count
-            if split == "train" and writers["train"].written + buffered >= train_target:
+            if (
+                split == "train"
+                and train_target is not None
+                and writers["train"].written + buffered >= train_target
+            ):
                 break
             doc_start[count] = writers[split].written + buffered
             doc_position[count] = positions[i]
@@ -709,7 +714,7 @@ def _write(
         )
     if not extend and not val_docs:
         raise RuntimeError("no document fits the held-out slice")
-    if writers["train"].written < train_target:
+    if train_target is not None and writers["train"].written < train_target:
         raise RuntimeError(
             f"selection exhausted at {writers['train'].written:,} of "
             f"{train_target:,} training tokens; rebuild with a smaller "
@@ -765,7 +770,10 @@ def _clean_committed_build(out: Path, meta: dict) -> None:
         if key != "extend_from"
     ):
         return  # An extension is still in progress, not committed.
-    if meta["train_tokens"] < meta["target_tokens"] - meta["val_target"]:
+    if (
+        meta["target_tokens"] is not None
+        and meta["train_tokens"] < meta["target_tokens"] - meta["val_target"]
+    ):
         return
     parts = out / "parts"
     if parts.exists():
@@ -802,7 +810,7 @@ def _restore_train_prefix(out: Path, meta: dict) -> None:
 def tokenize(
     out_dir: str | Path,
     *,
-    target_tokens: int,
+    target_tokens: int | None,
     val_tokens: int,
     seed: int = CANONICAL_SHUFFLE_SEED,
     tokens_per_doc: int = CANONICAL_TOKENS_PER_DOC,
@@ -817,12 +825,13 @@ def tokenize(
     check_packages: bool = True,
     extend: bool = False,
 ) -> dict:
-    """Build the chosen stream's first ``target_tokens`` stored tokens.
+    """Build the stream's first ``target_tokens`` tokens, or all when ``None``.
 
     Three resumable stages under ``out_dir``: index the source into
     ``source.json``; select the documents whose stream position falls below
     ``target_tokens / tokens_per_doc`` and tokenize them into per-file parts;
-    then write the parts in stream order, the held-out slice first. The
+    or every source document when no target is given; then write the parts
+    in stream order, the held-out slice first. The
     stream is a pure function of the source, its revision, the tokenizer,
     build package versions, ordering mode and seed: matching builds agree on
     their common prefix. Refuses to run if ``meta.json`` already exists unless
@@ -834,7 +843,7 @@ def tokenize(
         raise ValueError("readers must be at least 1")
     if workers < 1 or tokens_per_doc < 1:
         raise ValueError("workers and tokens_per_doc must be at least 1")
-    if not 0 < val_tokens < target_tokens:
+    if val_tokens <= 0 or (target_tokens is not None and val_tokens >= target_tokens):
         raise ValueError("target_tokens must exceed a positive val_tokens")
     if source_name not in SOURCES:
         raise ValueError(
@@ -871,7 +880,12 @@ def tokenize(
                     f"{value!r} requested"
                 )
         _clean_committed_build(out, previous)
-        if previous["train_tokens"] >= target_tokens - val_tokens:
+        if (
+            target_tokens is None and previous["target_tokens"] is None
+        ) or (
+            target_tokens is not None
+            and previous["train_tokens"] >= target_tokens - val_tokens
+        ):
             telemetry.log(
                 "tokenized",
                 train=previous["train_tokens"],
@@ -950,7 +964,10 @@ def tokenize(
     if universe == 0:
         raise RuntimeError("the source holds no documents")
     order = Shuffle(universe, seed, shuffle)
-    selected = min(universe, math.ceil(target_tokens / tokens_per_doc))
+    selected = (
+        universe if target_tokens is None
+        else min(universe, math.ceil(target_tokens / tokens_per_doc))
+    )
     first = 0
     if previous is not None:
         last = int(

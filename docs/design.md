@@ -38,15 +38,19 @@ raw text with `<|endoftext|>` after each nonempty document, not ChatML.
 [data.py](../delta_feedback_experiment/data.py) pins source revisions.
 `--shuffle` and `--no-shuffle` override the ordering. Source, revision,
 tokenizer, build-package versions, ordering, and shuffle seed identify one
-stream; larger stores extend its prefix. Different sources have different
-validation slices and do not form a paired comparison.
+stream; larger stores extend its prefix when the holdout is unchanged.
+Different sources have different validation slices and do not form a paired
+comparison.
 
 The builder indexes parquet rows, encodes complete documents, and assembles
 a contiguous uint32 stream. `--tokens-per-doc` estimates how many documents
-to select; it never truncates them. Validation takes the initial complete
-documents that fit within 30M tokens, and training takes the following
-documents to the requested target. `meta.json` records build identity and
-counts; each split's `.docs.npy` sidecar maps document starts to source rows.
+to select; it never truncates them. `--all` selects every source document
+and consumes the entire stream. Validation takes the initial complete
+documents that fit within `--val` (30M by default); the publication script
+uses 100M. Training takes the following documents to the requested target,
+or to source exhaustion with `--all`. Empty texts are skipped. `meta.json`
+records build identity and counts; each split's `.docs.npy` sidecar maps
+document starts to source rows.
 Build resume and extension require matching settings. Store commands and
 verification are in [operations](operations.md#tokenize).
 

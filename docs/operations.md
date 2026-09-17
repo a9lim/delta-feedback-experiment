@@ -61,13 +61,37 @@ concurrent files; `RAYON_NUM_THREADS` controls tokenizer threads per worker;
 `--readers` controls document reads during shuffled assembly. Published-order
 builds do not need shuffled reads. Scratch downloads are removed on success.
 
-`scripts/publish_store.sh --disk DISK` builds 100B stored tokens by default,
-verifies the store, writes checksums and a dataset card, and publishes
-`a9lim/dclm-100b-neox`. Use `--reference MANIFEST` to compare held-out files
-and complete prefix shards with an existing build; without a reference,
-cross-build prefix identity is unchecked. `--skip-upload` keeps the result
-local. Other machines can download a training-shard prefix together with the
-metadata, validation files, and document sidecars.
+`scripts/publish_store.sh --disk DISK` processes every document in the pinned
+`dclm-100b` source with `--all` and a 100M-token holdout target (`--val 1e8`).
+The holdout ends at the last whole document before that limit; training starts
+with the next document. The script writes `DISK/build/dclm-100b-val100m`,
+leaving earlier builds and the training store at `DISK/delta/dclm-100b` intact.
+Use `--out PATH` for another destination, `--target N` for a finite token
+prefix, or `--val N` for another holdout target. Rerunning resumes a partial
+build or reuses/extends a completed store with matching settings.
+
+Publication verifies the store, writes checksums and a dataset card with exact
+token and document counts, and uploads to `a9lim/dclm-100b-neox`.
+`--reference MANIFEST` compares held-out files and complete prefix shards only
+when the accompanying `meta.json` has the same source, tokenizer, packages,
+ordering and holdout target. Changing the holdout from 30M to 100M changes the
+training offset, so the old split's shard-prefix checks are explicitly skipped.
+`--skip-upload` keeps the result local.
+
+Build and upload output remains untruncated, with informational upload progress
+in unattended logs. The script publishes training shards in batches of eight,
+then validation and document indexes, then metadata and the card. The current
+`hf upload` pipeline resumes through Hub commits and Xet's content-addressed
+storage; keep `HF_HOME/xet` between attempts. Files already committed with
+matching sizes and content hashes are skipped. The script defaults Xet upload concurrency to
+at most 8 and concurrent file ingestion to 2 using
+`HF_XET_CLIENT_AC_MAX_UPLOAD_CONCURRENCY` and
+`HF_XET_DATA_MAX_CONCURRENT_FILE_INGESTION`; explicit environment values
+override these defaults. It retries each failed batch up to three times with
+backoff, then exits with the failure code. The final publication is checked
+against committed Hub file sizes and hashes. Rerun the same command
+to retry without rebuilding. Other machines can download a training-shard prefix
+together with the metadata, validation files, and document sidecars.
 
 ## Runs
 
