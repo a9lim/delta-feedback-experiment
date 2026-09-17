@@ -162,6 +162,67 @@ def test_precision_is_a_runtime_recipe_a_resume_keeps_unless_retyped():
 
 
 @pytest.mark.parametrize(
+    "saved_start,requested_start,checkpoint_step,allowed",
+    [
+        (0.25, 0.75, 2, True),   # round(2.5) == 2: last flat update.
+        (0.25, 0.75, 3, False),  # The first recurrent update already happened.
+        (0.35, 0.75, 4, True),   # round(3.5) == 4, not truncation to 3.
+        (0.35, 0.75, 5, False),
+        (0.25, 0.20, 0, False),  # Advancing recurrence is never postponement.
+        (0.25, 0.25, 9, True),   # An unchanged exact resume remains valid.
+    ],
+)
+def test_resume_recurrence_postponement_boundary(
+    saved_start, requested_start, checkpoint_step, allowed,
+):
+    from delta_feedback_experiment.train import inherit_resume_settings
+
+    saved = vars(parse_run_args([
+        "boundary", "--steps", "10", "--recurrence-start", str(saved_start),
+    ]))
+    args, pinned = resolve_run_args(build_parser(), [
+        "boundary", "--resume", "--recurrence-start", str(requested_start),
+    ])
+    if allowed:
+        inherit_resume_settings(args, saved, checkpoint_step, pinned)
+        assert args.recurrence_start == requested_start
+        assert args.steps == 10
+    else:
+        with pytest.raises(ValueError, match="recurrence"):
+            inherit_resume_settings(args, saved, checkpoint_step, pinned)
+    assert saved["recurrence_start"] == saved_start
+
+
+@pytest.mark.parametrize("postpone", [False, True])
+def test_resume_recurrence_keeps_exact_fields_and_runtime_inheritance(postpone):
+    from delta_feedback_experiment.train import inherit_resume_settings
+
+    saved = vars(parse_run_args([
+        "inherit", "--steps", "10", "--recurrence-start", "0.25",
+        "--checkpoint-margin-gib", "5.5", "--eval-every", "10",
+        "--snapshot-every", "5",
+    ]))
+    argv = ["inherit", "--resume", "--eval-every", "7"]
+    if postpone:
+        argv += ["--recurrence-start", "0.75"]
+    args, pinned = resolve_run_args(build_parser(), argv)
+    # Without an explicit change, even a late checkpoint inherits its saved
+    # recurrence start rather than taking the new-run parser default.
+    inherit_resume_settings(args, saved, 2 if postpone else 9, pinned)
+    assert args.recurrence_start == (0.75 if postpone else 0.25)
+    assert args.steps == saved["steps"]
+    assert args.checkpoint_margin_gib == 5.5
+    assert args.eval_every == 7
+    assert args.snapshot_every == 5
+
+    conflicting, explicit = resolve_run_args(
+        build_parser(), [*argv, "--three-rate", "0.2"],
+    )
+    with pytest.raises(ValueError, match="three_rate"):
+        inherit_resume_settings(conflicting, saved, 2, explicit)
+
+
+@pytest.mark.parametrize(
     "scale,dim,selected,routed,total,active,mtp_total,mtp_active",
     [
         ("screen", 768, 3, 15, 621389088, 191702304, 34321312, 11318176),
@@ -412,7 +473,19 @@ def assert_identical(left, right):
         assert left == right
 
 
-def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "saved_start,resumed_start,steps,expected_shapes",
+    [
+        (0.0, 0.0, 2, [(1, (2, 2)), (2, (2, 2))]),
+        (0.25, 0.75, 4, [
+            (1, (1, 1)), (2, (1, 1)), (3, (1, 1)), (4, (2, 2)),
+        ]),
+    ],
+    ids=["exact", "postponed-recurrence"],
+)
+def test_training_resume_preserves_the_exact_next_update(
+    tmp_path, monkeypatch, saved_start, resumed_start, steps, expected_shapes,
+):
     from transformer_experiments.spool import Spool
 
     from delta_feedback_experiment import cli
@@ -440,12 +513,12 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
         "batch-rows": 2,
         "micro-rows": 1,
         "loop-iterations": 2,
-        "steps": 2,
+        "steps": steps,
         "warmup-frac": 0,
         "cooldown-frac": 0,
-        "recurrence-start": 0,
+        "recurrence-start": resumed_start,
         "three-rate": 0,
-        "eval-every": 2,
+        "eval-every": steps,
         "eval-rows": 1,
         "snapshot-every": 1,
         "device": "cpu",
@@ -463,11 +536,14 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
 
     monkeypatch.setattr(trainer, "step_shape", record_shape)
     full = trainer.train(["full", *flags])
-    half = trainer.train(["half", *flags, "--max-steps", "1"])
+    half = trainer.train([
+        "half", *flags, "--recurrence-start", str(saved_start), "--max-steps", "1",
+    ])
     assert half["step"] == 1
     # Resume must restore a nonzero auxiliary controller state. Later updates
     # can legitimately bring these signed count corrections back to zero.
     halfway = trainer.read_checkpoint(tmp_path / "runs/half.pt.1")
+    assert halfway["args"]["recurrence_start"] == saved_start
     assert halfway["state"]["mtp.block.mlp.expert_bias"].count_nonzero()
     Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE).move("half", "renamed")
     with pytest.raises(ValueError, match="conflicts"):
@@ -482,13 +558,14 @@ def test_training_resume_preserves_the_exact_next_update(tmp_path, monkeypatch):
     resumed = trainer.train(["renamed", *resume_flags, "--resume"])
     for key in ("step", "loss", "val", "val_fused", "val_mtp", "val_mtp_fused"):
         assert resumed[key] == full[key]
-    complete = trainer.read_checkpoint(tmp_path / "runs/full.pt.2")
-    restored = trainer.read_checkpoint(tmp_path / "runs/renamed.pt.2")
+    complete = trainer.read_checkpoint(tmp_path / f"runs/full.pt.{steps}")
+    restored = trainer.read_checkpoint(tmp_path / f"runs/renamed.pt.{steps}")
     assert complete["version"] == CONTRACT.version == 42
     assert (
         complete["args"]["loop_iterations"] == restored["args"]["loop_iterations"] == 2
     )
-    assert sampled_shapes == [(1, (2, 2)), (2, (2, 2)), (1, (2, 2)), (2, (2, 2))]
+    assert sampled_shapes == expected_shapes + expected_shapes
+    assert complete["args"]["recurrence_start"] == restored["args"]["recurrence_start"] == resumed_start
     assert "recurrence_start" in restored["args"] and "three_rate" in restored["args"]
     assert "loop_max_iterations" not in restored["args"]
     assert_identical(complete["state"], restored["state"])

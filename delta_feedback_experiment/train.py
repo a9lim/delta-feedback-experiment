@@ -187,7 +187,7 @@ EXACT_FIELDS = (
     "pkda_head_dim",
     "pkda_conv_size",
 )
-"""State-defining settings: a resume takes these from the checkpoint."""
+"""State-defining settings, with recurrence postponement before it begins."""
 
 RUNTIME_FIELDS = (
     "data_root",
@@ -275,7 +275,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="continue the tag from its latest snapshot",
+        help=(
+            "continue the tag from its latest snapshot; recurrence may be "
+            "postponed before it begins"
+        ),
     )
     parser.add_argument(
         "--continue",
@@ -338,7 +341,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "fraction of steps before the recurrence roll begins; every earlier "
             "step is one plain column and every later step rolls two or three "
-            "passes (f) and two or three columns per pass (l)"
+            "passes (f) and two or three columns per pass (l); --resume may "
+            "increase this fraction while the saved step is at or before the "
+            "old boundary"
         ),
     )
     schedule.add_argument(
@@ -1987,6 +1992,39 @@ def parse_run_args(argv: list[str]) -> argparse.Namespace:
     return resolve_run_args(build_parser(), argv)[0]
 
 
+def inherit_resume_settings(args, saved: dict, step: int, pinned: frozenset[str]) -> None:
+    """Keep the saved trajectory while allowing recurrence to begin later.
+
+    The boundary itself is the last plain update. Until that step, increasing
+    the recurrence fraction leaves every completed update unchanged. Once a
+    recurrent update has run, its original boundary remains state-defining.
+    """
+    missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
+    if missing:
+        raise ValueError(f"checkpoint lacks settings {missing}")
+    conflicts = checkpoints.mismatched_fields(saved, args, EXACT_FIELDS, only=pinned)
+    if "recurrence_start" in conflicts:
+        previous, requested = conflicts["recurrence_start"]
+        boundary = recurrence_boundary(SimpleNamespace(**saved), saved["steps"])
+        if requested <= previous or step > boundary:
+            raise ValueError(
+                "resume can only postpone recurrence before it begins: "
+                f"checkpoint step {step}, old boundary {boundary}, "
+                f"recurrence_start {previous} -> {requested}"
+            )
+        saved = saved | {"recurrence_start": requested}
+        del conflicts["recurrence_start"]
+    if conflicts:
+        raise ValueError(f"resume conflicts with checkpoint settings: {conflicts}")
+    checkpoints.inherit(
+        args,
+        saved,
+        exact_fields=EXACT_FIELDS,
+        runtime_fields=RUNTIME_FIELDS,
+        explicit=pinned,
+    )
+
+
 def pick_device(
     name: str | None, topology: distributed.Topology = distributed.Topology()
 ) -> torch.device:
@@ -2078,21 +2116,7 @@ def _train(
         path = runs.latest_snapshot(args.tag, args.out_dir)
         payload = read_checkpoint(path)
         saved = payload["args"]
-        missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
-        if missing:
-            raise ValueError(f"{path}: checkpoint lacks settings {missing}")
-        conflicts = checkpoints.mismatched_fields(
-            saved, args, EXACT_FIELDS, only=pinned
-        )
-        if conflicts:
-            raise ValueError(f"resume conflicts with checkpoint settings: {conflicts}")
-        checkpoints.inherit(
-            args,
-            saved,
-            exact_fields=EXACT_FIELDS,
-            runtime_fields=RUNTIME_FIELDS,
-            explicit=pinned,
-        )
+        inherit_resume_settings(args, saved, int(payload["step"]), pinned)
         if "tokens_per_param" in pinned and schedule_steps(args) != args.steps:
             raise ValueError(
                 f"--tokens-per-param {args.tokens_per_param:g} is "
@@ -2197,35 +2221,40 @@ def _train(
         telemetry.log(
             "resume", step=telemetry.step_address(start_step, total), path=str(path)
         )
-    else:
+    # Emit the resolved configuration on every invocation, including resumes
+    # that postpone recurrence or change reporting cadence. The monitor uses
+    # the latest run record while the earlier records retain the history.
+    telemetry.log(
+        "run",
+        tag=args.tag,
+        data_root=args.data_root,
+        source=args.source,
+        params=sum(p.numel() for p in model.parameters()),
+        device=str(device),
+        ranks=topology.world,
+        precision=args.precision,
+        eval_every=args.eval_every,
+        snapshot_every=args.snapshot_every,
+        checkpoint_margin_gib=args.checkpoint_margin_gib,
+        routing_block_size=model.cfg.routing_block_size,
+        mup_ratio=model.cfg.mup_ratio,
+        expert_lr_scale=model.cfg.expert_lr_scale,
+        expert_shared=1,
+        expert_routed=model.cfg.num_routed_experts,
+        expert_top_k=model.cfg.experts_per_token,
+        expert_width=model.cfg.expert_intermediate,
+        expert_balance_coef=EXPERT_BALANCE_COEF,
+        expert_bias_rate=EXPERT_BIAS_RATE,
+        **{name: getattr(args, name) for name in EXACT_FIELDS},
+    )
+    if args.continue_from:
         telemetry.log(
-            "run",
-            tag=args.tag,
-            data_root=args.data_root,
-            source=args.source,
-            params=sum(p.numel() for p in model.parameters()),
-            device=str(device),
-            ranks=topology.world,
-            precision=args.precision,
-            routing_block_size=model.cfg.routing_block_size,
-            mup_ratio=model.cfg.mup_ratio,
-            expert_lr_scale=model.cfg.expert_lr_scale,
-            expert_shared=1,
-            expert_routed=model.cfg.num_routed_experts,
-            expert_top_k=model.cfg.experts_per_token,
-            expert_width=model.cfg.expert_intermediate,
-            expert_balance_coef=EXPERT_BALANCE_COEF,
-            expert_bias_rate=EXPERT_BIAS_RATE,
-            **{name: getattr(args, name) for name in EXACT_FIELDS},
+            "continue",
+            source=args.continue_from,
+            step=telemetry.step_address(start_step, total),
+            exact=source_schedule.warmup_steps == schedule.warmup_steps,
+            path=str(path),
         )
-        if args.continue_from:
-            telemetry.log(
-                "continue",
-                source=args.continue_from,
-                step=telemetry.step_address(start_step, total),
-                exact=source_schedule.warmup_steps == schedule.warmup_steps,
-                path=str(path),
-            )
 
     # Persistent snapshots at the cooldown boundary, the recurrence boundary
     # (the last single-column state), and the end, so cooldown and recurrence

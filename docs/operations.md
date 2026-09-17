@@ -145,10 +145,27 @@ assembles one whole snapshot; transient counts and working copies are rebuilt
 on load. Any supported rank count can resume it.
 
 `--resume` loads the latest snapshot for the tag and inherits state-defining
-settings; explicit conflicts are rejected. Paths, device, evaluation/snapshot
-cadence, evaluation rows, replay minimum, memory margin, and precision are
+settings; explicit conflicts are rejected, except that `--recurrence-start`
+may increase while the saved step is at or before the old recurrence boundary
+(`round(old_fraction * total_steps)`, the last single-column update). This
+postpones recurrence without changing any completed update. Decreasing the
+fraction or changing it after a recurrent update is rejected. Paths, device,
+evaluation/snapshot cadence, evaluation rows, replay minimum, memory margin, and precision are
 inherited unless overridden. `--ranks` always describes the new invocation
 and defaults to one. Changing precision changes subsequent training numerics.
+
+For example, stop `OLD`, wait for its checkpoint and exit, then rename and
+resume with a later recurrence boundary and new reporting cadence:
+
+```bash
+delta stop OLD
+# Once the run is idle:
+delta move OLD NEW
+delta queue NEW --resume --recurrence-start 0.6 --eval-every 500 --snapshot-every 1000
+```
+
+The resumed log records the resolved settings and schedule; later snapshots
+inherit the new recurrence fraction and cadence.
 
 Snapshots are written under `runs/TAG.pt.STEP` unless `--out-dir` is supplied.
 The trainer retains the latest two plus the recurrence boundary, cooldown
