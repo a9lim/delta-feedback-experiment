@@ -121,7 +121,7 @@
 \draw[flow] (blank.north) -- (5.8,38.0) -| ($(entry.south)+(-1.6,0)$);
 \op{blankembed}{3.1}{37.05}{4.0}{tokenop}{\textbf{Blank embedding}\\$e_0\in\mathbb R^D$}
 \op{loopfusion}{3.1}{39.05}{4.0}{fusionop,minimum height=1.12cm}{\textbf{Loop fusion}\\$F(e_0,\widetilde p_t^{(a,i)})$}
-\draw[flow] (blankembed) -- (loopfusion);
+\draw[loopflow] (blankembed) -- (loopfusion);
 \cell{c1}{43.4}{1}
 \cell{c2}{47.2}{2}
 \cell{c3}{51.0}{3}
@@ -171,9 +171,9 @@
 \op{nextembed}{18.2}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_{t+1}=50E[x_{t+1}]$}
 \op{nextfusion}{18.2}{39.05}{6.0}{fusionop,minimum height=1.12cm}{\textbf{Next-token fusion}\\$u_t=F(e_{t+1},\widetilde p_t^{(a,i)})$}
 \draw[flow] (nextembed) -- (nextfusion);
-\draw[loopflow] (jitter.north) -- (3.1,63.25) -- (13.3,63.25) -- (13.3,38.0)
+\draw[feedflow] (jitter.north) -- (3.1,63.25) -- (13.3,63.25) -- (13.3,38.0)
  -| ($(nextfusion.south)+(-1.6,0)$);
-\node[recurrencelabel,rotate=90,text=loopink] at (13.3,51.0)
+\node[recurrencelabel,rotate=90,text=feedink] at (13.3,51.0)
  {\textbf{MTP: same jittered payload}\quad $\widetilde p_t^{(a,i)}$};
 \coordinate (fused) at (18.2,40.6);
 \draw[wire] (nextfusion) -- (fused);
@@ -352,7 +352,7 @@
 \tikzset{op/.append style={fill=pkdafill!35},linear/.append style={fill=pkdafill},matmul/.append style={fill=pkdafill},norm/.append style={fill=normfill},bridge/.style={preaction={draw=white,line width=3.6pt}}}
 
 % One input bus feeds three content projections and the packed control matrix.
-\node[port] (pkdain) at (20,.35) {Normalized input $x\in\mathbb R^D$};
+\node[port] (pkdain) at (20,.35) {$x\in\mathbb R^D$};
 \draw[wire] (pkdain) -- (20,1.15);
 \draw[wire] (2.8,1.15) -- (25.8,1.15);
 \foreach \x/\branchname/\branchlabel in {2.8/q/Query,6.8/k/Key,10.8/v/Value}{
