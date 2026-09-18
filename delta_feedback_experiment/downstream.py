@@ -19,12 +19,21 @@ mode writes ``figures/downstream-TAG/MODE.STEP.json`` (``MODEk.STEP.json`` for
 ``python -m transformer_experiments.downstream --compare``.  A ``--limit`` run
 is a smoke and writes nothing.  The queue runs this module as the phase after
 a finished training schedule.
+
+``--baseline MODEL`` adds a yardstick: a published Hub causal LM scored on the
+same documents by the workspace's reference scorer in FP32, the numerics its
+published numbers use.  Its results do not depend on the run, so they are
+scored once into ``figures/baseline/ORG/NAME.json`` and reused; each mode then
+prints its paired comparison and one ``downstream`` record carrying ``against``
+and the pooled accuracy difference.  Accuracy, whole-continuation
+log-probability, and LAMBADA's per-word perplexity compare across tokenizers.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -37,6 +46,7 @@ from .tokenizer import TOKENIZER_ID, load_tokenizer, tokenizer_metadata
 
 MODES = ("standard", "fused", "soft")
 FIGURES = Path("figures")
+HUB_ID = re.compile(r"[A-Za-z0-9][\w.-]*(?:/[A-Za-z0-9][\w.-]*)?")
 
 
 class DeltaScorer:
@@ -91,6 +101,91 @@ def result_path(tag: str, step: int, mode: str, passes: int = 1) -> Path:
     return FIGURES / f"downstream-{tag}" / f"{suffix}.{step}.json"
 
 
+def baseline_path(model_id: str) -> Path:
+    """Where a published model's results live: ``figures/baseline/ORG/NAME.json``."""
+    if not HUB_ID.fullmatch(model_id):
+        raise ValueError(f"--baseline takes Hub model ids such as ORG/NAME, got {model_id!r}")
+    return FIGURES / "baseline" / f"{model_id}.json"
+
+
+def hub_id(text: str) -> str:
+    try:
+        baseline_path(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return text
+
+
+def load_baseline(model_id: str, device: torch.device):
+    """A published causal LM under the workspace's reference scorer, in FP32.
+
+    Returns its tokenizer callable, scorer, padding id, and resolved Hub commit.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
+    return (
+        downstream.hf_tokenize(tokenizer),
+        downstream.HFScorer(model, device),
+        tokenizer.pad_token_id or 0,
+        getattr(model.config, "_commit_hash", None),
+    )
+
+
+def baseline_results(
+    model_id: str,
+    tasks: list[str],
+    requests: dict[str, list[downstream.Request]],
+    device: torch.device,
+    *,
+    limit: int | None,
+    max_len: int,
+    **run_kwargs,
+) -> dict[str, downstream.TaskResult]:
+    """A published model's results on ``tasks``, scored once and then reused.
+
+    They do not depend on the run, so they are kept beside no tag. A stored
+    task is reused while its pinned dataset revision and ``max_len`` match;
+    only missing tasks load the model, and a model whose Hub commit has moved
+    is rescored whole. A ``--limit`` smoke neither reads nor writes the store.
+    """
+    path = baseline_path(model_id)
+    stored: dict[str, downstream.TaskResult] = {}
+    commit = None
+    if limit is None and path.is_file():
+        payload = json.loads(path.read_text())
+        commit = payload["meta"].get("commit")
+        stored = {
+            name: result
+            for name, result in downstream.from_json(payload).items()
+            if name in downstream.TASKS
+            and result.meta.get("revision") == downstream.TASKS[name].revision
+            and result.meta.get("max_len") == max_len
+        }
+    missing = [name for name in tasks if name not in stored]
+    if missing:
+        tokenize, scorer, pad_id, resolved = load_baseline(model_id, device)
+        if resolved != commit:
+            stored, missing, commit = {}, list(tasks), resolved
+        for name in missing:
+            stored[name] = downstream.run_task(
+                downstream.TASKS[name],
+                requests[name],
+                tokenize,
+                scorer,
+                max_len=max_len,
+                pad_id=pad_id,
+                **run_kwargs,
+            )
+        if limit is None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            meta = {"model": model_id, "commit": commit, "dtype": "float32"}
+            path.write_text(json.dumps(downstream.to_json(stored, **meta), indent=1) + "\n")
+            print(f"wrote {path}", flush=True)
+    return {name: stored[name] for name in tasks}
+
+
 def task_fields(result: downstream.TaskResult) -> dict[str, str]:
     """One task's headline numbers as telemetry fields."""
     fields = {"n": str(result.n)}
@@ -136,6 +231,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="documents per task; a smoke that writes no results",
     )
+    parser.add_argument(
+        "--baseline",
+        dest="baselines",
+        nargs="+",
+        type=hub_id,
+        metavar="MODEL",
+        default=[],
+        help="published Hub models to compare against, paired by document; each "
+        "is scored once in FP32 and kept under figures/baseline/",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--buckets", type=int, nargs="+", default=(128, 256, 512, 1024))
     parser.add_argument("--device", default=None)
@@ -170,9 +275,10 @@ def main(argv: list[str] | None = None) -> None:
     def progress(line: str) -> None:
         print(f"  [{time.time() - started:6.0f}s] {line}", flush=True)
 
+    scored: dict[str, dict[str, downstream.TaskResult]] = {}
     for scorer in scorers:
         print(f"{telemetry.HEADING}{scorer.mode}: {path}", flush=True)
-        results = {}
+        results = scored[scorer.mode] = {}
         for name in args.tasks:
             task = downstream.TASKS[name]
             if name not in requests:
@@ -218,6 +324,44 @@ def main(argv: list[str] | None = None) -> None:
             json.dumps(downstream.to_json(results, **meta), indent=1) + "\n"
         )
         print(f"wrote {out_path}", flush=True)
+
+    if not args.baselines:
+        return
+    # Baselines follow the snapshot's own results, and take its memory.
+    device, passes = scorers[0].device, {s.mode: s.passes for s in scorers}
+    del model, scorers, scorer
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    for model_id in args.baselines:
+        print(f"{telemetry.HEADING}baseline: {model_id}", flush=True)
+        reference = baseline_results(
+            model_id,
+            args.tasks,
+            requests,
+            device,
+            limit=args.limit,
+            max_len=max_len,
+            batch_size=args.batch_size,
+            buckets=buckets,
+            progress=progress,
+        )
+        print("\n" + downstream.format_table(reference), flush=True)
+        label = model_id.rsplit("/", 1)[-1]
+        for mode, results in scored.items():
+            comparison = downstream.compare(reference, results)
+            print("\n" + downstream.format_comparison(comparison, label, mode), flush=True)
+            pool = downstream.pooled(comparison)
+            telemetry.log(
+                "downstream",
+                step=address,
+                mode=mode,
+                passes=passes[mode],
+                against=model_id,
+                diff=telemetry.format_metric(pool["diff"]),
+                se=telemetry.format_metric(pool["se"]),
+                z=f"{pool['z']:+.1f}",
+                positive=f"{pool['positive']}/{pool['count']}",
+            )
 
 
 if __name__ == "__main__":

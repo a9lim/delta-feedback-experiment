@@ -151,6 +151,68 @@ def test_eval_refuses_missing_steps_and_synthetic_vocabularies(suite):
         downstream.main(["tiny", "--device", "cpu"])
 
 
+class Published:
+    """Stands in for a Hub model: scores by span length, counts its loads."""
+
+    def __init__(self, monkeypatch, commit="c1"):
+        self.commit, self.loads, self.scored = commit, 0, []
+        monkeypatch.setattr(downstream, "load_baseline", self.load)
+
+    def load(self, model_id, device):
+        self.loads += 1
+        tokenize = lambda text: [1 + ord(c) % 96 for c in text]
+        return tokenize, self, 0, self.commit
+
+    def score(self, ids, spans):
+        self.scored.append(len(spans))
+        return [(-float(end - start + row), row % 2 == 0) for row, (start, end) in enumerate(spans)]
+
+
+EVAL = ["tiny", "--device", "cpu", "--mode", "standard", "--baseline", "org/ref"]
+
+
+def test_baseline_is_scored_once_and_compared_by_document(suite, monkeypatch, capsys):
+    snapshot(suite)
+    published = Published(monkeypatch)
+    downstream.main([*EVAL, "--tasks", "piqa"])
+    stored = suite / "figures/baseline/org/ref.json"
+    payload = json.loads(stored.read_text())
+    assert payload["meta"] == {"model": "org/ref", "commit": "c1", "dtype": "float32"}
+    assert list(payload["tasks"]) == ["piqa"] and published.loads == 1
+    out = capsys.readouterr().out
+    assert "pooled" in out
+    against = [
+        record
+        for line in out.splitlines()
+        if (record := spool.telemetry.parse_record(line)) and "against" in record
+    ]
+    assert [(r["mode"], r["against"], r["step"]) for r in against] == [
+        ("standard", "org/ref", "5/5")
+    ]
+
+    downstream.main([*EVAL, "--tasks", "piqa"])
+    assert published.loads == 1  # the stored task needs no model
+    downstream.main([*EVAL, "--tasks", "piqa", "sciq"])
+    assert published.loads == 2 and len(published.scored) == 2  # only sciq is new
+    assert list(json.loads(stored.read_text())["tasks"]) == ["piqa", "sciq"]
+
+    published.commit = "c2"
+    downstream.main([*EVAL, "--tasks", "piqa", "arc_easy"])
+    payload = json.loads(stored.read_text())
+    assert payload["meta"]["commit"] == "c2"  # a moved model is rescored whole
+    assert list(payload["tasks"]) == ["piqa", "arc_easy"]
+
+
+def test_baseline_smoke_writes_nothing_and_ids_stay_under_figures(suite, monkeypatch):
+    snapshot(suite)
+    published = Published(monkeypatch)
+    downstream.main([*EVAL, "--tasks", "piqa", "--limit", "1"])
+    assert published.loads == 1 and not (suite / "figures").exists()
+    for bad in ("/abs/model", "../escape", "org/name/extra", ".hidden"):
+        with pytest.raises(SystemExit):
+            downstream.build_parser().parse_args(["tiny", "--baseline", bad])
+
+
 @pytest.fixture
 def operator(tmp_path, monkeypatch):
     operator = spool.Spool(replace(cli.LAYOUT, root=tmp_path), cli.PIPELINE, prog="delta")

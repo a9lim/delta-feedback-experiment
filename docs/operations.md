@@ -419,6 +419,7 @@ delta eval TAG                          # latest snapshot, every eligible mode
 delta eval TAG --step 5485 --mode standard
 delta eval TAG --mode fused --passes 2
 delta eval TAG --tasks piqa --limit 32  # smoke; writes nothing
+delta eval TAG --baseline EleutherAI/pythia-410m HuggingFaceTB/SmolLM2-360M
 python -m transformer_experiments.downstream --compare \
   figures/downstream-TAG/standard.STEP.json figures/downstream-TAG/fused.STEP.json
 ```
@@ -430,6 +431,15 @@ each mode writes `figures/downstream-TAG/MODE.STEP.json`, or
 `MODEk.STEP.json` for `--passes k`. `--out-dir` names a custom snapshot root.
 The first use downloads the task datasets from the Hub. The queue runs the
 same command [after a finished schedule](#runs).
+
+`--baseline MODEL` compares each mode against a published Hub model on the
+same documents. The model is scored once in FP32, a few minutes below 1B
+parameters, into `figures/baseline/ORG/NAME.json`, which belongs to no run
+and survives `clear`. Later evaluations reuse it without loading the model
+or reaching the Hub, and score only tasks it lacks; a model whose Hub commit
+has moved is rescored. The snapshot's own results are written first. Each
+mode prints a paired table and a `downstream` record with `against=MODEL` and
+the pooled accuracy difference, snapshot minus baseline.
 
 ## Conversation formatting
 
