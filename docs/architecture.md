@@ -299,13 +299,10 @@ and `R` the number of columns per pass. The first column of pass 1 uses
 seed_t^(a,i+1) = F(e₀, p_t^(a,i) + ξ_t^(a,i))
 ```
 
-A token enters a seed exactly when it is new to the position: the first
-column consumes `e_t`, and every later column reads the position only through
-its payload. Those columns' mixer tracks therefore hold payload-derived
-state alone. The four entries are distinct by construction: plain
-`F(e_t,p₀)`, feedback `F(e_t,p_(t−1))`, loop `F(e₀,p_t)`, and MTP
-`F(e_(t+1),p_t)`. A loop seed has no token term, so it differs from the
-feedback seed built from the same payload even when `x_(t+1) = x_t`.
+The first column consumes the token lookup `e_t`; every later column uses
+the learned baseline `e₀`. Those later columns receive token-dependent
+information through their payload and mixer caches, with no fresh token
+lookup.
 
 Later feedback passes instead take the preceding position's final-column
 payload from the previous pass:

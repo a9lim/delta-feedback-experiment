@@ -105,21 +105,23 @@
 
 % A. Main model and its two recurrence coordinates.
 \node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont] at (.8,65.7) {A\quad Model and recurrence};
+\node[anchor=west,note] at (.8,64.95)
+ {Shared fusion $F(e,p)=W_F[e;p]$,\quad $W_F:[D,2D]$; learned blanks $e_0,p_0$};
 \node[port] (tokens) at (9.5,35.8) {Input token $x_t$};
 \op{embedding}{9.5}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_t=50E[x_t],\quad E:[V,D]$}
-\op{entry}{9.5}{39.05}{6.0}{fusionop,minimum height=1.05cm}{\textbf{Concat-linear fusion}\\$F(e,p)=W_F[e;p],\quad W_F:[D,2D]$}
+\op{entry}{9.5}{39.05}{6.0}{fusionop,minimum height=1.12cm}{\textbf{Plain fusion}\\$F(e_t,p_0)$}
 \draw[flow] (tokens) -- (embedding);
 \draw[flow] (embedding) -- (entry);
 \coordinate (seed) at (9.5,41.0);
 \draw[wire] (entry) -- (seed);
+\node[edgeword] at (9.5,40.1) {$i=1$: pass 1 / plain prefix};
 \fill[ink] (seed) circle (1.5pt);
 \node[edgeword,anchor=west] at (9.7,41.0) {Column seed $s_t^{(a,i)}$};
-\op{blank}{3.6}{36.6}{2.9}{fusionop}{\textbf{Learned blank}\\$p_0\in\mathbb R^D$}
-\coordinate (payloadjoin) at (3.6,38.0);
-\draw[wire] (blank.north) -- (payloadjoin);
-\node[note,align=center] at (3.6,35.8) {Pass 1 / plain prefix, $i=1$};
-\node[note,anchor=west] at (10.9,35.8)
- {$i=1$ only; columns $i>1$ (\texttt{l}) take the learned blank $e_0\in\mathbb R^D$};
+\op{blank}{5.8}{35.6}{2.8}{fusionop}{\textbf{Blank payload}\\$p_0\in\mathbb R^D$}
+\draw[flow] (blank.north) -- (5.8,38.0) -| ($(entry.south)+(-1.6,0)$);
+\op{blankembed}{3.1}{37.05}{4.0}{tokenop}{\textbf{Blank embedding}\\$e_0\in\mathbb R^D$}
+\op{loopfusion}{3.1}{39.05}{4.0}{fusionop,minimum height=1.12cm}{\textbf{Loop fusion}\\$F(e_0,\widetilde p_t^{(a,i)})$}
+\draw[flow] (blankembed) -- (loopfusion);
 \cell{c1}{43.4}{1}
 \cell{c2}{47.2}{2}
 \cell{c3}{51.0}{3}
@@ -159,16 +161,15 @@
 % l returns the jittered payload to fusion with the learned blank embedding:
 % only a position's first column sees its token.
 \draw[loopflow] (jitter.west) -- (.2,62.35) -- (.2,38.0)
- -- (payloadjoin) -| ($(entry.south)+(-1.6,0)$);
-\fill[loopink] (payloadjoin) circle (1.5pt);
+ -| ($(loopfusion.south)+(-1.4,0)$);
+\draw[loopflow] (loopfusion.north) -- (3.1,40.6) -- (9.5,40.6);
 \node[recurrencelabel,rotate=90,text=loopink] at (.2,50.5)
- {\textbf{\texttt{l}: blank embedding}\quad $i<R,\ i\to i+1$};
-\node[note,text=loopink,align=center,text width=4.7cm] at (3.25,42.3)
- {$s_t^{(a,i+1)}=F(e_0,\widetilde p_t^{(a,i)})$};
+ {\textbf{\texttt{l}: same token}\quad $i<R,\ i\to i+1$};
+\node[edgeword,text=loopink] at (6.55,40.6) {$s_t^{(a,i+1)}$};
 % Every column also builds next-token fusion for MTP; final-column feedback
 % reuses this exact tensor, shifted to the next position and Jacobi pass.
 \op{nextembed}{18.2}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_{t+1}=50E[x_{t+1}]$}
-\op{nextfusion}{18.2}{39.05}{6.0}{fusionop,minimum height=1.05cm}{\textbf{Concat-linear fusion}\\$u_t=F(e_{t+1},\widetilde p_t^{(a,i)})$}
+\op{nextfusion}{18.2}{39.05}{6.0}{fusionop,minimum height=1.12cm}{\textbf{Next-token fusion}\\$u_t=F(e_{t+1},\widetilde p_t^{(a,i)})$}
 \draw[flow] (nextembed) -- (nextfusion);
 \draw[loopflow] (jitter.north) -- (3.1,63.25) -- (13.3,63.25) -- (13.3,38.0)
  -| ($(nextfusion.south)+(-1.6,0)$);
@@ -182,7 +183,7 @@
 \node[note,text=feedink,align=center,text width=6.6cm] at (18.2,50.2)
  {\textbf{\texttt{f}: next token, next pass}\\[4pt]
  $i=R:\quad s_{t+1}^{(a+1,1)}=u_t^{(a,R)}$\\[4pt]
- Decode: $p_t^{(R)}\to s_{t+1}^{(1)}$.};
+ Decode: $s_{t+1}^{(1)}=F(e_{t+1},p_t^{(R)})$.};
 \node[recurrencelabel,text=feedink] at (15.8,40.6)
  {\textbf{\texttt{f}: next token}\quad $i=R$};
 \node[op,text width=6cm,minimum height=1.8cm] (mtp) at (18.2,42.8) {};
