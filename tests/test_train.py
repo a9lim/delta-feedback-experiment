@@ -263,7 +263,9 @@ def test_preset_accounting_counts_shared_and_selected_experts(
     assert routed + 1 == 4 * (selected + 1)
     with torch.device("meta"):
         model = DeltaModel(cfg)
-    assert sum(p.numel() for p in model.parameters()) == total
+    # The table counts what every condition shares; ``l`` stores its
+    # width-D blank embedding on top.
+    assert sum(p.numel() for p in model.parameters()) == total + dim
     assert len(model.expert_banks) == 17
     assert all(
         bank.intermediate == 832

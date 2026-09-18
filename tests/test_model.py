@@ -141,6 +141,8 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
         "embed_tokens.weight"
     }
     assert {name for name in common if name.startswith("fuse_")} == {"fuse_proj.weight"}
+    assert "blank_payload" in common
+    assert ["blank_embedding" in state for state in states] == [False, True, True]
     projection = states[0]["fuse_proj.weight"]
     assert projection.shape == (TINY["dim"], 2 * TINY["dim"])
     torch.testing.assert_close(
@@ -262,12 +264,53 @@ def test_blank_payload_seeds_every_plain_position():
     assert gradient.abs().sum() > 0
 
 
+def test_blank_embedding_marks_the_loop_reentry():
+    """The token is news only to a position's first column. A later column
+    fuses its payload with the learned blank embedding, so its seed carries
+    no token term and differs from the feedback seed of the same payload
+    even when the next token repeats."""
+    model = tiny("fl")
+    toks = tokens()
+    toks[:, 3] = toks[:, 2]
+    e = model.embed_tokens(toks[:, :-1])
+    first, second = multipass(model, toks, 1, iterations=2)[0]
+    token_term = model.fuse(torch.zeros_like(e), e)
+    payload_term = model.fuse(first.payload, torch.zeros_like(e))
+    # Zero at construction: the re-entry seed is the payload term alone.
+    torch.testing.assert_close(second.sources[0], payload_term)
+    torch.testing.assert_close(model.loop_seed(first.payload), payload_term)
+    # Position 3 repeats position 2's token, so feeding position 2's payload
+    # forward fuses it with the very embedding the old re-entry used.
+    feedback_seed = model.fuse(first.payload[:, 2], e[:, 3])
+    torch.testing.assert_close(feedback_seed, (payload_term + token_term)[:, 2])
+    assert not torch.allclose(feedback_seed, second.sources[0][:, 2])
+    # Once learned, the blank is a constant marker on every re-entry seed.
+    with torch.no_grad():
+        model.blank_embedding.copy_(torch.linspace(1, -1, model.cfg.dim))
+    marker = model.fuse(torch.zeros(model.cfg.dim), model.blank_embedding)
+    torch.testing.assert_close(model.loop_seed(first.payload), payload_term + marker)
+    # A plain vector parameter of ``l`` alone: zero at construction,
+    # NAdam-owned, trained by every re-entry and untouched by a single column.
+    assert tiny("f").blank_embedding is None
+    fresh = tiny("l")
+    assert torch.equal(fresh.blank_embedding, torch.zeros(fresh.cfg.dim))
+    assert any(p is fresh.blank_embedding for p in split_parameters(fresh)["nadam"])
+    multipass_loss(fresh, toks, multipass(fresh, toks, 1, iterations=1)).total.backward()
+    assert fresh.blank_embedding.grad is None
+    multipass_loss(fresh, toks, multipass(fresh, toks, 1, iterations=2)).total.backward()
+    gradient = fresh.blank_embedding.grad
+    assert gradient is not None and torch.isfinite(gradient).all()
+    assert gradient.abs().sum() > 0
+
+
 def test_looped_columns_reenter_through_the_shared_fusion():
     """Under ``l`` a pass's later columns are seeded by the shared fusion of
-    the preceding column's jittered payload with the position's own
-    embedding; every column is read out; a column never depends on the
-    columns after it; and the first column is the single-column model."""
+    the preceding column's jittered payload with the blank embedding; every
+    column is read out; a column never depends on the columns after it; and
+    the first column is the single-column model."""
     model = tiny("fl")
+    with torch.no_grad():
+        model.blank_embedding.copy_(torch.linspace(1, -1, model.cfg.dim))
     toks = tokens()
     e = model.embed_tokens(toks)
     length = toks.shape[1] - 1
@@ -286,11 +329,12 @@ def test_looped_columns_reenter_through_the_shared_fusion():
     torch.testing.assert_close(
         first.h_top, model.forward_column(model.plain_seed(e[:, :-1])).h_top
     )
-    reentry = model.fuse(first.payload + loop_jitter[0, 0][:, :length], e[:, :-1])
+    jittered = first.payload + loop_jitter[0, 0][:, :length]
+    reentry = model.fuse(jittered, model.blank_embedding.expand_as(jittered))
     torch.testing.assert_close(second.sources[0], reentry)
     torch.testing.assert_close(second.h_top, model.forward_column(reentry).h_top)
     # One jitter draw per column serves both consumers of its payload: the
-    # MTP fusion with the next tokens and the loop re-entry with its own.
+    # MTP fusion with the next tokens and the loop re-entry with the blank.
     torch.testing.assert_close(
         first.fused_input,
         model.fuse(first.payload + loop_jitter[0, 0][:, :length], e[:, 1:]),
@@ -322,7 +366,10 @@ def test_looped_columns_reenter_through_the_shared_fusion():
 def test_loop_once_pairs_with_flat_values_and_gradients():
     geometry = {"layers": 16}
     flat, loop = tiny("f", **geometry).train(), tiny("fl", **geometry).train()
-    assert flat.state_dict().keys() == loop.state_dict().keys()
+    # The blank embedding is the loop's one parameter; a single column never
+    # re-enters, so it stays out of the graph.
+    assert loop.state_dict().keys() - flat.state_dict().keys() == {"blank_embedding"}
+    assert flat.state_dict().keys() <= loop.state_dict().keys()
     losses = []
     for model in (flat, loop):
         outs = multipass(
@@ -336,9 +383,11 @@ def test_loop_once_pairs_with_flat_values_and_gradients():
         losses.append(loss.detach())
         loss.backward()
     torch.testing.assert_close(*losses, atol=0, rtol=0)
-    for (name, left), (_, right) in zip(
-        flat.named_parameters(), loop.named_parameters(), strict=True
-    ):
+    assert loop.blank_embedding.grad is None
+    shared = [
+        item for item in loop.named_parameters() if item[0] != "blank_embedding"
+    ]
+    for (name, left), (_, right) in zip(flat.named_parameters(), shared, strict=True):
         torch.testing.assert_close(left, right, atol=0, rtol=0, msg=name)
         assert (left.grad is None) == (right.grad is None), name
         if left.grad is not None:
@@ -404,7 +453,7 @@ def test_cached_decode_matches_full_recomputation(condition):
     embedded = model.embed_tokens(toks)
     seeds = model.plain_seed(embedded)
     cache = KVCache(model.cfg, batch=1, device="cpu", dtype=torch.float32)
-    prefill = model.forward_iterations(seeds[:, :3], embedded[:, :3], cache=cache)[-1]
+    prefill = model.forward_iterations(seeds[:, :3], cache=cache)[-1]
     assert cache.pos == 3
     payload = prefill.payload[:, -1:] if model.cfg.feedback else None
     reference_rows = seeds[:, :3]
@@ -413,12 +462,10 @@ def test_cached_decode_matches_full_recomputation(condition):
         assert cache.pos == position + 1
         new = seeds[:, position : position + 1]
         if model.cfg.feedback:
-            reference_payload = model.forward_iterations(
-                reference_rows, embedded[:, :position]
-            )[-1].payload[:, -1:]
+            reference_payload = model.forward_iterations(reference_rows)[-1].payload[:, -1:]
             new = model.fuse(reference_payload, embedded[:, position : position + 1])
         reference_rows = torch.cat([reference_rows, new], dim=1)
-        reference = model.forward_iterations(reference_rows, embedded[:, : position + 1])[-1]
+        reference = model.forward_iterations(reference_rows)[-1]
         # Two looped columns compound full-row versus single-row projection
         # rounding. Bound both aggregate drift and spikes against state scale,
         # including coordinates where the reference happens to cross zero.

@@ -293,6 +293,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
             bank.expert_bias[-bank.experts_per_token :] = 2
         with torch.no_grad():
             candidate.blank_payload.copy_(torch.linspace(-1, 1, candidate.cfg.dim))
+            candidate.blank_embedding.copy_(torch.linspace(1, -1, candidate.cfg.dim))
     toks = tokens(length=6)
     iterations = 2
     jitter, loop_jitter = jitter_for(model, toks, count, iterations)
@@ -305,8 +306,8 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     assert [len(pass_outs) for pass_outs in actual.ntp] == [iterations] * count
     assert [len(pass_outs) for pass_outs in actual.mtp] == [iterations] * count
 
-    # Feedback, the loop, and MTP deliberately perform their own embedding
-    # lookups and fusion. They share parameters, but have no shared prepared
+    # Feedback and MTP deliberately perform their own embedding lookups, and
+    # all three consumers their own fusion. They share parameters, but have no shared prepared
     # tensor. The plain seed is the same concat equation with the blank
     # payload; a column's jitter row is the pass draw at a pass's last column
     # and the loop draw before it.
@@ -326,8 +327,10 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
             pass_outs.append(reference.forward_column(x))
             payload = pass_outs[-1].payload + draw(index, column)
             if column + 1 < iterations:
-                # The loop re-enters with the position's own raw embedding.
-                x = explicit_fusion(reference, payload, e)
+                # The loop re-enters with the blank embedding, never the token.
+                x = explicit_fusion(
+                    reference, payload, reference.blank_embedding.expand_as(payload)
+                )
         reference_outs.append(pass_outs)
         if index + 1 < count:
             # Keep the production order (fuse, then shift): changing the rows

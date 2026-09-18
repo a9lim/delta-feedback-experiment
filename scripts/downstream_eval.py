@@ -65,7 +65,7 @@ class DeltaScorer:
             # Under l every pass runs the evaluation column count and scores
             # its last column.
             out = model.forward_iterations(
-                model.plain_seed(e), e, need_payload=self.passes > 0
+                model.plain_seed(e), need_payload=self.passes > 0
             )[-1]
             if self.mode == "soft":
                 # Plain context, feedback along the scored continuation only.
@@ -75,7 +75,6 @@ class DeltaScorer:
             for i in range(self.passes):
                 out = model.forward_iterations(
                     analysis.fused_inputs(model, e, out.payload, prefix),
-                    e,
                     need_payload=i < self.passes - 1,
                 )[-1]
             weight = model.embed_tokens.weight

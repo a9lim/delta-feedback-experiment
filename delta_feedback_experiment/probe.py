@@ -204,7 +204,7 @@ def cuda_probe() -> None:
         tokens = data.rows[:1, :4].to(device)
         cache = KVCache(model.cfg, batch=1, device=device, dtype=torch.bfloat16)
         e = model.embed_tokens(tokens[:, :3])
-        prefill = model.forward_iterations(model.plain_seed(e), e, cache=cache)[-1]
+        prefill = model.forward_iterations(model.plain_seed(e), cache=cache)[-1]
         decoded = model.step(tokens[:, 3:], prefill.payload[:, -1:], cache)
         assert cache.pos == 4 and decoded.h_top.shape == (1, 1, args.dim)
         assert torch.isfinite(decoded.h_top).all()

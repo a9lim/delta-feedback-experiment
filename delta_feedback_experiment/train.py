@@ -874,7 +874,10 @@ def mode_activity(
     parameter is active in every mode, whatever its warm-up gradient holds:
     autograd reaches all of them on every column, and a reached gradient can
     be exactly zero (a routing site's key-norm gain multiplies its
-    zero-initialized query), which must not read as absence. Warm-up rows
+    zero-initialized query), which must not read as absence. The one
+    exception is ``l``'s blank embedding, which only a re-entry reaches:
+    before the recurrence boundary its arena gradient and NAdam moments stay
+    zero, so its step is exactly zero. Warm-up rows
     can select only a few experts, and replay data changes those choices,
     so activity is structural for the entire bank.
     """

@@ -1,8 +1,9 @@
 # Scaling and resource accounting
 
 `--scale screen|bridge|flagship|extension` selects geometry and batch settings;
-explicit flags override individual fields. All three conditions have identical
-parameter counts. Loops and feedback reuse weights. Source definitions are
+explicit flags override individual fields. The conditions share every
+parameter except `l`'s width-`D` blank embedding. Loops and feedback reuse
+weights. Source definitions are
 [`SCALES` and `reference_active`](../delta_feedback_experiment/train.py).
 
 ## Geometry and parameters
@@ -31,10 +32,13 @@ experts, selects `k` routed experts per token, and uses intermediate width
 `h=832`. Its active/stored widths are `(k+1)h` and `(n+1)h`: every preset
 executes one quarter of its expert matrices per token.
 
-Active counts include the selected experts and every router, mixer, payload,
-and fusion parameter, excluding only idle experts and the tied embedding
-matrix. They are a per-token accounting convention: a batch can touch all
-experts, and training must store all weights, gradients, and optimizer state.
+Totals and active counts cover the parameters every condition shares, so
+one denominator sets each scale's schedule; `l` and `fl` store `D` more for
+the blank embedding. Active counts include the selected experts and every
+router, mixer, payload, and fusion parameter, excluding only idle experts
+and the tied embedding matrix. They are a per-token accounting convention:
+a batch can touch all experts, and training must store all weights,
+gradients, and optimizer state.
 Selection biases are buffers, excluded from parameter counts.
 
 The auxiliary block contributes `P_PKDA + 3D(n+1)h + (n+2)D` parameters;

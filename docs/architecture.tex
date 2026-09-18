@@ -118,6 +118,8 @@
 \coordinate (payloadjoin) at (3.6,38.0);
 \draw[wire] (blank.north) -- (payloadjoin);
 \node[note,align=center] at (3.6,35.8) {Pass 1 / plain prefix, $i=1$};
+\node[note,anchor=west] at (10.9,35.8)
+ {$i=1$ only; columns $i>1$ (\texttt{l}) take the learned blank $e_0\in\mathbb R^D$};
 \cell{c1}{43.4}{1}
 \cell{c2}{47.2}{2}
 \cell{c3}{51.0}{3}
@@ -154,14 +156,15 @@
 \draw[flow] (payload) -- (jitter);
 \node[note,align=center,text width=4.8cm] at (3.1,64.0)
  {$\xi\sim U(-.02,.02)$ in training;\\$\xi=0$ for evaluation / decode.};
-% l returns the jittered payload to fusion with this token's embedding.
+% l returns the jittered payload to fusion with the learned blank embedding:
+% only a position's first column sees its token.
 \draw[loopflow] (jitter.west) -- (.2,62.35) -- (.2,38.0)
  -- (payloadjoin) -| ($(entry.south)+(-1.6,0)$);
 \fill[loopink] (payloadjoin) circle (1.5pt);
 \node[recurrencelabel,rotate=90,text=loopink] at (.2,50.5)
- {\textbf{\texttt{l}: same token}\quad $i<R,\ i\to i+1$};
+ {\textbf{\texttt{l}: blank embedding}\quad $i<R,\ i\to i+1$};
 \node[note,text=loopink,align=center,text width=4.7cm] at (3.25,42.3)
- {$s_t^{(a,i+1)}=F(e_t,\widetilde p_t^{(a,i)})$};
+ {$s_t^{(a,i+1)}=F(e_0,\widetilde p_t^{(a,i)})$};
 % Every column also builds next-token fusion for MTP; final-column feedback
 % reuses this exact tensor, shifted to the next position and Jacobi pass.
 \op{nextembed}{18.2}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_{t+1}=50E[x_{t+1}]$}

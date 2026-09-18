@@ -15,9 +15,10 @@ checkpoints.
 
 All conditions retain the same PKDA/GQA stack, MHDB readers, shared and routed
 experts, payload writer, fusion, and auxiliary second-token predictor (MTP).
-The letters select recurrence axes, not component ablations. Shared parameters
-initialize identically at a given `--seed`; at one column, `fl` and `f` have
-identical values and gradients. These conditions omit a no-recurrence control.
+The letters select recurrence axes, not component ablations. `l` adds one
+learned blank embedding, which replaces the token at every re-entry. Shared
+parameters initialize identically at a given `--seed`; at one column, `fl`
+and `f` have identical values and gradients. These conditions omit a no-recurrence control.
 
 ## Data
 
