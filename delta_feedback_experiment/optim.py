@@ -646,6 +646,82 @@ def split_parameters(model: torch.nn.Module) -> dict[str, list[torch.nn.Paramete
     return groups
 
 
+OPTIMIZER_GROUPS = (
+    ("normuonh", "normuonh_expert_in", "normuonh_expert_out"),
+    ("nadam", "nadam_width"),
+)
+"""The scheduled groups of each optimizer ``build_optimizers`` returns, in
+the order that numbers their state-dict entries."""
+
+
+def optimizer_parameter_names(model: torch.nn.Module) -> list[list[list[str]]]:
+    """The parameter name behind every state-dict index: per optimizer, per
+    group, in order. A state dict numbers its entries through the groups."""
+    names = {parameter: name for name, parameter in model.named_parameters()}
+    groups = split_parameters(model)
+    return [
+        [[names[parameter] for parameter in groups[group]] for group in stack]
+        for stack in OPTIMIZER_GROUPS
+    ]
+
+
+def rekey_optimizer_state(
+    saved: dict,
+    source: list[list[list[str]]],
+    target: list[list[list[str]]],
+    fresh: dict[str, Tensor],
+) -> dict:
+    """A saved optimizer stack under another model's parameter set.
+
+    Entries follow their parameter names to the target's indices. A parameter
+    only the target has must be NAdam's and must never have been stepped with
+    a gradient: it takes zero moments shaped like its ``fresh`` value and the
+    step counters every replicated parameter shares, which is its exact state
+    in a run that had it from the start. A parameter only the source has is
+    dropped, and must be in that same untouched state.
+    """
+    stacks = []
+    for position, (state, old, new) in enumerate(
+        zip(saved["stack"], source, target, strict=True)
+    ):
+        old_index = {
+            name: index
+            for index, name in enumerate(name for group in old for name in group)
+        }
+        entries = state["state"]
+        added = [name for group in new for name in group if name not in old_index]
+        removed = set(old_index) - {name for group in new for name in group}
+        if (added or removed) and position != 1:
+            raise ValueError(
+                f"NorMuonH parameters differ between conditions: {added or sorted(removed)}"
+            )
+        for name in removed:
+            entry = entries.get(old_index[name], {})
+            if any(entry[key].any() for key in ("exp_avg", "exp_avg_sq") if key in entry):
+                raise ValueError(f"{name} has trained; its snapshot is not pre-recurrence")
+        reference = next((entry for entry in entries.values() if "step" in entry), None)
+        rekeyed, groups, index = {}, [], 0
+        for settings, names in zip(state["param_groups"], new, strict=True):
+            members = []
+            for name in names:
+                if name in old_index:
+                    if old_index[name] in entries:
+                        rekeyed[index] = entries[old_index[name]]
+                elif reference is not None:
+                    moment = torch.zeros_like(fresh[name], dtype=reference["exp_avg"].dtype)
+                    rekeyed[index] = {
+                        "step": reference["step"].clone(),
+                        "mu_product": reference["mu_product"].clone(),
+                        "exp_avg": moment,
+                        "exp_avg_sq": moment.clone(),
+                    }
+                members.append(index)
+                index += 1
+            groups.append(settings | {"params": members})
+        stacks.append({"state": rekeyed, "param_groups": groups})
+    return {"stack": stacks}
+
+
 def build_optimizers(
     model: torch.nn.Module,
     *,
@@ -681,7 +757,7 @@ def build_optimizers(
         }
 
     normuonh = NorMuonH(
-        [group(name) for name in ("normuonh", "normuonh_expert_in", "normuonh_expert_out")],
+        [group(name) for name in OPTIMIZER_GROUPS[0]],
         lr=lr_normuonh,
         max_bucket_elements=32 * 1024 * 1024,
         owned=owned,
@@ -689,7 +765,7 @@ def build_optimizers(
     nadam_parameters = parameters["nadam"]
     use_foreach_nadam = bool(nadam_parameters) and nadam_parameters[0].is_cuda
     nadam = torch.optim.NAdam(
-        [group("nadam"), group("nadam_width")],
+        [group(name) for name in OPTIMIZER_GROUPS[1]],
         lr=lr_nadam,
         betas=nadam_betas,
         eps=1e-8,

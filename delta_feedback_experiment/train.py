@@ -30,7 +30,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -65,6 +65,8 @@ from .optim import (
     OptimizerPair,
     apply_schedule,
     build_optimizers,
+    optimizer_parameter_names,
+    rekey_optimizer_state,
 )
 from .sites import ParameterSites
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
@@ -189,6 +191,12 @@ EXACT_FIELDS = (
 )
 """State-defining settings, with recurrence postponement before it begins."""
 
+RECURRENCE_FIELDS = ("condition", "recurrence_start", "three_rate", "loop_iterations")
+"""The recurrence recipe: the state-defining settings only recurrent updates
+and evaluation read. Before the boundary every update is one plain column in
+every condition, so runs differing in these alone share that trajectory, and
+a fork may retype them."""
+
 RUNTIME_FIELDS = (
     "data_root",
     "source",
@@ -289,6 +297,18 @@ def build_parser() -> argparse.ArgumentParser:
             "extend a finished run under this tag: restore TAG's last snapshot "
             "that the longer schedule reproduces and train on, every setting "
             "but the schedule length inherited from it"
+        ),
+    )
+    parser.add_argument(
+        "--fork",
+        dest="fork_from",
+        metavar="TAG",
+        default=None,
+        help=(
+            "branch another condition off a run under this tag: restore TAG's "
+            "last snapshot before recurrence begins in either run and train "
+            "on, every setting but --condition and the recurrence recipe "
+            "(--recurrence-start, --three-rate, --loop-iterations) inherited"
         ),
     )
 
@@ -523,6 +543,57 @@ def continuation_step(
     if old != new:
         fork = min(fork, old, new)
     return fork
+
+
+def fork_step(source, args, total: int) -> int:
+    """The last update a fork shares with its source.
+
+    Both runs keep one schedule, data order, and keyed randomness, and differ
+    only in the recurrence recipe, which no plain update reads. They are one
+    trajectory until recurrence begins in either, so the fork is the earlier
+    recurrence boundary: the last single-column state both reach.
+    """
+    return min(recurrence_boundary(source, total), recurrence_boundary(args, total))
+
+
+def shared_snapshot(source: str, found, last_shared: int, reason: str) -> Path:
+    """The source's latest snapshot no later than the last step both runs share."""
+    eligible = [path for step, path in found if step <= last_shared]
+    if not eligible:
+        raise ValueError(
+            f"{source} has no snapshot at or before step {last_shared}, {reason}"
+        )
+    return eligible[-1]
+
+
+def graft_condition_state(payload: dict, source_condition: str, model: DeltaModel) -> None:
+    """Re-key a pre-recurrence snapshot for ``model``'s condition, in place.
+
+    Conditions share every parameter but those only a recurrent update
+    reaches (``l``'s blank embedding). Before the boundary such a parameter
+    still holds its initialization with zero moments, so a fork adds it in
+    that state or drops it without changing the trajectory: the result is the
+    snapshot the target condition would have written itself.
+    """
+    letters = parse_condition(source_condition)
+    flags = {flag: letter in letters for letter, (flag, _) in CONDITION_LETTERS.items()}
+    with torch.device("meta"):
+        source = DeltaModel(replace(model.cfg, **flags))
+    fresh = model.state_dict()
+    saved = payload[CONTRACT.state_key]
+    for name in saved.keys() - fresh.keys():
+        if saved[name].any():
+            raise ValueError(f"{name} has trained; its snapshot is not pre-recurrence")
+    payload[CONTRACT.state_key] = {
+        name: saved[name] if name in saved else value.detach().cpu().clone()
+        for name, value in fresh.items()
+    }
+    payload["optimizer"] = rekey_optimizer_state(
+        payload["optimizer"],
+        optimizer_parameter_names(source),
+        optimizer_parameter_names(model),
+        fresh,
+    )
 
 
 def draw_recurrence(args, step: int, total: int) -> tuple[int, int]:
@@ -1981,9 +2052,15 @@ def resolve_run_args(
         pinned.add("batch_rows")
     if "steps" in explicit and "tokens_per_param" in explicit:
         parser.error("give --steps or --tokens-per-param, not both")
-    if args.resume and args.continue_from:
-        parser.error("--resume continues this tag; --continue extends another")
-    if "steps" not in explicit and not (args.resume or args.continue_from):
+    starts = (args.resume, args.continue_from, args.fork_from)
+    if sum(map(bool, starts)) > 1:
+        parser.error(
+            "--resume continues this tag, --continue extends another, and "
+            "--fork branches one; give one"
+        )
+    if args.tag in (args.continue_from, args.fork_from):
+        parser.error("a continuation or fork needs its own tag")
+    if "steps" not in explicit and not any(starts):
         args.steps = schedule_steps(args)
         if "tokens_per_param" in explicit:
             pinned.add("steps")
@@ -2026,6 +2103,43 @@ def inherit_resume_settings(args, saved: dict, step: int, pinned: frozenset[str]
         runtime_fields=RUNTIME_FIELDS,
         explicit=pinned,
     )
+
+
+def inherit_fork_settings(args, saved: dict, source: str, pinned: frozenset[str]) -> dict:
+    """Carry the source's run and return what the fork retypes.
+
+    A fork is the source's trajectory up to the recurrence boundary under
+    another recurrence recipe. Everything outside ``RECURRENCE_FIELDS`` is
+    inherited, and typing a different value is a different experiment; the
+    recipe inherits wherever it was not typed, and must change somewhere.
+    """
+    missing = checkpoints.missing_fields(saved, EXACT_FIELDS)
+    if missing:
+        raise ValueError(f"checkpoint lacks settings {missing}")
+    carried = tuple(field for field in EXACT_FIELDS if field not in RECURRENCE_FIELDS)
+    conflicts = checkpoints.mismatched_fields(saved, args, carried, only=pinned)
+    if conflicts:
+        raise ValueError(
+            f"--fork {source} changes {conflicts}; a fork keeps every setting "
+            "but the condition and recurrence recipe"
+        )
+    checkpoints.inherit(
+        args,
+        saved,
+        exact_fields=carried,
+        runtime_fields=RUNTIME_FIELDS,
+        explicit=pinned,
+    )
+    for field in RECURRENCE_FIELDS:
+        if field not in pinned:
+            setattr(args, field, saved[field])
+    changed = checkpoints.mismatched_fields(saved, args, RECURRENCE_FIELDS)
+    if not changed:
+        raise ValueError(
+            f"--fork {source} changes nothing; give another --condition or "
+            "recurrence recipe, or --resume the run itself"
+        )
+    return changed
 
 
 def pick_device(
@@ -2092,7 +2206,8 @@ def train(argv: list[str] | None = None) -> dict:
         )
     if not topology.main:
         telemetry.silence()
-    tags = (args.tag, args.continue_from) if args.continue_from else (args.tag,)
+    source = args.continue_from or args.fork_from
+    tags = (args.tag, source) if source else (args.tag,)
     # The tag lock belongs to one process; the other ranks share its fate.
     lock = runs.lock_tags(args.out_dir, *tags) if topology.main else contextlib.nullcontext()
     try:
@@ -2165,13 +2280,24 @@ def _train(
                 f"{source_schedule.total} steps, not {longer.total}"
             )
         fork = continuation_step(source_args, source_schedule, args, longer)
-        eligible = [(step, p) for step, p in found if step <= fork]
-        if not eligible:
-            raise ValueError(
-                f"{source} has no snapshot at or before step {fork}, the last "
-                "step the longer schedule reproduces"
-            )
-        path = eligible[-1][1]
+        path = shared_snapshot(
+            source, found, fork, "the last step the longer schedule reproduces"
+        )
+        if path != latest_path:
+            payload = read_checkpoint(path)
+    elif args.fork_from:
+        source = args.fork_from
+        found = runs.snapshots(source, args.out_dir)
+        if not found:
+            raise FileNotFoundError(f"no snapshot of {source} under {args.out_dir}")
+        latest_path = found[-1][1]
+        payload = read_checkpoint(latest_path)
+        saved = payload["args"]
+        fork_changes = inherit_fork_settings(args, saved, source, pinned)
+        fork = fork_step(SimpleNamespace(**saved), args, build_schedule(args).total)
+        path = shared_snapshot(
+            source, found, fork, "the last update before recurrence begins in either run"
+        )
         if path != latest_path:
             payload = read_checkpoint(path)
 
@@ -2215,6 +2341,8 @@ def _train(
     )
     pair = OptimizerPair(optimizers)
 
+    if args.fork_from:
+        graft_condition_state(payload, saved["condition"], model)
     if payload is not None:
         start_step = checkpoints.restore(
             payload, CONTRACT, model, pair, current_optimizer_groups=False
@@ -2250,6 +2378,17 @@ def _train(
         expert_bias_rate=EXPERT_BIAS_RATE,
         **{name: getattr(args, name) for name in EXACT_FIELDS},
     )
+    if args.fork_from:
+        # The monitor inherits the source's log up to this step from the path.
+        telemetry.log(
+            "fork",
+            source=args.fork_from,
+            step=telemetry.step_address(start_step, total),
+            path=str(path),
+            changed=",".join(
+                f"{field}:{old}->{new}" for field, (old, new) in fork_changes.items()
+            ),
+        )
     if args.continue_from:
         telemetry.log(
             "continue",

@@ -30,6 +30,8 @@ delta — delta-feedback experiment operator
   delta queue FILE         append jobs from a file (TAG FLAGS per line)
   delta queue TAG --continue SRC [FLAGS]
                            extend finished run SRC to a longer schedule under TAG
+  delta queue TAG --fork SRC --condition C [FLAGS]
+                           branch condition C off SRC's pre-recurrence snapshot under TAG
   delta status             print queue and recent-run state
   delta watch              follow milestones until the queue is idle
   delta stop TAG|live [--at STEP]

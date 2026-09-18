@@ -729,3 +729,84 @@ def test_input_bytes_counts_tokens_prefix_and_both_jitters():
     assert input_bytes(args, GraphSpec(3, 2), 2) == (
         2 * columns * 8 + 2 * 2 * 8 + 3 * 2 * 2 * columns * 4 * 2
     )
+
+
+@pytest.mark.parametrize(
+    "source,target", [("f", "fl"), ("f", "l"), ("fl", "f")], ids=["f-fl", "f-l", "fl-f"]
+)
+def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source, target):
+    """Before the recurrence boundary every condition is one trajectory, so a
+    fork from the source's boundary snapshot finishes as the target condition
+    trained from scratch: values, optimizer state, and evaluation alike."""
+    from delta_feedback_experiment import train as trainer
+
+    write_synthetic(
+        tmp_path / "data" / DEFAULT_SOURCE, train_tokens=80, val_tokens=20, vocab=31
+    )
+    settings = {
+        "data-root": tmp_path / "data",
+        "out-dir": tmp_path / "runs",
+        "vocab-size": 31,
+        "dim": 16,
+        "layers": 16,
+        "heads": 2,
+        "kv-heads": 2,
+        "head-dim": 8,
+        "expert-intermediate": 8,
+        "num-routed-experts": 3,
+        "experts-per-token": 2,
+        "pkda-heads": 2,
+        "pkda-head-dim": 8,
+        "seq-len": 4,
+        "batch-rows": 2,
+        "micro-rows": 1,
+        "steps": 4,
+        "warmup-frac": 0,
+        "cooldown-frac": 0,
+        "recurrence-start": 0.5,
+        "three-rate": 0,
+        "eval-every": 4,
+        "eval-rows": 1,
+        "snapshot-every": 1,
+        "device": "cpu",
+    }
+    flags = [
+        item for key, value in settings.items() for item in (f"--{key}", str(value))
+    ]
+    scratch = trainer.train(["scratch", *flags, "--condition", target])
+    trainer.train(["source", *flags, "--condition", source])
+    # Retention kept the boundary snapshot beside the latest two.
+    assert [step for step, _ in trainer.runs.snapshots("source", tmp_path / "runs")] == [
+        2, 3, 4,
+    ]
+    # Only where to run and the new recipe are typed; the rest inherits.
+    start = ["--out-dir", str(tmp_path / "runs"), "--device", "cpu", "--fork", "source"]
+    forked = trainer.train(["forked", *start, "--condition", target])
+    # Fused evaluation exists only under f.
+    metrics = [key for key in scratch if key in ("step", "loss") or key.startswith("val")]
+    assert {"step", "loss", "val", "val_mtp"} <= set(metrics)
+    for key in metrics:
+        assert forked[key] == scratch[key], key
+    complete = trainer.read_checkpoint(tmp_path / "runs/scratch.pt.4")
+    branched = trainer.read_checkpoint(tmp_path / "runs/forked.pt.4")
+    assert branched["args"]["condition"] == target
+    assert ("blank_embedding" in branched["state"]) == ("l" in target)
+    assert_identical(complete["state"], branched["state"])
+    assert_identical(complete["optimizer"], branched["optimizer"])
+    # The fork begins at the boundary, not at the source's end.
+    assert [step for step, _ in trainer.runs.snapshots("forked", tmp_path / "runs")] == [
+        3, 4,
+    ]
+
+    with pytest.raises(ValueError, match="changes nothing"):
+        trainer.train(["same", *start])
+    with pytest.raises(ValueError, match="keeps every setting"):
+        trainer.train(["longer", *start, "--condition", target, "--steps", "8"])
+    # Recurrence from step 0 shares no update with a source that has no
+    # step-0 snapshot.
+    with pytest.raises(ValueError, match="no snapshot at or before step 0"):
+        trainer.train(["early", *start, "--condition", target, "--recurrence-start", "0"])
+    with pytest.raises(SystemExit):
+        parse_run_args(["both", "--fork", "source", "--resume"])
+    with pytest.raises(SystemExit):
+        parse_run_args(["source", "--fork", "source"])

@@ -102,6 +102,7 @@ delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 \
   --data-root /data/delta --source dclm-100b
 delta train example-fl-s1 --resume
 delta queue example-fl-s1-50x --continue example-fl-s1 --tokens-per-param 50
+delta queue example-l-s1 --fork example-fl-s1 --condition l
 
 delta status
 delta watch
@@ -172,11 +173,36 @@ The trainer retains the latest two plus the recurrence boundary, cooldown
 boundary, and final step. Writes stage immutable state before background
 atomic serialization; cooperative exits wait for the writer.
 
+Three flags start a run from a snapshot, and each holds a different thing
+fixed:
+
+| Flag | Tag | Restores | May change |
+|---|---|---|---|
+| `--resume` | Same | The tag's latest snapshot | Nothing state-defining, except postponing recurrence before it begins |
+| `--continue SOURCE` | New | The source's last snapshot the longer schedule reproduces | The schedule length |
+| `--fork SOURCE` | New | The source's last snapshot before recurrence begins in either run | The condition and recurrence recipe |
+
 `--continue SOURCE` starts a longer schedule under a new tag, keeping all
 other state-defining settings. It restores the latest source snapshot before
 the schedules diverge in recurrence or cooldown, rather than appending after
 the source's final step. Short source schedules can have a different warmup;
-the `fork` record's `exact` field reports whether warmup lengths match.
+the `continue` record's `exact` field reports whether warmup lengths match.
+
+`--fork SOURCE` branches another condition off a run at the same length.
+Before the recurrence boundary every update is one plain column in every
+condition, with one data order and keyed randomness, so runs that differ only
+in `--condition`, `--recurrence-start`, `--three-rate`, and
+`--loop-iterations` are one trajectory up to the earlier of their boundaries.
+A fork restores the source's protected boundary snapshot, or its latest one
+before that step, and trains on: it ends as the target condition trained
+from scratch, to the run's numerical floor, without repeating the shared
+steps. Every other state-defining setting is inherited, and typing a
+different one is refused, as is a fork that changes nothing. A parameter only one condition owns
+(`l`'s blank embedding) is still at its initialization with zero moments
+there, so the fork adds or drops it exactly. Recurrence can start no earlier
+than the source's retained snapshots allow. The `fork` record names the
+source snapshot and the changed settings, and the monitor draws the source's
+log up to that step as the fork's own history.
 
 ## CUDA execution
 
