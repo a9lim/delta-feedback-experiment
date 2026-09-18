@@ -126,9 +126,9 @@ delta queue example-f-s1 --condition f -- --mode standard fused
 delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 -- --skip
 ```
 
-The evaluation is one process on one device, about fifteen minutes for every
-mode at screen scale on a 4090; a multi-GPU node idles its other devices
-meanwhile. Its failure marks the job `EVAL FAILED` without touching the
+The evaluation is one process on one device, at most twenty minutes for
+every mode at screen scale on a 4090; a multi-GPU node idles its other
+devices meanwhile. Its failure marks the job `EVAL FAILED` without touching the
 finished snapshots, and `delta eval TAG` repeats it.
 
 | Command | Effect |
