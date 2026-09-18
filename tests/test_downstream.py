@@ -138,9 +138,11 @@ def test_eval_limit_is_a_smoke_and_passes_name_their_file(suite):
     downstream.main([*common, "--limit", "1"])
     assert not (suite / "figures").exists()
     downstream.main([*common, "--passes", "2", "--step", "5"])
-    assert [p.name for p in (suite / "figures/downstream-tiny").iterdir()] == [
-        "fused2.5.json"
-    ]
+    written = suite / "figures/downstream-tiny/fused2.5.json"
+    assert list((suite / "figures/downstream-tiny").iterdir()) == [written]
+    # A task subset updates its tasks and keeps the rest, in suite order.
+    downstream.main([*common[:2], "arc_easy", *common[3:], "--passes", "2"])
+    assert list(json.loads(written.read_text())["tasks"]) == ["arc_easy", "piqa"]
 
 
 def test_eval_refuses_missing_steps_and_synthetic_vocabularies(suite):
@@ -200,7 +202,7 @@ def test_baseline_is_scored_once_and_compared_by_document(suite, monkeypatch, ca
     downstream.main([*EVAL, "--tasks", "piqa", "arc_easy"])
     payload = json.loads(stored.read_text())
     assert payload["meta"]["commit"] == "c2"  # a moved model is rescored whole
-    assert list(payload["tasks"]) == ["piqa", "arc_easy"]
+    assert list(payload["tasks"]) == ["arc_easy", "piqa"]  # suite order, sciq gone
 
 
 def test_baseline_smoke_writes_nothing_and_ids_stay_under_figures(suite, monkeypatch):

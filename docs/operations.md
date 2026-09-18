@@ -428,7 +428,8 @@ python -m transformer_experiments.downstream --compare \
 model: Standard for every condition, plus Fused and Soft for conditions with
 `f`. Each task emits a `downstream` record (`delta watch` shows them), and
 each mode writes `figures/downstream-TAG/MODE.STEP.json`, or
-`MODEk.STEP.json` for `--passes k`. `--out-dir` names a custom snapshot root.
+`MODEk.STEP.json` for `--passes k`; a `--tasks` subset updates its tasks
+there and keeps the rest. `--out-dir` names a custom snapshot root.
 The first use downloads the task datasets from the Hub. The queue runs the
 same command [after a finished schedule](#runs).
 

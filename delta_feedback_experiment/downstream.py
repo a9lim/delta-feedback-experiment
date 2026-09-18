@@ -16,7 +16,8 @@ Every mode the snapshot's condition supports runs by default, against one
 loaded model.  Each task emits a ``downstream`` record as it finishes, and each
 mode writes ``figures/downstream-TAG/MODE.STEP.json`` (``MODEk.STEP.json`` for
 ``k > 1`` passes); compare two files with
-``python -m transformer_experiments.downstream --compare``.  A ``--limit`` run
+``python -m transformer_experiments.downstream --compare``.  A ``--tasks``
+subset updates those tasks in the file and keeps the rest; a ``--limit`` run
 is a smoke and writes nothing.  The queue runs this module as the phase after
 a finished training schedule.
 
@@ -101,6 +102,33 @@ def result_path(tag: str, step: int, mode: str, passes: int = 1) -> Path:
     return FIGURES / f"downstream-{tag}" / f"{suffix}.{step}.json"
 
 
+def stored_results(path: Path, max_len: int) -> tuple[dict[str, downstream.TaskResult], dict]:
+    """A result file's still-current tasks, in suite order, and its meta.
+
+    A task is current while the pinned dataset revision and ``max_len`` it was
+    scored under are the ones in force; scores depend on nothing else a rerun
+    could change, so a partial rerun updates its tasks and keeps the rest.
+    """
+    if not path.is_file():
+        return {}, {}
+    payload = json.loads(path.read_text())
+    found = downstream.from_json(payload)
+    return {
+        name: found[name]
+        for name, task in downstream.TASKS.items()
+        if name in found
+        and found[name].meta.get("revision") == task.revision
+        and found[name].meta.get("max_len") == max_len
+    }, payload["meta"]
+
+
+def write_results(path: Path, results: dict[str, downstream.TaskResult], meta: dict) -> None:
+    ordered = {name: results[name] for name in downstream.TASKS if name in results}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(downstream.to_json(ordered, **meta), indent=1) + "\n")
+    print(f"wrote {path}", flush=True)
+
+
 def baseline_path(model_id: str) -> Path:
     """Where a published model's results live: ``figures/baseline/ORG/NAME.json``."""
     if not HUB_ID.fullmatch(model_id):
@@ -151,18 +179,8 @@ def baseline_results(
     is rescored whole. A ``--limit`` smoke neither reads nor writes the store.
     """
     path = baseline_path(model_id)
-    stored: dict[str, downstream.TaskResult] = {}
-    commit = None
-    if limit is None and path.is_file():
-        payload = json.loads(path.read_text())
-        commit = payload["meta"].get("commit")
-        stored = {
-            name: result
-            for name, result in downstream.from_json(payload).items()
-            if name in downstream.TASKS
-            and result.meta.get("revision") == downstream.TASKS[name].revision
-            and result.meta.get("max_len") == max_len
-        }
+    stored, meta = stored_results(path, max_len) if limit is None else ({}, {})
+    commit = meta.get("commit")
     missing = [name for name in tasks if name not in stored]
     if missing:
         tokenize, scorer, pad_id, resolved = load_baseline(model_id, device)
@@ -179,10 +197,8 @@ def baseline_results(
                 **run_kwargs,
             )
         if limit is None:
-            path.parent.mkdir(parents=True, exist_ok=True)
             meta = {"model": model_id, "commit": commit, "dtype": "float32"}
-            path.write_text(json.dumps(downstream.to_json(stored, **meta), indent=1) + "\n")
-            print(f"wrote {path}", flush=True)
+            write_results(path, stored, meta)
     return {name: stored[name] for name in tasks}
 
 
@@ -306,7 +322,6 @@ def main(argv: list[str] | None = None) -> None:
             print(f"--limit {args.limit} is a smoke; nothing written", flush=True)
             continue
         out_path = result_path(saved["tag"], saved["step"], scorer.mode, args.passes)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
         meta = {
             "snapshot": str(path),
             "tag": saved["tag"],
@@ -320,10 +335,7 @@ def main(argv: list[str] | None = None) -> None:
             "batch_size": args.batch_size,
             "buckets": list(args.buckets),
         }
-        out_path.write_text(
-            json.dumps(downstream.to_json(results, **meta), indent=1) + "\n"
-        )
-        print(f"wrote {out_path}", flush=True)
+        write_results(out_path, stored_results(out_path, max_len)[0] | results, meta)
 
     if not args.baselines:
         return
