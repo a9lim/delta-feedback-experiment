@@ -59,7 +59,7 @@ holds beyond the current token and the draft readout, not whether it is read.
 | [`route_report.py`](../scripts/route_report.py) | Plain/fused routing at the configured final column: source mass, per-token and mean-distribution entropy, cross-group divergence, source/null magnitudes, and query geometry. |
 | [`payload_swap.py`](../scripts/payload_swap.py) | Fused CE with trained, top-only, uniform, or forced-source payload enrichment. `--head` restricts forced-source cases to one routing group; top-only and uniform still replace all groups. Choose `--rows` divisible by `--micro-rows`, because the script averages microbatch means equally. |
 | [`depth_trace.py`](../scripts/depth_trace.py) | Held-out loss and top-state update at every column, default `1..3`, in plain and eligible fused modes. Route mass is sampled from the first microbatch in plain mode. |
-| [`downstream_eval.py`](../scripts/downstream_eval.py) | Workspace zero-shot tasks with Standard, Soft, or Fused teacher-forced continuation scoring. |
+| [`delta eval`](operations.md#downstream-evaluation) | Workspace zero-shot tasks with Standard, Soft, or Fused teacher-forced continuation scoring; the queue runs it after a finished schedule. |
 | [`training_curves.py`](../scripts/training_curves.py) | Main/auxiliary CE, gradient norm, and throughput from logs; repeated steps retain their final record. |
 
 [Operations](operations.md#inspect-a-checkpoint) gives commands. Checkpoint

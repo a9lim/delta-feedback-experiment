@@ -8,7 +8,8 @@ Update affected code, CLI help, tests, and docs together.
 
 ## Map
 
-- `delta_feedback_experiment/`: model, training, data, analysis, and CLI.
+- `delta_feedback_experiment/`: model, training, data, analysis, downstream
+  evaluation, and CLI.
 - `tests/`: small portable numerical, causal, state, and lifecycle contracts.
 - `scripts/`: current checkpoint analysis, training plots, the rental
   session's first hour, and the replay bench.
@@ -37,6 +38,8 @@ smoke; `--ranks N` runs it on N devices. Queue startup runs training directly. K
 collection outside train/eval graph capture.
 
 The queue stores arguments and refreshes the checkout before each job;
-source changes do not stop an active child. `--ranks N` trains data-parallel
+source changes do not stop an active child. A queued job scores its final
+snapshot with `delta eval` after a finished schedule unless its eval slot is
+`--skip`. `--ranks N` trains data-parallel
 over N devices through torchrun; one rank is the same code path.
 Prime spending requires a9's decision.

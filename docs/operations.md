@@ -115,6 +115,22 @@ each job; edits do not stop an active child. `delta queue FILE` reads one
 invocation without shortening the schedule. `delta train --help` lists the
 recipe and runtime controls.
 
+A queued job trains, then scores its final snapshot with
+[`delta eval`](#downstream-evaluation) once the trainer's `done` record
+closes the schedule. A stopped, interrupted, or `--max-steps` invocation
+leaves a skip note in `logs/TAG.eval.log` instead. Flags after `--` (`|` in
+a queue file) go to that evaluation, and `--skip` alone opts out:
+
+```bash
+delta queue example-f-s1 --condition f -- --mode standard fused
+delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 -- --skip
+```
+
+The evaluation is one process on one device, about fifteen minutes for every
+mode at screen scale on a 4090; a multi-GPU node idles its other devices
+meanwhile. Its failure marks the job `EVAL FAILED` without touching the
+finished snapshots, and `delta eval TAG` repeats it.
+
 | Command | Effect |
 |---|---|
 | `stop TAG` | Remove that pending job or interrupt its active child; later jobs remain |
@@ -388,8 +404,6 @@ learning behavior with the training/evaluation recipe.
 python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
-python scripts/downstream_eval.py runs/TAG.pt.STEP --mode standard
-python scripts/downstream_eval.py runs/TAG.pt.STEP --mode fused
 python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
 ```
 
@@ -397,6 +411,25 @@ Checkpoint tools use `delta_feedback_experiment.analysis` and trainer
 evaluation numerics. Figures are regenerable; plotting uses Matplotlib from
 the shared analysis environment. The [analysis guide](interpretability.md)
 defines each tool's measurement.
+
+### Downstream evaluation
+
+```bash
+delta eval TAG                          # latest snapshot, every eligible mode
+delta eval TAG --step 5485 --mode standard
+delta eval TAG --mode fused --passes 2
+delta eval TAG --tasks piqa --limit 32  # smoke; writes nothing
+python -m transformer_experiments.downstream --compare \
+  figures/downstream-TAG/standard.STEP.json figures/downstream-TAG/fused.STEP.json
+```
+
+`delta eval` scores the workspace's pinned zero-shot tasks against one loaded
+model: Standard for every condition, plus Fused and Soft for conditions with
+`f`. Each task emits a `downstream` record (`delta watch` shows them), and
+each mode writes `figures/downstream-TAG/MODE.STEP.json`, or
+`MODEk.STEP.json` for `--passes k`. `--out-dir` names a custom snapshot root.
+The first use downloads the task datasets from the Hub. The queue runs the
+same command [after a finished schedule](#runs).
 
 ## Conversation formatting
 

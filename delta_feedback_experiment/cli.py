@@ -4,7 +4,8 @@ Model-lazy: subcommands import what they need, so ``delta --help`` costs
 nothing and the spool worker drives phases as separate processes.
 Durable orchestration (queue, worker, status/watch/stop/clear) is the
 shared ``transformer_experiments.spool``; this module owns only the
-training pipeline. The compact execution probe is an explicit operator check.
+pipeline: train, then evaluate a finished schedule on the downstream tasks.
+The compact execution probe is an explicit operator check.
 """
 
 from __future__ import annotations
@@ -23,11 +24,14 @@ USAGE = """\
 delta — delta-feedback experiment operator
 
   delta train TAG [FLAGS]  train one condition directly (delta train --help)
+  delta eval TAG [FLAGS]   score a snapshot on the downstream tasks (delta eval --help)
   delta tokenize [FLAGS]   build a source token stream prefix (once)
   delta verify DIR         check a token store against its meta and sidecars
   delta probe              run one CUDA train/eval/decode smoke
-  delta queue TAG [FLAGS]  append a training job to the detached spool
-  delta queue FILE         append jobs from a file (TAG FLAGS per line)
+  delta queue TAG [FLAGS] [-- EVAL_FLAGS]
+                           append a job to the detached spool: train, then eval a
+                           finished schedule with EVAL_FLAGS (-- --skip: no eval)
+  delta queue FILE         append jobs from a file (TAG FLAGS [| EVAL_FLAGS] per line)
   delta queue TAG --continue SRC [FLAGS]
                            extend finished run SRC to a longer schedule under TAG
   delta queue TAG --fork SRC --condition C [FLAGS]
@@ -41,8 +45,19 @@ delta — delta-feedback experiment operator
 """
 
 
+EVAL_SKIP = "--skip"
+"""The whole eval slot of a queued job that opts out of its evaluation phase."""
+
+TRAIN_ENDINGS = frozenset({"done", "yield", "interrupt"})
+"""Trainer records that close an invocation; only ``done`` ends the schedule."""
+
+
 def _train_args(job: spool.Job) -> tuple[str, ...]:
     return job.argv[0]
+
+
+def _eval_args(job: spool.Job) -> tuple[str, ...]:
+    return job.argv[1] if len(job.argv) > 1 else ()
 
 
 def _resumes(job: spool.Job) -> bool:
@@ -53,10 +68,44 @@ def _validate_job(job: spool.Job) -> None:
     from .train import parse_run_args
 
     parse_run_args([job.tag, *_train_args(job)])
+    eval_args = _eval_args(job)
+    if EVAL_SKIP in eval_args:
+        if eval_args != (EVAL_SKIP,):
+            raise ValueError(f"{EVAL_SKIP} skips the evaluation; give it alone")
+        return
+    from .downstream import build_parser
+
+    build_parser().parse_args([job.tag, *eval_args])
+
+
+def _eval_argv(job: spool.Job) -> list[str]:
+    from .train import parse_run_args
+
+    out_dir = parse_run_args([job.tag, *_train_args(job)]).out_dir
+    return [job.tag, "--out-dir", out_dir, *_eval_args(job)]
+
+
+def _eval_skip(job: spool.Job) -> str | None:
+    """Evaluate only a finished schedule: ``--max-steps`` also exits cleanly."""
+    from transformer_experiments import telemetry
+
+    if EVAL_SKIP in _eval_args(job):
+        return f"skipped by {EVAL_SKIP}"
+    try:
+        lines = (SPOOL.layout.logs / f"{job.tag}.log").read_text(errors="replace")
+    except FileNotFoundError:
+        lines = ""
+    for line in reversed(lines.splitlines()):
+        record = telemetry.parse_record(line)
+        if record is not None and record["event"] in TRAIN_ENDINGS:
+            if record["event"] == "done":
+                return None
+            break
+    return "skipped: the training schedule has not finished"
 
 
 PIPELINE = spool.Pipeline(
-    slots=("train",),
+    slots=("train", "eval"),
     validate=_validate_job,
     phases=(
         spool.Phase(
@@ -67,6 +116,13 @@ PIPELINE = spool.Pipeline(
             resume=_resumes,
             telemetry=True,
             report_exit=True,
+        ),
+        spool.Phase(
+            name="eval",
+            module="delta_feedback_experiment.downstream",
+            argv=_eval_argv,
+            log="{tag}.eval.log",
+            skip=_eval_skip,
         ),
     ),
 )
@@ -308,6 +364,10 @@ def main() -> None:
         from .train import main as train_main
 
         train_main(rest)
+    elif command == "eval":
+        from .downstream import main as eval_main
+
+        eval_main(rest)
     elif command == "tokenize":
         tokenize_command(rest)
     elif command == "verify":
