@@ -233,12 +233,6 @@ class MixtureOfExperts(nn.Module):
         Counts include all microbatches and all uses of this physical bank.
         Comparing integers avoids rounding the fractional per-expert target.
         Evaluation keeps the trained selection biases fixed.
-
-        Top-k selection sees only differences between biases, so their mean
-        is a free offset. Step counts are right-skewed, which leaves more
-        experts under target than over it, and the sign rule would integrate
-        that imbalance into the offset without bound. Removing the mean keeps
-        every difference, and so every routing decision, unchanged.
         """
         if not self.training:
             return
@@ -246,7 +240,6 @@ class MixtureOfExperts(nn.Module):
             raise ValueError("expert counts must be an int64 vector matching the routed bank")
         direction = (counts.sum() - self.num_routed_experts * counts).sign()
         self.expert_bias.add_(direction.to(self.expert_bias), alpha=rate)
-        self.expert_bias.sub_(self.expert_bias.mean())
 
     def site_spec(self, name: str, kind: str) -> SlabSpec:
         """The bank's gate/up or down matrices as one stacked site.

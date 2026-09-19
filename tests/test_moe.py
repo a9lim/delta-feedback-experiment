@@ -121,33 +121,19 @@ def test_bias_update_uses_global_counts_and_has_no_optimizer_gradient():
     assert "expert_bias" in dict(moe.named_buffers())
     assert "expert_bias" not in dict(moe.named_parameters())
     assert not moe.expert_bias.requires_grad
-    # One hot expert, one exactly on target, the rest under it: the skew that
-    # step counts show in training.
-    counts = torch.tensor([6, 2, 1, 1, 0], dtype=torch.int64)
-    direction = torch.tensor([-1, 0, 1, 1, 1], dtype=torch.float32)
-    # The sign rule is not zero-sum, so the update removes the mean it would
-    # otherwise accumulate; selection reads only differences between biases.
-    centered = direction - direction.mean()
-    assert direction.sum() != 0
-    moe.update_bias(counts)
-    torch.testing.assert_close(moe.expert_bias, 0.001 * centered)
-    moe.update_bias(counts * 100, rate=0.002)
-    torch.testing.assert_close(moe.expert_bias, 0.003 * centered)
-    torch.testing.assert_close(
-        moe.expert_bias.mean(), torch.zeros(()), rtol=0, atol=1e-9
+    counts = torch.tensor(
+        [2 * count - 3, count, 3] + [0] * (count - 3), dtype=torch.int64
     )
+    direction = torch.tensor([-1, -1, 0] + [1] * (count - 3), dtype=torch.float32)
+    moe.update_bias(counts)
+    torch.testing.assert_close(moe.expert_bias, 0.001 * direction)
+    moe.update_bias(counts * 100, rate=0.002)
+    torch.testing.assert_close(moe.expert_bias, 0.003 * direction)
     assert moe.expert_bias.grad_fn is None and moe.expert_bias.grad is None
     before = moe.expert_bias.clone()
     moe.update_bias(torch.zeros_like(counts))
     moe.update_bias(torch.ones_like(counts) * 3)
-    torch.testing.assert_close(moe.expert_bias, before, rtol=0, atol=1e-9)
-    # An offset inherited from an older snapshot leaves on the first update,
-    # and the differences it carried do not move.
-    with torch.no_grad():
-        moe.expert_bias.add_(0.4)
-    moe.update_bias(torch.ones_like(counts) * 3)
-    torch.testing.assert_close(moe.expert_bias, before, rtol=0, atol=1e-7)
-    before = moe.expert_bias.clone()
+    torch.testing.assert_close(moe.expert_bias, before, rtol=0, atol=0)
     moe.eval()
     moe.update_bias(counts)
     torch.testing.assert_close(moe.expert_bias, before, rtol=0, atol=0)

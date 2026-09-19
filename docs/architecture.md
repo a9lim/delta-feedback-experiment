@@ -232,11 +232,7 @@ Two mechanisms balance utilization at different levels:
 - **Step-level controller:** aggregate actual integer assignment counts
   `C_j` for each physical bank across all microbatches, passes, columns, and
   ranks, then update once after the optimizer step:
-  `b_j ← b_j + η_bias sign(Σ_i C_i − n C_j)`, then `b ← b − mean(b)`.
-  Top-`k` reads only differences between biases, so the mean is a free
-  offset. Step counts are right-skewed, leaving more experts under target
-  than over it, and the sign rule alone integrates that imbalance into the
-  offset at a constant rate; removing it changes no routing decision.
+  `b_j ← b_j + η_bias sign(Σ_i C_i − n C_j)`.
   Biases start at zero, remain outside optimizer groups, and stay fixed in
   evaluation and backward recomputation.
 - **Sequence regularizer:** let `q_j = s_j / Σ_i s_i`,
