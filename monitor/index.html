@@ -83,6 +83,8 @@
   .results th:first-child { text-align: left; min-width: 165px; position: sticky; left: 0; background: var(--surface); }
   .results thead th { vertical-align: bottom; overflow-wrap: anywhere; max-width: 240px; }
   .results small { display: block; font-size: 10px; color: var(--muted); margin-top: 4px; }
+  .result-metrics { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(95px, 1fr); gap: 18px; }
+  .results .result-label { margin: 0 0 5px; white-space: nowrap; }
   .results tr:last-child > * { border-bottom: 0; }
   #downstream-controls { margin: 12px 0; align-items: baseline; }
   #downstream-controls label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; overflow-wrap: anywhere; }
@@ -332,9 +334,10 @@ function resultColumns(groups) {
     return [...modes.values()].sort((a, b) => rank(a) - rank(b) || a.passes - b.passes);
   });
 }
-function resultCell(result, metric, reference = null) {
+function resultCell(result, metric, reference = null, label = false) {
+  const heading = label ? `<small class="result-label">${METRICS[metric]}</small>` : '';
   const value = result?.metrics[metric];
-  if (!value) return '<td aria-label="No result">–</td>';
+  if (!value) return `<div aria-label="No result">${heading}–</div>`;
   const scale = metric === 'ppl' ? 1 : 100;
   const score = (value.mean * scale).toFixed(2) + (metric === 'ppl' ? '' : '%');
   let delta = '';
@@ -343,19 +346,21 @@ function resultCell(result, metric, reference = null) {
       ? ` · Δ ${signed((value.mean - reference.metrics[metric].mean) * scale, 2)}${metric === 'ppl' ? '' : ' pp'}`
       : ' · Δ unavailable';
   }
-  return `<td>${score}<small>n=${count(result.n)}${delta}</small></td>`;
+  return `<div>${heading}${score}<small>n=${count(result.n)}${delta}</small></div>`;
 }
 function resultsHTML(columns) {
   if (!columns.length) return '';
   const tasks = [...new Set(columns.flatMap((column) => [...column.tasks.keys()]))];
   tasks.sort((a, b) => (TASKS.includes(a) ? TASKS.indexOf(a) : TASKS.length) - (TASKS.includes(b) ? TASKS.indexOf(b) : TASKS.length) || a.localeCompare(b));
   const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)} · step ${count(column.current)}</small></th>`).join('');
-  const rows = tasks.flatMap((task) => Object.keys(METRICS).filter((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])).map((metric) => {
+  const rows = tasks.flatMap((task) => [['acc', 'acc_norm'], ['ppl']]
+    .map((metrics) => metrics.filter((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])))
+    .filter((metrics) => metrics.length).map((metrics) => {
     const cells = columns.map((column) => {
       const reference = column.index > 0 ? columns.find((c) => c.index === 0 && c.mode === column.mode && c.passes === column.passes)?.tasks.get(task) : null;
-      return resultCell(column.tasks.get(task), metric, reference);
+      return `<td><div class="result-metrics">${metrics.map((metric) => resultCell(column.tasks.get(task), metric, reference, metrics.length > 1)).join('')}</div></td>`;
     }).join('');
-    return `<tr><th scope="row">${esc(task)}<small>${METRICS[metric]}</small></th>${cells}</tr>`;
+    return `<tr><th scope="row">${esc(task)}${metrics.length === 1 ? `<small>${METRICS[metrics[0]]}</small>` : ''}</th>${cells}</tr>`;
   })).join('');
   return `<div class="results-scroll"><table class="results" aria-label="Downstream scores across runs"><thead><tr><th scope="col">Task / metric</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
