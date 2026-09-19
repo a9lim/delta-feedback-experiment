@@ -302,7 +302,7 @@ capture/step records before treating a quiet startup as stalled.
 | `gnorm` | Unclipped global L2 gradient norm |
 | `expert_balance` | Unweighted mean sequence-balance loss |
 | `expert_max_violation` | Worst bank's whole-update `max(load)/mean(load)-1` |
-| `expert_bias_max` | Largest absolute post-update selection bias |
+| `expert_bias_max` | Largest absolute post-update selection bias; each bank's biases are zero-mean |
 | `tok_s`, `pass_tok_s`, `cell_tok_s` | Predicted-token, pass-token, and cell-token rates; their counts exclude MTP |
 
 The [Jobe monitor](https://runs.a9l.im/delta-feedback/) and
