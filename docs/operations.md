@@ -313,6 +313,25 @@ The overview shows progress, pace, token totals, and the host's GPU reading;
 configuration and non-step logs expand on demand. Exact token totals require
 complete addressed step history, including inherited fork steps.
 
+**Log x** gives training-step charts a logarithmic x axis; step zero is omitted
+while it is enabled. **Log y** independently controls positive-valued y axes.
+Layer-site axes, masses, counts, and signed differences retain their linear
+scales where appropriate.
+
+**Downstream** reads only `logs/TAG.eval.log` (including classified
+`TAG.eval.*.log` files), as tasks finish. It does not read saved result JSON
+or inherit a fork parent's scores. A run without an eval log has no downstream
+results in the monitor. **Compare runs** places logged scores side by side,
+with a separate checkpoint choice for each run and columns for every recorded
+mode and feedback pass count. Accuracy and normalized accuracy are percentages;
+LAMBADA perplexity remains per word. Missing tasks stay blank and document
+counts are shown. Differences use the selected run's matching task, metric,
+mode, and pass count, and require equal document counts; these are raw score
+differences, not paired statistical tests. Logged pooled baseline comparisons
+appear separately with their reported standard errors. Rerunning a task replaces
+the same checkpoint/mode/pass/task entry; rewritten or deleted logs discard
+their old results.
+
 The **Eval step** slider synchronizes layer profiles and expert heatmaps;
 arrows select recorded evaluations, and **Follow latest** resumes tracking.
 A selection stays pinned through refresh. Switching runs selects the latest
@@ -329,9 +348,10 @@ Both disable jitter. These are sample diagnostics, not whole-corpus loads.
 The recurrence view shows per-column depth readouts; training feedback gain
 appears only on single-column steps, where the combined CE isolates it.
 
-For monitor changes, run `node --test tests/monitor.test.cjs` from this
-checkout and check slider, overlays, refresh, heatmaps, and responsive layout
-in the browser.
+For monitor changes, run
+`node --test tests/monitor.test.cjs ../tests/test_monitor_chassis.mjs` from this
+checkout and check the sliders, overlays, eval comparison, axis controls,
+refresh, heatmaps, and responsive layout in the browser.
 
 ## Hopper and node workflow
 

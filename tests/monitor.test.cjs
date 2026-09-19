@@ -19,15 +19,25 @@ function monitor() {
   });
   vm.runInContext(fs.readFileSync(path.join(shared, 'vendor/uPlot.iife.min.js'), 'utf8'), context);
   // Expose ingestion from the chassis closure without changing its behavior.
-  vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, configure,'), context);
+  vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, newRun, configure,'), context);
   vm.runInContext(inline.replace('\nsetupSnapshotControls();\nM.start();', ''), context);
   vm.runInContext("M.configure({onStep, onEval, onRecord, metaEvents: ['run', 'schedule']});", context);
-  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, tokenTotals})', context);
+  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, tokenTotals, downstream, downstreamRecord, resultsFor, resultSelection, resultColumns, resultsHTML, resultCell, tightLogRange})', context);
   api.read = (tag, log) => {
     api.M.ingest(api.M.runFor(tag), log);
     api.M.rebuildAll();
     api.M.state.selected = tag;
     return api.M.viewOf(tag);
+  };
+  api.evalLog = (tag, log, file = `${tag}.eval.log`) => {
+    const key = JSON.stringify([tag, 'eval', file]);
+    let run = api.M.state.companions.get(key);
+    if (!run) {
+      run = Object.assign(api.M.newRun(tag), { kind: 'eval', file, lastModified: 1000 });
+      api.M.state.companions.set(key, run);
+    }
+    api.M.ingest(run, log);
+    return run;
   };
   return api;
 }
@@ -188,4 +198,85 @@ test('token totals account for every column of every pass and reject incomplete 
   assert.deepEqual(plain(a.tokenTotals(view)), {predicted: 32, passes: 80, cells: 512});
   view = a.read('a', step(4));
   assert.equal(a.tokenTotals(view), null);
+});
+
+const score = (extras = {}) => line('downstream', {step: '9142/9142', mode: 'standard', passes: 0, task: 'hellaswag', n: 10042, acc: '3.326e-01', acc_norm: '3.969e-01', ...extras});
+
+test('downstream scores come exclusively from eval logs, not training or fork ancestry', () => {
+  const a = monitor();
+  a.read('parent', setup('parent') + score());
+  assert.deepEqual(plain(a.resultsFor('parent')), []);
+  a.evalLog('parent', score());
+  assert.equal(a.resultsFor('parent').length, 1);
+  a.read('child', setup('child') + line('fork', {step: '9142/10000', path: 'runs/parent.pt.9142'}));
+  assert.deepEqual(plain(a.resultsFor('child')), []);
+  a.M.state.companions.clear();
+  assert.deepEqual(plain(a.resultsFor('parent')), []);
+});
+
+test('eval log ingestion buffers partial lines, replaces reruns and separates modes, passes and steps', () => {
+  const a = monitor(), text = score();
+  a.evalLog('a', text.slice(0, -3));
+  assert.equal(a.resultsFor('a').length, 0);
+  a.evalLog('a', text.slice(-3));
+  assert.equal(a.resultsFor('a')[0].metrics.acc_norm.mean, 0.3969);
+  a.evalLog('a', score({acc: 0.4}) + score({mode: 'fused', passes: 1}) + score({mode: 'fused', passes: 2}) + score({step: '4000/9142'}));
+  const results = a.resultsFor('a');
+  assert.equal(results.length, 4);
+  assert.equal(results[0].metrics.acc.mean, 0.4);
+  assert.deepEqual(plain(a.resultSelection('a', results)), {steps: [4000, 9142], selected: null, current: 9142});
+  a.downstream.selection.set('a', 4000);
+  assert.equal(a.resultSelection('a', results).current, 4000);
+  assert.equal(a.resultSelection('a', results.filter((r) => r.step === 9142)).current, 9142);
+});
+
+test('task metrics preserve zero, reject malformed scores, and keep baselines separate', () => {
+  const a = monitor();
+  a.evalLog('a', score({task: 'lambada_openai', n: 5153, ppl: '1.580e+01', acc: 0, acc_norm: 'nan'})
+    + line('downstream', {step: '9142/9142', mode: 'standard', passes: 0, against: 'org/reference', diff: '-1.2e-02', se: '3.0e-03', z: '-4.0', positive: '2/9'}));
+  const results = a.resultsFor('a');
+  assert.equal(results.length, 2);
+  assert.deepEqual(plain(results[0].metrics), {acc: {mean: 0, se: null}, ppl: {mean: 15.8, se: null}});
+  assert.equal(results[1].task, undefined);
+  assert.equal(results[1].against, 'org/reference');
+  assert.equal(results[1].diff, -0.012);
+  for (const overrides of [{step: 'bad'}, {passes: -1}, {mode: 'bogus'}, {n: 0}, {n: '4oops'}, {acc: 'nan', acc_norm: 'Infinity'}]) {
+    assert.equal(a.downstreamRecord(a.M.parseRecord(score(overrides).trim())), null);
+  }
+});
+
+test('cross-run table aligns tasks and modes, retains missing scores, and compares matching counts', () => {
+  const a = monitor();
+  a.evalLog('a', score({acc: 0.3}) + score({mode: 'fused', passes: 2, acc: 0.5}));
+  a.evalLog('b', score({acc: 0.4}) + score({mode: 'fused', passes: 1, acc: 0.8}) + score({task: 'piqa', n: 1838, acc: 0.7}));
+  const groups = ['a', 'b', 'no-log'].map((tag, index) => ({tag, index, current: 9142, color: '#888', records: a.resultsFor(tag)}));
+  const columns = a.resultColumns(groups), html = a.resultsHTML(columns);
+  assert.equal(columns.length, 4);
+  assert.match(html, /Δ \+10.00 pp/);
+  assert.doesNotMatch(html, /Δ \+30.00 pp|no-log/);
+  assert.match(html, /aria-label="No result"/);
+  assert.match(html, /n=1,838/);
+  const first = a.resultsFor('a')[0], other = a.resultsFor('b')[0];
+  assert.match(a.resultCell({...other, n: 32}, 'acc', first), /Δ unavailable/);
+  assert.match(a.resultCell({...other, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<small>/);
+  assert.doesNotMatch(html, /NaN|Infinity|undefined/);
+});
+
+test('eval table escapes log-provided task and run labels', () => {
+  const a = monitor();
+  a.evalLog('a', score({task: '<script>alert(1)</script>'}));
+  const columns = a.resultColumns([{tag: '<img src=x onerror=alert(1)>', index: 0, current: 9142, records: a.resultsFor('a'), color: '#888'}]);
+  const html = a.resultsHTML(columns);
+  assert.doesNotMatch(html, /<script>|<img/);
+  assert.match(html, /&lt;script&gt;/);
+});
+
+test('log axis has finite positive bounds for empty, singleton and normal ranges', () => {
+  const a = monitor();
+  for (const [lo, hi] of [[null, null], [0, 0], [1, 1], [100, 100], [1, 10000]]) {
+    const range = a.tightLogRange(null, lo, hi);
+    assert.ok(range.every(Number.isFinite));
+    assert.ok(range[0] > 0 && range[1] > range[0]);
+    if (lo > 0) assert.ok(range[0] <= lo && range[1] >= hi);
+  }
 });

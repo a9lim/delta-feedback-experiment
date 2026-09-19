@@ -76,6 +76,18 @@
   .heatmap-empty { padding: 42px 12px; text-align: center; color: var(--muted); font-size: 12px; }
   .log { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--grid); }
   .log pre { margin-top: 10px !important; }
+  .results-scroll { overflow-x: auto; border: 1px solid var(--grid); border-radius: 8px; }
+  .results { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .results th, .results td { padding: 10px 14px; border-bottom: 1px solid var(--grid); text-align: right; min-width: 155px; }
+  .results th { font-weight: 500; }
+  .results th:first-child { text-align: left; min-width: 165px; position: sticky; left: 0; background: var(--surface); }
+  .results thead th { vertical-align: bottom; overflow-wrap: anywhere; max-width: 240px; }
+  .results small { display: block; font-size: 10px; color: var(--muted); margin-top: 4px; }
+  .results tr:last-child > * { border-bottom: 0; }
+  #downstream-controls { margin: 12px 0; align-items: baseline; }
+  #downstream-controls label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; overflow-wrap: anywhere; }
+  #downstream-controls select { font-size: 12px; }
+  #downstream-status { white-space: pre-line; }
   @media (min-width: 1180px) { .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 850px) { .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } .tile .v { font-size: 22px; } }
   @media (max-width: 640px) {
@@ -100,7 +112,8 @@
 <header>
   <h1><span class="brand">delta</span><select id="run" aria-label="Run"></select></h1>
   <div class="controls">
-    <label title="Logarithmic scale for positive quantities; masses, counts and signed differences stay linear"><input type="checkbox" id="logy" checked> log scale</label>
+    <label title="Logarithmic training-step axis; step zero is omitted and layer sites stay linear"><input type="checkbox" id="logx"> log x</label>
+    <label title="Logarithmic scale for positive quantities; masses, counts and signed differences stay linear"><input type="checkbox" id="logy" checked> log y</label>
     <span>refresh <output id="every">–</output></span>
     <button id="refresh" aria-label="Refresh now" title="Refresh now">↻</button>
   </div>
@@ -116,7 +129,7 @@
 <div class="tiles" id="tiles"></div>
 <details class="config"><summary>Run configuration <span class="hint">· geometry, optimizer &amp; schedule</span></summary><div class="config-grid" id="config"></div></details>
 <nav aria-label="Monitor sections">
-  <button data-section="learning">Learning</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letter="f">Feedback</button><button data-section="loop" data-letter="l">Looped column</button>
+  <button data-section="learning">Learning</button><button data-section="downstream">Downstream</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letter="f">Feedback</button><button data-section="loop" data-letter="l">Looped column</button>
 </nav>
 <section id="learning">
   <div class="section-head"><h3>Learning</h3><p>Raw observations · nats · ▲ checkpoint snapshots</p></div>
@@ -125,6 +138,14 @@
     <div class="chart"><h2>Held-out next token</h2><p class="caption">Pass-1 and feedback at the evaluation column count · first column under l</p><div class="plot" id="p-val"></div></div>
     <div class="chart"><h2>Held-out second token</h2><p class="caption">Teacher-forced auxiliary prediction · unweighted CE</p><div class="plot" id="p-mtp-val"></div></div>
   </div>
+</section>
+<section id="downstream">
+  <div class="section-head"><h3>Downstream evaluation</h3><p>Zero-shot tasks · select runs with Compare runs above</p></div>
+  <div id="downstream-controls" class="controls"></div>
+  <p id="downstream-status" class="section-note" role="status">No downstream results yet.</p>
+  <div id="downstream-results"></div>
+  <p class="section-note">Accuracy is percent (↑); perplexity is per word (↓). Each cell includes its document count. Δ is the raw score difference versus the selected run in the same mode and pass count, shown only for equal document counts; it is not a paired significance test. Step choices are independent of the layer slider.</p>
+  <div id="downstream-baselines"></div>
 </section>
 <section id="anatomy">
   <div class="section-head"><h3>Layer anatomy</h3><p>Eval snapshots · up to two validation rows</p></div>
@@ -181,10 +202,10 @@
 <script>
 'use strict';
 // Shared chassis owns ingestion, resume/fork folding and polling. Every eval
-// observable stays in run.evals so rewinds apply to snapshots and trajectories.
+// training observable stays in run.evals so rewinds apply to snapshots and trajectories.
 const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtAge, esc,
         tile, pace, gpuTile, configGroup, scheduleFields, makeChart, setData,
-        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state, runFor } = M;
+        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state, runFor, companionRuns } = M;
 const finite = (v) => Number.isFinite(v) ? v : null;
 const signed = (v, digits = 3) => v == null || !Number.isFinite(v) ? '–' : (v > 0 ? '+' : '') + v.toFixed(digits);
 const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).toLocaleString();
@@ -223,7 +244,13 @@ function onEval(run, rec, step) {
   });
 }
 function onRecord(run, rec) {
-  if (rec.event === 'route') {
+  if (rec.event === 'downstream') {
+    const record = downstreamRecord(rec);
+    if (record) {
+      if (!run.extra.downstream) run.extra.downstream = new Map();
+      run.extra.downstream.set(resultKey(record), record);
+    }
+  } else if (rec.event === 'route') {
     Object.assign(entryAt(run, `route|${rec.site}`, address(rec.step)[0]),
       { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), prev: num(rec.prev), nul: num(rec.null), nulrms: num(rec.null_rms) });
   } else if (rec.event === 'expert') {
@@ -246,6 +273,121 @@ function onRecord(run, rec) {
   }
 }
 
+
+// ---------------------------------------------------------------- downstream
+// Only separate eval logs supply downstream results, including unfinished modes.
+// These records belong to this run, never its training log or fork ancestry.
+const downstream = { selection: new Map(), markup: new Map() };
+const METRICS = { acc: 'Accuracy ↑', acc_norm: 'Normalized accuracy ↑', ppl: 'Perplexity ↓' };
+const TASKS = ['hellaswag', 'arc_easy', 'arc_challenge', 'piqa', 'winogrande', 'boolq', 'openbookqa', 'sciq', 'lambada_openai'];
+const numeric = (value) => value == null || value === '' ? null : finite(Number(value));
+const resultKey = (r) => JSON.stringify([r.step, r.mode, r.passes, r.task ?? null, r.against ?? null]);
+function resultAddress(step, mode, passes) {
+  step = numeric(step); passes = numeric(passes);
+  if (!Number.isInteger(step) || step < 0 || !['standard', 'fused', 'soft'].includes(mode)
+      || !Number.isInteger(passes) || (mode === 'standard' ? passes !== 0 : passes < 1)) return null;
+  return { step, mode, passes };
+}
+function downstreamRecord(rec) {
+  const key = resultAddress(rec.step?.split('/')[0], rec.mode, rec.passes);
+  if (!key) return null;
+  if (rec.against) {
+    const diff = numeric(rec.diff);
+    return diff == null ? null : { ...key, against: rec.against, diff, se: numeric(rec.se), z: numeric(rec.z), positive: rec.positive };
+  }
+  const n = numeric(rec.n), metrics = {};
+  for (const name of Object.keys(METRICS)) {
+    const mean = numeric(rec[name]);
+    if (mean != null) metrics[name] = { mean, se: null };
+  }
+  if (!rec.task || !Number.isInteger(n) || n < 1 || !Object.keys(metrics).length) return null;
+  return { ...key, task: rec.task, n, metrics };
+}
+function resultsFor(tag) {
+  const merged = new Map();
+  for (const log of companionRuns(tag, 'eval')) {
+    for (const [key, record] of log.extra.downstream || []) merged.set(key, record);
+  }
+  return [...merged.values()];
+}
+function resultSelection(tag, records) {
+  const steps = [...new Set(records.map((r) => r.step))].sort((a, b) => a - b);
+  let selected = downstream.selection.get(tag) ?? null;
+  if (selected != null && !steps.includes(selected)) {
+    selected = steps.filter((step) => step <= selected).at(-1) ?? steps[0] ?? null;
+    downstream.selection.set(tag, selected);
+  }
+  return { steps, selected, current: selected ?? steps.at(-1) ?? null };
+}
+const modeLabel = (r) => r.mode === 'standard' ? 'Standard' : `${r.mode === 'fused' ? 'Fused' : 'Soft'} · ${r.passes} feedback pass${r.passes === 1 ? '' : 'es'}`;
+function resultColumns(groups) {
+  return groups.flatMap((group) => {
+    const modes = new Map();
+    for (const record of group.records) if (record.step === group.current && record.task) {
+      const key = JSON.stringify([record.mode, record.passes]);
+      if (!modes.has(key)) modes.set(key, { ...group, mode: record.mode, passes: record.passes, tasks: new Map() });
+      modes.get(key).tasks.set(record.task, record);
+    }
+    const rank = (r) => ['standard', 'fused', 'soft'].indexOf(r.mode);
+    return [...modes.values()].sort((a, b) => rank(a) - rank(b) || a.passes - b.passes);
+  });
+}
+function resultCell(result, metric, reference = null) {
+  const value = result?.metrics[metric];
+  if (!value) return '<td aria-label="No result">–</td>';
+  const scale = metric === 'ppl' ? 1 : 100;
+  const score = (value.mean * scale).toFixed(2) + (metric === 'ppl' ? '' : '%');
+  let delta = '';
+  if (reference?.metrics[metric]) {
+    delta = result.n === reference.n
+      ? ` · Δ ${signed((value.mean - reference.metrics[metric].mean) * scale, 2)}${metric === 'ppl' ? '' : ' pp'}`
+      : ' · Δ unavailable';
+  }
+  return `<td>${score}<small>n=${count(result.n)}${delta}</small></td>`;
+}
+function resultsHTML(columns) {
+  if (!columns.length) return '';
+  const tasks = [...new Set(columns.flatMap((column) => [...column.tasks.keys()]))];
+  tasks.sort((a, b) => (TASKS.includes(a) ? TASKS.indexOf(a) : TASKS.length) - (TASKS.includes(b) ? TASKS.indexOf(b) : TASKS.length) || a.localeCompare(b));
+  const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)} · step ${count(column.current)}</small></th>`).join('');
+  const rows = tasks.flatMap((task) => Object.keys(METRICS).filter((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])).map((metric) => {
+    const cells = columns.map((column) => {
+      const reference = column.index > 0 ? columns.find((c) => c.index === 0 && c.mode === column.mode && c.passes === column.passes)?.tasks.get(task) : null;
+      return resultCell(column.tasks.get(task), metric, reference);
+    }).join('');
+    return `<tr><th scope="row">${esc(task)}<small>${METRICS[metric]}</small></th>${cells}</tr>`;
+  })).join('');
+  return `<div class="results-scroll"><table class="results" aria-label="Downstream scores across runs"><thead><tr><th scope="col">Task / metric</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+function renderDownstream(views) {
+  const groups = views.map((view, index) => {
+    const tag = view.run.tag, records = resultsFor(tag);
+    return { tag, records, index, color: index === 0 ? P.s1 : hue(index - 1), ...resultSelection(tag, records) };
+  });
+  const controls = groups.map((group) => `<label style="color:${group.color}">${esc(group.tag)} <select data-result-tag="${esc(group.tag)}" aria-label="Evaluation step for ${esc(group.tag)}" ${group.steps.length ? '' : 'disabled'}><option value="" ${group.selected == null ? 'selected' : ''}>Latest${group.steps.length ? ` · ${count(group.steps.at(-1))}` : ''}</option>${group.steps.map((step) => `<option value="${step}" ${group.selected === step ? 'selected' : ''}>Step ${count(step)}</option>`).join('')}</select></label>`).join('');
+  // Keep focused checkpoint controls in place during unchanged polls.
+  const replace = (id, html) => {
+    if (downstream.markup.get(id) !== html) { document.getElementById(id).innerHTML = html; downstream.markup.set(id, html); }
+  };
+  replace('downstream-controls', controls);
+  const columns = resultColumns(groups);
+  replace('downstream-results', resultsHTML(columns));
+  const status = [];
+  for (const group of groups) {
+    const logs = companionRuns(group.tag, 'eval');
+    if (!group.records.length) status.push(`${group.tag}: ${logs.length ? 'no downstream scores logged yet.' : 'no eval log.'}`);
+    for (const log of logs) if (log.error) status.push(`${group.tag}: ${log.error}`);
+    // Failed or explicitly skipped evals should remain distinguishable from waiting.
+    for (const log of logs) {
+      const note = log.tail.filter((line) => /skip|smoke|FAILED|Traceback|Error|Killed|OOM/i.test(line)).at(-1);
+      if (note) status.push(`${group.tag}: ${note}`);
+    }
+  }
+  if (columns.length) status.unshift(`${columns.length} run / mode result${columns.length === 1 ? '' : 's'} · updates as tasks finish in the eval log`);
+  document.getElementById('downstream-status').textContent = status.join('\n');
+  const baselines = groups.flatMap((group) => group.records.filter((r) => r.step === group.current && r.against).map((r) => `<tr><th scope="row">${esc(group.tag)}<small>${modeLabel(r)} · step ${count(r.step)}</small></th><td>${esc(r.against)}</td><td>${signed(r.diff * 100, 2)} pp${r.se == null ? '' : ` ± ${(r.se * 100).toFixed(2)}`}<small>z=${signed(r.z, 1)} · positive tasks ${esc(r.positive ?? '–')}</small></td></tr>`));
+  replace('downstream-baselines', baselines.length ? `<p class="section-note">Logged paired baseline comparisons · snapshot minus baseline</p><div class="results-scroll"><table class="results" aria-label="Baseline comparisons"><thead><tr><th>Run / mode</th><th>Baseline</th><th>Pooled accuracy difference</th></tr></thead><tbody>${baselines.join('')}</tbody></table></div>` : '');
+}
 
 // ---------------------------------------------------------------- snapshots
 // A null selection follows the newest eval. Explicit step addresses stay pinned
@@ -319,7 +461,11 @@ function nullRange() {
 }
 function plotData(id, data, idle = null) {
   setData(id, data, idle);
-  document.getElementById(id).closest('.chart').dataset.empty = !data.slice(1).some((col) => col.some(Number.isFinite));
+  document.getElementById(id).closest('.chart').dataset.empty = !hasObservations(id, data);
+}
+function hasObservations(id, data) {
+  const logX = M.charts.get(id)?.u.scales.x.distr === 3;
+  return data.slice(1).some((col) => col.some((value, i) => Number.isFinite(value) && (!logX || data[0][i] > 0)));
 }
 function heatmapHTML(view, sites, field) {
   const entries = sites.map((s) => atStep(view, s.key));
@@ -380,6 +526,10 @@ function renderSnapshots(view) {
 function setupSnapshotControls() {
   // The fragment belongs to the shareable run/overlay selection, not navigation.
   for (const button of document.querySelectorAll('nav [data-section]')) button.onclick = () => document.getElementById(button.dataset.section).scrollIntoView();
+  document.getElementById('downstream-controls').onchange = (event) => {
+    const tag = event.target.dataset.resultTag;
+    if (tag) { downstream.selection.set(tag, event.target.value === '' ? null : Number(event.target.value)); renderDownstream(shownViews()); }
+  };
   const select = (index) => {
     snapshot.step = snapshot.steps[index] ?? snapshot.step;
     const view = viewOf(state.selected); if (view) renderSnapshots(view);
@@ -487,13 +637,14 @@ function tightLogRange(u, lo, hi) {
 }
 function rebuild() {
   const yLog = document.getElementById('logy').checked ? { distr: 3, log: 10, range: tightLogRange } : {};
+  const xLog = document.getElementById('logx').checked ? { distr: 3, log: 10, range: tightLogRange } : {};
   const ovs = overlayTags(), unit = { range: [0, 1] };
   const bands = () => bandsOf(runFor(state.selected));
   const forks = () => { const view = viewOf(state.selected); return [...(view?.forks ?? []), ...eventLines(view)]; };
   const perRun = (build) => [...build(P.s1, ovs.length ? ' [1]' : ''), ...ovs.flatMap((tag, i) => build(hue(i), ` [${i + 2}]`))];
   const v3 = { value: (u, v) => fmt(v, 3) }, v0 = { value: (u, v) => count(v) };
   const vs = { value: (u, v) => signed(v, 4), ...PTS };
-  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks, height: 230, ...extra });
+  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks, height: 230, xScale: xLog, ...extra });
   const site = (id, series, extra = {}) => makeChart(id, {
     series, sync: 'site', height: 240,
     x: { label: 'site', value: (u, v) => SITES[v]?.name ?? '–' },
@@ -570,16 +721,18 @@ function render(view) {
     const data = join(series.map((s) => s[id]));
     const reference = ['p-gap', 'p-drift'].includes(id) ? 0 : undefined;
     // Only recorded measurements drive the empty state; references are decoration.
-    const observed = data.slice(1).some((col) => col.some(Number.isFinite));
+    const observed = hasObservations(id, data);
     if (reference !== undefined) spanRefs(data, { [data.length]: reference });
     const ownX = series[0][id][0];
     plotData(id, data, ownX.at(-1));
     document.getElementById(id).closest('.chart').dataset.empty = !observed;
   }
   renderSnapshots(view);
+  renderDownstream(views);
 }
 M.configure({
   primaryKind: 'train',
+  companionKinds: ['eval'],
   pollSeconds: (view) => {
     const p = pace(view), seconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
     return Number.isFinite(seconds) ? Math.ceil(seconds + 1) : 5;
