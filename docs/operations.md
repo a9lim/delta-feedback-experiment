@@ -324,11 +324,10 @@ or inherit a fork parent's scores. A run without an eval log has no downstream
 results in the monitor. **Compare runs** places logged scores side by side,
 with a separate checkpoint choice for each run and columns for every recorded
 mode and feedback pass count. Accuracy and normalized accuracy appear side by
-side in the same task row, both as percentages; LAMBADA perplexity remains per
-word on its own row. Missing tasks stay blank and document
-counts are shown. Differences use the selected run's matching task, metric,
-mode, and pass count, and require equal document counts; these are raw score
-differences, not paired statistical tests. Logged pooled baseline comparisons
+side in fixed columns in the same task row, both as percentages. Every score
+has the same metric heading, including tasks without normalized accuracy;
+unreported metrics show a dash. LAMBADA perplexity remains per word on its
+own row. Document counts are shown without cross-run deltas. Logged pooled baseline comparisons
 appear separately with their reported standard errors. Rerunning a task replaces
 the same checkpoint/mode/pass/task entry; rewritten or deleted logs discard
 their old results.

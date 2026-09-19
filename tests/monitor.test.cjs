@@ -245,19 +245,18 @@ test('task metrics preserve zero, reject malformed scores, and keep baselines se
   }
 });
 
-test('cross-run table aligns tasks and modes, retains missing scores, and compares matching counts', () => {
+test('cross-run table aligns tasks and modes and retains missing scores without deltas', () => {
   const a = monitor();
   a.evalLog('a', score({acc: 0.3}) + score({mode: 'fused', passes: 2, acc: 0.5}));
   a.evalLog('b', score({acc: 0.4}) + score({mode: 'fused', passes: 1, acc: 0.8}) + score({task: 'piqa', n: 1838, acc: 0.7}));
   const groups = ['a', 'b', 'no-log'].map((tag, index) => ({tag, index, current: 9142, color: '#888', records: a.resultsFor(tag)}));
   const columns = a.resultColumns(groups), html = a.resultsHTML(columns);
   assert.equal(columns.length, 4);
-  assert.match(html, /Δ \+10.00 pp/);
-  assert.doesNotMatch(html, /Δ \+30.00 pp|no-log/);
+  assert.doesNotMatch(html, /Δ|no-log/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
-  const first = a.resultsFor('a')[0], other = a.resultsFor('b')[0];
-  assert.match(a.resultCell({...other, n: 32}, 'acc', first), /Δ unavailable/);
+  const other = a.resultsFor('b')[0];
+  assert.match(a.resultCell({...other, n: 32}, 'acc'), /Accuracy ↑.*40.00%.*n=32/);
   assert.match(a.resultCell({...other, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<small>/);
   assert.doesNotMatch(html, /NaN|Infinity|undefined/);
 });
