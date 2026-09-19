@@ -33,6 +33,7 @@
 \newcommand{\cat}{\operatorname{concat}}
 \newcommand{\diag}{\operatorname{Diag}}
 \newcommand{\op}[6]{\node[op,text width=#4cm,#5] (#1) at (#2,#3) {#6};}
+\newcommand{\outputarrow}[1]{\draw[flow] (#1.north) -- ++(0,.65);}
 % Headings label cutaways; only operations, cells, and repeats have outlines.
 \newcommand{\heading}[5]{%
   \node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont,text=#5] (heading#2)
@@ -90,7 +91,7 @@
  port/.style={font=\fontsize{9}{11}\selectfont,align=center,inner sep=2pt},
  sum/.style={circle,draw=ink,fill=white,minimum size=.45cm,inner sep=0pt,font=\fontsize{12}{12}\selectfont,line width=.8pt}
 ]
-\path[use as bounding box] (-.1,-.15) rectangle (42.2,72.8);
+\path[use as bounding box] (-.1,-9.25) rectangle (42.2,72.8);
 \begin{scope}[shift={(0,3)}]
 \node[font=\bfseries\fontsize{25}{29}\selectfont] at (21,69.05)
   {Delta: feedback + looped depth};
@@ -107,7 +108,7 @@
 \node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont] at (.8,65.7) {A\quad Model and recurrence};
 \node[anchor=west,note] at (.8,64.95)
  {Shared fusion $F(e,p)=W_F[e;p]$,\quad $W_F:[D,2D]$; learned blanks $e_0,p_0$};
-\node[port] (tokens) at (9.5,35.8) {Input token $x_t$};
+\node[port] (tokens) at (9.5,35.8) {$x_t$};
 \op{embedding}{9.5}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_t=50E[x_t],\quad E:[V,D]$}
 \op{entry}{9.5}{39.05}{6.0}{fusionop,minimum height=1.12cm}{\textbf{Plain fusion}\\$F(e_t,p_0)$}
 \draw[flow] (tokens) -- (embedding);
@@ -169,6 +170,8 @@
 % Every column also builds next-token fusion for MTP; final-column feedback
 % reuses this exact tensor, shifted to the next position and Jacobi pass.
 \op{nextembed}{18.2}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_{t+1}=50E[x_{t+1}]$}
+\node[port] (nexttokens) at (18.2,35.8) {$x_{t+1}$};
+\draw[flow] (nexttokens) -- (nextembed);
 \op{nextfusion}{18.2}{39.05}{6.0}{fusionop,minimum height=1.12cm}{\textbf{Next-token fusion}\\$u_t=F(e_{t+1},\widetilde p_t^{(a,i)})$}
 \draw[flow] (nextembed) -- (nextfusion);
 \draw[feedflow] (jitter.north) -- (3.1,63.25) -- (13.3,63.25) -- (13.3,38.0)
@@ -248,24 +251,25 @@
 \node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont,text=bankink] (headingC) at (25.0,40.55) {C\quad MHDB};
 \node[note,anchor=west] at (25.0,39.85)
  {$\mathcal B=\{\mathrm{null},s,\Delta_1,\ldots,\Delta_c\}$, plus $\delta_{\rm live}$ when present.};
-\op{banksources}{26.8}{35.8}{3.1}{bankop}{\textbf{Source bank}\\$\mathcal B=\{b_j\}$}
-\op{bankkeys}{26.8}{37.55}{3.5}{norm}{\textbf{Normalize keys}\\$K_j=\rms_D(b_j)$}
-\op{bankscores}{31.5}{37.55}{4.2}{bankop}{\textbf{Grouped scores}\\$z_{j,h}=q_h^\top K_{j,h}$}
-\op{banksoftmax}{36.9}{37.55}{4.2}{bankop}{\textbf{Source weights}\\$w_{\cdot,h}=\operatorname{softmax}_j(z_{\cdot,h})$}
-\op{bankvalues}{36.9}{35.8}{4.2}{bankop}{\textbf{Read values}\\$r=\cat_h\sum_j w_{j,h}b_{j,h}$}
+\op{banksources}{31.3}{32.0}{4.2}{bankop}{\textbf{Source bank}\\$\mathcal B=\{b_j\}$}
+\op{bankkeys}{31.3}{33.45}{5.7}{norm}{\textbf{Normalize keys}\\$K_j=\rms_D(b_j)$}
+\op{bankscores}{31.3}{34.9}{5.7}{bankop}{\textbf{Grouped scores}\\$z_{j,h}=q_h^\top K_{j,h}$}
+\op{banksoftmax}{31.3}{36.35}{5.7}{bankop}{\textbf{Source weights}\\$w_{\cdot,h}=\operatorname{softmax}_j(z_{\cdot,h})$}
+\op{bankvalues}{31.3}{37.8}{5.7}{bankop}{\textbf{Read values}\\$r=\cat_h\sum_j w_{j,h}b_{j,h}$}
 \draw[flow] (banksources) -- (bankkeys);
 \draw[flow] (bankkeys) -- (bankscores);
 \draw[flow] (bankscores) -- (banksoftmax);
 \draw[flow] (banksoftmax) -- (bankvalues);
-\draw[flow] (banksources.east) -- (bankvalues.west);
-\node[edgeword] at (31.6,35.8) {$b_j$};
-\node[port] (bankquery) at (31.5,38.9) {$q_h$};
-\draw[flow] (bankquery) -- (bankscores);
+\draw[flow] (banksources.east) -- (36.3,32.0) -- (36.3,37.8) -- (bankvalues.east);
+\node[edgeword] at (36.3,34.9) {$b_j$};
+\node[port] (bankquery) at (26.2,32.0) {$q_h$};
+\draw[flow] (bankquery.north) |- (bankscores.west);
+\outputarrow{bankvalues}
 
 \end{scope}
 
 % D. Shared and routed SwiGLU experts.
-\begin{scope}[shift={(.8,23.5)}]
+\begin{scope}[shift={(.8,20.0)}]
 \heading{14.4}{D}{MoE FFN}{$h=832$; one shared expert and $k$ of $n$ routed experts.}{moeink}
 \tikzset{op/.append style={fill=moefill!45},linear/.append style={fill=moefill},norm/.append style={fill=normfill}}
 \node[port] (ffinput) at (9.3,.55) {$x\in\mathbb R^D$};
@@ -304,13 +308,14 @@
 \draw[flow] (affinity.east) -- (19.45,3.9) -- (19.45,7.1) -- (weights.east);
 \draw[flow] (weights.north) |- (expertweight.east);
 \node[edgeword] at (13.7,8.8) {$k\,w_j$};
-\op{ffcombine}{9.3}{11.7}{13.0}{}{\textbf{Mix experts}\\$\displaystyle y=\frac{S(x)+k\sum_{j\in J}w_jE_j(x)}{\sqrt{k+1}}$}
+\op{ffcombine}{9.3}{11.45}{13.0}{}{\textbf{Mix experts}\\$\displaystyle y=\frac{S(x)+k\sum_{j\in J}w_jE_j(x)}{\sqrt{k+1}}$}
 \draw[flow] (sharedout.north) -- (3.3,10.45) -| ($(ffcombine.south)+(-3.0,0)$);
 \draw[flow] (expertweight.north) -- (ffcombine.south);
+\outputarrow{ffcombine}
 \end{scope}
 
 % E. Causal grouped-query attention with an output gate.
-\begin{scope}[shift={(21.6,23.5)}]
+\begin{scope}[shift={(21.6,20.0)}]
 \heading{14.4}{E}{Gated GQA}{$Q=4D/3$, $K=2D/3$; head width 256; two query heads per KV head; NoPE.}{gqaink}
 \tikzset{op/.append style={fill=gqafill!45},linear/.append style={fill=gqafill},matmul/.append style={fill=gqafill},norm/.append style={fill=normfill}}
 \node[port] (gqain) at (9.7,.55) {$x\in\mathbb R^D$};
@@ -344,11 +349,12 @@
 \draw[flow] (gatesig.north) |- (gateproduct.east);
 \op{gout}{9.7}{11.7}{7.5}{linear}{\textbf{Output projection}\\$y=W_oo,\quad W_o:[D,Q]$}
 \draw[flow] (gateproduct) -- (gout);
+\outputarrow{gout}
 \end{scope}
 
 % F. PKDA: one connected flow from learned projections through memory to output.
-\begin{scope}[shift={(.8,-.1)}]
-\heading{22.5}{F}{Preconditioned KDA}{Head width $d=128$; $H$ heads; projection width $P=Hd=4D/3$. Projection shapes precede the split into heads.}{pkdaink}
+\begin{scope}[shift={(.8,-9.2)}]
+\heading{28.1}{F}{Preconditioned KDA}{Head width $d=128$; $H$ heads; projection width $P=Hd=4D/3$. Projection shapes precede the split into heads.}{pkdaink}
 \tikzset{op/.append style={fill=pkdafill!35},linear/.append style={fill=pkdafill},matmul/.append style={fill=pkdafill},norm/.append style={fill=normfill},bridge/.style={preaction={draw=white,line width=3.6pt}}}
 
 % One input bus feeds three content projections and the packed control matrix.
@@ -440,20 +446,21 @@
 \node[edgeword] at (8.0,19.8) {$q_t$};
 
 % The read flows directly into the normalized, gated, projected output.
-\op{pkoutnorm}{23.15}{19.8}{4.1}{norm}{\textbf{Head normalization}\\$\bar o_t=\rms(o_t)$}
-\node[sum] (pkoutgate) at (27.1,19.8) {$\cdot$};
-\op{pkcat}{30.4}{19.8}{3.3}{}{\textbf{Join heads}\\$z=\cat_h(g_t\odot\bar o_t)$}
-\op{pkout}{35.65}{19.8}{5.0}{linear}{\textbf{Output projection}\\$y=W_o z,\quad W_o:[D,P]$}
+\op{pkoutnorm}{16.8}{21.3}{5.7}{norm}{\textbf{Head normalization}\\$\bar o_t=\rms(o_t)$}
+\node[sum] (pkoutgate) at (16.8,22.55) {$\cdot$};
+\op{pkcat}{16.8}{23.8}{5.7}{}{\textbf{Join heads}\\$z=\cat_h(g_t\odot\bar o_t)$}
+\op{pkout}{16.8}{25.3}{5.7}{linear}{\textbf{Output projection}\\$y=W_o z,\quad W_o:[D,P]$}
 \foreach \a/\b in {read/pkoutnorm,pkoutnorm/pkoutgate,pkoutgate/pkcat,pkcat/pkout}{\draw[flow] (\a) -- (\b);}
-\draw[flow] (gatesigpk.north) -- (36,18.05) -- (27.1,18.05) -- (pkoutgate.south);
-\node[edgeword] at (33.9,18.05) {$g_t$};
+\draw[flow] (gatesigpk.north) |- (pkoutgate.east);
+\node[edgeword] at (27.0,22.55) {$g_t$};
+\outputarrow{pkout}
 \foreach \point in {keybranch,keywritebranch,decayedbranch,abranch}{\fill[ink] (\point) circle (1.4pt);}
 \end{scope}
 
 % Cutaway leaders meet the same heading anchor, with a consistent text gap.
 \draw[leader] (pread.south) |- ($(headingC.east)+(.35,0)$);
-\draw[leader] (gff.west) -- (23.15,63.5) -- (23.15,38.05)
- -- (20.8,38.05) |- ($(headingD.east)+(.35,0)$);
+\draw[leader] (gff.west) -- (23.15,63.5) -- (23.15,34.55)
+ -- (20.8,34.55) |- ($(headingD.east)+(.35,0)$);
 \draw[leader] (gmixer.east) -- (41.15,59.2) |- ($(headingE.east)+(.35,0)$);
 \draw[leader] (pmixer.east) -- (41.8,49.2) |- ($(headingF.east)+(.35,0)$);
 
