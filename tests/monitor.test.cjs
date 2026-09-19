@@ -256,8 +256,8 @@ test('cross-run table aligns tasks and modes and retains missing scores without 
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
   const other = a.resultsFor('b')[0];
-  assert.match(a.resultCell({...other, n: 32}, 'acc'), /Accuracy ↑.*40.00%.*n=32/);
-  assert.match(a.resultCell({...other, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<small>/);
+  assert.match(a.resultCell({...other, n: 32}, 'acc'), /title="Accuracy ↑ · n=32">40.00%<\/div>/);
+  assert.match(a.resultCell({...other, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<\/div>/);
   assert.doesNotMatch(html, /NaN|Infinity|undefined/);
 });
 

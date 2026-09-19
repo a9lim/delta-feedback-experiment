@@ -84,7 +84,7 @@
   .results thead th { vertical-align: bottom; overflow-wrap: anywhere; max-width: 240px; }
   .results small { display: block; font-size: 10px; color: var(--muted); margin-top: 4px; }
   .result-metrics { display: grid; grid-template-columns: repeat(2, minmax(95px, 1fr)); gap: 18px; }
-  .results .result-label { margin: 0 0 5px; white-space: nowrap; }
+  .result-head { margin-top: 14px; color: var(--muted); font-size: 10px; }
   .results tr:last-child > * { border-bottom: 0; }
   #downstream-controls { margin: 12px 0; align-items: baseline; }
   #downstream-controls label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; overflow-wrap: anywhere; }
@@ -146,7 +146,7 @@
   <div id="downstream-controls" class="controls"></div>
   <p id="downstream-status" class="section-note" role="status">No downstream results yet.</p>
   <div id="downstream-results"></div>
-  <p class="section-note">Accuracy is percent (↑); perplexity is per word (↓). Each score includes its document count. Step choices are independent of the layer slider.</p>
+  <p class="section-note">acc / norm: accuracy / normalized accuracy, percent (↑). ppl: perplexity per word (↓). Document counts sit beside each task; hover for details when counts differ. Step choices are independent of the layer slider.</p>
   <div id="downstream-baselines"></div>
 </section>
 <section id="anatomy">
@@ -335,23 +335,25 @@ function resultColumns(groups) {
   });
 }
 function resultCell(result, metric) {
-  const heading = `<small class="result-label">${METRICS[metric]}</small>`;
   const value = result?.metrics[metric];
-  if (!value) return `<div aria-label="No result">${heading}–</div>`;
+  if (!value) return '<div aria-label="No result">–</div>';
   const scale = metric === 'ppl' ? 1 : 100;
   const score = (value.mean * scale).toFixed(2) + (metric === 'ppl' ? '' : '%');
-  return `<div>${heading}${score}<small>n=${count(result.n)}</small></div>`;
+  return `<div title="${METRICS[metric]} · n=${count(result.n)}">${score}</div>`;
 }
 function resultsHTML(columns) {
   if (!columns.length) return '';
   const tasks = [...new Set(columns.flatMap((column) => [...column.tasks.keys()]))];
   tasks.sort((a, b) => (TASKS.includes(a) ? TASKS.indexOf(a) : TASKS.length) - (TASKS.includes(b) ? TASKS.indexOf(b) : TASKS.length) || a.localeCompare(b));
-  const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)} · step ${count(column.current)}</small></th>`).join('');
+  const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)} · step ${count(column.current)}</small><div class="result-metrics result-head"><span title="Accuracy">acc</span><span title="Normalized accuracy">norm</span></div></th>`).join('');
   const rows = tasks.flatMap((task) => [['acc', 'acc_norm'], ['ppl']]
     .filter((metrics) => metrics.some((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])))
     .map((metrics) => {
+      const observations = columns.filter((column) => metrics.some((metric) => column.tasks.get(task)?.metrics[metric]));
+      const counts = [...new Set(observations.map((column) => column.tasks.get(task).n))].sort((a, b) => a - b);
+      const countDetails = counts.length > 1 ? ` title="${esc(observations.map((column) => `${column.tag} · ${modeLabel(column)}: n=${count(column.tasks.get(task).n)}`).join('; '))}"` : '';
       const cells = columns.map((column) => `<td><div class="result-metrics">${metrics.map((metric) => resultCell(column.tasks.get(task), metric)).join('')}</div></td>`).join('');
-      return `<tr><th scope="row">${esc(task)}</th>${cells}</tr>`;
+      return `<tr><th scope="row">${esc(task)}${metrics[0] === 'ppl' ? ' · ppl ↓' : ''}<small${countDetails}>n=${counts.map(count).join(' / ')}</small></th>${cells}</tr>`;
   })).join('');
   return `<div class="results-scroll"><table class="results" aria-label="Downstream scores across runs"><thead><tr><th scope="col">Task / metric</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
