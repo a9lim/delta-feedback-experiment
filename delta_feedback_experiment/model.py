@@ -2049,13 +2049,15 @@ def head_row_losses(
     """Per-row NLL and log-partition [heads, B, T] through the tied readout.
 
     The heads share one vocabulary pass: CUDA concatenates their readout rows
-    into a single cut cross-entropy request, so the classifier is tiled, its
-    gradient filtered, and its accumulated gradient written once per pass
-    rather than once per head. CCE fuses tied unembedding and CE, never
-    materializing [B,T,V]; its high-threshold gradient filter is an
-    intentional throughput-first numerical divergence of the authoritative
-    CUDA recipe. CPU/MPS checkpoint sequence chunks per head to bound the
-    materialized vocabulary logits in forward and backward.
+    into a single request, so the classifier is read and its accumulated
+    gradient written once per pass rather than once per head. Hopper runs
+    the dense cuBLAS head (``head.py``), unfiltered with FP32 logits; other
+    CUDA devices run cut cross-entropy, which never materializes [B,T,V] and
+    whose high-threshold gradient filter is an intentional throughput-first
+    numerical divergence. CPU/MPS checkpoint sequence chunks per head to
+    bound the materialized vocabulary logits in forward and backward.
+    Training calls ``weighted_head_loss`` instead, which on Hopper applies
+    the objective's gradient during the forward.
 
     The rows come back unweighted, so a row a head does not supervise simply
     takes no weight; the caller owns every reduction.

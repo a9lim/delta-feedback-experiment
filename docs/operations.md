@@ -232,12 +232,18 @@ operands. The precision boundaries are:
 | Working weights, activations, classifier, evaluation | BF16; RMSNorm computes in FP32 and casts back |
 | Projection/expert forward and input-gradient GEMMs | Rowwise FP8 under `fp8`; BF16 under `bf16` |
 | Weight-gradient GEMMs | BF16 operands, FP32 accumulation |
+| Tied-readout logits (Hopper) | FP32 from BF16 operands, 4,096-row chunks; BF16 logit gradient |
 | PKDA recurrent boundaries | FP32 |
 | NorMuonH momentum storage and Newton–Schulz iterations | BF16 |
 | Momentum EMA, Nesterov direction, row moments, radii, spectral/tangent update and retraction | FP32 |
 
-CCE accumulates the classifier gradient directly into the tied embedding's
-FP32 sink. Causal GQA prefers cuDNN with Flash fallback; cached prefixes use
+The tied readout's cross-entropy accumulates the classifier gradient
+directly into the tied embedding's FP32 sink. On Hopper it is a dense
+cuBLAS head (`head.py`): each chunk's FP32 logits give the row statistics
+and the logit gradient in one fused pass, and because the objective's row
+weights are fixed before the forward, both gradient GEMMs run in the forward
+and the backward returns the saved row gradient. Nothing is filtered. Other
+CUDA devices run CCE with its gradient filter, which won on Ada. Causal GQA prefers cuDNN with Flash fallback; cached prefixes use
 FlexAttention. CPU/MPS use FP32 eager attention, literal PKDA, chunked
 tied-head loss, and FP32 optimizer arithmetic.
 
@@ -392,8 +398,10 @@ HBM. Kernel choices are automatic:
 | Kernel | Hopper choice |
 |---|---|
 | Routed expert weight gradients | `(BM, BN, BK, warps, stages) = (64, 128, 128, 4, 3)` |
-| BF16 classifier | `(B, V, D, warps, stages) = (256, 128, 64, 8, 3)` |
+| Classifier head | Dense cuBLAS logits instead of CCE, about twice as fast |
 | PKDA ATK inter-chunk scan at head width 128 | `BK=128`, four warps |
+| PKDA WY backward | Autotuned over two to eight warps |
+| MHDB routing backward | Half the forward's warps |
 
 For a single GPU, run the lifecycle script with a fresh tag:
 
@@ -441,7 +449,8 @@ for process-local comparisons.
 | `attention_bench.py` | Attention backend, outputs/gradients, graph capture |
 | `pkda_bench.py` | PKDA head counts, recurrence saving modes, input gradients |
 | `moe_bench.py` | Balanced/skewed routing and expert GEMM tiles |
-| `cce_bench.py` | Classifier configurations; use twice the replay rows for paired NTP/MTP |
+| `cce_bench.py` | CCE configurations off Hopper; use twice the replay rows for paired NTP/MTP |
+| `route_bench.py` | MHDB routing forward/backward over the screen site profile |
 | `dense_fp8_bench.py` | Dense FP8 scaling, quantization, weight refresh |
 
 All are under `scripts/`; use `--help` for dimensions and output controls.
