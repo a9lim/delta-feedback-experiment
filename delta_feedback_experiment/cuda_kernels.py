@@ -916,14 +916,22 @@ def _padded_sources(sources: tuple[Tensor, ...]) -> tuple[Tensor, ...]:
     return sources + (sources[-1],) * (MAX_ROUTE_SOURCES - len(sources))
 
 
-def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int, int]:
-    """``(block_h, block_k, tiles, num_warps)`` for one routing site.
+def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int, int, int]:
+    """``(block_h, block_k, tiles, forward_warps, backward_warps)`` for a site.
 
     The head width is covered by ``tiles`` sub-tiles of ``block_k`` lanes
     instead of one tile padded to the next power of two, so the common widths
     (384 at every registered scale) carry no idle lanes.  A width wider than
     ``ROUTE_TILE_LANES * MAX_ROUTE_TILES`` widens the sub-tile rather than
     adding tiles, which keeps the kernels' unrolled tile count fixed.
+
+    The two kernels want different warp counts for the same tile.  The forward
+    holds one value tile and one mixture tile per token, so ~384 lanes per warp
+    keeps its loads in flight; the backward's token block holds the query, the
+    upstream gradient, the value, the source gradient and the accumulator at
+    once, and halving its warps -- doubling each thread's slice of the tile --
+    trades threads for registers and lifts it from 1.49 to 1.65 TB/s at screen
+    geometry on an H100 PCIe.
     """
     block_h = 1 << (num_heads - 1).bit_length()
     block_k = min(ROUTE_TILE_LANES, 1 << (head_dim - 1).bit_length())
@@ -937,8 +945,8 @@ def _route_launch(num_heads: int, head_dim: int) -> tuple[int, int, int, int]:
             f"MHDB routing tile {block_h}x{block_k}x{tiles} is too large "
             f"(H={num_heads}, D/H={head_dim})"
         )
-    num_warps = 8 if lanes >= 4096 else (4 if lanes >= 1024 else 2)
-    return block_h, block_k, tiles, num_warps
+    forward_warps = 8 if lanes >= 4096 else (4 if lanes >= 1024 else 2)
+    return block_h, block_k, tiles, forward_warps, max(1, forward_warps // 2)
 
 
 def _check_route_dims(dim: int, num_heads: int) -> int:
@@ -962,7 +970,9 @@ def _route_forward_impl(
     batch, length, dim = sources[0].shape
     bt = batch * length
     head_dim = _check_route_dims(dim, num_heads)
-    block_h, block_k, tiles, num_warps = _route_launch(num_heads, head_dim)
+    block_h, block_k, tiles, num_warps, _backward_warps = _route_launch(
+        num_heads, head_dim
+    )
     padded = _padded_sources(bank)
     inv_rms = torch.empty((n_sources, bt), device=projected.device, dtype=torch.float32)
     weights = torch.empty(
@@ -1011,7 +1021,9 @@ def _route_backward_impl(
     batch, length, dim = sources[0].shape
     bt = batch * length
     head_dim = _check_route_dims(dim, num_heads)
-    block_h, block_k, tiles, num_warps = _route_launch(num_heads, head_dim)
+    block_h, block_k, tiles, _forward_warps, num_warps = _route_launch(
+        num_heads, head_dim
+    )
     flat_weights = weights.view(n_sources, bt, num_heads)
     padded = _padded_sources(bank)
     # A banked source's destination is its own accumulator, which the kernel

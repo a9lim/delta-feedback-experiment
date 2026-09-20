@@ -217,12 +217,17 @@ def test_routing_sub_tiles_cover_the_head_width():
     to the next power of two, so 384 -- the width at every registered scale --
     is three full 128-lane tiles with no idle lanes."""
     for num_heads in (2, 3, 4, 6):
-        block_h, block_k, tiles, _ = _route_launch(num_heads, 384)
+        block_h, block_k, tiles, forward_warps, backward_warps = _route_launch(
+            num_heads, 384
+        )
         assert block_h >= num_heads
         assert (block_k, tiles) == (128, 3)
         assert block_k * tiles == 384
+        # The backward carries more live tiles per token, so it takes half the
+        # forward's warps and twice its lanes per thread.
+        assert backward_warps == max(1, forward_warps // 2)
     for num_heads, head_dim in ((4, 16), (2, 32), (2, 96), (4, 192), (2, 1024)):
-        _, block_k, tiles, _ = _route_launch(num_heads, head_dim)
+        _, block_k, tiles, *_ = _route_launch(num_heads, head_dim)
         assert tiles <= MAX_ROUTE_TILES
         assert block_k * (tiles - 1) < head_dim <= block_k * tiles
 

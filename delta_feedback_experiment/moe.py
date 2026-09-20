@@ -148,8 +148,13 @@ class MixtureOfExperts(nn.Module):
         # controller receives detached counts and never runs in this forward.
         # V3's sequence auxiliary uses affinity-only choices, independently
         # of the bias-controlled dispatch decisions used by the controller.
+        # Only membership in the affinity-only top-k matters here, and the
+        # comparison below is order-blind, so this selection skips the ranking
+        # sort that the dispatch-order selection above needs.
         auxiliary_selection = (
-            affinities.topk(self.experts_per_token, dim=-1).indices.unsqueeze(-1)
+            affinities.topk(
+                self.experts_per_token, dim=-1, sorted=False
+            ).indices.unsqueeze(-1)
             == experts
         ).sum(dim=1)
         length = x.shape[-2] if x.ndim >= 2 else 1
