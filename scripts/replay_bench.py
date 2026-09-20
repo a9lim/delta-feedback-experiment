@@ -3,7 +3,7 @@ by kernel class: the baseline the Hopper levers are scored against.
 
     python scripts/replay_bench.py --data-root /data/delta [--tag gh200-base]
         [--condition fl] [--scale screen] [--specs 1:1,2:2,3:2] [--trace]
-        [--replay-rows 2] [--attention-backend cudnn|flash] [--fp8-head]
+        [--replay-rows 2] [--attention-backend cudnn|flash]
         [--cce-config bf16-base] [--expert-tiles default|ada]
         [--train-steps 4]  # optional optimizer check; requires one captured spec
         [--init runs/TAG.pt.STEP]  # trained weights and selection biases
@@ -27,7 +27,8 @@ and sums kernel time by class (GEMM, FLA recurrence, CCE head, experts,
 attention, pointwise, ...) with the top kernels by time. Writes
 ``logs/replay-bench/<tag>.json``. Run from the experiment directory.
 CCE/expert overrides affect only this benchmark process; omitted controls
-use the production configuration. FP8 CCE candidates require --fp8-head.
+use the production configuration; --cce-config applies where the head runs
+CCE (off Hopper).
 ``--train-steps N`` then performs N full-batch optimizer updates from the
 same initialization, using production schedules and keyed row draws with
 one fixed captured graph. This paired check does not exercise the full
@@ -98,7 +99,6 @@ def main() -> None:
     parser.add_argument("--replay-rows", type=int, help="force this replay width; reject graphs that cannot fit it")
     parser.add_argument("--attention-backend", choices=("default", "cudnn", "flash"), default="default",
                         help="force a single attention backend for an A/B comparison")
-    parser.add_argument("--fp8-head", action="store_true", help="try the FP8 classifier as well as the selected site precision")
     parser.add_argument("--cce-config", choices=tuple(CCE_CANDIDATES), default=None,
                         help="use this fixed CCE benchmark configuration; omitted uses production")
     parser.add_argument("--expert-tiles", choices=("default", "ada"), default="default",
@@ -112,12 +112,6 @@ def main() -> None:
         parser.error("--warm must be nonnegative and --repeat must be positive")
     if opts.train_steps < 0:
         parser.error("--train-steps must be nonnegative")
-    if opts.cce_config is not None:
-        candidate = CCE_CANDIDATES[opts.cce_config]
-        if candidate.precision == "fp8" and not opts.fp8_head:
-            parser.error("an FP8 --cce-config requires --fp8-head")
-        if candidate.precision == "bf16" and opts.fp8_head:
-            parser.error("a BF16 --cce-config cannot be used with --fp8-head")
 
     import torch
     from torch.profiler import ProfilerActivity, profile
@@ -174,7 +168,6 @@ def main() -> None:
         model.load_state_dict(payload["state"])
         del payload
     model = model.to(device)
-    model.fp8_classifier = opts.fp8_head
     sites = ParameterSites(model, topology, fp8=args.precision == "fp8")
     optimizers = build_optimizers(
         model, lr_normuonh=args.lr_normuonh, lr_nadam=args.lr_nadam, owned=sites.owned
@@ -225,7 +218,6 @@ def main() -> None:
         "seed": args.seed,
         "data_seed": args.data_seed,
         "precision": args.precision,
-        "fp8_head": opts.fp8_head,
         "cce_config": opts.cce_config,
         "expert_tiles": opts.expert_tiles,
         "attention_backend": opts.attention_backend,

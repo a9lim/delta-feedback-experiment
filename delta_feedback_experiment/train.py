@@ -1660,7 +1660,7 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, float]
     return {
         "flash_sdpa": int(has_global_attention),
         # The tied readout's cross-entropy: dense cuBLAS on Hopper, else CCE.
-        "head": "dense" if dense_head_device(device) and not model.fp8_classifier else "cce",
+        "head": "dense" if dense_head_device(device) else "cce",
         "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
         "eval_graphs": len(eval_graph_runner.states),
         "ranks": graph_runner.topology.world,

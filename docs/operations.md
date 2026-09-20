@@ -433,7 +433,7 @@ trainer's captured graphs. `--replay-rows N` fixes actual width;
 `--condition f --specs 1:1` isolates a single-column trial. `--trace` groups
 kernel time, while `--train-steps N` adds full-batch optimizer updates for
 one selected graph. The latter does not exercise evaluation or checkpoints.
-Use `--attention-backend`, `--expert-tiles`, `--cce-config`, and `--fp8-head`
+Use `--attention-backend`, `--expert-tiles`, and `--cce-config` (off Hopper)
 for process-local comparisons.
 
 | Script | Measurement |
