@@ -12,7 +12,7 @@ Update affected code, CLI help, tests, and docs together.
   evaluation, and CLI.
 - `tests/`: small portable numerical, causal, state, and lifecycle contracts.
 - `scripts/`: current checkpoint analysis, training plots, the rental
-  session's first hour, and the replay bench.
+  session's first hour, the replay bench, and the routing-kernel bench.
 - `docs/`: architecture, recipe, scale/runtime accounting, operations, and analysis.
 - `references/refs.yaml`: concise mechanism sources.
 
