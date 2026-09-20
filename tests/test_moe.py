@@ -171,3 +171,17 @@ def test_equal_affinities_normalize_all_active_branches():
         weights.new_full((6 * selected_count,), 1 / selected_count),
     )
     assert counts.sum() == 6 * selected_count
+
+
+def test_nonfinite_affinity_keeps_dispatch_in_bounds():
+    count, selected_count = 5, 2
+    moe = MixtureOfExperts(4, 2, count, selected_count)
+    with torch.no_grad():
+        moe.router.weight.zero_()
+        moe.router.weight[:, 0].copy_(torch.linspace(-2, 2, count))
+        moe.router.weight[count - 1, 0] = math.nan
+    _, _, weights, counts = moe(torch.ones(1, 3, 4), want_weights=True)
+    # A NaN ranks last, so each token still dispatches to exactly its top two
+    # finite experts and never past the assignment buffer.
+    assert counts.tolist() == [0, 0, 3, 3, 0]
+    assert torch.equal((weights > 0).sum(dim=-1), torch.full((1, 3), selected_count))

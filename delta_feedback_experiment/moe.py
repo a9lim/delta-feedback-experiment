@@ -134,12 +134,16 @@ class MixtureOfExperts(nn.Module):
 
             Fewer than ``experts_per_token`` experts outranking one is exactly
             membership in the top-k, and the place is the slot it takes there.
-            Equal values order by index, so one token's ranks are always a
-            permutation of the bank and the order is the same everywhere.
+            Equal values order by index and a NaN ranks below everything, so
+            one token's ranks are always a permutation of the bank (which the
+            dispatch below indexes by) and the order is the same everywhere.
             Over one bank this is a small reduction the block's own graph
             fuses; a device-wide selection is a launch of its own, and an
             ordered one a ranking sort after that.
             """
+            values = values.nan_to_num(
+                nan=-math.inf, posinf=math.inf, neginf=-math.inf
+            )
             outranked = values.unsqueeze(-1) < values.unsqueeze(-2)
             tied_earlier = (values.unsqueeze(-1) == values.unsqueeze(-2)) & (
                 experts < experts.unsqueeze(-1)
