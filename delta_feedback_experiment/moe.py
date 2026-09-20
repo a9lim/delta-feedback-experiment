@@ -138,11 +138,14 @@ class MixtureOfExperts(nn.Module):
             torch.finfo(router_dtype).tiny
         )
         # Membership by comparison rather than one_hot: the compiled graph then
-        # carries no index-range assertions, and the same [pairs, experts]
-        # matrix drives the counts and the dispatch order below.
+        # carries no index-range assertions, and the same matrix drives the
+        # counts and the dispatch order below. A token's selected experts are
+        # distinct, so membership is one row per token rather than one per
+        # (token, slot) pair: a third of the elements, and the dispatch scan
+        # below runs over tokens instead of over pairs.
         experts = torch.arange(self.num_routed_experts, device=flat.device)
         flat_selected = selected.reshape(-1)
-        membership = (flat_selected.unsqueeze(1) == experts).to(torch.int32)
+        membership = (selected.unsqueeze(-1) == experts).sum(dim=1).to(torch.int32)
         counts = membership.sum(dim=0, dtype=torch.int64)
         # The weak auxiliary controls individual sequences. The step-level
         # controller receives detached counts and never runs in this forward.
@@ -176,8 +179,8 @@ class MixtureOfExperts(nn.Module):
             # replace a general sort and make the order deterministic.
             ranks = (
                 (membership.cumsum(dim=0) - membership)
-                .gather(1, flat_selected.unsqueeze(1))
-                .squeeze(1)
+                .gather(1, selected)
+                .reshape(-1)
             )
             inverse = offsets[flat_selected] + ranks
             assignments = torch.empty_like(inverse).scatter_(
