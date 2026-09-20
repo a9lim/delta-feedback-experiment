@@ -35,6 +35,8 @@ CANDIDATES = {
     "state32": "Forward/backward state BV=32, 2 warps, 2 stages; fixed narrow baseline.",
     "scan128": "Gate forward scan BS=128, 4 warps; one K tile per chunk/head.",
     "atk-scan128": "ATK inter-chunk forward scan BK=128, 4 warps; one sweep through the chunks.",
+    "intra:BK=../BC=../W=../S=..": "One explicit intra backward launch.",
+    "wy:BK=../BV=../W=../S=..": "One explicit WY plus inter backward launch.",
 }
 INPUT_NAMES = (
     "q", "k", "v", "g", "g_atk", "beta_atk", "beta", "A_log", "dt_bias", "log_atk_scale",
@@ -89,7 +91,20 @@ def candidate_launches(name):
         for part in name.split("+"):
             if part == "baseline":
                 continue
-            if part == "intra64":
+            if part.startswith("intra:"):
+                # intra:BK=64/BC=16/W=4/S=2 - one explicit intra backward launch.
+                spec = dict(item.split("=") for item in part.removeprefix("intra:").split("/"))
+                module = "fla.ops.precond_kda.chunk_intra"
+                replace(module, "BWD_INTRA_BK", int(spec["BK"]))
+                fixed(module, "chunk_precond_kda_bwd_kernel_intra",
+                      BC=int(spec["BC"]), num_warps=int(spec["W"]), num_stages=int(spec["S"]))
+            elif part.startswith("wy:"):
+                # wy:BK=64/BV=128/W=4/S=2 - one explicit WY+inter backward launch.
+                spec = dict(item.split("=") for item in part.removeprefix("wy:").split("/"))
+                fixed("fla.ops.precond_kda.chunk_bwd", "chunk_precond_kda_bwd_kernel_wy_dqkg",
+                      BK=int(spec["BK"]), BV=int(spec["BV"]),
+                      num_warps=int(spec["W"]), num_stages=int(spec["S"]))
+            elif part == "intra64":
                 module = "fla.ops.precond_kda.chunk_intra"
                 replace(module, "BWD_INTRA_BK", 64)
                 fixed(module, "chunk_precond_kda_bwd_kernel_intra", BC=16, num_warps=4, num_stages=2)
@@ -115,10 +130,18 @@ def candidate_launches(name):
 
 def checkout(path):
     def git(*args):
-        return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
-    diff = subprocess.check_output(["git", "-C", str(path), "diff", "--binary", "HEAD"])
-    return {"head": git("rev-parse", "HEAD"), "status": git("status", "--short"),
-            "tracked_diff_sha256": hashlib.sha256(diff).hexdigest()}
+        return subprocess.check_output(
+            ["git", "-C", str(path), *args], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    try:
+        diff = subprocess.check_output(
+            ["git", "-C", str(path), "diff", "--binary", "HEAD"], stderr=subprocess.DEVNULL
+        )
+        return {"head": git("rev-parse", "HEAD"), "status": git("status", "--short"),
+                "tracked_diff_sha256": hashlib.sha256(diff).hexdigest()}
+    except (OSError, subprocess.CalledProcessError):
+        # Benchmarking from a synchronized copy that carries no repository.
+        return {"head": None, "status": None, "tracked_diff_sha256": None, "path": str(path)}
 
 
 def make_inputs(rows, length, heads, seed):
@@ -267,7 +290,7 @@ def main():
     heads, rows = ([int(value) for value in text.split(",")] for text in (args.heads, args.rows))
     candidates = list(dict.fromkeys(["baseline", *args.candidates.split(",")]))
     for candidate in candidates:
-        parts = candidate.split("+")
+        parts = [part for part in candidate.split("+") if not part.startswith(("intra:", "wy:"))]
         if any(part not in CANDIDATES for part in parts) or {"state16", "state32"} <= set(parts):
             parser.error(f"Invalid candidate {candidate!r}; see --describe")
     if min(*heads, *rows, args.length, args.warm, args.repeat) < 1 or args.length % 64:

@@ -32,6 +32,15 @@ except (ImportError, OSError):  # pragma: no cover - exercised on Jobe
 CHUNK_SIZE = 64
 """The chunk length FLA's preconditioned KDA forward and backward share."""
 
+CONV_TILE = 32
+"""The row tile the fused Q/K/V convolution walks, independent of the chunk.
+
+The backward recomputes the SiLU derivative for its tile plus the convolution
+halo and holds it in registers, so the tile trades halo overhead against
+occupancy. On an H100 PCIe at the screen shape this tile runs the backward
+0.558 ms against 0.590 ms at 64; 128 costs 0.750 ms and 256 spills.
+"""
+
 PKDA_INTERMEDIATES = (
     "Aqk",
     "Akk",
@@ -147,7 +156,7 @@ def pkda_qkv_conv(
         cu_seqlens=None,
         cu_seqlens_cpu=None,
         chunk_indices=None,
-        BT=CHUNK_SIZE,
+        BT=CONV_TILE,
         layout_fallback=False,
         l2norm_head_dim=head_dim,
         l2norm_channels=norm_channels,
@@ -195,7 +204,7 @@ def _pkda_qkv_conv_backward(
         cu_seqlens=None,
         cu_seqlens_cpu=None,
         chunk_indices=None,
-        BT=CHUNK_SIZE,
+        BT=CONV_TILE,
         layout_fallback=False,
         l2norm_head_dim=head_dim,
         l2norm_channels=norm_channels,
