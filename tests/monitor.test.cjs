@@ -23,7 +23,7 @@ function monitor() {
   vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, newRun, configure,'), context);
   vm.runInContext(inline.replace('\nsetupSnapshotControls();\nM.start();', ''), context);
   vm.runInContext("M.configure({onStep, onEval, onRecord, metaEvents: ['run', 'schedule']});", context);
-  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, downstream, downstreamRecord, resultsFor, resultSelection, resultColumns, resultsHTML, resultCell, tightLogRange})', context);
+  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, downstream, taskRecords, baselineColumns, resultsFor, resultSelection, resultColumns, resultsHTML, resultCell, tightLogRange})', context);
   api.scaleSteps = scaleSteps;
   api.read = (tag, log) => {
     api.M.ingest(api.M.runFor(tag), log);
@@ -31,15 +31,8 @@ function monitor() {
     api.M.state.selected = tag;
     return api.M.viewOf(tag);
   };
-  api.evalLog = (tag, log, file = `${tag}.eval.log`) => {
-    const key = JSON.stringify([tag, 'eval', file]);
-    let run = api.M.state.companions.get(key);
-    if (!run) {
-      run = Object.assign(api.M.newRun(tag), { kind: 'eval', file, lastModified: 1000 });
-      api.M.state.companions.set(key, run);
-    }
-    api.M.ingest(run, log);
-    return run;
+  api.save = (file) => {
+    api.M.state.results.files = api.M.state.results.files.filter((old) => old.file !== file.file).concat(file);
   };
   return api;
 }
@@ -202,27 +195,32 @@ test('token totals account for every column of every pass and reject incomplete 
   assert.equal(a.tokenTotals(view), null);
 });
 
-const score = (extras = {}) => line('downstream', {step: '9142/9142', mode: 'standard', passes: 0, task: 'hellaswag', n: 10042, acc: '3.326e-01', acc_norm: '3.969e-01', ...extras});
+const task = (metrics = {acc: {mean: 0.3326, se: 0.01}, acc_norm: {mean: 0.3969, se: 0.01}}, n = 10042) => ({n, metrics, meta: {revision: 'test', max_len: 1024}});
+const result = (tag, overrides = {}, tasks = {hellaswag: task()}) => {
+  const meta = {tag, step: 9142, mode: 'standard', passes: 0, ...overrides};
+  return {file: `figures/downstream-${tag}/${meta.mode}${meta.passes}.${meta.step}.json`, meta, tasks};
+};
+const baseline = (model = 'org/reference', tasks = {hellaswag: task()}) => ({file: `figures/baseline/${model}.json`, meta: {model, dtype: 'float32'}, tasks});
 
-test('downstream scores come exclusively from eval logs, not training or fork ancestry', () => {
+test('saved JSON supplies results without eval logs or fork inheritance', () => {
   const a = monitor();
-  a.read('parent', setup('parent') + score());
+  a.read('parent', setup('parent') + line('downstream', {step: '9142/9142', mode: 'standard', passes: 0, task: 'hellaswag', n: 10042, acc: 0.99}));
   assert.deepEqual(plain(a.resultsFor('parent')), []);
-  a.evalLog('parent', score());
-  assert.equal(a.resultsFor('parent').length, 1);
+  a.save(result('parent'));
+  assert.equal(a.resultsFor('parent')[0].metrics.acc.mean, 0.3326);
   a.read('child', setup('child') + line('fork', {step: '9142/10000', path: 'runs/parent.pt.9142'}));
   assert.deepEqual(plain(a.resultsFor('child')), []);
-  a.M.state.companions.clear();
+  a.M.state.results.files = [];
   assert.deepEqual(plain(a.resultsFor('parent')), []);
 });
 
-test('eval log ingestion buffers partial lines, replaces reruns and separates modes, passes and steps', () => {
-  const a = monitor(), text = score();
-  a.evalLog('a', text.slice(0, -3));
-  assert.equal(a.resultsFor('a').length, 0);
-  a.evalLog('a', text.slice(-3));
-  assert.equal(a.resultsFor('a')[0].metrics.acc_norm.mean, 0.3969);
-  a.evalLog('a', score({acc: 0.4}) + score({mode: 'fused', passes: 1}) + score({mode: 'fused', passes: 2}) + score({step: '4000/9142'}));
+test('JSON replacements separate modes, passes and steps and preserve checkpoint selection', () => {
+  const a = monitor();
+  a.save(result('a'));
+  a.save(result('a', {}, {hellaswag: task({acc: {mean: 0.4, se: 0.02}})}));
+  a.save(result('a', {mode: 'fused', passes: 1}));
+  a.save(result('a', {mode: 'fused', passes: 2}));
+  a.save(result('a', {step: 4000}));
   const results = a.resultsFor('a');
   assert.equal(results.length, 4);
   assert.equal(results[0].metrics.acc.mean, 0.4);
@@ -232,44 +230,61 @@ test('eval log ingestion buffers partial lines, replaces reruns and separates mo
   assert.equal(a.resultSelection('a', results.filter((r) => r.step === 9142)).current, 9142);
 });
 
-test('task metrics preserve zero, reject malformed scores, and keep baselines separate', () => {
+test('JSON task metrics preserve zero and precision, translate perplexity, and reject malformed scores', () => {
   const a = monitor();
-  a.evalLog('a', score({task: 'lambada_openai', n: 5153, ppl: '1.580e+01', acc: 0, acc_norm: 'nan'})
-    + line('downstream', {step: '9142/9142', mode: 'standard', passes: 0, against: 'org/reference', diff: '-1.2e-02', se: '3.0e-03', z: '-4.0', positive: '2/9'}));
-  const results = a.resultsFor('a');
-  assert.equal(results.length, 2);
-  assert.deepEqual(plain(results[0].metrics), {acc: {mean: 0, se: null}, ppl: {mean: 15.8, se: null}});
-  assert.equal(results[1].task, undefined);
-  assert.equal(results[1].against, 'org/reference');
-  assert.equal(results[1].diff, -0.012);
-  for (const overrides of [{step: 'bad'}, {passes: -1}, {mode: 'bogus'}, {n: 0}, {n: '4oops'}, {acc: 'nan', acc_norm: 'Infinity'}]) {
-    assert.equal(a.downstreamRecord(a.M.parseRecord(score(overrides).trim())), null);
+  a.save(result('a', {}, {lambada_openai: task({perplexity: {mean: 15.81234, se: 0.2}, acc: {mean: 0, se: 0}, acc_norm: {mean: null}}, 5153)}));
+  assert.deepEqual(plain(a.resultsFor('a')[0].metrics), {acc: {mean: 0, se: 0}, ppl: {mean: 15.81234, se: 0.2}});
+  for (const overrides of [{step: 'bad'}, {passes: -1}, {mode: 'bogus'}, {passes: null}, {step: false}]) {
+    const b = monitor(); b.save(result('a', overrides));
+    assert.deepEqual(plain(b.resultsFor('a')), []);
+  }
+  for (const raw of [task(undefined, 0), task(undefined, '4oops'), task({acc: {mean: 'nan'}, acc_norm: {mean: Infinity}}), null]) {
+    assert.deepEqual(plain(a.taskRecords({tasks: {bad: raw}})), []);
   }
 });
 
-test('cross-run table aligns tasks and modes and retains missing scores without deltas', () => {
+test('baselines appear alongside runs and remain when no selected run has saved results', () => {
   const a = monitor();
-  a.evalLog('a', score({acc: 0.3}) + score({mode: 'fused', passes: 2, acc: 0.5}));
-  a.evalLog('b', score({acc: 0.4}) + score({mode: 'fused', passes: 1, acc: 0.8}) + score({task: 'piqa', n: 1838, acc: 0.7}));
-  const groups = ['a', 'b', 'no-log'].map((tag, index) => ({tag, index, current: 9142, color: '#888', records: a.resultsFor(tag)}));
-  const columns = a.resultColumns(groups), html = a.resultsHTML(columns);
-  assert.equal(columns.length, 4);
-  assert.doesNotMatch(html, /Δ|no-log/);
+  a.save(result('a'));
+  a.save(baseline());
+  a.save(baseline('org/second', {piqa: task({acc: {mean: 0.8}}, 1838)}));
+  const groups = [{tag: 'a', current: 9142, color: '#888', records: a.resultsFor('a')}];
+  const columns = [...a.resultColumns(groups), ...a.baselineColumns()], html = a.resultsHTML(columns);
+  assert.equal(columns.length, 3);
+  assert.match(html, /org\/reference<small>Baseline<\/small>/);
+  assert.match(html, /80.00%/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
-  const other = a.resultsFor('b')[0];
-  assert.match(a.resultCell({...other, n: 32}, 'acc'), /title="Accuracy ↑ · n=32">40.00%<\/div>/);
-  assert.match(a.resultCell({...other, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<\/div>/);
-  assert.doesNotMatch(html, /NaN|Infinity|undefined/);
+  assert.doesNotMatch(html, /Δ|Baseline · step|NaN|Infinity|undefined/);
+  assert.equal(a.resultsFor('org/reference').length, 0);
+  assert.match(a.resultsHTML(a.baselineColumns()), /org\/reference/);
 });
 
-test('eval table escapes log-provided task and run labels', () => {
+test('cross-run table aligns tasks and modes and keeps missing scores', () => {
   const a = monitor();
-  a.evalLog('a', score({task: '<script>alert(1)</script>'}));
-  const columns = a.resultColumns([{tag: '<img src=x onerror=alert(1)>', index: 0, current: 9142, records: a.resultsFor('a'), color: '#888'}]);
+  a.save(result('a'));
+  a.save(result('a', {mode: 'fused', passes: 2}));
+  a.save(result('b'));
+  a.save(result('b', {mode: 'fused', passes: 1}, {piqa: task({acc: {mean: 0.7}}, 1838)}));
+  const groups = ['a', 'b', 'no-json'].map((tag) => ({tag, current: 9142, color: '#888', records: a.resultsFor(tag)}));
+  const columns = a.resultColumns(groups), html = a.resultsHTML(columns);
+  assert.equal(columns.length, 4);
+  assert.doesNotMatch(html, /Δ|no-json/);
+  assert.match(html, /aria-label="No result"/);
+  assert.match(html, /n=1,838/);
+  assert.match(a.resultCell({n: 32, metrics: {acc: {mean: 0.4}}}, 'acc'), /title="Accuracy ↑ · n=32">40.00%<\/div>/);
+  assert.match(a.resultCell({n: 32, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<\/div>/);
+});
+
+test('eval table escapes JSON-provided task, model and run labels', () => {
+  const a = monitor();
+  a.save(result('a', {}, {'<script>alert(1)</script>': task()}));
+  a.save(baseline('<img src=x onerror=alert(1)>'));
+  const columns = [...a.resultColumns([{tag: '<img src=x>', current: 9142, records: a.resultsFor('a'), color: '#888'}]), ...a.baselineColumns()];
   const html = a.resultsHTML(columns);
   assert.doesNotMatch(html, /<script>|<img/);
   assert.match(html, /&lt;script&gt;/);
+  assert.match(html, /&lt;img/);
 });
 
 test('log axis has finite positive bounds for empty, singleton and normal ranges', () => {

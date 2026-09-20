@@ -1,4 +1,5 @@
 {
   "primary": "train",
-  "kinds": ["eval"]
+  "kinds": ["eval"],
+  "results": ["figures/downstream-*/*.json", "figures/baseline/**/*.json"]
 }

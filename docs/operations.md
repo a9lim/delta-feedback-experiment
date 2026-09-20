@@ -328,21 +328,25 @@ and fork boundaries, and checkpoint markers use the same conversion. Log x
 can be enabled independently. Layer profiles and eval selectors retain their
 recorded step addresses.
 
-**Downstream** reads only `logs/TAG.eval.log` (including classified
-`TAG.eval.*.log` files), as tasks finish. It does not read saved result JSON
-or inherit a fork parent's scores. A run without an eval log has no downstream
-results in the monitor. **Compare runs** places logged scores side by side,
-with a separate checkpoint choice for each run and columns for every recorded
-mode and feedback pass count. Accuracy and normalized accuracy appear side by
-side in fixed columns beneath compact **acc / norm** headers, both as
-percentages; unreported metrics show a dash. Document counts appear beneath
-each task name. If counts differ across runs or modes, the row lists the
-distinct counts and a tooltip identifies each result's count. LAMBADA
-perplexity remains per word on its own **ppl** row. Scores have no cross-run
-deltas. Logged pooled baseline comparisons
-appear separately with their reported standard errors. Rerunning a task replaces
-the same checkpoint/mode/pass/task entry; rewritten or deleted logs discard
-their old results.
+**Downstream** reads saved `figures/downstream-TAG/*.json` results and
+`figures/baseline/**/*.json` reference scores through the monitor's
+`api/results` endpoint. It updates when each mode's JSON is saved; an eval log
+is unnecessary, smoke runs write no results, and a fork does not inherit its
+parent's scores. **Compare runs** places selected runs side by side, with a
+separate checkpoint choice for each run and columns for every saved mode and
+feedback pass count. All saved baselines appear alongside them, labeled by
+model ID, independent of the selected runs.
+
+Accuracy and normalized accuracy appear side by side beneath compact
+**acc / norm** headers, both as percentages; unreported metrics show a dash.
+Document counts appear beneath each task name. If counts differ across runs,
+modes, or baselines, the row lists the distinct counts and a tooltip identifies
+each result's count. LAMBADA perplexity remains per word on its own **ppl** row.
+The table shows saved scores without cross-run deltas; paired comparisons
+remain available through the evaluation CLI. Replacing or deleting a result
+file replaces or removes its scores on refresh. An unreadable file is reported
+and retried without retaining stale scores. The server caches summaries of
+unchanged files and omits per-document records from browser responses.
 
 The **Eval step** slider synchronizes layer profiles and expert heatmaps;
 arrows select recorded evaluations, and **Follow latest** resumes tracking.

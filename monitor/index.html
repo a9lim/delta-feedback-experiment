@@ -149,7 +149,6 @@
   <p id="downstream-status" class="section-note" role="status">No downstream results yet.</p>
   <div id="downstream-results"></div>
   <p class="section-note">acc / norm: accuracy / normalized accuracy, percent (↑). ppl: perplexity per word (↓). Document counts sit beside each task; hover for details when counts differ. Step choices are independent of the layer slider.</p>
-  <div id="downstream-baselines"></div>
 </section>
 <section id="anatomy">
   <div class="section-head"><h3>Layer anatomy</h3><p>Eval snapshots · up to two validation rows</p></div>
@@ -209,7 +208,7 @@
 // training observable stays in run.evals so rewinds apply to snapshots and trajectories.
 const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtAge, esc,
         tile, pace, gpuTile, configGroup, scheduleFields, makeChart, setData,
-        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state, companionRuns } = M;
+        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state } = M;
 const finite = (v) => Number.isFinite(v) ? v : null;
 const signed = (v, digits = 3) => v == null || !Number.isFinite(v) ? '–' : (v > 0 ? '+' : '') + v.toFixed(digits);
 const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).toLocaleString();
@@ -248,13 +247,7 @@ function onEval(run, rec, step) {
   });
 }
 function onRecord(run, rec) {
-  if (rec.event === 'downstream') {
-    const record = downstreamRecord(rec);
-    if (record) {
-      if (!run.extra.downstream) run.extra.downstream = new Map();
-      run.extra.downstream.set(resultKey(record), record);
-    }
-  } else if (rec.event === 'route') {
+  if (rec.event === 'route') {
     Object.assign(entryAt(run, `route|${rec.site}`, address(rec.step)[0]),
       { n: num(rec.n), heads: num(rec.heads), max: num(rec.max), headjs: num(rec.head_js), seed: num(rec.seed), prev: num(rec.prev), nul: num(rec.null), nulrms: num(rec.null_rms) });
   } else if (rec.event === 'expert') {
@@ -279,40 +272,43 @@ function onRecord(run, rec) {
 
 
 // ---------------------------------------------------------------- downstream
-// Only separate eval logs supply downstream results, including unfinished modes.
-// These records belong to this run, never its training log or fork ancestry.
+// Saved JSON supplies downstream scores, independent of logs and fork ancestry.
+// Baselines belong to models and are shown alongside every selection of runs.
 const downstream = { selection: new Map(), markup: new Map() };
 const METRICS = { acc: 'Accuracy ↑', acc_norm: 'Normalized accuracy ↑', ppl: 'Perplexity ↓' };
 const TASKS = ['hellaswag', 'arc_easy', 'arc_challenge', 'piqa', 'winogrande', 'boolq', 'openbookqa', 'sciq', 'lambada_openai'];
-const numeric = (value) => value == null || value === '' ? null : finite(Number(value));
-const resultKey = (r) => JSON.stringify([r.step, r.mode, r.passes, r.task ?? null, r.against ?? null]);
+const numeric = (value) => typeof value === 'number' ? finite(value) : null;
 function resultAddress(step, mode, passes) {
   step = numeric(step); passes = numeric(passes);
   if (!Number.isInteger(step) || step < 0 || !['standard', 'fused', 'soft'].includes(mode)
       || !Number.isInteger(passes) || (mode === 'standard' ? passes !== 0 : passes < 1)) return null;
   return { step, mode, passes };
 }
-function downstreamRecord(rec) {
-  const key = resultAddress(rec.step?.split('/')[0], rec.mode, rec.passes);
-  if (!key) return null;
-  if (rec.against) {
-    const diff = numeric(rec.diff);
-    return diff == null ? null : { ...key, against: rec.against, diff, se: numeric(rec.se), z: numeric(rec.z), positive: rec.positive };
+function taskRecords(file) {
+  const records = [];
+  for (const [task, raw] of Object.entries(file.tasks || {})) {
+    const n = numeric(raw?.n), metrics = {};
+    for (const name of Object.keys(METRICS)) {
+      const value = raw?.metrics?.[name === 'ppl' ? 'perplexity' : name];
+      const mean = numeric(value?.mean), se = numeric(value?.se);
+      if (mean != null) metrics[name] = { mean, se };
+    }
+    if (Number.isInteger(n) && n > 0 && Object.keys(metrics).length) records.push({task, n, metrics});
   }
-  const n = numeric(rec.n), metrics = {};
-  for (const name of Object.keys(METRICS)) {
-    const mean = numeric(rec[name]);
-    if (mean != null) metrics[name] = { mean, se: null };
-  }
-  if (!rec.task || !Number.isInteger(n) || n < 1 || !Object.keys(metrics).length) return null;
-  return { ...key, task: rec.task, n, metrics };
+  return records;
 }
 function resultsFor(tag) {
-  const merged = new Map();
-  for (const log of companionRuns(tag, 'eval')) {
-    for (const [key, record] of log.extra.downstream || []) merged.set(key, record);
-  }
-  return [...merged.values()];
+  return state.results.files.filter((file) => file.file.startsWith('figures/downstream-') && file.meta?.tag === tag)
+    .flatMap((file) => {
+      const key = resultAddress(file.meta.step, file.meta.mode, file.meta.passes);
+      return key ? taskRecords(file).map((record) => ({...key, ...record})) : [];
+    });
+}
+function baselineColumns() {
+  return state.results.files.filter((file) => file.file.startsWith('figures/baseline/') && typeof file.meta?.model === 'string')
+    .map((file) => ({tag: file.meta.model, baseline: true, color: P.muted,
+      tasks: new Map(taskRecords(file).map((record) => [record.task, record]))}))
+    .filter((column) => column.tasks.size).sort((a, b) => a.tag.localeCompare(b.tag));
 }
 function resultSelection(tag, records) {
   const steps = [...new Set(records.map((r) => r.step))].sort((a, b) => a - b);
@@ -323,7 +319,7 @@ function resultSelection(tag, records) {
   }
   return { steps, selected, current: selected ?? steps.at(-1) ?? null };
 }
-const modeLabel = (r) => r.mode === 'standard' ? 'Standard' : `${r.mode === 'fused' ? 'Fused' : 'Soft'} · ${r.passes} feedback pass${r.passes === 1 ? '' : 'es'}`;
+const modeLabel = (r) => r.baseline ? 'Baseline' : r.mode === 'standard' ? 'Standard' : `${r.mode === 'fused' ? 'Fused' : 'Soft'} · ${r.passes} feedback pass${r.passes === 1 ? '' : 'es'}`;
 function resultColumns(groups) {
   return groups.flatMap((group) => {
     const modes = new Map();
@@ -347,7 +343,7 @@ function resultsHTML(columns) {
   if (!columns.length) return '';
   const tasks = [...new Set(columns.flatMap((column) => [...column.tasks.keys()]))];
   tasks.sort((a, b) => (TASKS.includes(a) ? TASKS.indexOf(a) : TASKS.length) - (TASKS.includes(b) ? TASKS.indexOf(b) : TASKS.length) || a.localeCompare(b));
-  const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)} · step ${count(column.current)}</small><div class="result-metrics result-head"><span title="Accuracy">acc</span><span title="Normalized accuracy">norm</span></div></th>`).join('');
+  const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)}${column.baseline ? '' : ` · step ${count(column.current)}`}</small><div class="result-metrics result-head"><span title="Accuracy">acc</span><span title="Normalized accuracy">norm</span></div></th>`).join('');
   const rows = tasks.flatMap((task) => [['acc', 'acc_norm'], ['ppl']]
     .filter((metrics) => metrics.some((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])))
     .map((metrics) => {
@@ -357,7 +353,7 @@ function resultsHTML(columns) {
       const cells = columns.map((column) => `<td><div class="result-metrics">${metrics.map((metric) => resultCell(column.tasks.get(task), metric)).join('')}</div></td>`).join('');
       return `<tr><th scope="row">${esc(task)}${metrics[0] === 'ppl' ? ' · ppl ↓' : ''}<small${countDetails}>n=${counts.map(count).join(' / ')}</small></th>${cells}</tr>`;
   })).join('');
-  return `<div class="results-scroll"><table class="results" aria-label="Downstream scores across runs"><thead><tr><th scope="col">Task / metric</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div class="results-scroll"><table class="results" aria-label="Downstream scores across runs and baselines"><thead><tr><th scope="col">Task / metric</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 function renderDownstream(views) {
   const groups = views.map((view, index) => {
@@ -370,23 +366,14 @@ function renderDownstream(views) {
     if (downstream.markup.get(id) !== html) { document.getElementById(id).innerHTML = html; downstream.markup.set(id, html); }
   };
   replace('downstream-controls', controls);
-  const columns = resultColumns(groups);
+  const columns = [...resultColumns(groups), ...baselineColumns()];
   replace('downstream-results', resultsHTML(columns));
   const status = [];
-  for (const group of groups) {
-    const logs = companionRuns(group.tag, 'eval');
-    if (!group.records.length) status.push(`${group.tag}: ${logs.length ? 'no downstream scores logged yet.' : 'no eval log.'}`);
-    for (const log of logs) if (log.error) status.push(`${group.tag}: ${log.error}`);
-    // Failed or explicitly skipped evals should remain distinguishable from waiting.
-    for (const log of logs) {
-      const note = log.tail.filter((line) => /skip|smoke|FAILED|Traceback|Error|Killed|OOM/i.test(line)).at(-1);
-      if (note) status.push(`${group.tag}: ${note}`);
-    }
-  }
-  if (columns.length) status.unshift(`${columns.length} run / mode result${columns.length === 1 ? '' : 's'} · updates as tasks finish in the eval log`);
+  for (const group of groups) if (!group.records.length) status.push(`${group.tag}: no saved evaluation results.`);
+  if (state.resultsError) status.push(`Could not load saved evaluations: ${state.resultsError}`);
+  for (const error of state.results.errors) status.push(`${error.file}: could not read result JSON; retrying on refresh.`);
+  if (columns.length) status.unshift(`${columns.length} result columns · updates when result JSON files are saved`);
   document.getElementById('downstream-status').textContent = status.join('\n');
-  const baselines = groups.flatMap((group) => group.records.filter((r) => r.step === group.current && r.against).map((r) => `<tr><th scope="row">${esc(group.tag)}<small>${modeLabel(r)} · step ${count(r.step)}</small></th><td>${esc(r.against)}</td><td>${signed(r.diff * 100, 2)} pp${r.se == null ? '' : ` ± ${(r.se * 100).toFixed(2)}`}<small>z=${signed(r.z, 1)} · positive tasks ${esc(r.positive ?? '–')}</small></td></tr>`));
-  replace('downstream-baselines', baselines.length ? `<p class="section-note">Logged paired baseline comparisons · snapshot minus baseline</p><div class="results-scroll"><table class="results" aria-label="Baseline comparisons"><thead><tr><th>Run / mode</th><th>Baseline</th><th>Pooled accuracy difference</th></tr></thead><tbody>${baselines.join('')}</tbody></table></div>` : '');
 }
 
 // ---------------------------------------------------------------- snapshots
@@ -760,7 +747,7 @@ function render(view) {
 }
 M.configure({
   primaryKind: 'train',
-  companionKinds: ['eval'],
+  resultJSON: true,
   pollSeconds: (view) => {
     const p = pace(view), seconds = p && p.rateRecent > 0 ? 1 / p.rateRecent : NaN;
     return Number.isFinite(seconds) ? Math.ceil(seconds + 1) : 5;
