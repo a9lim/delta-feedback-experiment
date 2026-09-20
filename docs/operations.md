@@ -403,7 +403,6 @@ HBM. Kernel choices are automatic:
 | PKDA WY backward | Autotuned over two to eight warps |
 | MHDB routing backward | Half the forward's warps |
 | Fused Q/K/V convolution | 32-row tiles, autotuned per tile in both directions |
-| PKDA gate cumsum | Retained by a full forward, relaunched by a lean one |
 | PKDA ATK reverse chunk scan | Elementwise carry over 32-wide state slices; its gate gradient runs as its own chunk-parallel pass |
 
 For a single GPU, run the lifecycle script with a fresh tag:
