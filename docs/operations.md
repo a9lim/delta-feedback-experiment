@@ -318,6 +318,16 @@ while it is enabled. **Log y** independently controls positive-valued y axes.
 Layer-site axes, masses, counts, and signed differences retain their linear
 scales where appropriate.
 
+**Scale steps** changes training-step x coordinates to predicted tokens per
+reference active non-embedding parameter, using the same denominator as
+`--tokens-per-param`. Equal token budgets line up across model sizes; a
+100 tok/param run spans four times a 25 tok/param run on the linear axis
+(up to whole-step rounding). Batch size and sequence length enter the
+conversion; feedback passes and loop visits do not. Schedule bands, recurrence
+and fork boundaries, and checkpoint markers use the same conversion. Log x
+can be enabled independently. Layer profiles and eval selectors retain their
+recorded step addresses.
+
 **Downstream** reads only `logs/TAG.eval.log` (including classified
 `TAG.eval.*.log` files), as tasks finish. It does not read saved result JSON
 or inherit a fork parent's scores. A run without an eval log has no downstream

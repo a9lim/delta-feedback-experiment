@@ -12,9 +12,10 @@ const inline = html.slice(html.indexOf("'use strict';"), html.lastIndexOf('</scr
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function monitor() {
+  const scaleSteps = { checked: false };
   const context = vm.createContext({
     console, location: { pathname: '/delta-feedback/', hash: '' },
-    document: { documentElement: {} },
+    document: { documentElement: {}, getElementById: (id) => id === 'scalesteps' ? scaleSteps : null },
     getComputedStyle: () => ({ getPropertyValue: () => '#888888' }),
   });
   vm.runInContext(fs.readFileSync(path.join(shared, 'vendor/uPlot.iife.min.js'), 'utf8'), context);
@@ -22,7 +23,8 @@ function monitor() {
   vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, newRun, configure,'), context);
   vm.runInContext(inline.replace('\nsetupSnapshotControls();\nM.start();', ''), context);
   vm.runInContext("M.configure({onStep, onEval, onRecord, metaEvents: ['run', 'schedule']});", context);
-  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, tokenTotals, downstream, downstreamRecord, resultsFor, resultSelection, resultColumns, resultsHTML, resultCell, tightLogRange})', context);
+  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, downstream, downstreamRecord, resultsFor, resultSelection, resultColumns, resultsHTML, resultCell, tightLogRange})', context);
+  api.scaleSteps = scaleSteps;
   api.read = (tag, log) => {
     api.M.ingest(api.M.runFor(tag), log);
     api.M.rebuildAll();
@@ -278,4 +280,89 @@ test('log axis has finite positive bounds for empty, singleton and normal ranges
     assert.ok(range[0] > 0 && range[1] > range[0]);
     if (lo > 0) assert.ok(range[0] <= lo && range[1] >= hi);
   }
+});
+
+test('scaled trajectories align equal token budgets while preserving fourfold longer runs', () => {
+  const a = monitor();
+  const make = (tag, dim, params, end) => a.read(tag,
+    line('run', { condition: 'f', dim, params, vocab_size: 8, layers: 2, expert_width: 3, expert_routed: 3, expert_top_k: 1, batch_rows: 2, seq_len: 5 }) +
+    line('step', { step: `${end / 2}/${end}`, loss: 4, ntp: 3, pass1: 2, k: 2 }) +
+    line('step', { step: `${end}/${end}`, loss: 3, ntp: 2, pass1: 1, k: 3 }) +
+    line('eval', { step: `${end}/${end}`, val: 2 }));
+  // Reference active counts are 4,000 and 8,000; each update predicts 10 tokens.
+  const views = [make('screen-25', 2, 4124, 10000), make('bridge-25', 4, 8248, 20000), make('screen-100', 2, 4124, 40000)];
+  const original = views.map(a.seriesOf);
+  assert.deepEqual(original.map((s) => s['p-nll'][0].at(-1)), [10000, 20000, 40000]);
+  a.scaleSteps.checked = true;
+  const scaled = views.map(a.seriesOf);
+  assert.deepEqual(scaled.map((s) => s['p-nll'][0].at(-1)), [25, 25, 100]);
+  for (let i = 0; i < views.length; i++) for (const id of Object.keys(original[i])) {
+    assert.deepEqual(plain(scaled[i][id].slice(1)), plain(original[i][id].slice(1)), `${id} values unchanged`);
+    assert.deepEqual(plain(scaled[i][id][0]), plain(original[i][id][0].map((x) => x * a.stepScale(views[i]))), `${id} addresses scaled`);
+  }
+  const joined = a.M.join(scaled.map((s) => s['p-val']));
+  assert.deepEqual(plain(joined), [[25, 100], [2, null], [null, null], [null, null], [2, null], [null, null], [null, null], [null, 2], [null, null], [null, null]]);
+  a.scaleSteps.checked = false;
+  assert.deepEqual(views.map((v) => plain(a.seriesOf(v))), original.map(plain));
+});
+
+test('step scaling matches the schedule denominator for every current scale and condition', () => {
+  const { execFileSync } = require('node:child_process');
+  const geometries = JSON.parse(execFileSync('python', ['-c', `
+import json
+import torch
+from delta_feedback_experiment.model import DeltaModel, condition_config
+from delta_feedback_experiment.train import parse_run_args, model_fields, reference_active
+records = []
+for scale in ('screen', 'bridge', 'flagship', 'extension'):
+    args = parse_run_args(['monitor-check', '--scale', scale])
+    active = reference_active(args)
+    for condition in ('f', 'l', 'fl'):
+        with torch.device('meta'):
+            model = DeltaModel(condition_config(condition, **model_fields(args)))
+        cfg = model.cfg
+        records.append(dict(condition=condition, params=sum(p.numel() for p in model.parameters()),
+            dim=cfg.dim, vocab_size=cfg.vocab_size, layers=cfg.layers, expert_width=cfg.expert_intermediate,
+            expert_routed=cfg.num_routed_experts, expert_top_k=cfg.experts_per_token,
+            batch_rows=args.batch_rows, seq_len=args.seq_len, active=active, scale=scale))
+print(json.dumps(records))
+`], { cwd: root, encoding: 'utf8' }));
+  const a = monitor();
+  a.scaleSteps.checked = true;
+  for (const record of geometries) {
+    const view = a.read(`${record.scale}-${record.condition}`, line('run', record));
+    assert.equal(a.stepScale(view), record.batch_rows * record.seq_len / record.active);
+    record.batch_rows *= 2;
+    const largerBatch = a.read(view.run.tag, line('run', record));
+    assert.equal(a.stepScale(largerBatch), record.batch_rows * record.seq_len / record.active);
+  }
+});
+
+test('scaled bands, fork/recurrence lines and checkpoints preserve raw snapshot selection', () => {
+  const a = monitor();
+  const view = a.read('a', line('run', { condition: 'fl', params: 4126, dim: 2, vocab_size: 8, layers: 2, expert_width: 3, expert_routed: 3, expert_top_k: 1, batch_rows: 2, seq_len: 5 }) +
+    line('schedule', { warmup_steps: 10, preheat_steps: 0, heat_steps: 70, cooldown_steps: 20, recurrence_boundary: 60 }) +
+    line('fork', { step: '40/100', path: 'runs/parent.pt.40' }) + step(100) + route(80, 'L0.attn', 0.2) +
+    line('checkpoint', { step: '80/100', kind: 'snapshot' }));
+  a.reconcileSnapshot(view);
+  a.snapshot.step = 80;
+  const raw = a.stepDecorations(view), profile = plain(a.profileOf(view));
+  a.scaleSteps.checked = true;
+  const factor = a.stepScale(view), scaled = a.stepDecorations(view);
+  assert.deepEqual(plain(scaled.bands), plain(raw.bands.map((b) => ({ ...b, from: b.from * factor, to: b.to * factor }))));
+  assert.deepEqual(plain(scaled.forks.map((f) => f.step)), [0.1, 0.15]);
+  assert.deepEqual(plain(scaled.marks), [0.2]);
+  a.reconcileSnapshot(view);
+  assert.equal(a.snapshot.current, 80);
+  assert.equal(view.snapshots[0], 80);
+  assert.deepEqual(plain(a.profileOf(view)), profile);
+});
+
+test('missing geometry never mixes raw steps into scaled trajectories', () => {
+  const a = monitor(), view = a.read('a', setup('a') + step(1, { loss: 2 }));
+  assert.equal(a.stepScale(view), 1);
+  a.scaleSteps.checked = true;
+  assert.equal(a.stepScale(view), null);
+  assert.ok(Object.values(a.seriesOf(view)).every((data) => data.every((col) => col.length === 0)));
+  assert.deepEqual(plain(a.stepDecorations(view)), { bands: [], forks: [], marks: [] });
 });

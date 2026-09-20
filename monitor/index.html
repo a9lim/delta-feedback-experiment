@@ -116,6 +116,7 @@
   <div class="controls">
     <label title="Logarithmic training-step axis; step zero is omitted and layer sites stay linear"><input type="checkbox" id="logx"> log x</label>
     <label title="Logarithmic scale for positive quantities; masses, counts and signed differences stay linear"><input type="checkbox" id="logy" checked> log y</label>
+    <label title="Plot predicted tokens per reference active parameter, aligning equal token budgets across model sizes"><input type="checkbox" id="scalesteps"> scale steps</label>
     <span>refresh <output id="every">–</output></span>
     <button id="refresh" aria-label="Refresh now" title="Refresh now">↻</button>
   </div>
@@ -127,6 +128,7 @@
   <span id="status" role="status"></span>
 </div>
 <div class="controls" id="run-key" hidden></div>
+<p class="hint" id="scale-note" role="status" hidden></p>
 <div id="banner">Fetch failed — tap to reload the session.</div>
 <div class="tiles" id="tiles"></div>
 <details class="config"><summary>Run configuration <span class="hint">· geometry, optimizer &amp; schedule</span></summary><div class="config-grid" id="config"></div></details>
@@ -207,7 +209,7 @@
 // training observable stays in run.evals so rewinds apply to snapshots and trajectories.
 const { P, hue, num, address, viewOf, overlayTags, fmt, fmtDuration, fmtAge, esc,
         tile, pace, gpuTile, configGroup, scheduleFields, makeChart, setData,
-        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state, runFor, companionRuns } = M;
+        bandsOf, line, dashed, dotted, ref, PTS, join, spanRefs, state, companionRuns } = M;
 const finite = (v) => Number.isFinite(v) ? v : null;
 const signed = (v, digits = 3) => v == null || !Number.isFinite(v) ? '–' : (v > 0 ? '+' : '') + v.toFixed(digits);
 const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).toLocaleString();
@@ -633,16 +635,39 @@ function tightLogRange(u, lo, hi) {
   const [safeLo] = uPlot.rangeLog(lo / 1.15, hi * 1.15, 10, false);
   return [safeLo, hi * 1.15];
 }
+function stepScale(view, enabled = document.getElementById('scalesteps').checked) {
+  if (!enabled) return 1;
+  const setup = view?.run.meta.run;
+  if (!setup || !['f', 'l', 'fl'].includes(setup.condition)) return null;
+  const fields = ['params', 'dim', 'vocab_size', 'layers', 'expert_width', 'expert_routed', 'expert_top_k', 'batch_rows', 'seq_len'];
+  const [params, dim, vocab, layers, width, routed, topK, batch, seq] = fields.map((key) => num(setup[key]));
+  if (![params, dim, vocab, layers, width, routed, topK, batch, seq].every((v) => Number.isSafeInteger(v) && v > 0) || topK > routed) return null;
+  // Match train.reference_active: remove the tied embedding, idle SwiGLU
+  // experts in every trunk bank plus MTP, and the loop-only blank embedding.
+  const inactive = (layers + 1) * (routed - topK) * 3 * dim * width;
+  const active = params - vocab * dim - inactive - (has(view, 'l') ? dim : 0);
+  return active > 0 ? batch * seq / active : null;
+}
+function stepDecorations(view) {
+  const factor = stepScale(view);
+  if (!view || factor == null) return { bands: [], forks: [], marks: [] };
+  return {
+    bands: bandsOf(view.run).map((b) => ({ ...b, from: b.from * factor, to: b.to * factor })),
+    forks: [...view.forks, ...eventLines(view)].map((f) => ({ ...f, step: f.step * factor })),
+    marks: view.snapshots.map((step) => step * factor),
+  };
+}
 function rebuild() {
   const yLog = document.getElementById('logy').checked ? { distr: 3, log: 10, range: tightLogRange } : {};
   const xLog = document.getElementById('logx').checked ? { distr: 3, log: 10, range: tightLogRange } : {};
   const ovs = overlayTags(), unit = { range: [0, 1] };
-  const bands = () => bandsOf(runFor(state.selected));
-  const forks = () => { const view = viewOf(state.selected); return [...(view?.forks ?? []), ...eventLines(view)]; };
+  const decorations = () => stepDecorations(viewOf(state.selected));
+  const bands = () => decorations().bands, forks = () => decorations().forks;
+  const x = document.getElementById('scalesteps').checked ? { label: 'tok/param', value: (u, v) => fmt(v, 4) } : {};
   const perRun = (build) => [...build(P.s1, ovs.length ? ' [1]' : ''), ...ovs.flatMap((tag, i) => build(hue(i), ` [${i + 2}]`))];
   const v3 = { value: (u, v) => fmt(v, 3) }, v0 = { value: (u, v) => count(v) };
   const vs = { value: (u, v) => signed(v, 4), ...PTS };
-  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks, height: 230, xScale: xLog, ...extra });
+  const step = (id, series, extra = {}) => makeChart(id, { series, bands, forks, height: 230, x, xScale: xLog, ...extra });
   const site = (id, series, extra = {}) => makeChart(id, {
     series, sync: 'site', height: 240,
     x: { label: 'site', value: (u, v) => SITES[v]?.name ?? '–' },
@@ -650,7 +675,7 @@ function rebuild() {
     xAxis: siteAxis(), ...extra,
   });
   const points = { points: { size: 4 }, spanGaps: false };
-  step('p-nll', perRun((c, t) => [line(`total${t}`, c), dashed(`pass-1${t}`, c), dotted(`NTP${t}`, c), { ...line(`MTP${t}`, c), dash: [8, 3, 2, 3] }]), { yScale: yLog, marks: () => viewOf(state.selected)?.snapshots ?? [] });
+  step('p-nll', perRun((c, t) => [line(`total${t}`, c), dashed(`pass-1${t}`, c), dotted(`NTP${t}`, c), { ...line(`MTP${t}`, c), dash: [8, 3, 2, 3] }]), { yScale: yLog, marks: () => decorations().marks });
   step('p-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS), dotted(`first column${t}`, c, PTS)]), { yScale: yLog });
   step('p-mtp-val', perRun((c, t) => [line(`pass-1${t}`, c, PTS), dashed(`fused${t}`, c, PTS)]), { yScale: yLog });
   site('p-site-mass', perRun((c, t) => [line(`null${t}`, c, points), dashed(`seed${t}`, c, points), dotted(`prev${t}`, c, points)]), { yScale: unit });
@@ -671,11 +696,12 @@ function rebuild() {
   step('p-recurrence', perRun((c, t) => [line(`k${t}`, c, v0), dashed(`r${t}`, c, v0)]));
 }
 function seriesOf(view) {
-  const steps = view.steps, xs = steps.map((s) => s.step);
+  const factor = stepScale(view);
+  const steps = factor == null ? [] : view.steps, xs = steps.map((s) => s.step * factor);
   const col = (field) => steps.map((s) => s[field] ?? null);
   const ev = (key, ...fields) => {
-    const list = view.evals.get(key) || [];
-    return [list.map((e) => e.step), ...fields.map((f) => list.map((e) => finite(typeof f === 'function' ? f(e) : e[f])))];
+    const list = factor == null ? [] : view.evals.get(key) || [];
+    return [list.map((e) => e.step * factor), ...fields.map((f) => list.map((e) => finite(typeof f === 'function' ? f(e) : e[f])))];
   };
   return {
     'p-nll': [xs, col('loss'), col('pass1'), col('ntp'), col('mtp')],
@@ -702,6 +728,10 @@ function render(view) {
   renderTiles(view);
   renderConfig(view);
   const views = shownViews();
+  const unscaled = views.filter((v) => stepScale(v) == null).map((v) => v.run.tag);
+  const scaleNote = document.getElementById('scale-note');
+  scaleNote.hidden = !unscaled.length;
+  scaleNote.textContent = unscaled.length ? `Step scaling needs complete run geometry; trajectories unavailable for ${unscaled.join(', ')}.` : '';
   const key = document.getElementById('run-key');
   key.hidden = views.length < 2;
   key.innerHTML = views.length < 2 ? '' : views.map((v, i) => `<span style="color:${i === 0 ? P.s1 : hue(i - 1)}">[${i + 1}] ${esc(v.run.tag)}</span>`).join('');
