@@ -251,7 +251,8 @@ test('baselines appear alongside runs and remain when no selected run has saved 
   const groups = [{tag: 'a', current: 9142, color: '#888', records: a.resultsFor('a')}];
   const columns = [...a.resultColumns(groups), ...a.baselineColumns()], html = a.resultsHTML(columns);
   assert.equal(columns.length, 3);
-  assert.match(html, /org\/reference<small>Baseline<\/small>/);
+  assert.match(html, /title="org\/reference"><span class="result-name">reference<\/span>/);
+  assert.match(html, /scope="colgroup" colspan="2"[^>]*><span class="result-name">Baselines<\/span>/);
   assert.match(html, /80.00%/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
@@ -269,6 +270,11 @@ test('cross-run table aligns tasks and modes and keeps missing scores', () => {
   const groups = ['a', 'b', 'no-json'].map((tag) => ({tag, current: 9142, color: '#888', records: a.resultsFor(tag)}));
   const columns = a.resultColumns(groups), html = a.resultsHTML(columns);
   assert.equal(columns.length, 4);
+  assert.equal((html.match(/<span class="result-name">a<\/span>/g) || []).length, 1);
+  assert.equal((html.match(/<span class="result-name">b<\/span>/g) || []).length, 1);
+  assert.equal((html.match(/scope="colgroup" colspan="2"/g) || []).length, 2);
+  assert.match(html, /Fused ×2<\/span>/);
+  assert.match(html, /Fused · 2 feedback passes · step 9,142/);
   assert.doesNotMatch(html, /Δ|no-json/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);

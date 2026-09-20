@@ -77,18 +77,23 @@
   .log { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--grid); }
   .log pre { margin-top: 10px !important; }
   .results-scroll { overflow-x: auto; border: 1px solid var(--grid); border-radius: 8px; }
-  .results { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
-  .results th, .results td { padding: 10px 14px; border-bottom: 1px solid var(--grid); text-align: right; min-width: 155px; }
+  .results { min-width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 11px; line-height: 1.3; font-variant-numeric: tabular-nums; }
+  .results th, .results td { padding: 4px 6px; border-bottom: 1px solid var(--grid); text-align: right; }
   .results th { font-weight: 500; }
-  .results th:first-child { text-align: left; min-width: 165px; position: sticky; left: 0; background: var(--surface); }
-  .results thead th { vertical-align: bottom; overflow-wrap: anywhere; max-width: 240px; }
-  .results small { display: block; font-size: 10px; color: var(--muted); margin-top: 4px; }
-  .result-metrics { display: grid; grid-template-columns: repeat(2, minmax(95px, 1fr)); gap: 18px; }
-  .result-head { margin-top: 14px; color: var(--muted); font-size: 10px; }
-  .results tr:last-child > * { border-bottom: 0; }
-  #downstream-controls { margin: 12px 0; align-items: baseline; }
+  .results .result-task { text-align: left; position: sticky; left: 0; background: var(--surface); z-index: 1; }
+  .results thead th { text-align: center; vertical-align: middle; }
+  .results thead .result-task { z-index: 2; }
+  .results thead tr:not(:last-child) th:not(.result-task) { border-bottom: 0; }
+  .results .result-start { border-left: 1px solid var(--grid); }
+  .result-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .result-task-label { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; white-space: nowrap; }
+  .results small { font-size: 10px; color: var(--muted); font-weight: 400; }
+  .result-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; text-align: right; }
+  .result-head { color: var(--muted); font-size: 10px; }
+  .results tbody tr:last-child > * { border-bottom: 0; }
+  #downstream-controls { margin: 8px 0; align-items: baseline; gap: 6px 14px; }
   #downstream-controls label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; overflow-wrap: anywhere; }
-  #downstream-controls select { font-size: 12px; }
+  #downstream-controls select { font-size: 11px; padding: 2px 5px; }
   #downstream-status { white-space: pre-line; }
   @media (min-width: 1180px) { .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 850px) { .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } .tile .v { font-size: 22px; } }
@@ -148,7 +153,7 @@
   <div id="downstream-controls" class="controls"></div>
   <p id="downstream-status" class="section-note" role="status">No downstream results yet.</p>
   <div id="downstream-results"></div>
-  <p class="section-note">acc / norm: accuracy / normalized accuracy, percent (↑). ppl: perplexity per word (↓). Document counts sit beside each task; hover for details when counts differ. Step choices are independent of the layer slider.</p>
+  <p class="section-note">acc / norm: accuracy / normalized accuracy, % ↑. ppl: perplexity per word ↓. ×: feedback passes. n: documents; hover for differing counts or full identifiers. Step choices are independent of the layer slider.</p>
 </section>
 <section id="anatomy">
   <div class="section-head"><h3>Layer anatomy</h3><p>Eval snapshots · up to two validation rows</p></div>
@@ -343,17 +348,35 @@ function resultsHTML(columns) {
   if (!columns.length) return '';
   const tasks = [...new Set(columns.flatMap((column) => [...column.tasks.keys()]))];
   tasks.sort((a, b) => (TASKS.includes(a) ? TASKS.indexOf(a) : TASKS.length) - (TASKS.includes(b) ? TASKS.indexOf(b) : TASKS.length) || a.localeCompare(b));
-  const header = columns.map((column) => `<th scope="col" style="color:${column.color}">${esc(column.tag)}<small>${modeLabel(column)}${column.baseline ? '' : ` · step ${count(column.current)}`}</small><div class="result-metrics result-head"><span title="Accuracy">acc</span><span title="Normalized accuracy">norm</span></div></th>`).join('');
+  const groups = [];
+  columns.forEach((column, index) => {
+    const key = column.baseline ? 'baselines' : JSON.stringify([column.tag, column.current]);
+    if (groups.at(-1)?.key === key) groups.at(-1).size++;
+    else groups.push({key, column, start: index, size: 1});
+  });
+  const starts = new Set(groups.map((group) => group.start));
+  const edge = (index) => starts.has(index) ? ' class="result-start"' : '';
+  const groupHeaders = groups.map(({column, size}) => {
+    const label = column.baseline ? 'Baselines' : column.tag;
+    const detail = column.baseline ? 'Pretrained reference models' : `${column.tag} · step ${count(column.current)}`;
+    return `<th scope="colgroup" colspan="${size}" class="result-start" style="color:${column.color}" title="${esc(detail)}"><span class="result-name">${esc(label)}</span></th>`;
+  }).join('');
+  const modeHeaders = columns.map((column, index) => {
+    const label = column.baseline ? column.tag.split('/').at(-1) : column.mode === 'standard' ? 'Standard' : `${column.mode === 'fused' ? 'Fused' : 'Soft'} ×${column.passes}`;
+    const detail = column.baseline ? column.tag : `${modeLabel(column)} · step ${count(column.current)}`;
+    return `<th scope="col"${edge(index)} style="color:${column.color}" title="${esc(detail)}"><span class="result-name">${esc(label)}</span></th>`;
+  }).join('');
+  const metricHeaders = columns.map((_, index) => `<th${edge(index)}><div class="result-metrics result-head"><span title="Accuracy, percent ↑">acc</span><span title="Normalized accuracy, percent ↑">norm</span></div></th>`).join('');
   const rows = tasks.flatMap((task) => [['acc', 'acc_norm'], ['ppl']]
     .filter((metrics) => metrics.some((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])))
     .map((metrics) => {
       const observations = columns.filter((column) => metrics.some((metric) => column.tasks.get(task)?.metrics[metric]));
       const counts = [...new Set(observations.map((column) => column.tasks.get(task).n))].sort((a, b) => a - b);
       const countDetails = counts.length > 1 ? ` title="${esc(observations.map((column) => `${column.tag} · ${modeLabel(column)}: n=${count(column.tasks.get(task).n)}`).join('; '))}"` : '';
-      const cells = columns.map((column) => `<td><div class="result-metrics">${metrics.map((metric) => resultCell(column.tasks.get(task), metric)).join('')}</div></td>`).join('');
-      return `<tr><th scope="row">${esc(task)}${metrics[0] === 'ppl' ? ' · ppl ↓' : ''}<small${countDetails}>n=${counts.map(count).join(' / ')}</small></th>${cells}</tr>`;
+      const cells = columns.map((column, index) => `<td${edge(index)}><div class="result-metrics">${metrics.map((metric) => resultCell(column.tasks.get(task), metric)).join('')}</div></td>`).join('');
+      return `<tr><th scope="row" class="result-task"><div class="result-task-label"><span>${esc(task)}${metrics[0] === 'ppl' ? ' · ppl ↓' : ''}</span><small${countDetails}>${counts.length > 1 ? 'n varies' : `n=${count(counts[0])}`}</small></div></th>${cells}</tr>`;
   })).join('');
-  return `<div class="results-scroll"><table class="results" aria-label="Downstream scores across runs and baselines"><thead><tr><th scope="col">Task / metric</th>${header}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  return `<div class="results-scroll"><table class="results" style="width:${180 + columns.length * 104}px" aria-label="Downstream scores across runs and baselines"><colgroup><col style="width:180px"></colgroup>${groups.map((group) => `<colgroup span="${group.size}"></colgroup>`).join('')}<thead><tr><th scope="col" rowspan="3" class="result-task"><div class="result-task-label"><span>Task / metric</span><small>documents</small></div></th>${groupHeaders}</tr><tr>${modeHeaders}</tr><tr>${metricHeaders}</tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 function renderDownstream(views) {
   const groups = views.map((view, index) => {

@@ -334,13 +334,15 @@ recorded step addresses.
 is unnecessary, smoke runs write no results, and a fork does not inherit its
 parent's scores. **Compare runs** places selected runs side by side, with a
 separate checkpoint choice for each run and columns for every saved mode and
-feedback pass count. All saved baselines appear alongside them, labeled by
-model ID, independent of the selected runs.
+feedback pass count beneath one shared run header. Mode labels use × for
+feedback passes. Saved baselines share a **Baselines** header and show only the
+model name; hover reveals the full model ID. Run headers expose the full tag
+and checkpoint on hover, including when a narrow column truncates the label.
 
 Accuracy and normalized accuracy appear side by side beneath compact
 **acc / norm** headers, both as percentages; unreported metrics show a dash.
-Document counts appear beneath each task name. If counts differ across runs,
-modes, or baselines, the row lists the distinct counts and a tooltip identifies
+Document counts sit inline beside each task name. If counts differ across
+runs, modes, or baselines, the row shows **n varies** and a tooltip identifies
 each result's count. LAMBADA perplexity remains per word on its own **ppl** row.
 The table shows saved scores without cross-run deltas; paired comparisons
 remain available through the evaluation CLI. Replacing or deleting a result
