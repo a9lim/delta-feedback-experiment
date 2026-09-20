@@ -162,6 +162,7 @@ def _statistics(rows: Tensor, classifier: Tensor, targets: Tensor, chunk: int):
             logits, targets[start:stop], lse[start:stop], target_logit[start:stop],
             vocab, LSE_BLOCK, num_warps=8,
         )
+        del logits
     return lse - target_logit, lse
 
 
@@ -204,6 +205,7 @@ class _DenseHead(torch.autograd.Function):
             )
             del logits
             _gradient_gemms(gradient, classifier, rows[start:stop], grad_rows[start:stop], target)
+            del gradient
         grad_classifier = None if sink is not None else target.to(classifier.dtype)
         return grad_rows, grad_classifier, None, None, None
 
@@ -223,8 +225,10 @@ def dense_head(
     ``[V, D]`` buffer and the classifier receives no autograd gradient.
     """
     rows = rows.contiguous()
-    targets = targets.contiguous()
-    if not torch.is_grad_enabled() or not rows.requires_grad:
+    targets = targets.reshape(-1).contiguous()
+    if targets.shape[0] != rows.shape[0]:
+        raise ValueError("the head needs one target per readout row")
+    if not torch.is_grad_enabled() or not (rows.requires_grad or classifier.requires_grad):
         with torch.no_grad():
             return _statistics(rows, classifier, targets, chunk)
     return _DenseHead.apply(rows, classifier, targets, sink, chunk)
@@ -251,6 +255,7 @@ class _WeightedDenseHead(torch.autograd.Function):
             )
             del logits
             _gradient_gemms(gradient, classifier, rows[start:stop], grad_rows[start:stop], target)
+            del gradient
         ctx.save_for_backward(grad_rows)
         ctx.grad_classifier = None if sink is not None else target.to(classifier.dtype)
         ctx.grad_scale = grad_scale
@@ -288,7 +293,9 @@ def weighted_dense_head(
     FP32 ``[N]`` tensors.
     """
     rows = rows.contiguous()
-    targets = targets.contiguous()
+    targets = targets.reshape(-1).contiguous()
+    if not targets.shape[0] == rows.shape[0] == weight_nll.shape[0] == weight_z.shape[0]:
+        raise ValueError("the head needs one target and one weight pair per readout row")
     return _WeightedDenseHead.apply(
         rows, classifier, targets, weight_nll.float().contiguous(),
         weight_z.float().contiguous(), sink, float(grad_scale), chunk,

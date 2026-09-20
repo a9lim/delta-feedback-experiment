@@ -61,8 +61,9 @@ def test_dense_head_matches_fp32_autograd(cuda_device, with_sink):
         sink = torch.full(weights.shape, 0.25, device=cuda_device)
     else:
         weights.requires_grad_(True)
-    # A chunk that does not divide the rows exercises the ragged last chunk.
-    nll, lse = dense_head(rows, weights, targets, sink=sink, chunk=128)
+    # A chunk that does not divide the rows exercises the ragged last chunk,
+    # and [heads, rows] targets are the shape head_row_losses hands over.
+    nll, lse = dense_head(rows, weights, targets.view(3, -1), sink=sink, chunk=128)
     ((nll * grad_nll).sum() + (lse * grad_lse).sum()).backward()
 
     torch.testing.assert_close(nll, nll_ref, rtol=1e-4, atol=1e-4)
@@ -115,6 +116,8 @@ def test_dense_head_without_gradients(cuda_device):
         torch.zeros_like(targets, dtype=torch.float),
     )
     with torch.no_grad():
-        nll, lse = dense_head(embeddings.bfloat16(), classifier.bfloat16(), targets)
+        nll, lse = dense_head(
+            embeddings.bfloat16(), classifier.bfloat16(), targets.view(3, -1), chunk=128
+        )
     torch.testing.assert_close(nll, nll_ref, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-4, atol=1e-4)
