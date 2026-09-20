@@ -37,6 +37,8 @@ CANDIDATES = {
     "atk-scan128": "ATK inter-chunk forward scan BK=128, 4 warps; one sweep through the chunks.",
     "intra:BK=../BC=../W=../S=..": "One explicit intra backward launch.",
     "wy:BK=../BV=../W=../S=..": "One explicit WY plus inter backward launch.",
+    "fix:<module>#<kernel>#K=V/..": "One explicit launch for any kernel; W and S name the warps and stages.",
+    "set:<module>#<name>#<int>": "One module constant, for the tile widths a wrapper reads.",
 }
 INPUT_NAMES = (
     "q", "k", "v", "g", "g_atk", "beta_atk", "beta", "A_log", "dt_bias", "log_atk_scale",
@@ -91,7 +93,20 @@ def candidate_launches(name):
         for part in name.split("+"):
             if part == "baseline":
                 continue
-            if part.startswith("intra:"):
+            if part.startswith("fix:"):
+                # fix:fla.ops.kda.gate#kda_gate_bwd_kernel#W=8/S=3/BS=64
+                module, attribute, spec = part.removeprefix("fix:").split("#")
+                meta = {}
+                for item in spec.split("/") if spec else ():
+                    key, value = item.split("=")
+                    key = {"W": "num_warps", "S": "num_stages"}.get(key, key)
+                    meta[key] = int(value)
+                fixed(module, attribute, **meta)
+            elif part.startswith("set:"):
+                # set:fla.ops.precond_kda.chunk_intra#BWD_INTRA_BK#64
+                module, attribute, value = part.removeprefix("set:").split("#")
+                replace(module, attribute, int(value))
+            elif part.startswith("intra:"):
                 # intra:BK=64/BC=16/W=4/S=2 - one explicit intra backward launch.
                 spec = dict(item.split("=") for item in part.removeprefix("intra:").split("/"))
                 module = "fla.ops.precond_kda.chunk_intra"
@@ -290,7 +305,10 @@ def main():
     heads, rows = ([int(value) for value in text.split(",")] for text in (args.heads, args.rows))
     candidates = list(dict.fromkeys(["baseline", *args.candidates.split(",")]))
     for candidate in candidates:
-        parts = [part for part in candidate.split("+") if not part.startswith(("intra:", "wy:"))]
+        parts = [
+            part for part in candidate.split("+")
+            if not part.startswith(("intra:", "wy:", "fix:", "set:"))
+        ]
         if any(part not in CANDIDATES for part in parts) or {"state16", "state32"} <= set(parts):
             parser.error(f"Invalid candidate {candidate!r}; see --describe")
     if min(*heads, *rows, args.length, args.warm, args.repeat) < 1 or args.length % 64:
