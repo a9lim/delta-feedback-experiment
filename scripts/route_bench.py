@@ -63,7 +63,7 @@ def make_case(rows: int, n_bank: int, dtype=torch.bfloat16):
 def launch_geometry(block_k: int | None, warps: int | None, backward=False):
     block_h = 1 << (HEADS - 1).bit_length()
     if block_k is None:
-        block_h, bk, tiles, *picks = ck._route_launch(HEADS, DIM // HEADS)
+        block_h, bk, tiles, *picks = ck._route_launch(HEADS, DIM // HEADS, torch.device("cuda"))
         nw = picks[1] if backward and len(picks) > 1 else picks[0]
         return block_h, bk, tiles, (warps or nw)
     head_dim = DIM // HEADS
