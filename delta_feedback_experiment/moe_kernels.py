@@ -45,10 +45,12 @@ TILE_DACT = (64, 64, 32, 4, 3)
 TILE_DX = (128, 64, 32, 4, 3)
 TILE_DW_GATE = (64, 64, 64, 4, 3)
 TILE_DW_DOWN = (64, 64, 64, 4, 3)
-# GH200 benefits from wider output/reduction tiles in both BF16 dW GEMMs.
-# The activation GEMMs and their FP8 scale boundaries retain their own tiles.
+# Hopper wants wider tiles in both BF16 dW GEMMs. The gate/up gradient,
+# whose reduction runs over the widest operand, keeps the deeper reduction
+# block; the down gradient does better with a square output tile that fits
+# two blocks per multiprocessor.
 TILE_DW_GATE_HOPPER = (64, 128, 128, 4, 3)
-TILE_DW_DOWN_HOPPER = (64, 128, 128, 4, 3)
+TILE_DW_DOWN_HOPPER = (128, 128, 64, 4, 3)
 SWIGLU_BLOCK = 1024
 
 # The FP8 GEMMs read half the bytes per reduction step, so their tiles reach
@@ -58,12 +60,16 @@ TILE_GATE_UP_FP8 = (64, 128, 64, 4, 3)
 TILE_DOWN_FP8 = (64, 64, 64, 4, 3)
 TILE_DACT_FP8 = (64, 64, 64, 4, 3)
 TILE_DX_FP8 = (128, 64, 64, 4, 3)
-# Hopper reaches further along every axis of the FP8 GEMMs: its wider tiles
-# cut the number of times each operand is re-read out of L2, which is what
-# these kernels are bound by at the screen geometry.
+# Measured on an H100 PCIe at the screen geometry (49,152 assignments).
+# The gate/up projection and the input gradient already run near this
+# machine's arithmetic roof and keep their tiles. The down projection wants
+# a wider output tile. The activation gradient is bound by the traffic of
+# its epilogue rather than by operand reuse, so it reaches along the
+# reduction instead: a wider output tile there costs more in registers than
+# the reuse returns.
 TILE_GATE_UP_FP8_HOPPER = (64, 128, 64, 4, 3)
-TILE_DOWN_FP8_HOPPER = (64, 64, 64, 4, 3)
-TILE_DACT_FP8_HOPPER = (64, 64, 64, 4, 3)
+TILE_DOWN_FP8_HOPPER = (64, 128, 64, 4, 3)
+TILE_DACT_FP8_HOPPER = (64, 64, 256, 8, 3)
 TILE_DX_FP8_HOPPER = (128, 64, 64, 4, 3)
 
 # The column span of one gate/up gradient scale. It is the quantization
