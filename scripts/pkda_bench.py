@@ -35,7 +35,7 @@ CANDIDATES = {
     "state32": "Forward/backward state BV=32, 2 warps, 2 stages; fixed narrow baseline.",
     "scan128": "Gate forward scan BS=128, 4 warps; one K tile per chunk/head.",
     "atk-scan128": "ATK inter-chunk forward scan BK=128, 4 warps; one sweep through the chunks.",
-    "intra:BK=../BC=../DIAG=../W=../S=..": "One explicit intra backward launch; DIAG is the diagonal column group.",
+    "intra:BK=../BC=../W=../S=..": "One explicit intra backward launch.",
     "wy:BK=../BV=../W=../S=..": "One explicit WY plus inter backward launch.",
 }
 INPUT_NAMES = (
@@ -92,13 +92,12 @@ def candidate_launches(name):
             if part == "baseline":
                 continue
             if part.startswith("intra:"):
-                # intra:BK=64/BC=16/DIAG=8/W=4/S=2 - one explicit intra backward launch.
+                # intra:BK=64/BC=16/W=4/S=2 - one explicit intra backward launch.
                 spec = dict(item.split("=") for item in part.removeprefix("intra:").split("/"))
                 module = "fla.ops.precond_kda.chunk_intra"
                 replace(module, "BWD_INTRA_BK", int(spec["BK"]))
                 fixed(module, "chunk_precond_kda_bwd_kernel_intra",
-                      BC=int(spec["BC"]), DIAG_J=int(spec["DIAG"]),
-                      num_warps=int(spec["W"]), num_stages=int(spec["S"]))
+                      BC=int(spec["BC"]), num_warps=int(spec["W"]), num_stages=int(spec["S"]))
             elif part.startswith("wy:"):
                 # wy:BK=64/BV=128/W=4/S=2 - one explicit WY+inter backward launch.
                 spec = dict(item.split("=") for item in part.removeprefix("wy:").split("/"))
