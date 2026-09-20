@@ -35,10 +35,12 @@ CHUNK_SIZE = 64
 CONV_TILE = 32
 """The row tile the fused Q/K/V convolution walks, independent of the chunk.
 
-The backward recomputes the SiLU derivative for its tile plus the convolution
-halo and holds it in registers, so the tile trades halo overhead against
-occupancy. On an H100 PCIe at the screen shape this tile runs the backward
-0.558 ms against 0.590 ms at 64; 128 costs 0.750 ms and 256 spills.
+Each tile reloads the convolution's ``W - 1`` row halo, and the backward also
+recomputes the SiLU derivative for its tile plus that halo and holds it in
+registers, so the tile trades halo overhead against occupancy. On an H100 PCIe
+at the screen shape this tile runs the forward 0.215 ms against 0.218 ms at 16
+and 0.224 ms at 64, and the backward 0.504 ms against 0.523 ms at 16 and 0.548
+ms at 64; 256 spills.
 """
 
 PKDA_INTERMEDIATES = (
