@@ -74,6 +74,17 @@ CANDIDATES = {
 }
 
 
+def _git(*arguments: str) -> str:
+    """The repository's state, or an empty record when run from a plain copy.
+
+    Rented machines take an rsync of the checkout without its history.
+    """
+    try:
+        return subprocess.check_output(["git", *arguments], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
 def tile_targets(capability):
     """Keep candidate names conceptual while patching the effective device tiles."""
     targets = {key: key for key in TILE_NAMES}
@@ -456,10 +467,8 @@ def main():
         },
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "git_status": subprocess.check_output(["git", "status", "--short"], text=True),
-        "git_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "git_status": _git("status", "--short"),
+        "git_revision": _git("rev-parse", "HEAD").strip(),
         "seed": args.seed,
         "cases": [],
         "timing_scope": "CUDA graph of six GEMMs plus SwiGLU/combine; excludes dispatch, external FP8 copies, sink zeroing",
