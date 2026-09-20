@@ -9,6 +9,7 @@ checkpoints.
 
 | Condition | Feedback between positions | Looped columns per position | Token side of a re-entry |
 |---|---|---|---|
+| `n` | Disabled | One | — |
 | `f` (default) | Enabled | One | — |
 | `l` | Disabled | Sampled during training | Blank embedding |
 | `v` | Disabled | Sampled during training | The position's own token |
@@ -27,8 +28,11 @@ re-entry is the feedback entry of a chain that repeats every token once, the
 payload carries only what the token does not, and the blank payload is an
 in-distribution null under which a later column repeats the first. Shared
 parameters initialize identically at a given `--seed`; at one column, `fl`
-and `fv` have the values and gradients of `f`. These conditions omit a
-no-recurrence control.
+and `fv` have the values and gradients of `f`. `n` selects neither axis and
+is the no-recurrence control: every update and evaluation is the plain column
+that each condition trains through its recurrence boundary, seeded by fusing
+the token with the blank payload. It has `f`'s parameters and trains as `f`
+with `--recurrence-start 1`.
 
 ## Data
 
@@ -83,7 +87,7 @@ training randomness seed.
 
 Let `k` be feedback passes and `r` columns per pass. Through step
 `round(recurrence_start * steps)`, every condition executes `(k,r) = (1,1)`.
-Every subsequent step draws one shared shape:
+Every subsequent step draws one shared shape, which `n` projects to `(1,1)`:
 
 | Draw | Probability | `f`: `(k,r)` | `l`, `v`: `(k,r)` | `fl`, `fv`: `(k,r)` |
 |---|---:|---|---|---|
@@ -95,6 +99,8 @@ The draw is shared across the whole optimizer step and all scales. Thus
 passes and columns are coupled, never independent; each enabled axis takes
 two or three on rolled steps. `--three-rate` must be at most 0.5.
 `--recurrence-start` defaults to 0.75; setting it to zero rolls from step 1.
+Under `n` it rolls nothing but still places the protected boundary snapshot,
+so `n` forks to and from the conditions that roll.
 Compute expectations are in [scaling](scaling.md#loop-compute-and-decode-state).
 
 Every feedback pass after the first draws a separate plain-prefix length
@@ -120,7 +126,8 @@ column, then over columns. On rolled `fl` or `fv` steps this assigns one unit of
 weight to each of four groups: the plain first column, later columns of
 pass 1, column 1 of later passes, and later columns of later passes. It
 does not average the four groups into one unit. With a single recurrence
-axis, the corresponding two groups each receive one unit.
+axis, the corresponding two groups each receive one unit; `n` trains only
+the plain first column.
 
 ```text
 loss = combine(CE_ntp) + mtp_weight * combine(CE_mtp)
@@ -176,7 +183,8 @@ flag reference.
 Evaluation uses the first `--eval-rows` validation rows (default 128), no
 jitter, and unregularized per-head cross-entropy. For looped conditions,
 `--loop-iterations` sets a fixed evaluation/decode count in `1..3`, default
-2; it does not control training draws. `f` always uses one column per pass.
+2; it does not control training draws. `f` and `n` always use one column
+per pass.
 
 | Metric | Measurement |
 |---|---|
@@ -188,8 +196,9 @@ jitter, and unregularized per-head cross-entropy. For looped conditions,
 
 Generation uses the main next-token head. **Standard** prefills and decodes
 without feedback; **Soft** prefills plainly and uses feedback during decode;
-**Fused** adds a fused prompt pass before feedback decode. Looped conditions
-use their configured columns in each mode. The [analysis guide](interpretability.md)
+**Fused** adds a fused prompt pass before feedback decode. Conditions
+without `f` run Standard only. Looped conditions use their configured
+columns in each mode. The [analysis guide](interpretability.md)
 distinguishes sequential generation from downstream teacher-forced scoring.
 
 Compare conditions on matching source, rows, initialization and data seeds,

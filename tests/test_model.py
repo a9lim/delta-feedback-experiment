@@ -47,9 +47,18 @@ def tokens():
 
 
 def test_condition_letters_name_one_feedback_and_one_loop_choice():
-    for text, canonical in (("f", "f"), ("lf", "fl"), ("vf", "fv"), ("v", "v")):
+    for text, canonical in (("n", "n"), ("f", "f"), ("lf", "fl"), ("vf", "fv"), ("v", "v")):
         assert parse_condition(text) == canonical
         assert condition_config(text).condition == canonical
+    # ``n`` names the empty letter set: one plain column, one pass.
+    null = condition_config("n")
+    assert not (null.feedback or null.loop)
+    assert ModelConfig(feedback=False).condition == "n"
+    with pytest.raises(ValueError, match="multi-pass batches require"):
+        multipass(tiny("n"), tokens(), 2)
+    for text in ("nf", "fn", "nl", "nn"):
+        with pytest.raises(ValueError, match="not n alone"):
+            parse_condition(text)
     looping = {c: condition_config(c) for c in ("l", "v", "fl", "fv")}
     assert all(cfg.loop for cfg in looping.values())
     assert not condition_config("f").loop
@@ -155,7 +164,7 @@ def separate_expert_selection(model):
 
 
 def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
-    conditions = ("f", "l", "fl", "v", "fv")
+    conditions = ("f", "l", "fl", "v", "fv", "n")
     states = [tiny(condition, layers=16).state_dict() for condition in conditions]
     common = set.intersection(*(set(state) for state in states))
     assert "payload_router.query" in common and "payload_norm.weight" in common
@@ -167,8 +176,9 @@ def test_payload_and_auxiliary_initialization_pair_across_all_conditions():
     assert ["blank_embedding" in state for state in states] == [
         "l" in condition for condition in conditions
     ]
-    # ``v`` re-enters with the token itself, so it is ``f``'s parameter set.
-    assert states[0].keys() == states[3].keys() == states[4].keys()
+    # ``v`` re-enters with the token itself and ``n`` never re-enters, so each
+    # is ``f``'s parameter set.
+    assert states[0].keys() == states[3].keys() == states[4].keys() == states[5].keys()
     projection = states[0]["fuse_proj.weight"]
     assert projection.shape == (TINY["dim"], 2 * TINY["dim"])
     torch.testing.assert_close(

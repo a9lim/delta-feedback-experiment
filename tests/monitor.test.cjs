@@ -61,6 +61,7 @@ test('condition panels and recurrence remain visible for token loops and mixed o
     [['v'], false, true], [['fv'], true, true], [['f'], true, false],
     [['l'], false, true], [['fl'], true, true],
     [['f', 'v'], true, true], [['v', 'f'], true, true], [['f'], true, false],
+    [['n'], false, false], [['n', 'l'], false, true],
   ]) {
     a.renderConditions(conditions.map((condition) => a.read(condition, setup(condition, condition))));
     for (const gate of gates) {
@@ -476,7 +477,7 @@ records = []
 for scale in ('screen', 'bridge', 'flagship', 'extension'):
     args = parse_run_args(['monitor-check', '--scale', scale])
     active = reference_active(args)
-    for condition in ('f', 'l', 'fl', 'v', 'fv'):
+    for condition in ('n', 'f', 'l', 'fl', 'v', 'fv'):
         with torch.device('meta'):
             model = DeltaModel(condition_config(condition, **model_fields(args)))
         cfg = model.cfg
@@ -499,10 +500,13 @@ print(json.dumps(records))
 
 test('scaled bands, fork/recurrence lines and checkpoints preserve raw snapshot selection', () => {
   const a = monitor();
-  const view = a.read('a', line('run', { condition: 'fl', params: 4126, dim: 2, vocab_size: 8, layers: 2, expert_width: 3, expert_routed: 3, expert_top_k: 1, batch_rows: 2, seq_len: 5 }) +
+  const log = (condition) => line('run', { condition, params: 4126, dim: 2, vocab_size: 8, layers: 2, expert_width: 3, expert_routed: 3, expert_top_k: 1, batch_rows: 2, seq_len: 5 }) +
     line('schedule', { warmup_steps: 10, preheat_steps: 0, heat_steps: 70, cooldown_steps: 20, recurrence_boundary: 60 }) +
     line('fork', { step: '40/100', path: 'runs/parent.pt.40' }) + step(100) + route(80, 'L0.attn', 0.2) +
-    line('checkpoint', { step: '80/100', kind: 'snapshot' }));
+    line('checkpoint', { step: '80/100', kind: 'snapshot' });
+  // n pairs at the boundary without rolling, so it keeps the fork line only.
+  assert.deepEqual(plain(a.stepDecorations(a.read('n', log('n'))).forks.map((f) => f.step)), [40]);
+  const view = a.read('a', log('fl'));
   a.reconcileSnapshot(view);
   a.snapshot.step = 80;
   const raw = a.stepDecorations(view), profile = plain(a.profileOf(view));

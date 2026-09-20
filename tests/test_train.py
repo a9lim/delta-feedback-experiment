@@ -302,7 +302,7 @@ def test_keyed_schedule_draws_are_reproducible():
         assert roll == draw_recurrence(args, step, args.steps)
         assert roll in {(1, 1), (2, 2), (3, 2), (2, 3)}
         # Every condition projects the same roll onto the letters it has.
-        for condition in ("f", "l", "fl", "v", "fv"):
+        for condition in ("n", "f", "l", "fl", "v", "fv"):
             cfg = condition_config(condition)
             passes, iterations = step_shape(args, step, args.steps, cfg)
             assert passes == (roll[0] if cfg.feedback else 1)
@@ -399,6 +399,8 @@ def test_reachable_graphs_cover_every_rolled_shape_without_cuda():
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(1, 2), GraphSpec(1, 3),
     ]
+    runner.model.cfg = replace(runner.model.cfg, loop_token=False)
+    assert runner._reachable_specs(schedule) == [GraphSpec(1, 1)]
 
 
 @pytest.mark.parametrize("depth", [0, 4])
@@ -732,17 +734,9 @@ def test_input_bytes_counts_tokens_prefix_and_both_jitters():
     )
 
 
-@pytest.mark.parametrize(
-    "source,target",
-    [("f", "fl"), ("f", "l"), ("fl", "f"), ("f", "v"), ("fl", "fv")],
-    ids=["f-fl", "f-l", "fl-f", "f-v", "fl-fv"],
-)
-def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source, target):
-    """Before the recurrence boundary every condition is one trajectory, so a
-    fork from the source's boundary snapshot finishes as the target condition
-    trained from scratch: values, optimizer state, and evaluation alike."""
-    from delta_feedback_experiment import train as trainer
-
+def tiny_run(tmp_path):
+    """Flags for a four-step CPU run on a fresh synthetic store, with the
+    recurrence boundary at step 2 and a snapshot every step."""
     write_synthetic(
         tmp_path / "data" / DEFAULT_SOURCE, train_tokens=80, val_tokens=20, vocab=31
     )
@@ -773,9 +767,43 @@ def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source,
         "snapshot-every": 1,
         "device": "cpu",
     }
-    flags = [
-        item for key, value in settings.items() for item in (f"--{key}", str(value))
-    ]
+    return [item for key, value in settings.items() for item in (f"--{key}", str(value))]
+
+
+def test_null_condition_trains_as_f_whose_roll_never_begins(tmp_path):
+    """``n`` runs every update and evaluation as the plain column each
+    condition trains before its boundary, so it is ``f`` at recurrence start
+    1: the same losses, values, and optimizer state, less the fused readout."""
+    from delta_feedback_experiment import train as trainer
+
+    flags = tiny_run(tmp_path)
+    null = trainer.train(["null", *flags, "--condition", "n"])
+    never = trainer.train(["never", *flags, "--condition", "f", "--recurrence-start", "1"])
+    metrics = [key for key in null if key in ("step", "loss") or key.startswith("val")]
+    assert {"step", "loss", "val", "val_mtp"} <= set(metrics)
+    assert not any("fused" in key for key in metrics) and "val_fused" in never
+    for key in metrics:
+        assert null[key] == never[key], key
+    plain = trainer.read_checkpoint(tmp_path / "runs/null.pt.4")
+    unrolled = trainer.read_checkpoint(tmp_path / "runs/never.pt.4")
+    assert plain["args"]["condition"] == "n"
+    assert_identical(plain["state"], unrolled["state"])
+    assert_identical(plain["optimizer"], unrolled["optimizer"])
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [("f", "fl"), ("f", "l"), ("fl", "f"), ("f", "v"), ("fl", "fv"), ("f", "n"), ("n", "fl")],
+    ids=["f-fl", "f-l", "fl-f", "f-v", "fl-fv", "f-n", "n-fl"],
+)
+def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source, target):
+    """Before the recurrence boundary every condition is one trajectory, so a
+    fork from the source's boundary snapshot finishes as the target condition
+    trained from scratch: values, optimizer state, and evaluation alike. ``n``
+    never rolls but keeps the boundary snapshot, so it forks both ways."""
+    from delta_feedback_experiment import train as trainer
+
+    flags = tiny_run(tmp_path)
     scratch = trainer.train(["scratch", *flags, "--condition", target])
     trainer.train(["source", *flags, "--condition", source])
     # Retention kept the boundary snapshot beside the latest two.

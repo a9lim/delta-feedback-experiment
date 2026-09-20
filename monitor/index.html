@@ -231,8 +231,9 @@ const loops = (view) => has(view, 'lv');
 const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
 function eventLines(view) {
   if (!view) return [];
+  // n keeps the boundary only to pair with the rolling conditions; nothing rolls.
   const b = num(view.run.meta.schedule?.recurrence_boundary);
-  return b > 0 && b < view.total ? [{ label: 'roll →', step: b }] : [];
+  return has(view, 'flv') && b > 0 && b < view.total ? [{ label: 'roll →', step: b }] : [];
 }
 
 function onStep(run, rec) {
@@ -696,7 +697,7 @@ function tightLogRange(u, lo, hi) {
 function stepScale(view, enabled = document.getElementById('scalesteps').checked) {
   if (!enabled) return 1;
   const setup = view?.run.meta.run;
-  if (!setup || !['f', 'l', 'fl', 'v', 'fv'].includes(setup.condition)) return null;
+  if (!setup || !['n', 'f', 'l', 'fl', 'v', 'fv'].includes(setup.condition)) return null;
   const fields = ['params', 'dim', 'vocab_size', 'layers', 'expert_width', 'expert_routed', 'expert_top_k', 'batch_rows', 'seq_len'];
   const [params, dim, vocab, layers, width, routed, topK, batch, seq] = fields.map((key) => num(setup[key]));
   if (![params, dim, vocab, layers, width, routed, topK, batch, seq].every((v) => Number.isSafeInteger(v) && v > 0) || topK > routed) return null;

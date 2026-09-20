@@ -50,6 +50,8 @@ from .model import (
     EXPERT_BIAS_RATE,
     LOOP_MAX_ITERATIONS,
     MTP_LOSS_WEIGHT,
+    NULL_CHANGE,
+    NULL_CONDITION,
     DeltaModel,
     combine_column_losses,
     condition_config,
@@ -253,13 +255,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--condition",
         type=condition,
         default="f",
-        metavar="{f,l,v,fl,fv}",
+        metavar="{n,f,l,v,fl,fv}",
         help=(
-            "feedback (f), looped depth (l or v), or feedback with either "
-            "(fl, fv); default f: "
+            "no recurrence (n), feedback (f), looped depth (l or v), or "
+            "feedback with either (fl, fv); default f: "
             + "; ".join(
-                f"{letter} = {change}"
-                for letter, (_, change) in CONDITION_LETTERS.items()
+                [f"{NULL_CONDITION} = {NULL_CHANGE}"]
+                + [
+                    f"{letter} = {change}"
+                    for letter, (_, change) in CONDITION_LETTERS.items()
+                ]
             )
         ),
     )
@@ -363,7 +368,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "fraction of steps before the recurrence roll begins; every earlier "
             "step is one plain column and every later step rolls two or three "
-            "passes (f) and two or three columns per pass (l); --resume may "
+            "passes (f) and two or three columns per pass (l or v), while n "
+            "stays one plain column and keeps the boundary only to pair with "
+            "the conditions that roll; --resume may "
             "increase this fraction while the saved step is at or before the "
             "old boundary"
         ),
@@ -427,7 +434,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, LOOP_MAX_ITERATIONS + 1),
         default=DEFAULT_LOOP_ITERATIONS,
         help=(
-            "l: fixed evaluation/decode columns per position (default: 2); "
+            "l or v: fixed evaluation/decode columns per position (default: 2); "
             "training draws two or three from the recurrence roll"
         ),
     )
@@ -608,8 +615,9 @@ def draw_recurrence(args, step: int, total: int) -> tuple[int, int]:
     lands on three passes at two columns with probability ``three_rate``, on
     three columns at two passes with the same probability, and otherwise on
     two and two. ``f`` reads the pass count, ``l`` or ``v`` the column count,
-    and ``fl`` or ``fv`` both, so the conditions align step by step, and the
-    pass projection is the feedback draw of a condition that does not loop.
+    ``fl`` or ``fv`` both, and ``n`` neither, so the conditions align step by
+    step, and the pass projection is the feedback draw of a condition that
+    does not loop.
     """
     if step <= recurrence_boundary(args, total):
         return 1, 1

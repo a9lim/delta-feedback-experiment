@@ -107,12 +107,12 @@ A step with `p` passes and `r` columns per pass executes `pr` columns,
 `4pr` cells, and `16pr` trunk layers per token position. The
 [recurrence roll](design.md#the-recurrence-roll) gives these expectations:
 
-| Quantity | `f` | `l`, `v` | `fl`, `fv` |
-|---|---:|---:|---:|
-| Mean columns per position on rolled steps | 2.12 | 2.12 | 4.48 |
-| Maximum columns per position on rolled steps | 3 | 3 | 6 |
-| Mean columns per position over the default schedule | 1.28 | 1.28 | 1.87 |
-| Columns per pass in evaluation/decode | 1 | 2 | 2 |
+| Quantity | `n` | `f` | `l`, `v` | `fl`, `fv` |
+|---|---:|---:|---:|---:|
+| Mean columns per position on rolled steps | 1 | 2.12 | 2.12 | 4.48 |
+| Maximum columns per position on rolled steps | 1 | 3 | 3 | 6 |
+| Mean columns per position over the default schedule | 1 | 1.28 | 1.28 | 1.87 |
+| Columns per pass in evaluation/decode | 1 | 1 | 2 | 2 |
 
 For looped conditions, a rolled pass averages 33.92 executed trunk layers; fixed
 evaluation/decode uses 32, and a three-column pass uses 48.
@@ -162,7 +162,8 @@ before the optimizer step:
 | Flagship | 15.18 | 30.69 / 49.99 | 66.56 / 103.00 / 103.12 | 33.00 / 75.32 |
 
 Rolled means weight each shape by its roll probability: 0.88 / 0.12 for `f`'s
-two and three passes, and 0.76 / 0.12 / 0.12 for `fl` and `fv`. The planner
+two and three passes, and 0.76 / 0.12 / 0.12 for `fl` and `fv`; `n` runs
+`(1,1)` on every step. The planner
 narrows replays as scale grows: `(2,2)` runs four, two, then one row per
 replay. Flagship's six-column graphs keep lean intermediates and recompute
 five blocks. Extension does not fit one 80 GB card; see the memory boundary

@@ -216,7 +216,8 @@ from scratch, to the run's numerical floor, without repeating the shared
 steps. Every other state-defining setting is inherited, and typing a
 different one is refused, as is a fork that changes nothing. A parameter only one condition owns
 (`l`'s blank embedding) is still at its initialization with zero moments
-there, so the fork adds or drops it exactly; `v` has `f`'s parameter set. Recurrence can start no earlier
+there, so the fork adds or drops it exactly; `v` and `n` have `f`'s parameter set.
+`n` never rolls but still keeps its boundary snapshot, so it forks both ways. Recurrence can start no earlier
 than the source's retained snapshots allow. The `fork` record names the
 source snapshot and the changed settings, and the monitor draws the source's
 log up to that step as the fork's own history.

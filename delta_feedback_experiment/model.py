@@ -5,8 +5,9 @@ layers of each four-layer cell, with NoPE gated GQA in the fourth, MHDB reads
 before every sublayer, MoE channel mixers, and sequential two-token prediction.
 ``f`` adds FBT feedback; ``l`` and ``v`` re-enter the whole column through
 the same fusion, iterated per column: ``l`` fuses its own payload with a
-learned blank embedding, ``v`` with the position's own token again. At least
-one recurrence must be selected, and at most one of ``l`` and ``v``.
+learned blank embedding, ``v`` with the position's own token again. At most
+one of ``l`` and ``v`` is selected; ``n`` selects neither recurrence, the
+plain column every condition trains before its recurrence boundary.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired conditions
 architecturally identical in everything but the flags.
@@ -100,17 +101,39 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
 }
 """Letter -> (``ModelConfig`` flag, one-line change), in canonical order."""
 
+NULL_CONDITION = "n"
+"""The name of the condition with none of the letters.
+
+Every update and evaluation is one plain column seeded by the shared fusion
+of the token with the blank payload, which is every condition's update before
+its recurrence boundary, so ``n`` trains as ``f`` whose roll never begins."""
+
+NULL_CHANGE = (
+    "no recurrence: every column is plain, fusing the raw token embedding "
+    "with the blank payload"
+)
+"""``n``'s one-line change, in the form of ``CONDITION_LETTERS``."""
+
 
 def parse_condition(text: str) -> str:
-    """Accept ``f``, one of ``l`` and ``v``, or ``f`` with one of them, in
-    either order; reject an empty condition."""
+    """Accept ``n`` alone, or ``f``, one of ``l`` and ``v``, or ``f`` with
+    one of them, in either order; reject an empty condition."""
+    if text == NULL_CONDITION:
+        return text
     if not text:
-        raise ValueError("condition must contain f, one of l and v, or f with one of them")
+        raise ValueError(
+            "condition must be n, or contain f, one of l and v, or f with one of them"
+        )
+    if NULL_CONDITION in text:
+        raise ValueError(
+            f"condition {text!r} is not n alone; n names the condition "
+            "without any letters and takes none beside it"
+        )
     unknown = sorted(set(text) - set(CONDITION_LETTERS))
     if unknown:
         raise ValueError(
             f"unknown condition letters {''.join(unknown)!r} in {text!r}; "
-            f"expected letters from {''.join(CONDITION_LETTERS)!r}"
+            f"expected n or letters from {''.join(CONDITION_LETTERS)!r}"
         )
     if len(set(text)) != len(text):
         raise ValueError(f"repeated letter in condition {text!r}")
@@ -224,11 +247,6 @@ class ModelConfig:
     the recurrence roll, independently of this count."""
 
     def __post_init__(self) -> None:
-        if not (self.feedback or self.loop):
-            raise ValueError(
-                "condition must enable feedback (f), looping (l or v), or "
-                "feedback with looping"
-            )
         if self.loop_blank and self.loop_token:
             raise ValueError("a condition loops with l or with v, not both")
         validate_expert_geometry(
@@ -256,12 +274,13 @@ class ModelConfig:
 
     @property
     def condition(self) -> str:
-        """The canonical letters of this configuration."""
-        return "".join(
+        """The canonical letters of this configuration, ``n`` for none."""
+        letters = "".join(
             letter
             for letter, (flag, _) in CONDITION_LETTERS.items()
             if getattr(self, flag)
         )
+        return letters or NULL_CONDITION
 
     @property
     def mup_ratio(self) -> float:
