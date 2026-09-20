@@ -402,6 +402,9 @@ HBM. Kernel choices are automatic:
 | PKDA ATK inter-chunk scan at head width 128 | `BK=128`, four warps |
 | PKDA WY backward | Autotuned over two to eight warps |
 | MHDB routing backward | Half the forward's warps |
+| Fused Q/K/V convolution | 32-row tiles, autotuned per tile in both directions |
+| PKDA gate cumsum | Retained by a full forward, relaunched by a lean one |
+| PKDA ATK reverse chunk scan | Elementwise carry over 32-wide state slices; its gate gradient runs as its own chunk-parallel pass |
 
 For a single GPU, run the lifecycle script with a fresh tag:
 
@@ -447,7 +450,7 @@ for process-local comparisons.
 | Script | Measurement |
 |---|---|
 | `attention_bench.py` | Attention backend, outputs/gradients, graph capture |
-| `pkda_bench.py` | PKDA head counts, recurrence saving modes, input gradients |
+| `pkda_bench.py` | PKDA head counts, recurrence saving modes, input gradients; `fix:`/`set:` candidates pin any kernel's launch or a wrapper's tile |
 | `moe_bench.py` | Balanced/skewed routing and expert GEMM tiles |
 | `cce_bench.py` | CCE configurations off Hopper; use twice the replay rows for paired NTP/MTP |
 | `route_bench.py` | MHDB routing forward/backward over the screen site profile |
