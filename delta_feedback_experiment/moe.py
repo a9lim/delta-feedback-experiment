@@ -151,15 +151,20 @@ class MixtureOfExperts(nn.Module):
         # controller receives detached counts and never runs in this forward.
         # V3's sequence auxiliary uses affinity-only choices, independently
         # of the bias-controlled dispatch decisions used by the controller.
-        # Only membership in the affinity-only top-k matters here, and the
-        # comparison below is order-blind, so this selection skips the ranking
-        # sort that the dispatch-order selection above needs.
-        auxiliary_selection = (
-            affinities.topk(
-                self.experts_per_token, dim=-1, sorted=False
-            ).indices.unsqueeze(-1)
-            == experts
-        ).sum(dim=1)
+        # Only membership in the affinity-only top-k matters here, so this
+        # selection counts ranks instead of selecting them: an expert belongs
+        # when fewer than ``experts_per_token`` experts outrank it, equal
+        # affinities ordered by index so exactly that many always qualify.
+        # Over one bank that is a small reduction the block's own graph fuses,
+        # rather than a device-wide selection of its own; only exactly tied
+        # affinities fall differently from a selection's arbitrary order.
+        outranked = affinities.unsqueeze(-1) < affinities.unsqueeze(-2)
+        tied_earlier = (affinities.unsqueeze(-1) == affinities.unsqueeze(-2)) & (
+            experts < experts.unsqueeze(-1)
+        )
+        auxiliary_selection = (outranked | tied_earlier).sum(
+            dim=-1
+        ) < self.experts_per_token
         length = x.shape[-2] if x.ndim >= 2 else 1
         sequence_probabilities = probabilities.reshape(-1, length, self.num_routed_experts)
         fractions = (
