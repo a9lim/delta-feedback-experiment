@@ -478,6 +478,9 @@ has moved is rescored. The snapshot's own results are written first. Each
 mode prints a paired table and a `downstream` record with `against=MODEL` and
 the pooled accuracy difference, snapshot minus baseline.
 
+Reference tokenization preserves a model's native beginning-of-sequence token
+(including Gemma's tokenizer post-processor) without appending an end token.
+
 ## Conversation formatting
 
 ```python
