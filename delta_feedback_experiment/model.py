@@ -2188,21 +2188,22 @@ def weighted_head_loss(
     weight_nll: Tensor,
     weight_z: Tensor,
     *,
-    grad_scale: float = 1.0,
+    grad_scale: float | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """``(sum(w_nll * nll + w_z * lse^2), nll, lse)`` through the tied readout.
 
     The weights are FP32 over the heads' rows in order, ``[heads * B * T]``;
-    ``nll`` and ``lse`` come back ``[heads, B, T]``. A Hopper training call
-    runs the dense head, which applies the objective's gradient during its
-    forward for an incoming gradient of exactly ``grad_scale`` and returns
-    detached statistics; every other call forms the same sum over
-    ``head_row_losses`` with ordinary autograd.
+    ``nll`` and ``lse`` come back ``[heads, B, T]``. A trainer that will
+    back-propagate exactly ``grad_scale`` into the sum passes it; on Hopper
+    that call runs the dense head, which applies the objective's gradient
+    during its forward and returns detached statistics. Every other call
+    forms the same sum over ``head_row_losses`` with ordinary autograd.
     """
     shape = (len(hiddens), *targets[0].shape)
     main = hiddens[0]
     if (
-        main.is_cuda
+        grad_scale is not None
+        and main.is_cuda
         and torch.is_grad_enabled()
         and main.requires_grad
         and dense_head_device(main.device)
@@ -2230,7 +2231,7 @@ def multipass_loss(
     *,
     z_coef: float | Tensor = 0.0,
     mtp_weight: float = MTP_LOSS_WEIGHT,
-    grad_scale: float = 1.0,
+    grad_scale: float | None = None,
 ) -> LossOutput:
     """FBT Eq. 12 with λ=1 along passes and again along columns, plus (in
     cooldown) the z-loss under the same weighting: ``combine_column_losses``
@@ -2248,9 +2249,10 @@ def multipass_loss(
     The objective is assembled row by row: each column's head call receives
     every row's weight (its column's combine coefficient, the row mean, the
     MTP weight, the z-loss coefficient), which lets the Hopper head apply
-    its gradient during the forward. ``grad_scale`` is the gradient the
-    caller back-propagates into ``total`` (a replay's share of the step);
-    the per-column CE series are the same means as before.
+    its gradient during the forward. A trainer opts into that by passing
+    ``grad_scale``, the gradient it back-propagates into ``total`` (a
+    replay's share of the step); the per-column CE series then come back
+    detached there. Without it every output stays differentiable.
     """
     if not outs or not outs[0]:
         raise ValueError("loss needs at least one model column")
