@@ -224,7 +224,12 @@ Experts(x)= (S(x) + k Σ_(j∈J) w_j E_j(x)) / sqrt(k+1)
 
 All selected assignments execute; there is no capacity limit or token
 dropping. The selected affinities remain differentiable through their
-normalization, while top-`k` membership is discrete. At equal affinities,
+normalization, while top-`k` membership is discrete. Membership is read as a
+rank count over the bank rather than a device-wide selection: an expert
+belongs when fewer than `k` experts outrank it, equal values ordered by
+index. That rank is also the expert's slot, so the dispatch order needs no
+ranking sort after the selection, and ties fall the same way on every device
+and in every run. At equal affinities,
 `k w_j = 1`, so the shared and selected branches have equal coefficients.
 The final divisor preserves one expert's variance when the `k+1` outputs
 are independent with equal variance; it does not fix learned variance.

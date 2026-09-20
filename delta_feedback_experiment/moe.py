@@ -127,9 +127,30 @@ class MixtureOfExperts(nn.Module):
                 flat.to(router_dtype), self.router.weight.to(router_dtype)
             )
         affinities = logits.sigmoid()
-        selected = (affinities + self.expert_bias.to(router_dtype)).topk(
-            self.experts_per_token, dim=-1
-        ).indices
+        experts = torch.arange(self.num_routed_experts, device=flat.device)
+
+        def descending_rank(values: Tensor) -> Tensor:
+            """Each expert's place in the descending order of ``values``.
+
+            Fewer than ``experts_per_token`` experts outranking one is exactly
+            membership in the top-k, and the place is the slot it takes there.
+            Equal values order by index, so one token's ranks are always a
+            permutation of the bank and the order is the same everywhere.
+            Over one bank this is a small reduction the block's own graph
+            fuses; a device-wide selection is a launch of its own, and an
+            ordered one a ranking sort after that.
+            """
+            outranked = values.unsqueeze(-1) < values.unsqueeze(-2)
+            tied_earlier = (values.unsqueeze(-1) == values.unsqueeze(-2)) & (
+                experts < experts.unsqueeze(-1)
+            )
+            return (outranked | tied_earlier).sum(dim=-1)
+
+        rank = descending_rank(affinities + self.expert_bias.to(router_dtype))
+        # Ranks are a permutation, so inverting one writes every expert of a
+        # token exactly once and the leading slots are its selection in order.
+        order = torch.zeros_like(rank).scatter_(1, rank, experts.expand_as(rank))
+        selected = order[:, : self.experts_per_token]
         selected_scores = affinities.gather(1, selected)
         selected_probability = selected_scores / selected_scores.sum(
             dim=-1, keepdim=True
@@ -137,26 +158,23 @@ class MixtureOfExperts(nn.Module):
         probabilities = affinities / affinities.sum(dim=-1, keepdim=True).clamp_min(
             torch.finfo(router_dtype).tiny
         )
-        # Membership by comparison rather than one_hot: the compiled graph then
-        # carries no index-range assertions, and the same [pairs, experts]
-        # matrix drives the counts and the dispatch order below.
-        experts = torch.arange(self.num_routed_experts, device=flat.device)
+        # Membership is the same rank threshold, so the compiled graph carries
+        # no index-range assertions and nothing is one-hot encoded. A token's
+        # selected experts are distinct, so it is one row per token rather than
+        # one per (token, slot) pair: a third of the elements, and the dispatch
+        # scan below runs over tokens instead of over pairs.
         flat_selected = selected.reshape(-1)
-        membership = (flat_selected.unsqueeze(1) == experts).to(torch.int32)
+        membership = (rank < self.experts_per_token).to(torch.int32)
         counts = membership.sum(dim=0, dtype=torch.int64)
         # The weak auxiliary controls individual sequences. The step-level
         # controller receives detached counts and never runs in this forward.
         # V3's sequence auxiliary uses affinity-only choices, independently
         # of the bias-controlled dispatch decisions used by the controller.
-        # Only membership in the affinity-only top-k matters here, and the
-        # comparison below is order-blind, so this selection skips the ranking
-        # sort that the dispatch-order selection above needs.
+        # Only membership in the affinity-only top-k matters here, which is
+        # the same rank threshold over the unbiased affinities.
         auxiliary_selection = (
-            affinities.topk(
-                self.experts_per_token, dim=-1, sorted=False
-            ).indices.unsqueeze(-1)
-            == experts
-        ).sum(dim=1)
+            descending_rank(affinities) < self.experts_per_token
+        )
         length = x.shape[-2] if x.ndim >= 2 else 1
         sequence_probabilities = probabilities.reshape(-1, length, self.num_routed_experts)
         fractions = (
@@ -176,8 +194,8 @@ class MixtureOfExperts(nn.Module):
             # replace a general sort and make the order deterministic.
             ranks = (
                 (membership.cumsum(dim=0) - membership)
-                .gather(1, flat_selected.unsqueeze(1))
-                .squeeze(1)
+                .gather(1, selected)
+                .reshape(-1)
             )
             inverse = offsets[flat_selected] + ranks
             assignments = torch.empty_like(inverse).scatter_(
