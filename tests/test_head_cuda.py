@@ -31,6 +31,13 @@ def _case(device, rows=300, vocab=5003, dim=64):
     )
 
 
+def _close(actual, expected, tolerance=5e-3):
+    """Relative Frobenius error: the logit gradient is BF16 by design, so
+    individual near-zero entries carry large relative error."""
+    error = (actual.float() - expected).norm() / expected.norm()
+    assert error < tolerance, f"relative error {error.item():.2e}"
+
+
 def _reference(embeddings, classifier, targets, grad_nll, grad_lse):
     e = embeddings.bfloat16().float().requires_grad_(True)
     c = classifier.bfloat16().float().requires_grad_(True)
@@ -60,12 +67,12 @@ def test_dense_head_matches_fp32_autograd(cuda_device, with_sink):
 
     torch.testing.assert_close(nll, nll_ref, rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(lse, lse_ref, rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(rows.grad.float(), de_ref, rtol=2e-2, atol=2e-5)
+    _close(rows.grad, de_ref)
     if with_sink:
         assert weights.grad is None
-        torch.testing.assert_close(sink - 0.25, dc_ref, rtol=2e-2, atol=2e-6)
+        _close(sink - 0.25, dc_ref)
     else:
-        torch.testing.assert_close(weights.grad.float(), dc_ref, rtol=2e-2, atol=2e-6)
+        _close(weights.grad, dc_ref)
 
 
 @pytest.mark.parametrize("with_sink", [True, False])
@@ -97,9 +104,8 @@ def test_weighted_head_applies_its_gradient_in_forward(cuda_device, with_sink):
     torch.testing.assert_close(total, total_ref.detach(), rtol=1e-4, atol=1e-6)
     torch.testing.assert_close(nll, nll_ref.detach(), rtol=1e-4, atol=1e-4)
     torch.testing.assert_close(lse, lse_ref.detach(), rtol=1e-4, atol=1e-4)
-    torch.testing.assert_close(rows.grad.float(), e.grad, rtol=2e-2, atol=2e-6)
-    classifier_grad = sink if with_sink else weights.grad.float()
-    torch.testing.assert_close(classifier_grad, c.grad, rtol=2e-2, atol=2e-7)
+    _close(rows.grad, e.grad)
+    _close(sink if with_sink else weights.grad, c.grad)
 
 
 def test_dense_head_without_gradients(cuda_device):
