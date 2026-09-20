@@ -373,7 +373,9 @@ Routing profiles show null/seed/previous-cell mass, maximum weight against
 rows from the final column of the fused pass when feedback is enabled. Expert
 profiles use the first column of pass 1 and the teacher-forced MTP block.
 Both disable jitter. These are sample diagnostics, not whole-corpus loads.
-The recurrence view shows per-column depth readouts; training feedback gain
+The Looped column section appears for `l`, `v`, `fl`, and `fv`, including
+when a looped run is an overlay. It shows per-column depth readouts and
+executed recurrence; training feedback gain
 appears only on single-column steps, where the combined CE isolates it.
 
 For monitor changes, run

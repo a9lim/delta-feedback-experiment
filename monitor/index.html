@@ -144,7 +144,7 @@
 <div class="tiles" id="tiles"></div>
 <details class="config"><summary>Run configuration <span class="hint">· geometry, optimizer &amp; schedule</span></summary><div class="config-grid" id="config"></div></details>
 <nav aria-label="Monitor sections">
-  <button data-section="learning">Learning</button><button data-section="downstream">Downstream</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letter="f">Feedback</button><button data-section="loop" data-letter="l">Looped column</button>
+  <button data-section="learning">Learning</button><button data-section="downstream">Downstream</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letters="f">Feedback</button><button data-section="loop" data-letters="lv">Looped column</button>
 </nav>
 <section id="learning">
   <div class="section-head"><h3>Learning</h3><p>Raw observations · nats · ▲ checkpoint snapshots</p></div>
@@ -193,7 +193,7 @@
     <div class="chart"><h2>Expert bias magnitude</h2><p class="caption">Largest absolute selection bias after each update</p><div class="plot" id="p-expert-bias"></div></div>
   </div>
 </section>
-<section id="feedback" data-letter="f" hidden>
+<section id="feedback" data-letters="f" hidden>
   <div class="section-head"><h3>Feedback</h3><p>Self-composition: eight repeated fused prefills on two rows</p></div>
   <div class="grid three">
     <div class="chart"><h2>Feedback gain</h2><p class="caption">Fused − pass-1 CE · negative means improvement</p><div class="plot" id="p-gap"></div></div>
@@ -201,7 +201,7 @@
     <div class="chart"><h2>Self-composition update</h2><p class="caption">‖h(8) − h(7)‖ · smaller means less movement</p><div class="plot" id="p-upd"></div></div>
   </div>
 </section>
-<section id="loop" data-letter="l" hidden>
+<section id="loop" data-letters="lv" hidden>
   <div class="section-head"><h3>Looped column</h3><p>Per-column readout on two validation rows</p></div>
   <div class="grid three">
     <div class="chart"><h2>Loss by column</h2><p class="caption">The same rows after 1, r eval, and r max columns</p><div class="plot" id="p-depth"></div></div>
@@ -225,9 +225,9 @@ const signed = (v, digits = 3) => v == null || !Number.isFinite(v) ? '–' : (v 
 const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).toLocaleString();
 const compact = (v) => v == null || !Number.isFinite(v) ? '–' : v >= 1e9 ? `${fmt(v / 1e9, 3)}B` : v >= 1e6 ? `${fmt(v / 1e6, 3)}M` : count(v);
 const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
-const has = (view, letter) => conditionOf(view).includes(letter);
+const has = (view, letters) => [...letters].some((letter) => conditionOf(view).includes(letter));
 // l and v are the same looped columns with a different re-entry token side.
-const loops = (view) => has(view, 'l') || has(view, 'v');
+const loops = (view) => has(view, 'lv');
 const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
 function eventLines(view) {
   if (!view) return [];
@@ -665,7 +665,7 @@ const CONFIG_GROUPS = [
 ];
 const LABELS = { routing_block_size: 'cell layers', lr_normuonh: 'lr NorMuonH', lr_nadam: 'lr NAdam', mup_ratio: 'muP ratio 1536/D', expert_lr_scale: 'expert LR multiplier', zloss: 'z-loss', recurrence_start: 'roll start', three_rate: 'three rate', loop_iterations: 'r eval', mtp_weight: 'auxiliary weight' };
 function renderConfig(view) {
-  const run = view.run, setup = run.meta.run, condition = conditionOf(view);
+  const run = view.run, setup = run.meta.run;
   const cards = [];
   if (setup) {
     const used = new Set(['event', 'tag', 'expert_intermediate', 'num_routed_experts', 'experts_per_token']);
@@ -675,7 +675,7 @@ function renderConfig(view) {
     for (const [title, letters, keys] of CONFIG_GROUPS) {
       const fields = {};
       for (const key of keys) if (setup[key] != null) { if (!used.has(key)) fields[key] = setup[key]; used.add(key); }
-      if (!letters || [...letters].some((letter) => condition.includes(letter))) cards.push(configGroup(title, fields, LABELS));
+      if (!letters || has(view, letters)) cards.push(configGroup(title, fields, LABELS));
     }
     const other = Object.fromEntries(Object.entries(setup).filter(([key]) => !used.has(key)));
     cards.push(configGroup('other', other, LABELS));
@@ -793,13 +793,7 @@ function render(view) {
   const key = document.getElementById('run-key');
   key.hidden = views.length < 2;
   key.innerHTML = views.length < 2 ? '' : views.map((v, i) => `<span style="color:${i === 0 ? P.s1 : hue(i - 1)}">[${i + 1}] ${esc(v.run.tag)}</span>`).join('');
-  for (const el of document.querySelectorAll('[data-letter]')) el.hidden = !views.some((v) => has(v, el.dataset.letter));
-  const looped = views.some(loops);
-  const recurrence = document.getElementById('p-recurrence').closest('.chart');
-  const recurrenceGrid = document.querySelector(looped ? '#loop .grid' : '#feedback .grid');
-  if (recurrence.parentElement !== recurrenceGrid) recurrenceGrid.appendChild(recurrence);
-  document.querySelector('#feedback .grid').classList.toggle('three', looped);
-  document.querySelector('#feedback .grid').classList.toggle('two', !looped);
+  renderConditions(views);
   const last = view.steps.at(-1), setup = view.run.meta.run || {};
   document.getElementById('work-summary').textContent = last ? `${fmt(last.mem, 3)} GiB allocated at step ${count(last.step)} · trunk counters exclude MTP` : '';
   const series = views.map(seriesOf);
@@ -815,6 +809,17 @@ function render(view) {
   }
   renderSnapshots(view);
   renderDownstream(views);
+}
+function renderConditions(views) {
+  for (const el of document.querySelectorAll('[data-letters]')) {
+    el.hidden = !views.some((v) => has(v, el.dataset.letters));
+  }
+  const looped = views.some(loops);
+  const recurrence = document.getElementById('p-recurrence').closest('.chart');
+  const recurrenceGrid = document.querySelector(looped ? '#loop .grid' : '#feedback .grid');
+  if (recurrence.parentElement !== recurrenceGrid) recurrenceGrid.appendChild(recurrence);
+  document.querySelector('#feedback .grid').classList.toggle('three', looped);
+  document.querySelector('#feedback .grid').classList.toggle('two', !looped);
 }
 M.configure({
   primaryKind: 'train',

@@ -11,11 +11,11 @@ const html = fs.readFileSync(path.join(root, 'monitor/index.html'), 'utf8');
 const inline = html.slice(html.indexOf("'use strict';"), html.lastIndexOf('</script>'));
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
-function monitor() {
+function monitor(document = {}) {
   const scaleSteps = { checked: false };
   const context = vm.createContext({
     console, location: { pathname: '/delta-feedback/', hash: '' },
-    document: { documentElement: {}, getElementById: (id) => id === 'scalesteps' ? scaleSteps : null },
+    document: { documentElement: {}, getElementById: (id) => id === 'scalesteps' ? scaleSteps : null, ...document },
     getComputedStyle: () => ({ getPropertyValue: () => '#888888' }),
   });
   vm.runInContext(fs.readFileSync(path.join(shared, 'vendor/uPlot.iife.min.js'), 'utf8'), context);
@@ -23,7 +23,7 @@ function monitor() {
   vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, newRun, configure,'), context);
   vm.runInContext(inline.replace('\nsetupSnapshotControls();\nM.start();', ''), context);
   vm.runInContext("M.configure({onStep, onEval, onRecord, metaEvents: ['run', 'schedule']});", context);
-  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, downstream, taskRecords, baselineRows, resultsFor, resultSelection, resultRows, resultMetrics, cycleResultSort, sortResultRows, resultsHTML, resultCell, tightLogRange})', context);
+  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, renderConditions, downstream, taskRecords, baselineRows, resultsFor, resultSelection, resultRows, resultMetrics, cycleResultSort, sortResultRows, resultsHTML, resultCell, tightLogRange})', context);
   api.scaleSteps = scaleSteps;
   api.read = (tag, log) => {
     api.M.ingest(api.M.runFor(tag), log);
@@ -41,6 +41,35 @@ const setup = (tag, condition = 'fl') => line('run', {tag, condition, batch_rows
 const route = (step, site, nul, extras = {}) => line('route', {step: `${step}/100`, site, null: nul, seed: 0.2, max: 0.4, head_js: 0.1, n: 4, null_rms: 0, ...extras});
 const expert = (step, site, extras = {}) => line('expert', {step: `${step}/100`, site, used: 2, entropy: 0.6, expert0: 0.25, expert1: 0.75, bias0: -0.1, bias1: 0.1, ...extras});
 const step = (n, extras = {}) => line('step', {step: `${n}/100`, k: 2, r: 1, ...extras});
+
+test('condition panels and recurrence remain visible for token loops and mixed overlays', () => {
+  // Use the page's actual gates for both navigation buttons and sections.
+  const gates = [...html.matchAll(/<(button|section)\b[^>]*data-letters="([^"]+)"[^>]*>/g)]
+    .map(([, tag, letters]) => ({tag, dataset: {letters}, hidden: true}));
+  assert.equal(gates.length, 4);
+  const grid = () => ({
+    classList: {toggle() {}},
+    appendChild(child) { child.parentElement = this; },
+  });
+  const feedback = grid(), loop = grid(), recurrence = {parentElement: loop};
+  const a = monitor({
+    querySelectorAll: (selector) => { assert.equal(selector, '[data-letters]'); return gates; },
+    querySelector: (selector) => ({'#loop .grid': loop, '#feedback .grid': feedback})[selector],
+    getElementById: (id) => id === 'p-recurrence' ? {closest: () => recurrence} : null,
+  });
+  for (const [conditions, feedbackVisible, loopVisible] of [
+    [['v'], false, true], [['fv'], true, true], [['f'], true, false],
+    [['l'], false, true], [['fl'], true, true],
+    [['f', 'v'], true, true], [['v', 'f'], true, true], [['f'], true, false],
+  ]) {
+    a.renderConditions(conditions.map((condition) => a.read(condition, setup(condition, condition))));
+    for (const gate of gates) {
+      assert.equal(!gate.hidden, gate.dataset.letters === 'f' ? feedbackVisible : loopVisible,
+        `${conditions}: ${gate.tag} ${gate.dataset.letters}`);
+    }
+    assert.equal(recurrence.parentElement, loopVisible ? loop : feedback);
+  }
+});
 
 test('eval slider uses sorted unique addresses, including partial eval batches', () => {
   const a = monitor();
@@ -139,9 +168,9 @@ test('expert sites order by layer with the auxiliary bank last', () => {
   assert.deepEqual(plain(a.orderedSites([view], 'expert').map((s) => s.name)), ['L4.experts', 'L12.experts', 'mtp.experts']);
 });
 
-test('depth and eval records read out per column at the evaluation count', () => {
+for (const condition of ['l', 'fl', 'v', 'fv']) test(`${condition}: depth and eval records read out per column at the evaluation count`, () => {
   const a = monitor();
-  const view = a.read('a', setup('a') + line('eval', {step: '10/100', val: 6, val_fused: 5.5, val_one: 5.8, val_mtp: 7})
+  const view = a.read('a', setup('a', condition) + line('eval', {step: '10/100', val: 6, val_fused: 5.5, val_one: 5.8, val_mtp: 7})
     + line('depth', {step: '10/100', r_eval: 2, r_max: 3, loss_one: 5.8, loss_eval: 6, loss_max: 5.9, upd_max: 0.3}));
   const series = a.seriesOf(view);
   assert.deepEqual(plain(series['p-val']), [[10], [6], [5.5], [5.8]]);
@@ -187,9 +216,9 @@ test('raw training traces and feedback gap use CE, not weighted total loss', () 
   assert.deepEqual(plain(series['p-recurrence']), [[1, 2, 3], [2, 1, 2], [1, 1, 2]]);
 });
 
-test('token totals account for every column of every pass and reject incomplete histories', () => {
+for (const condition of ['l', 'fl', 'v', 'fv']) test(`${condition}: token totals account for every column of every pass and reject incomplete histories`, () => {
   const a = monitor();
-  let view = a.read('a', setup('a') + step(1, {k: 2, r: 1}) + step(2, {k: 3, r: 2}));
+  let view = a.read('a', setup('a', condition) + step(1, {k: 2, r: 1}) + step(2, {k: 3, r: 2}));
   assert.deepEqual(plain(a.tokenTotals(view)), {predicted: 32, passes: 80, cells: 512});
   view = a.read('a', step(4));
   assert.equal(a.tokenTotals(view), null);
