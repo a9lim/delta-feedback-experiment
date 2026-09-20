@@ -226,6 +226,8 @@ const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).to
 const compact = (v) => v == null || !Number.isFinite(v) ? '–' : v >= 1e9 ? `${fmt(v / 1e9, 3)}B` : v >= 1e6 ? `${fmt(v / 1e6, 3)}M` : count(v);
 const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
 const has = (view, letter) => conditionOf(view).includes(letter);
+// l and v are the same looped columns with a different re-entry token side.
+const loops = (view) => has(view, 'l') || has(view, 'v');
 const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
 function eventLines(view) {
   if (!view) return [];
@@ -625,10 +627,10 @@ function tokenTotals(view) {
   if (!(per > 0 && layers > 0 && cell > 0) || !view.steps.length) return null;
   // Exact totals require the complete addressed history, including fork parents.
   // A partial log cannot reconstruct the missing k/r draws.
-  if (view.steps.some((step, index) => step.step !== index + 1 || !(step.k > 0) || (has(view, 'l') && !(step.r > 0)))) return null;
+  if (view.steps.some((step, index) => step.step !== index + 1 || !(step.k > 0) || (loops(view) && !(step.r > 0)))) return null;
   const passes = view.steps.reduce((total, s) => total + s.k * per, 0);
   // Every column of every pass runs the whole stack: k * r columns of layers / cell cells.
-  const cells = view.steps.reduce((total, s) => total + s.k * (has(view, 'l') ? s.r : 1) * per * layers / cell, 0);
+  const cells = view.steps.reduce((total, s) => total + s.k * (loops(view) ? s.r : 1) * per * layers / cell, 0);
   return { predicted: view.steps.length * per, passes, cells };
 }
 function renderTiles(view) {
@@ -656,7 +658,7 @@ const CONFIG_GROUPS = [
   ['attention', null, ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
   ['experts', null, ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
   ['recurrence roll', null, ['recurrence_start', 'three_rate', 'jitter']],
-  ['l · loop', 'l', ['loop_iterations']],
+  ['l, v · loop', 'lv', ['loop_iterations']],
   ['prediction', null, ['mtp_weight']],
   ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_lr_scale', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
@@ -670,10 +672,10 @@ function renderConfig(view) {
     // Once the resolved schedule is present, its address and phase lengths
     // supersede the raw step/warmup/cooldown inputs.
     if (run.meta.schedule) for (const key of ['steps', 'warmup_frac', 'cooldown_frac']) used.add(key);
-    for (const [title, letter, keys] of CONFIG_GROUPS) {
+    for (const [title, letters, keys] of CONFIG_GROUPS) {
       const fields = {};
       for (const key of keys) if (setup[key] != null) { if (!used.has(key)) fields[key] = setup[key]; used.add(key); }
-      if (!letter || condition.includes(letter)) cards.push(configGroup(title, fields, LABELS));
+      if (!letters || [...letters].some((letter) => condition.includes(letter))) cards.push(configGroup(title, fields, LABELS));
     }
     const other = Object.fromEntries(Object.entries(setup).filter(([key]) => !used.has(key)));
     cards.push(configGroup('other', other, LABELS));
@@ -694,7 +696,7 @@ function tightLogRange(u, lo, hi) {
 function stepScale(view, enabled = document.getElementById('scalesteps').checked) {
   if (!enabled) return 1;
   const setup = view?.run.meta.run;
-  if (!setup || !['f', 'l', 'fl'].includes(setup.condition)) return null;
+  if (!setup || !['f', 'l', 'fl', 'v', 'fv'].includes(setup.condition)) return null;
   const fields = ['params', 'dim', 'vocab_size', 'layers', 'expert_width', 'expert_routed', 'expert_top_k', 'batch_rows', 'seq_len'];
   const [params, dim, vocab, layers, width, routed, topK, batch, seq] = fields.map((key) => num(setup[key]));
   if (![params, dim, vocab, layers, width, routed, topK, batch, seq].every((v) => Number.isSafeInteger(v) && v > 0) || topK > routed) return null;
@@ -792,7 +794,7 @@ function render(view) {
   key.hidden = views.length < 2;
   key.innerHTML = views.length < 2 ? '' : views.map((v, i) => `<span style="color:${i === 0 ? P.s1 : hue(i - 1)}">[${i + 1}] ${esc(v.run.tag)}</span>`).join('');
   for (const el of document.querySelectorAll('[data-letter]')) el.hidden = !views.some((v) => has(v, el.dataset.letter));
-  const looped = views.some((v) => has(v, 'l'));
+  const looped = views.some(loops);
   const recurrence = document.getElementById('p-recurrence').closest('.chart');
   const recurrenceGrid = document.querySelector(looped ? '#loop .grid' : '#feedback .grid');
   if (recurrence.parentElement !== recurrenceGrid) recurrenceGrid.appendChild(recurrence);

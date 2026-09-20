@@ -283,17 +283,21 @@ def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
         )
 
 
-def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
+@pytest.mark.parametrize("condition", ["fl", "fv"])
+def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses(condition):
     """Independent consumers recompute the jittered concat equation; sharing that
     input and raw token lookup must preserve both objectives' derivatives."""
     count, z_coef, coefficient = 3, 0.017, 0.23
-    model, reference = tiny("fl"), tiny("fl")
+    model, reference = tiny(condition), tiny(condition)
     for candidate in (model, reference):
         for bank in candidate.expert_banks:
             bank.expert_bias[-bank.experts_per_token :] = 2
         with torch.no_grad():
             candidate.blank_payload.copy_(torch.linspace(-1, 1, candidate.cfg.dim))
-            candidate.blank_embedding.copy_(torch.linspace(1, -1, candidate.cfg.dim))
+            if candidate.cfg.loop_blank:
+                candidate.blank_embedding.copy_(
+                    torch.linspace(1, -1, candidate.cfg.dim)
+                )
     toks = tokens(length=6)
     iterations = 2
     jitter, loop_jitter = jitter_for(model, toks, count, iterations)
@@ -327,10 +331,14 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
             pass_outs.append(reference.forward_column(x))
             payload = pass_outs[-1].payload + draw(index, column)
             if column + 1 < iterations:
-                # The loop re-enters with the blank embedding, never the token.
-                x = explicit_fusion(
-                    reference, payload, reference.blank_embedding.expand_as(payload)
+                # ``l`` re-enters with the blank embedding, never the token;
+                # ``v`` with its own lookup of the position's token.
+                token_side = (
+                    reference.blank_embedding.expand_as(payload)
+                    if reference.cfg.loop_blank
+                    else explicit_embedding(reference, toks[:, :-1])
                 )
+                x = explicit_fusion(reference, payload, token_side)
         reference_outs.append(pass_outs)
         if index + 1 < count:
             # Keep the production order (fuse, then shift): changing the rows

@@ -7,18 +7,28 @@ checkpoints.
 
 ## Conditions
 
-| Condition | Feedback between positions | Looped columns per position |
-|---|---|---|
-| `f` (default) | Enabled | One |
-| `l` | Disabled | Sampled during training |
-| `fl` | Enabled | Sampled during training |
+| Condition | Feedback between positions | Looped columns per position | Token side of a re-entry |
+|---|---|---|---|
+| `f` (default) | Enabled | One | — |
+| `l` | Disabled | Sampled during training | Blank embedding |
+| `v` | Disabled | Sampled during training | The position's own token |
+| `fl` | Enabled | Sampled during training | Blank embedding |
+| `fv` | Enabled | Sampled during training | The position's own token |
 
 All conditions retain the same PKDA/GQA stack, MHDB readers, shared and routed
 experts, payload writer, fusion, and auxiliary second-token predictor (MTP).
-The letters select recurrence axes, not component ablations. `l` adds one
-learned blank embedding, which replaces the token at every re-entry. Shared
+The letters select recurrence axes, not component ablations. `l` and `v` are
+the same looped columns and differ only in what a later column fuses with its
+payload, so a condition has at most one of them. `l` adds one learned blank
+embedding, which replaces the token at every re-entry: the payload alone
+carries the position, and a re-entry seed is marked apart from a feedback
+seed. `v` fuses the position's own token again and adds no parameter: its
+re-entry is the feedback entry of a chain that repeats every token once, the
+payload carries only what the token does not, and the blank payload is an
+in-distribution null under which a later column repeats the first. Shared
 parameters initialize identically at a given `--seed`; at one column, `fl`
-and `f` have identical values and gradients. These conditions omit a no-recurrence control.
+and `fv` have the values and gradients of `f`. These conditions omit a
+no-recurrence control.
 
 ## Data
 
@@ -75,7 +85,7 @@ Let `k` be feedback passes and `r` columns per pass. Through step
 `round(recurrence_start * steps)`, every condition executes `(k,r) = (1,1)`.
 Every subsequent step draws one shared shape:
 
-| Draw | Probability | `f`: `(k,r)` | `l`: `(k,r)` | `fl`: `(k,r)` |
+| Draw | Probability | `f`: `(k,r)` | `l`, `v`: `(k,r)` | `fl`, `fv`: `(k,r)` |
 |---|---:|---|---|---|
 | Three passes, two columns | `three_rate` = 0.12 | `(3,1)` | `(1,2)` | `(3,2)` |
 | Two passes, three columns | `three_rate` = 0.12 | `(2,1)` | `(1,3)` | `(2,3)` |
@@ -97,15 +107,16 @@ Every supervised column adds uniform payload jitter in
 `[-jitter, jitter]`, with `--jitter 0.02` by default. One draw serves that
 column's MTP, feedback, and loop consumers, including on single-pass batches
 and final columns. Prefix draws and last-column jitter precede earlier-column
-jitter in each row's keyed stream, so adding `l` preserves the draws shared
-with `f`. Evaluation and diagnostics disable jitter.
+jitter in each row's keyed stream, so adding `l` or `v` preserves the draws
+shared with `f`, and `l` and `v` read the same loop jitter. Evaluation and
+diagnostics disable jitter.
 
 ### Objective
 
 Every executed column trains next-token prediction and MTP. Define
 `F(x) = x[0]` for one element, otherwise
 `F(x) = x[0] + mean(x[1:])`. `combine` applies `F` over passes for each
-column, then over columns. On rolled `fl` steps this assigns one unit of
+column, then over columns. On rolled `fl` or `fv` steps this assigns one unit of
 weight to each of four groups: the plain first column, later columns of
 pass 1, column 1 of later passes, and later columns of later passes. It
 does not average the four groups into one unit. With a single recurrence
@@ -163,17 +174,17 @@ flag reference.
 ## Evaluation
 
 Evaluation uses the first `--eval-rows` validation rows (default 128), no
-jitter, and unregularized per-head cross-entropy. For `l` and `fl`,
+jitter, and unregularized per-head cross-entropy. For looped conditions,
 `--loop-iterations` sets a fixed evaluation/decode count in `1..3`, default
 2; it does not control training draws. `f` always uses one column per pass.
 
 | Metric | Measurement |
 |---|---|
 | `val` | Main-head CE after the final column of a plain pass |
-| `val_fused` | Main-head CE after the final column of a second pass with plain-prefix length 1; `f`/`fl` only |
-| `val_one` | Main-head CE after the first column of the plain pass; `l`/`fl` only |
+| `val_fused` | Main-head CE after the final column of a second pass with plain-prefix length 1; conditions with `f` only |
+| `val_one` | Main-head CE after the first column of the plain pass; looped conditions only |
 | `val_mtp` | MTP CE on valid second-token targets of the plain pass's final column |
-| `val_mtp_fused` | Corresponding MTP CE of the second pass; `f`/`fl` only |
+| `val_mtp_fused` | Corresponding MTP CE of the second pass; conditions with `f` only |
 
 Generation uses the main next-token head. **Standard** prefills and decodes
 without feedback; **Soft** prefills plainly and uses feedback during decode;

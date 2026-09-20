@@ -3,9 +3,10 @@
 The architecture contract is ``docs/architecture.md``. PKDA occupies three
 layers of each four-layer cell, with NoPE gated GQA in the fourth, MHDB reads
 before every sublayer, MoE channel mixers, and sequential two-token prediction.
-``f`` adds FBT feedback; ``l`` re-enters the whole column through the same
-fusion of its own payload with a learned blank embedding, iterated per
-column. At least one recurrence must be selected.
+``f`` adds FBT feedback; ``l`` and ``v`` re-enter the whole column through
+the same fusion, iterated per column: ``l`` fuses its own payload with a
+learned blank embedding, ``v`` with the position's own token again. At least
+one recurrence must be selected, and at most one of ``l`` and ``v``.
 Randomness (jitter draws, prefix lengths, pass counts) enters as *data* —
 the trainer owns the shared streams that keep paired conditions
 architecturally identical in everything but the flags.
@@ -82,10 +83,18 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
         ),
     ),
     "l": (
-        "loop",
+        "loop_blank",
         (
             "looped depth: the whole column re-enters through the shared fusion "
             "of its own payload with the learned blank embedding, iterated per column"
+        ),
+    ),
+    "v": (
+        "loop_token",
+        (
+            "looped depth on a virtual repeat of the token: the whole column "
+            "re-enters through the shared fusion of its own payload with the "
+            "position's own token embedding, iterated per column"
         ),
     ),
 }
@@ -93,9 +102,10 @@ CONDITION_LETTERS: dict[str, tuple[str, str]] = {
 
 
 def parse_condition(text: str) -> str:
-    """Accept ``f``, ``l``, or both in either order; reject an empty condition."""
+    """Accept ``f``, one of ``l`` and ``v``, or ``f`` with one of them, in
+    either order; reject an empty condition."""
     if not text:
-        raise ValueError("condition must contain f, l, or both")
+        raise ValueError("condition must contain f, one of l and v, or f with one of them")
     unknown = sorted(set(text) - set(CONDITION_LETTERS))
     if unknown:
         raise ValueError(
@@ -104,6 +114,11 @@ def parse_condition(text: str) -> str:
         )
     if len(set(text)) != len(text):
         raise ValueError(f"repeated letter in condition {text!r}")
+    if "l" in text and "v" in text:
+        raise ValueError(
+            f"condition {text!r} names both l and v; they fill the same "
+            "re-entry token slot, so a condition loops with one of them"
+        )
     return "".join(letter for letter in CONDITION_LETTERS if letter in text)
 
 
@@ -166,7 +181,7 @@ DEFAULT_LOOP_ITERATIONS = 2
 
 @dataclass(frozen=True)
 class ModelConfig:
-    """Permanent PKDA/MoE/MHDB/MTP geometry plus two recurrence flags.
+    """Permanent PKDA/MoE/MHDB/MTP geometry plus the recurrence flags.
 
     Routing uses one contiguous feature group per KV head. These groups do
     not align to mixer projections. The default condition is feedback (f).
@@ -192,19 +207,30 @@ class ModelConfig:
     feedback: bool = True
     """``f``: consume the preceding column's payload through shared concat fusion."""
 
-    loop: bool = False
+    loop_blank: bool = False
     """``l``: every column runs the whole stack ``iterations`` times, each
     later column seeded by the shared fusion of the preceding column's payload
     with the learned blank embedding, the one width-``D`` vector this flag
     adds (``docs/architecture.md``)."""
 
+    loop_token: bool = False
+    """``v``: the same looped columns, each later column seeded by the shared
+    fusion of the preceding column's payload with the position's own token
+    embedding, which is a feedback entry onto a virtual repeat of the token.
+    It adds no parameter."""
+
     loop_iterations: int = DEFAULT_LOOP_ITERATIONS
-    """``l``: fixed evaluation/decode count in 1..3. Training draws from the
-    recurrence roll, independently of this count."""
+    """``l``/``v``: fixed evaluation/decode count in 1..3. Training draws from
+    the recurrence roll, independently of this count."""
 
     def __post_init__(self) -> None:
         if not (self.feedback or self.loop):
-            raise ValueError("condition must enable feedback (f), looping (l), or both")
+            raise ValueError(
+                "condition must enable feedback (f), looping (l or v), or "
+                "feedback with looping"
+            )
+        if self.loop_blank and self.loop_token:
+            raise ValueError("a condition loops with l or with v, not both")
         validate_expert_geometry(
             self.expert_intermediate, self.num_routed_experts, self.experts_per_token
         )
@@ -222,6 +248,11 @@ class ModelConfig:
             raise ValueError("PKDA head count and dimension must be positive")
         if self.pkda_conv_size < 1:
             raise ValueError("PKDA convolution width must be positive")
+
+    @property
+    def loop(self) -> bool:
+        """Whether a pass runs looped columns, under ``l`` or ``v``."""
+        return self.loop_blank or self.loop_token
 
     @property
     def condition(self) -> str:
@@ -262,7 +293,7 @@ class ModelConfig:
         """The columns one pass runs at a position; ``None`` is the default."""
         if not self.loop:
             if iterations not in (None, 1):
-                raise ValueError("a condition without l runs one column per pass")
+                raise ValueError("a condition without l or v runs one column per pass")
             return 1
         if iterations is None:
             return self.loop_iterations
@@ -371,7 +402,7 @@ class KVCache:
     Only global-attention layers receive KV slots. PKDA layers retain their
     FP32 matrix/preconditioner states and three short-convolution histories.
     ``forward_iterations`` advances the shared position once per token
-    position. Under ``l`` every layer owns one track per iteration, because
+    position. Under ``l`` or ``v`` every layer owns one track per iteration, because
     column ``i`` at a position mixes over the earlier positions' column-``i``
     writes; the driver selects the track through ``iteration`` before each
     column and every track shares the position.
@@ -999,14 +1030,17 @@ class DeltaModel(nn.Module):
         decoding. Every column seed therefore passes through ``fuse_proj``,
         and a feedback position differs from a plain one only by
         ``W_p (p_(t-1) - p_0)``. Zero-initialized, consuming no draws."""
-        self.blank_embedding = nn.Parameter(torch.zeros(cfg.dim)) if cfg.loop else None
+        self.blank_embedding = (
+            nn.Parameter(torch.zeros(cfg.dim)) if cfg.loop_blank else None
+        )
         """Learned stand-in token, in post-lookup token units, for a looped
-        column's re-entry. The token is news only to a position's first
-        column, so a later column is seeded by ``fuse(payload,
+        column's re-entry under ``l``. The token is news only to a position's
+        first column, so a later column is seeded by ``fuse(payload,
         blank_embedding)``: its payload alone carries the position, and its
         seed differs from a feedback seed even when the next token repeats.
         Present only under ``l``, so every other condition keeps its
-        parameter set. Zero-initialized, consuming no draws."""
+        parameter set; ``v`` re-enters with the token itself and adds
+        nothing. Zero-initialized, consuming no draws."""
         self.checkpoint_blocks = 0
         """Runtime switch: how many PKDA and auxiliary block invocations of
         each logical forward, in execution order, recompute in backward
@@ -1092,8 +1126,8 @@ class DeltaModel(nn.Module):
         unit RMS. Any jitter is already in payload units. Token magnitudes
         and learned payload gains survive the linear fusion. Every column
         seed is one of these products; ``plain_seed`` supplies the blank
-        payload where no payload arrives, and ``loop_seed`` the blank
-        embedding where no new token does.
+        payload where no payload arrives, and ``loop_seed`` fills the token
+        side where no new token does.
         """
         return sink_linear(
             torch.cat((token_embedding, payload), dim=-1),
@@ -1109,9 +1143,17 @@ class DeltaModel(nn.Module):
         blank = self.blank_payload.to(token_embedding.dtype).expand_as(token_embedding)
         return self.fuse(blank, token_embedding)
 
-    def loop_seed(self, payload: Tensor) -> Tensor:
+    def loop_seed(self, payload: Tensor, token_embedding: Tensor) -> Tensor:
         """The seed of a looped column's re-entry: the shared fusion of the
-        preceding column's payload with the learned blank embedding."""
+        preceding column's payload with the learned blank embedding under
+        ``l``, or with the position's own raw ``token_embedding`` under ``v``.
+
+        The ``v`` seed is the feedback entry of a chain that repeats every
+        token once, so with the blank payload it is ``plain_seed`` and a
+        later column repeats the first.
+        """
+        if self.cfg.loop_token:
+            return self.fuse(payload, token_embedding)
         blank = self.blank_embedding.to(payload.dtype).expand_as(payload)
         return self.fuse(payload, blank)
 
@@ -1538,8 +1580,9 @@ class DeltaModel(nn.Module):
         ``x`` is the actual column input: the shared fusion of raw embeddings
         with the blank payload (``plain_seed``) on pass 1, plain prefixes, and
         Standard decoding, or with the preceding position's payload on
-        feedback positions; on a looped column, the fusion of the blank
-        embedding with the preceding column's own payload (``loop_seed``).
+        feedback positions; on a looped column, the fusion of the preceding
+        column's own payload with the blank embedding or the position's own
+        token (``loop_seed``).
         With a cache, positions start at ``cache.pos`` on the cache's
         current iteration track; ``forward_iterations`` owns the track
         selection and advances the position once per token position.
@@ -1659,6 +1702,7 @@ class DeltaModel(nn.Module):
     def forward_iterations(
         self,
         x: Tensor,
+        token_embedding: Tensor,
         *,
         iterations: int | None = None,
         cache: KVCache | None = None,
@@ -1668,16 +1712,18 @@ class DeltaModel(nn.Module):
     ) -> list[ColumnOutput]:
         """Run every column of one position range and return them in order.
 
-        ``x`` [B, T, D] seeds the first column, the only one that sees the
-        position's token. Each later column is seeded by the shared fusion of
-        the preceding column's payload with the blank embedding
+        ``x`` [B, T, D] seeds the first column and ``token_embedding``
+        [B, T, D] is the raw lookup of the same positions' tokens. Each later
+        column is seeded by the shared fusion of the preceding column's
+        payload with the blank embedding under ``l``, so only the first column
+        sees the token, or with ``token_embedding`` under ``v``
         (``loop_seed``), after adding that column's row of ``loop_jitter``
         [iterations-1, B, T, D] in payload units when given. ``iterations``
-        is the column count under ``l``: the configured evaluation/decode
-        count, or the count the cache was allocated for. Every column but
-        possibly the last writes a payload. With a cache, column ``i`` mixes
-        on track ``i`` and the shared position advances once, after the last
-        column.
+        is the column count under ``l`` or ``v``: the configured
+        evaluation/decode count, or the count the cache was allocated for.
+        Every column but possibly the last writes a payload. With a cache,
+        column ``i`` mixes on track ``i`` and the shared position advances
+        once, after the last column.
         """
         cfg = self.cfg
         if cache is not None:
@@ -1706,14 +1752,14 @@ class DeltaModel(nn.Module):
             if not last:
                 if loop_jitter is None:
                     reentry = _compiled_loop_seed if compiled else _loop_seed
-                    x = reentry(self, out.payload)
+                    x = reentry(self, out.payload, token_embedding)
                 else:
                     reentry = (
                         _compiled_jittered_loop_seed
                         if compiled
                         else _jittered_loop_seed
                     )
-                    x = reentry(self, out.payload, loop_jitter[i])
+                    x = reentry(self, out.payload, loop_jitter[i], token_embedding)
         if cache is not None:
             cache.iteration = 0
             cache.advance(x.shape[1])
@@ -1734,7 +1780,9 @@ class DeltaModel(nn.Module):
         if payload is not None and not self.cfg.feedback:
             raise ValueError("a condition without f cannot consume a payload")
         x = self.fuse(payload, e) if payload is not None else self.plain_seed(e)
-        return self.forward_iterations(x, cache=cache, want_weights=want_weights)[-1]
+        return self.forward_iterations(
+            x, e, cache=cache, want_weights=want_weights
+        )[-1]
 
 
 # -- multi-pass training forward ----------------------------------------------
@@ -1757,12 +1805,12 @@ def _jittered_fused_input(model, payload, jitter, token_embedding):
     return model.fuse(payload + jitter, token_embedding)
 
 
-def _loop_seed(model, payload):
-    return model.loop_seed(payload)
+def _loop_seed(model, payload, token_embedding):
+    return model.loop_seed(payload, token_embedding)
 
 
-def _jittered_loop_seed(model, payload, jitter):
-    return model.loop_seed(payload + jitter)
+def _jittered_loop_seed(model, payload, jitter, token_embedding):
+    return model.loop_seed(payload + jitter, token_embedding)
 
 
 def _feedback_entry(fused_input, seed, positions, prefix):
@@ -1813,9 +1861,10 @@ def multipass(
     Pass 1 seeds every position through the shared fusion with the blank
     payload; feedback passes replace the suffix past each row's prefix.
     The final stored token is a main-head target and MTP input, but needs no
-    trunk column.  Under ``l`` every pass runs ``iterations`` columns at each
-    position, each later column seeded by the fusion of the preceding
-    column's jittered payload with the blank embedding.
+    trunk column.  Under ``l`` or ``v`` every pass runs ``iterations`` columns
+    at each position, each later column seeded by the fusion of the preceding
+    column's jittered payload with the blank embedding (``l``) or the
+    position's own token embedding (``v``).
     prefix_lens [n_passes-1, B] holds values in 1..T-1 (the plain-embedding
     prefix per feedback pass; position 0 is always plain and position T-1 is
     always fused). jitter [n_passes, B, T+1, D] is drawn at the stored-row
@@ -1876,6 +1925,7 @@ def multipass(
             )
         columns = model.forward_iterations(
             x,
+            own_embedding,
             iterations=iterations,
             loop_jitter=(
                 None if loop_jitter is None else loop_jitter[p][:, :, :length]
@@ -2136,7 +2186,7 @@ def combine_column_losses(values: list[list[Tensor]]) -> Tensor:
     inside the block: the plain first column; the loop alone (pass 1, later
     columns); feedback alone (later passes, column 1); and both together.
     With one axis absent this is the other axis's own combine, so the ``f``
-    and ``l`` objectives are its marginals.
+    and ``l``/``v`` objectives are its marginals.
     """
     per_column = [
         _first_plus_mean([pass_values[column] for pass_values in values])
@@ -2257,8 +2307,8 @@ def iterate_fused(
     ||h(k) − h(k−1)|| (FBT Fig. 3).  Decaying update norms and flat loss
     are the contraction signature; oscillation or rising loss means the
     map diverges under self-composition.  Every pass runs ``iterations``
-    columns per position under ``l`` (default: the evaluation count), and
-    the map composes the last column's payload.
+    columns per position under ``l`` or ``v`` (default: the evaluation
+    count), and the map composes the last column's payload.
     """
     cfg = model.cfg
     if not cfg.feedback:
@@ -2270,14 +2320,14 @@ def iterate_fused(
         positions = torch.arange(length, device=tokens.device)
         plain = (positions[None, :] < 1).expand(batch, -1)
 
-        out = model.forward_iterations(seed, iterations=iterations)[-1]
+        out = model.forward_iterations(seed, e, iterations=iterations)[-1]
         records = []
         for _ in range(n_iters):
             previous = out.h_top
             p_shifted = shift_right(out.payload)
             fused = model.fuse(p_shifted, e)
             out = model.forward_iterations(
-                torch.where(plain[..., None], seed, fused), iterations=iterations
+                torch.where(plain[..., None], seed, fused), e, iterations=iterations
             )[-1]
             loss, _ = sequence_ce(model, out.h_top, tokens[:, 1:])
             delta = (out.h_top - previous).float().norm(dim=-1).mean()
@@ -2305,7 +2355,7 @@ def depth_trace(
     """
     cfg = model.cfg
     if not cfg.loop:
-        raise ValueError("the depth trace needs a condition with l")
+        raise ValueError("the depth trace needs a condition with l or v")
     if fused and not cfg.feedback:
         raise ValueError("a fused depth trace needs a condition with f")
     if iterations is None:
@@ -2320,12 +2370,12 @@ def depth_trace(
         plain = (positions[None, :] < 1).expand(batch, -1)
         x = seed
         if fused:
-            first = model.forward_iterations(seed, iterations=iterations)[-1]
+            first = model.forward_iterations(seed, e, iterations=iterations)[-1]
             x = torch.where(
                 plain[..., None], seed, model.fuse(shift_right(first.payload), e)
             )
         columns = model.forward_iterations(
-            x, iterations=iterations, need_payload=False
+            x, e, iterations=iterations, need_payload=False
         )
         records = []
         previous = x

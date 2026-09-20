@@ -2,7 +2,7 @@
 
 `--scale screen|bridge|flagship|extension` selects geometry and batch settings;
 explicit flags override individual fields. The conditions share every
-parameter except `l`'s width-`D` blank embedding. Loops and feedback reuse
+parameter except `l`'s width-`D` blank embedding; `v` adds none. Loops and feedback reuse
 weights. Source definitions are
 [`SCALES` and `reference_active`](../delta_feedback_experiment/train.py).
 
@@ -107,14 +107,14 @@ A step with `p` passes and `r` columns per pass executes `pr` columns,
 `4pr` cells, and `16pr` trunk layers per token position. The
 [recurrence roll](design.md#the-recurrence-roll) gives these expectations:
 
-| Quantity | `f` | `l` | `fl` |
+| Quantity | `f` | `l`, `v` | `fl`, `fv` |
 |---|---:|---:|---:|
 | Mean columns per position on rolled steps | 2.12 | 2.12 | 4.48 |
 | Maximum columns per position on rolled steps | 3 | 3 | 6 |
 | Mean columns per position over the default schedule | 1.28 | 1.28 | 1.87 |
 | Columns per pass in evaluation/decode | 1 | 2 | 2 |
 
-For `l`/`fl`, a rolled pass averages 33.92 executed trunk layers; fixed
+For looped conditions, a rolled pass averages 33.92 executed trunk layers; fixed
 evaluation/decode uses 32, and a three-column pass uses 48.
 `--loop-iterations` changes only the evaluation/decode count within `1..3`.
 Feedback evaluation additionally runs a second pass. Decode carries feedback

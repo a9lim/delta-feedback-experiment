@@ -33,7 +33,8 @@ delta probe
 
 The default tests cover portable numerical, state, and lifecycle contracts.
 `delta probe` exercises small CUDA train/eval/decode graphs, recomputation,
-shared fusion, and replay; `--ranks N` adds the step's collectives on N devices.
+shared fusion, and replay under `fl`, or under `fv` with `--condition fv`;
+`--ranks N` adds the step's collectives on N devices.
 Neither is a production memory or throughput measurement. The queue starts
 training directly. Kernel compilation and graph capture add startup time.
 
@@ -215,7 +216,7 @@ from scratch, to the run's numerical floor, without repeating the shared
 steps. Every other state-defining setting is inherited, and typing a
 different one is refused, as is a fork that changes nothing. A parameter only one condition owns
 (`l`'s blank embedding) is still at its initialization with zero moments
-there, so the fork adds or drops it exactly. Recurrence can start no earlier
+there, so the fork adds or drops it exactly; `v` has `f`'s parameter set. Recurrence can start no earlier
 than the source's retained snapshots allow. The `fork` record names the
 source snapshot and the changed settings, and the monitor draws the source's
 log up to that step as the fork's own history.

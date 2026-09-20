@@ -31,7 +31,7 @@ def route_mass_by_column(model, rows, iterations: int) -> dict[str, dict[int, di
     with autocast(device):
         e = model.embed_tokens(rows[:, :-1])
         columns = model.forward_iterations(
-            model.plain_seed(e), iterations=iterations, want_weights=True
+            model.plain_seed(e), e, iterations=iterations, want_weights=True
         )
     routes: dict[str, dict[int, dict[str, float]]] = {}
     for iteration, out in enumerate(columns):

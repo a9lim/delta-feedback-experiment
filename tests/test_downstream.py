@@ -68,9 +68,9 @@ def test_standard_and_fused_scores_match_the_analysis_passes():
     spans = [(3, 6), (5, 8)]
     with torch.no_grad():
         e = model.embed_tokens(IDS)
-        plain = model.forward_iterations(model.plain_seed(e), need_payload=True)[-1]
+        plain = model.forward_iterations(model.plain_seed(e), e, need_payload=True)[-1]
         fused = model.forward_iterations(
-            analysis.fused_inputs(model, e, plain.payload, 1), need_payload=False
+            analysis.fused_inputs(model, e, plain.payload, 1), e, need_payload=False
         )[-1]
     for mode, out in (("standard", plain), ("fused", fused)):
         got = downstream.DeltaScorer(model, mode).score(IDS, spans)
@@ -94,10 +94,12 @@ def test_soft_feedback_starts_after_the_first_continuation_token():
 
 def test_modes_follow_the_condition():
     assert downstream.condition_modes(tiny("f")) == downstream.MODES
-    looped = tiny("l")
-    assert downstream.condition_modes(looped) == ("standard",)
-    with pytest.raises(ValueError, match="condition with f"):
-        downstream.DeltaScorer(looped, "fused")
+    assert downstream.condition_modes(tiny("fv")) == downstream.MODES
+    for condition in ("l", "v"):
+        looped = tiny(condition)
+        assert downstream.condition_modes(looped) == ("standard",)
+        with pytest.raises(ValueError, match="condition with f"):
+            downstream.DeltaScorer(looped, "fused")
 
 
 @pytest.fixture

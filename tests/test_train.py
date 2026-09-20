@@ -302,7 +302,7 @@ def test_keyed_schedule_draws_are_reproducible():
         assert roll == draw_recurrence(args, step, args.steps)
         assert roll in {(1, 1), (2, 2), (3, 2), (2, 3)}
         # Every condition projects the same roll onto the letters it has.
-        for condition in ("f", "l", "fl"):
+        for condition in ("f", "l", "fl", "v", "fv"):
             cfg = condition_config(condition)
             passes, iterations = step_shape(args, step, args.steps, cfg)
             assert passes == (roll[0] if cfg.feedback else 1)
@@ -391,11 +391,11 @@ def test_reachable_graphs_cover_every_rolled_shape_without_cuda():
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(2, 2), GraphSpec(2, 3), GraphSpec(3, 2),
     ]
-    runner.model.cfg = replace(runner.model.cfg, loop=False)
+    runner.model.cfg = replace(runner.model.cfg, loop_blank=False)
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(2, 1), GraphSpec(3, 1),
     ]
-    runner.model.cfg = replace(runner.model.cfg, feedback=False, loop=True)
+    runner.model.cfg = replace(runner.model.cfg, feedback=False, loop_token=True)
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(1, 2), GraphSpec(1, 3),
     ]
@@ -403,8 +403,9 @@ def test_reachable_graphs_cover_every_rolled_shape_without_cuda():
 
 @pytest.mark.parametrize("depth", [0, 4])
 def test_eval_depth_stays_within_the_trained_range(depth):
-    with pytest.raises(ValueError, match="loop.*iterations"):
-        ModelConfig(loop=True, loop_iterations=depth)
+    for flag in ("loop_blank", "loop_token"):
+        with pytest.raises(ValueError, match="loop.*iterations"):
+            ModelConfig(**{flag: True}, loop_iterations=depth)
     with pytest.raises(SystemExit):
         parse_run_args(["draws", "--steps", "1", "--loop-iterations", str(depth)])
 
@@ -732,7 +733,9 @@ def test_input_bytes_counts_tokens_prefix_and_both_jitters():
 
 
 @pytest.mark.parametrize(
-    "source,target", [("f", "fl"), ("f", "l"), ("fl", "f")], ids=["f-fl", "f-l", "fl-f"]
+    "source,target",
+    [("f", "fl"), ("f", "l"), ("fl", "f"), ("f", "v"), ("fl", "fv")],
+    ids=["f-fl", "f-l", "fl-f", "f-v", "fl-fv"],
 )
 def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source, target):
     """Before the recurrence boundary every condition is one trajectory, so a

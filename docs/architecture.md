@@ -1,8 +1,9 @@
 # Architecture
 
-The full `fl` model combines two differentiable recurrences around one shared
-causal decoder: feedback (`f`) passes a predictive payload to the next token
-position, and looping (`l`) re-enters the decoder at the same position. A
+The full `fl` or `fv` model combines two differentiable recurrences around one
+shared causal decoder: feedback (`f`) passes a predictive payload to the next
+token position, and looping re-enters the decoder at the same position, with a
+blank embedding (`l`) or with the position's own token again (`v`). A
 **column** is one execution of the entire trunk; a **pass** runs the requested
 columns over a sequence. Columns share all parameters, but keep separate
 mixer-state tracks across token positions.
@@ -26,7 +27,8 @@ scaled token lookup or blank embedding + incoming or blank payload
                    ▼
              payload RMSNorm
                    │ + one training jitter draw
-                   ├─ fuse with blank embedding → next column at this position (l)
+                   ├─ fuse with blank embedding (l) or this token (v)
+                   │    → next column at this position
                    └─ fuse with next token ─┬→ next position's first column (f)
                                            └→ independent PKDA/expert block
                                               → tied second-token readout
@@ -283,7 +285,7 @@ to zero, supplies positions with no incoming payload. Their seed is
 `W_p(p − p₀)`. Its counterpart on the token side is a learned width-`D`
 blank embedding `e₀`, in post-lookup token units and also initialized to
 zero, which stands in for the token wherever a column re-enters at its own
-position. Only `l` has it.
+position under `l`. Only `l` has it; `v` re-enters with `e_t` itself.
 
 During training, each column adds one keyed perturbation `ξ_t` **after**
 payload normalization. Its amplitude is specified directly in payload units
@@ -297,16 +299,29 @@ use zero jitter.
 
 Let `p_t^(a,i)` denote the payload at position `t`, pass `a`, column `i`,
 and `R` the number of columns per pass. The first column of pass 1 uses
-`F(e_t,p₀)`. Later columns of any pass use the blank embedding:
+`F(e_t,p₀)`. Later columns of any pass fill the token side according to the
+condition:
 
 ```text
-seed_t^(a,i+1) = F(e₀, p_t^(a,i) + ξ_t^(a,i))
+seed_t^(a,i+1) = F(e₀,  p_t^(a,i) + ξ_t^(a,i))        (l)
+seed_t^(a,i+1) = F(e_t, p_t^(a,i) + ξ_t^(a,i))        (v)
 ```
 
-The first column consumes the token lookup `e_t`; every later column uses
-the learned baseline `e₀`. Those later columns receive token-dependent
-information through their payload and mixer caches, with no fresh token
-lookup.
+Under `l` the first column consumes the token lookup `e_t` and every later
+column uses the learned baseline `e₀`. Those later columns receive
+token-dependent information through their payload and mixer caches, with no
+fresh token lookup, and their seed differs from a feedback seed even when the
+next token repeats.
+
+Under `v` every column consumes `e_t`. The re-entry is then the feedback
+equation below applied to a chain in which every token is followed by a
+virtual repeat of itself: the seed operator and the payload chain of
+sequential decoding are those of feedback on `x_1, x_1, x_2, x_2, …`, while
+each column keeps its own mixer-state track instead of sharing one stream of
+twice the length. The payload is relieved of carrying the token, and because
+`F(e_t,p₀)` is the plain seed, replacing a looped payload with the blank makes
+the later column repeat the first: the loop payload has an in-distribution
+null.
 
 Later feedback passes instead take the preceding position's final-column
 payload from the previous pass:
@@ -323,10 +338,10 @@ through every payload and fusion.
 
 Every loop iteration is a complete column with a fresh seed and source bank;
 no cell delta is carried across its boundary as a separate source. Looping
-adds only `e₀`. Its first column does not depend on later columns, and
-setting `R=1` makes `fl` equal to `f` in values, routes, losses, and gradients
-for matched inputs and randomness, with `e₀` outside the graph. Every
-executed column is supervised.
+adds only `e₀`, and under `v` nothing. Its first column does not depend on
+later columns, and setting `R=1` makes `fl` and `fv` equal to `f` in values,
+routes, losses, and gradients for matched inputs and randomness, with `e₀`
+outside the graph. Every executed column is supervised.
 
 For sequential decoding, the first column at position `t` consumes the
 final payload from `t−1`; later columns loop at `t`. Each layer owns one
@@ -370,7 +385,8 @@ The next-token fusion `u` is computed once per column and exposed as
 `ColumnOutput.fused_input`. MTP reads it directly. After the pass's last
 column, feedback shifts that same tensor right and restores the plain
 prefix. A later looped column reuses the jittered payload but fuses it with
-the blank embedding instead. The auxiliary objective therefore trains the
+the blank embedding or the position's own token instead. The auxiliary
+objective therefore trains the
 trunk, payload router and gain, fusion, embedding, and auxiliary block,
 including on a single-pass batch or the final pass.
 
@@ -399,10 +415,11 @@ at `−0.2`.
 
 A payload-bearing fusion combines two approximately unit-RMS inputs with
 fan-in `2D`, giving an order-one seed. The zero-blank plain seed has only the
-token contribution, and the zero-blank loop seed only the payload's; each has
-expected RMS near `1/sqrt(2)`. These are initialization
-scales, not restrictions on learned magnitudes. Shared parameters initialize
-byte-identically across `f`, `l`, and `fl` for a given seed. Attention gates,
+token contribution, and the zero-blank `l` loop seed only the payload's; each
+has expected RMS near `1/sqrt(2)`, while a `v` loop seed is payload-bearing.
+These are initialization scales, not restrictions on learned magnitudes.
+Shared parameters initialize byte-identically across every condition for a
+given seed. Attention gates,
 fusion, and the auxiliary module use separate deterministic streams;
 training recurrence and jitter draws are keyed separately.
 

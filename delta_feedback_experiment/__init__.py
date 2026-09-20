@@ -2,7 +2,9 @@
 
 One ``DeltaModel`` combines a PKDA/gated-GQA trunk, MoE channel mixers,
 MHDB block-delta reads, and sequential two-token prediction. Conditions
-select feedback (``f``), looped depth (``l``), or both (``fl``).
+select feedback (``f``), looped depth re-entering with a blank embedding
+(``l``) or with the token again (``v``), or feedback with either (``fl``,
+``fv``).
 See docs/architecture.md for the model and docs/design.md for the recipe.
 """
 

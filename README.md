@@ -7,8 +7,9 @@ cells, shared and routed SwiGLU experts, and Multi-Head Delta Block routing
 over the seed and cell deltas. A shared fusion projection connects token
 embeddings, payloads, and an auxiliary second-token predictor.
 
-The `f`, `l`, and `fl` conditions select feedback, looped depth, or both.
-They share parameters, paired initialization, and keyed training draws.
+The conditions select feedback (`f`), looped depth re-entering with a blank
+embedding (`l`) or with the token again (`v`), or feedback with either (`fl`,
+`fv`). They share parameters, paired initialization, and keyed training draws.
 Four presets span 621M–5.32B stored parameters; the CLI defaults to screen
 scale and `f`. Ordinary generation uses the main next-token head.
 

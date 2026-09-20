@@ -447,7 +447,7 @@ records = []
 for scale in ('screen', 'bridge', 'flagship', 'extension'):
     args = parse_run_args(['monitor-check', '--scale', scale])
     active = reference_active(args)
-    for condition in ('f', 'l', 'fl'):
+    for condition in ('f', 'l', 'fl', 'v', 'fv'):
         with torch.device('meta'):
             model = DeltaModel(condition_config(condition, **model_fields(args)))
         cfg = model.cfg

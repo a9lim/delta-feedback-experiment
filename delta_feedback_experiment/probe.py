@@ -10,7 +10,7 @@ import warnings
 from dataclasses import replace
 
 
-def cuda_probe() -> None:
+def cuda_probe(condition: str) -> None:
     import torch
 
     from . import distributed
@@ -36,7 +36,7 @@ def cuda_probe() -> None:
         [
             "probe",
             "--condition",
-            "fl",
+            condition,
             "--steps",
             "2",
             "--recurrence-start",
@@ -204,7 +204,7 @@ def cuda_probe() -> None:
         tokens = data.rows[:1, :4].to(device)
         cache = KVCache(model.cfg, batch=1, device=device, dtype=torch.bfloat16)
         e = model.embed_tokens(tokens[:, :3])
-        prefill = model.forward_iterations(model.plain_seed(e), cache=cache)[-1]
+        prefill = model.forward_iterations(model.plain_seed(e), e, cache=cache)[-1]
         decoded = model.step(tokens[:, 3:], prefill.payload[:, -1:], cache)
         assert cache.pos == 4 and decoded.h_top.shape == (1, 1, args.dim)
         assert torch.isfinite(decoded.h_top).all()
@@ -224,8 +224,16 @@ def main(argv: list[str] | None = None) -> None:
         "one rank per device, with the same collectives a training step "
         "makes (default: 1)",
     )
+    parser.add_argument(
+        "--condition",
+        choices=("fl", "fv"),
+        default="fl",
+        help="feedback with either loop re-entry: the blank embedding (fl) or "
+        "the position's own token (fv) (default: fl)",
+    )
     argv = list(sys.argv[1:] if argv is None else argv)
-    ranks = parser.parse_args(argv).ranks
+    parsed = parser.parse_args(argv)
+    ranks = parsed.ranks
     if ranks < 1:
         raise SystemExit("--ranks must be positive")
     import torch
@@ -241,7 +249,7 @@ def main(argv: list[str] | None = None) -> None:
         warnings.filterwarnings(
             "ignore", message=r"flex_attention called without torch\.compile\(\)"
         )
-        cuda_probe()
+        cuda_probe(parsed.condition)
 
 
 if __name__ == "__main__":

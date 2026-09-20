@@ -252,9 +252,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--condition",
         type=condition,
         default="f",
-        metavar="{f,l,fl}",
+        metavar="{f,l,v,fl,fv}",
         help=(
-            "feedback (f), looped depth (l), or both (fl); default f: "
+            "feedback (f), looped depth (l or v), or feedback with either "
+            "(fl, fv); default f: "
             + "; ".join(
                 f"{letter} = {change}"
                 for letter, (_, change) in CONDITION_LETTERS.items()
@@ -605,9 +606,9 @@ def draw_recurrence(args, step: int, total: int) -> tuple[int, int]:
     every update rather than eroded between them: one keyed uniform draw
     lands on three passes at two columns with probability ``three_rate``, on
     three columns at two passes with the same probability, and otherwise on
-    two and two. ``f`` reads the pass count, ``l`` the column count, and
-    ``fl`` both, so the three conditions align step by step, and the pass
-    projection is the feedback draw of a condition without ``l``.
+    two and two. ``f`` reads the pass count, ``l`` or ``v`` the column count,
+    and ``fl`` or ``fv`` both, so the conditions align step by step, and the
+    pass projection is the feedback draw of a condition that does not loop.
     """
     if step <= recurrence_boundary(args, total):
         return 1, 1
@@ -650,8 +651,8 @@ def micro_draws(
     they are identical across conditions sharing the batch geometry and
     independent of how many rows a replay holds or which rank replays them.
     Within a row the prefix and the pass jitter, which perturbs each pass's
-    last column, are drawn first, so a condition with ``l`` shares them with
-    the condition without it; the loop jitter for the earlier columns
+    last column, are drawn first, so a looping condition shares them with
+    the condition that does not loop; the loop jitter for the earlier columns
     follows. Jitter is drawn directly in payload units, uniform in +/-
     args.jitter.
     """
@@ -1682,7 +1683,8 @@ def evaluate(
     topology: distributed.Topology = distributed.Topology(),
 ) -> dict[str, float]:
     """Paired val losses at the evaluation depth: pass 1 always, one fused
-    pass on feedback conditions, and the single-column readout under ``l``."""
+    pass on feedback conditions, and the single-column readout under ``l`` or
+    ``v``."""
     if graph_runner is not None:
         return graph_runner.run(data_val)
     model.eval()
