@@ -14,8 +14,9 @@ Each candidate must match the current production tiles on output, input
 gradient, and both weight gradients before it receives a timing. This checks
 tile equivalence, not the FP8 recipe against a higher-precision oracle.
 
-Tile overrides exist only in this process. FP8 DACT.BN stays fixed because
-it defines the gradient quantization recipe; DX.BK must divide that width.
+Tile overrides exist only in this process. The gate/up gradient scale width
+is the FP8 recipe and stays fixed: FP8 DACT.BN must be a multiple of it and
+DX.BK must divide it.
 Default sweep: four configurations, two routing distributions, one width.
 Results are incremental JSON under logs/moe-bench/; no training state changes.
 """
@@ -97,7 +98,14 @@ def tile_targets(capability):
     """Keep candidate names conceptual while patching the effective device tiles."""
     targets = {key: key for key in TILE_NAMES}
     if capability == (9, 0):
-        for key in ("TILE_DW_GATE", "TILE_DW_DOWN"):
+        for key in (
+            "TILE_DW_GATE",
+            "TILE_DW_DOWN",
+            "TILE_GATE_UP_FP8",
+            "TILE_DOWN_FP8",
+            "TILE_DACT_FP8",
+            "TILE_DX_FP8",
+        ):
             targets[key] = key + "_HOPPER"
     return targets
 
@@ -121,10 +129,11 @@ def routes(torch, tokens, kind, experts, selected):
 @contextmanager
 def tiles(module, baseline, candidate, targets):
     chosen = baseline | CANDIDATES[candidate]
-    if chosen["TILE_DACT_FP8"][1] != baseline["TILE_DACT_FP8"][1]:
-        raise ValueError("DACT.BN changes the FP8 recipe")
-    if chosen["TILE_DACT_FP8"][1] % chosen["TILE_DX_FP8"][2]:
-        raise ValueError("DX.BK must divide DACT.BN")
+    width = module.DACT_SCALE_WIDTH
+    if chosen["TILE_DACT_FP8"][1] % width:
+        raise ValueError("DACT.BN must cover whole gradient scale groups")
+    if width % chosen["TILE_DX_FP8"][2]:
+        raise ValueError("DX.BK must divide the gradient scale width")
     previous = {key: getattr(module, key) for key in targets.values()}
     try:
         for key, value in chosen.items():
