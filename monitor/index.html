@@ -341,7 +341,7 @@ function resultCell(result, metric) {
   const value = result?.metrics[metric];
   if (!value) return '<div aria-label="No result">–</div>';
   const scale = metric === 'ppl' ? 1 : 100;
-  const score = (value.mean * scale).toFixed(2) + (metric === 'ppl' ? '' : '%');
+  const score = (value.mean * scale).toFixed(2);
   return `<div title="${METRICS[metric]} · n=${count(result.n)}">${score}</div>`;
 }
 function resultsHTML(columns) {
@@ -366,7 +366,7 @@ function resultsHTML(columns) {
     const detail = column.baseline ? column.tag : `${modeLabel(column)} · step ${count(column.current)}`;
     return `<th scope="col"${edge(index)} style="color:${column.color}" title="${esc(detail)}"><span class="result-name">${esc(label)}</span></th>`;
   }).join('');
-  const metricHeaders = columns.map((_, index) => `<th${edge(index)}><div class="result-metrics result-head"><span title="Accuracy, percent ↑">acc</span><span title="Normalized accuracy, percent ↑">norm</span></div></th>`).join('');
+  const metricHeaders = columns.map((_, index) => `<th${edge(index)}><div class="result-metrics result-head"><span title="Accuracy, percent ↑">acc %</span><span title="Normalized accuracy, percent ↑">norm %</span></div></th>`).join('');
   const rows = tasks.flatMap((task) => [['acc', 'acc_norm'], ['ppl']]
     .filter((metrics) => metrics.some((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])))
     .map((metrics) => {

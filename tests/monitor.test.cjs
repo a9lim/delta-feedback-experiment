@@ -253,7 +253,7 @@ test('baselines appear alongside runs and remain when no selected run has saved 
   assert.equal(columns.length, 3);
   assert.match(html, /title="org\/reference"><span class="result-name">reference<\/span>/);
   assert.match(html, /scope="colgroup" colspan="2"[^>]*><span class="result-name">Baselines<\/span>/);
-  assert.match(html, /80.00%/);
+  assert.match(html, />80.00<\/div>/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
   assert.doesNotMatch(html, /Δ|Baseline · step|NaN|Infinity|undefined/);
@@ -278,7 +278,7 @@ test('cross-run table aligns tasks and modes and keeps missing scores', () => {
   assert.doesNotMatch(html, /Δ|no-json/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
-  assert.match(a.resultCell({n: 32, metrics: {acc: {mean: 0.4}}}, 'acc'), /title="Accuracy ↑ · n=32">40.00%<\/div>/);
+  assert.match(a.resultCell({n: 32, metrics: {acc: {mean: 0.4}}}, 'acc'), /title="Accuracy ↑ · n=32">40.00<\/div>/);
   assert.match(a.resultCell({n: 32, metrics: {ppl: {mean: 15.8}}}, 'ppl'), />15.80<\/div>/);
 });
 

@@ -340,7 +340,8 @@ model name; hover reveals the full model ID. Run headers expose the full tag
 and checkpoint on hover, including when a narrow column truncates the label.
 
 Accuracy and normalized accuracy appear side by side beneath compact
-**acc / norm** headers, both as percentages; unreported metrics show a dash.
+**acc % / norm %** headers, with the percent unit only in the headers;
+unreported metrics show a dash.
 Document counts sit inline beside each task name. If counts differ across
 runs, modes, or baselines, the row shows **n varies** and a tooltip identifies
 each result's count. LAMBADA perplexity remains per word on its own **ppl** row.
