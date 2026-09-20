@@ -1096,7 +1096,8 @@ class EagerTrainer(Trainer):
                 prefix_lens=prefix, jitter=jitter, loop_jitter=loop_jitter,
             )
             loss_result = multipass_loss(
-                self.model, rows, outs, z_coef=self.z_coef, mtp_weight=args.mtp_weight
+                self.model, rows, outs, z_coef=self.z_coef, mtp_weight=args.mtp_weight,
+                grad_scale=scale,
             )
             loss, losses = loss_result.total, loss_result.ntp
             (loss * scale).backward()
@@ -1406,7 +1407,7 @@ class CudaGraphTrainer(Trainer):
             )
             loss_result = multipass_loss(
                 self.model, state.rows, outs, z_coef=state.z_coef,
-                mtp_weight=self.args.mtp_weight,
+                mtp_weight=self.args.mtp_weight, grad_scale=scale,
             )
             loss, losses = loss_result.total, loss_result.ntp
         (loss * scale).backward()

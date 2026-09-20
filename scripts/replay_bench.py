@@ -6,6 +6,7 @@ by kernel class: the baseline the Hopper levers are scored against.
         [--replay-rows 2] [--attention-backend cudnn|flash] [--fp8-head]
         [--cce-config bf16-base] [--expert-tiles default|ada]
         [--train-steps 4]  # optional optimizer check; requires one captured spec
+        [--init runs/TAG.pt.STEP]  # trained weights and selection biases
         [--warm 3] [--repeat 10] [-- --precision bf16 --micro-rows 2 ...]
 
 Builds the trainer exactly as ``delta train`` does (same planner, same
@@ -15,9 +16,13 @@ micro-batch ``--warm`` times untimed and ``--repeat`` times timed. Reports
 milliseconds per replay, per row, and per row-column, the replays a
 128-row step needs, and the step time each graph implies; weights the
 graphs by how often the schedule rolls them for one mean step figure.
-The loss sum of one replay at initialization is a numerics fingerprint
-for comparisons at the same width (different widths use different corpus
-rows). ``--trace`` profiles one replay per graph
+The loss sum of one replay is a numerics fingerprint for comparisons at
+the same width and weights (different widths use different corpus rows).
+``--init`` loads a snapshot's model state (weights and expert-selection
+biases, not optimizer state) before the trainer is built: an untrained
+head filters nothing in the CCE backward and untrained routers spread
+tokens evenly, so kernel timings need trained weights. Any condition with
+the snapshot's parameter set loads (``v`` weights run ``fv``). ``--trace`` profiles one replay per graph
 and sums kernel time by class (GEMM, FLA recurrence, CCE head, experts,
 attention, pointwise, ...) with the top kernels by time. Writes
 ``logs/replay-bench/<tag>.json``. Run from the experiment directory.
@@ -98,6 +103,8 @@ def main() -> None:
                         help="use this fixed CCE benchmark configuration; omitted uses production")
     parser.add_argument("--expert-tiles", choices=("default", "ada"), default="default",
                         help="use production expert tiles or restore Ada dW tiles for a paired comparison")
+    parser.add_argument("--init", default=None,
+                        help="load this snapshot's model state (weights and selection biases) first")
     parser.add_argument("--out", default=None, help="default logs/replay-bench/<tag>.json")
     parser.add_argument("extra", nargs="*", help="further delta train flags after --")
     opts = parser.parse_args()
@@ -138,6 +145,7 @@ def main() -> None:
         parse_run_args,
         pick_device,
         plan_replay,
+        read_checkpoint,
         step_shape,
     )
 
@@ -159,7 +167,13 @@ def main() -> None:
     device = pick_device(args.device, topology)
     distributed.initialize(topology, device)
     data = TokenData.load(Path(args.data_root) / args.source, "train", args.seq_len)
-    model = DeltaModel(condition_config(args.condition, **model_fields(args))).to(device)
+    model = DeltaModel(condition_config(args.condition, **model_fields(args)))
+    if opts.init is not None:
+        payload = read_checkpoint(opts.init)
+        # A geometry that differs fails here on the first mismatched shape.
+        model.load_state_dict(payload["state"])
+        del payload
+    model = model.to(device)
     model.fp8_classifier = opts.fp8_head
     sites = ParameterSites(model, topology, fp8=args.precision == "fp8")
     optimizers = build_optimizers(
@@ -216,6 +230,7 @@ def main() -> None:
         "expert_tiles": opts.expert_tiles,
         "attention_backend": opts.attention_backend,
         "requested_replay_rows": opts.replay_rows,
+        "init": opts.init,
         "device": torch.cuda.get_device_name(),
         "torch": torch.__version__,
         "revisions": {

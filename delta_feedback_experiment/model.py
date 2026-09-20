@@ -53,6 +53,7 @@ from .cuda_kernels import (
     quantize_weights,
     sink_linear,
 )
+from .head import dense_head, dense_head_device, weighted_dense_head
 from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
@@ -2107,6 +2108,11 @@ def head_row_losses(
             if len(hiddens) == 2
             else torch.cat([model.readout_input(h) for h in hiddens]).flatten(0, -2)
         )
+        if dense_head_device(normalized.device) and not model.fp8_classifier:
+            classifier, accum, _ = model.classifier_for_loss()
+            nll, lse = dense_head(normalized, classifier, torch.cat(targets), sink=accum)
+            shape = (len(hiddens), *targets[0].shape)
+            return nll.view(shape), lse.view(shape)
         # The ordering is a scheduling hint for the backward, so evaluation
         # (no backward) tiles the classifier in place.
         ordering = (
@@ -2176,6 +2182,12 @@ def _first_plus_mean(values: list[Tensor]) -> Tensor:
     return values[0] + torch.stack(values[1:]).mean()
 
 
+def first_plus_mean_weights(count: int) -> list[float]:
+    """Each element's coefficient under ``_first_plus_mean`` of ``count``
+    values: one for the first, ``1/(count-1)`` for each later one."""
+    return [1.0] + [1.0 / (count - 1)] * (count - 1) if count > 1 else [1.0]
+
+
 def combine_column_losses(values: list[list[Tensor]]) -> Tensor:
     """FBT's first-plus-mean combine applied along both recurrence axes.
 
@@ -2210,6 +2222,49 @@ class LossOutput:
     """Assignments summed over columns, [trunk layers + MTP, routed experts]."""
 
 
+def weighted_head_loss(
+    model: DeltaModel,
+    hiddens: tuple[Tensor, ...],
+    targets: tuple[Tensor, ...],
+    weight_nll: Tensor,
+    weight_z: Tensor,
+    *,
+    grad_scale: float = 1.0,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """``(sum(w_nll * nll + w_z * lse^2), nll, lse)`` through the tied readout.
+
+    The weights are FP32 over the heads' rows in order, ``[heads * B * T]``;
+    ``nll`` and ``lse`` come back ``[heads, B, T]``. A Hopper training call
+    runs the dense head, which applies the objective's gradient during its
+    forward for an incoming gradient of exactly ``grad_scale`` and returns
+    detached statistics; every other call forms the same sum over
+    ``head_row_losses`` with ordinary autograd.
+    """
+    shape = (len(hiddens), *targets[0].shape)
+    main = hiddens[0]
+    if (
+        main.is_cuda
+        and torch.is_grad_enabled()
+        and main.requires_grad
+        and dense_head_device(main.device)
+        and not model.fp8_classifier
+    ):
+        normalized = (
+            _compiled_readout_pair(model, *hiddens)
+            if len(hiddens) == 2
+            else torch.cat([model.readout_input(h) for h in hiddens]).flatten(0, -2)
+        )
+        classifier, accum, _ = model.classifier_for_loss()
+        total, nll, lse = weighted_dense_head(
+            normalized, classifier, torch.cat(targets).flatten(), weight_nll, weight_z,
+            grad_scale=grad_scale, sink=accum,
+        )
+        return total, nll.view(shape), lse.view(shape)
+    nll, lse = head_row_losses(model, hiddens, targets)
+    total = (weight_nll * nll.flatten()).sum() + (weight_z * lse.flatten().square()).sum()
+    return total, nll, lse
+
+
 def multipass_loss(
     model: DeltaModel,
     tokens: Tensor,
@@ -2217,6 +2272,7 @@ def multipass_loss(
     *,
     z_coef: float | Tensor = 0.0,
     mtp_weight: float = MTP_LOSS_WEIGHT,
+    grad_scale: float = 1.0,
 ) -> LossOutput:
     """FBT Eq. 12 with λ=1 along passes and again along columns, plus (in
     cooldown) the z-loss under the same weighting: ``combine_column_losses``
@@ -2230,6 +2286,13 @@ def multipass_loss(
     last row, whose second token is past the end of the stored row, takes a
     dummy target and no weight. Both heads' rows go through one vocabulary
     pass per column. ``ntp[0][0]`` is the Standard-mode tracking metric.
+
+    The objective is assembled row by row: each column's head call receives
+    every row's weight (its column's combine coefficient, the row mean, the
+    MTP weight, the z-loss coefficient), which lets the Hopper head apply
+    its gradient during the forward. ``grad_scale`` is the gradient the
+    caller back-propagates into ``total`` (a replay's share of the step);
+    the per-column CE series are the same means as before.
     """
     if not outs or not outs[0]:
         raise ValueError("loss needs at least one model column")
@@ -2239,30 +2302,39 @@ def multipass_loss(
         raise ValueError("MTP needs at least three stored tokens")
     targets = tokens[:, 1:]
     mtp_targets = F.pad(tokens[:, 2:], (0, 1))
+    batch, length = targets.shape
+    # Row weights of one unit-coefficient column: each head's mean over its
+    # real targets. The padded row is the auxiliary head's causally last
+    # one, so leaving it out of both means leaves every earlier row untouched.
+    row_weights = torch.full(
+        (2, batch, length), 1.0 / (batch * length), device=tokens.device
+    )
+    row_weights[1] = mtp_weight / (batch * (length - 1))
+    row_weights[1, :, -1] = 0.0
+    row_weights = row_weights.flatten()
+    pass_coefficients = first_plus_mean_weights(len(outs))
+    column_coefficients = first_plus_mean_weights(len(outs[0]))
     losses: list[list[Tensor]] = []
-    z_terms: list[list[Tensor]] = []
     mtp_losses: list[list[Tensor]] = []
-    mtp_z: list[list[Tensor]] = []
-    expert_losses, expert_counts = [], []
+    head_totals, expert_losses, expert_counts = [], [], []
     invocations = model.cfg.layers
-    for columns in outs:
-        for series in (losses, z_terms, mtp_losses, mtp_z):
-            series.append([])
-        for out in columns:
+    for pass_coefficient, columns in zip(pass_coefficients, outs, strict=True):
+        losses.append([])
+        mtp_losses.append([])
+        for column_coefficient, out in zip(column_coefficients, columns, strict=True):
             if out.payload is None:
                 raise ValueError("MTP loss needs a payload from every column")
             if out.fused_input is None:
                 raise ValueError("MTP loss needs the column's shared fused input")
             mtp = model.forward_mtp_fused(out.fused_input)
-            nll, lse = head_row_losses(
-                model, (out.h_top, mtp.hidden), (targets, mtp_targets)
+            weight_nll = row_weights * (pass_coefficient * column_coefficient)
+            head_total, nll, lse = weighted_head_loss(
+                model, (out.h_top, mtp.hidden), (targets, mtp_targets),
+                weight_nll, weight_nll * z_coef, grad_scale=grad_scale,
             )
+            head_totals.append(head_total)
             losses[-1].append(nll[0].mean())
-            z_terms[-1].append(lse[0].square().mean())
-            # The padded row is the auxiliary head's causally last one, so
-            # leaving it out of both means leaves every earlier row untouched.
             mtp_losses[-1].append(nll[1][:, :-1].mean())
-            mtp_z[-1].append(lse[1][:, :-1].square().mean())
             expert_losses.append(
                 (out.expert_aux_loss * invocations + mtp.expert_aux_loss)
                 / (invocations + 1)
@@ -2271,13 +2343,8 @@ def multipass_loss(
                 torch.cat((out.expert_counts, mtp.expert_counts[None]))
             )
 
-    total = combine_column_losses(losses)
-    total = total + z_coef * combine_column_losses(z_terms)
-    total = total + mtp_weight * (
-        combine_column_losses(mtp_losses) + z_coef * combine_column_losses(mtp_z)
-    )
     expert_aux_loss = torch.stack(expert_losses).mean()
-    total = total + EXPERT_BALANCE_COEF * expert_aux_loss
+    total = torch.stack(head_totals).sum() + EXPERT_BALANCE_COEF * expert_aux_loss
     return LossOutput(
         total, losses, mtp_losses, expert_aux_loss, torch.stack(expert_counts).sum(0)
     )
