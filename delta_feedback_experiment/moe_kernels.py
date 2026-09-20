@@ -13,8 +13,9 @@ Under the FP8 recipe the two forward GEMMs and the two activation-gradient
 GEMMs read FP8 operands with per-row scales: the block input and the
 incoming gradient are quantized per token by the caller, the SwiGLU output
 by the kernel that computes it, and the gate/up gradient by the epilogue
-that produces it, with one scale per row of each column tile, which the
-input-gradient GEMM applies block by block along its reduction. The bank's
+that produces it, with one scale per row of each fixed-width column group,
+which the input-gradient GEMM applies block by block along its reduction.
+That width is the recipe and is independent of the tile that writes it. The bank's
 FP8 copies supply the weights, the transposed copy wherever the reduction
 runs over the weight's output axis, so every operand is contiguous along the
 reduction. The two weight-gradient GEMMs keep BF16 operands into the FP32
@@ -44,10 +45,12 @@ TILE_DACT = (64, 64, 32, 4, 3)
 TILE_DX = (128, 64, 32, 4, 3)
 TILE_DW_GATE = (64, 64, 64, 4, 3)
 TILE_DW_DOWN = (64, 64, 64, 4, 3)
-# GH200 benefits from wider output/reduction tiles in both BF16 dW GEMMs.
-# The activation GEMMs and their FP8 scale boundaries retain their own tiles.
+# Hopper wants wider tiles in both BF16 dW GEMMs. The gate/up gradient,
+# whose reduction runs over the widest operand, keeps the deeper reduction
+# block; the down gradient does better with a square output tile that fits
+# two blocks per multiprocessor.
 TILE_DW_GATE_HOPPER = (64, 128, 128, 4, 3)
-TILE_DW_DOWN_HOPPER = (64, 128, 128, 4, 3)
+TILE_DW_DOWN_HOPPER = (128, 128, 64, 4, 3)
 SWIGLU_BLOCK = 1024
 
 # The FP8 GEMMs read half the bytes per reduction step, so their tiles reach
@@ -57,6 +60,23 @@ TILE_GATE_UP_FP8 = (64, 128, 64, 4, 3)
 TILE_DOWN_FP8 = (64, 64, 64, 4, 3)
 TILE_DACT_FP8 = (64, 64, 64, 4, 3)
 TILE_DX_FP8 = (128, 64, 64, 4, 3)
+# Measured on an H100 PCIe at the screen geometry (49,152 assignments).
+# The gate/up projection and the input gradient already run near this
+# machine's arithmetic roof and keep their tiles. The down projection wants
+# a wider output tile. The activation gradient is bound by the traffic of
+# its epilogue rather than by operand reuse, so it reaches along the
+# reduction instead: a wider output tile there costs more in registers than
+# the reuse returns.
+TILE_GATE_UP_FP8_HOPPER = (64, 128, 64, 4, 3)
+TILE_DOWN_FP8_HOPPER = (64, 128, 64, 4, 3)
+TILE_DACT_FP8_HOPPER = (64, 64, 256, 8, 3)
+TILE_DX_FP8_HOPPER = (128, 64, 64, 4, 3)
+
+# The column span of one gate/up gradient scale. It is the quantization
+# recipe, not a tile: the activation-gradient epilogue writes one scale per
+# row of each group, so its own output tile may span several of them, and the
+# input-gradient GEMM's reduction block must divide it.
+DACT_SCALE_WIDTH = 64
 
 
 def _weight_gradient_tiles(device: torch.device):
@@ -65,6 +85,18 @@ def _weight_gradient_tiles(device: torch.device):
     if torch.cuda.get_device_capability(device) == (9, 0):
         return TILE_DW_GATE_HOPPER, TILE_DW_DOWN_HOPPER
     return TILE_DW_GATE, TILE_DW_DOWN
+
+
+def _fp8_tiles(device: torch.device):
+    """The four FP8 GEMM tiles for this device, widest first."""
+    if torch.cuda.get_device_capability(device) == (9, 0):
+        return (
+            TILE_GATE_UP_FP8_HOPPER,
+            TILE_DOWN_FP8_HOPPER,
+            TILE_DACT_FP8_HOPPER,
+            TILE_DX_FP8_HOPPER,
+        )
+    return TILE_GATE_UP_FP8, TILE_DOWN_FP8, TILE_DACT_FP8, TILE_DX_FP8
 
 
 if triton is not None:
@@ -328,6 +360,7 @@ if triton is not None:
         K: tl.constexpr,
         O: tl.constexpr,
         SCALE_TILES: tl.constexpr,
+        SCALE_WIDTH: tl.constexpr,
         FP8_MAX_VALUE: tl.constexpr,
         SCALE_FLOOR: tl.constexpr,
         BM: tl.constexpr,
@@ -337,8 +370,10 @@ if triton is not None:
         """``dact = grad @ W_down`` on FP8 operands (``weight`` is the bank's
         transposed down copy ``[E, h, D]``) with the SwiGLU backward in the
         epilogue: writes both halves of ``dgate_up`` in BF16 for the weight
-        gradient and in FP8 for the input gradient, one scale per row of this
-        column tile covering both halves, and recomputes ``activated``."""
+        gradient and in FP8 for the input gradient, one scale per row of each
+        ``SCALE_WIDTH``-column group covering both halves, and recomputes
+        ``activated``. The output tile spans ``BN // SCALE_WIDTH`` groups, so
+        the tile is free to grow without coarsening the quantization."""
         expert = tl.program_id(2)
         start = tl.load(offsets + expert)
         end = tl.load(offsets + expert + 1)
@@ -379,15 +414,22 @@ if triton is not None:
                 gate * sigmoid * up,
                 mask,
             )
+            groups: tl.constexpr = BN // SCALE_WIDTH
+            shape: tl.constexpr = (BM, groups, SCALE_WIDTH)
             amax = tl.maximum(
-                tl.max(tl.abs(dgate), axis=1), tl.max(tl.abs(dup), axis=1)
+                tl.max(tl.abs(tl.reshape(dgate, shape)), axis=2),
+                tl.max(tl.abs(tl.reshape(dup, shape)), axis=2),
             )
             scale = tl.maximum(amax / FP8_MAX_VALUE, SCALE_FLOOR)
+            spread = tl.reshape(tl.broadcast_to(scale[:, :, None], shape), (BM, BN))
             gate_quantized = dgate_up_fp8 + rows[:, None] * (2 * O) + columns[None, :]
-            tl.store(gate_quantized, (dgate / scale[:, None]).to(tl.float8e4nv), mask)
-            tl.store(gate_quantized + O, (dup / scale[:, None]).to(tl.float8e4nv), mask)
+            tl.store(gate_quantized, (dgate / spread).to(tl.float8e4nv), mask)
+            tl.store(gate_quantized + O, (dup / spread).to(tl.float8e4nv), mask)
+            tiles = tl.program_id(1) * groups + tl.arange(0, groups)
             tl.store(
-                dgate_up_scale + rows * SCALE_TILES + tl.program_id(1), scale, rows < end
+                dgate_up_scale + rows[:, None] * SCALE_TILES + tiles[None, :],
+                scale,
+                (rows[:, None] < end) & (tiles[None, :] < SCALE_TILES),
             )
 
     @triton.jit
@@ -786,9 +828,10 @@ def _forward_fp8(
     the BF16 output and the BF16 pre-activation the backward reads."""
     tokens, dim = x.shape
     width = down_weight.shape[-1]
+    gate_up_tile, down_tile, _, _ = _fp8_tiles(x.device)
     gate_up = _mm_fp8(
         x, x_scale, gate_weight, gate_scale, assignments, offsets, tokens,
-        2 * width, TILE_GATE_UP_FP8, gather=True,
+        2 * width, gate_up_tile, gather=True,
     )
     activated = torch.empty(
         (assignments.numel(), width), dtype=torch.float8_e4m3fn, device=x.device
@@ -807,7 +850,7 @@ def _forward_fp8(
     )
     output = _mm_fp8(
         activated, activated_scale, down_weight, down_scale, assignments, offsets,
-        tokens, dim, TILE_DOWN_FP8,
+        tokens, dim, down_tile,
     )
     return output, gate_up
 
@@ -893,13 +936,16 @@ def _backward_fp8(
     dgate_up = torch.empty_like(gate_up)
     dgate_up_fp8 = torch.empty_like(gate_up, dtype=torch.float8_e4m3fn)
     activated = x.new_empty((assignments.numel(), width))
-    block_m, block_n, block_k, warps, stages = TILE_DACT_FP8
-    scale_tiles = triton.cdiv(width, block_n)
+    _, _, dact_tile, dx_tile = _fp8_tiles(x.device)
+    block_m, block_n, block_k, warps, stages = dact_tile
+    if block_n % DACT_SCALE_WIDTH:
+        raise ValueError("the activation-gradient tile must cover whole scale groups")
+    scale_tiles = triton.cdiv(width, DACT_SCALE_WIDTH)
     dgate_up_scale = torch.empty(
         (assignments.numel(), scale_tiles), dtype=torch.float32, device=x.device
     )
     _grouped_mm_dact_swiglu_fp8[
-        (triton.cdiv(tokens, block_m), scale_tiles, experts)
+        (triton.cdiv(tokens, block_m), triton.cdiv(width, block_n), experts)
     ](
         gradient_fp8,
         gradient_scale,
@@ -914,6 +960,7 @@ def _backward_fp8(
         dim,
         width,
         scale_tiles,
+        DACT_SCALE_WIDTH,
         FP8_MAX,
         FP8_SCALE_FLOOR,
         block_m,
@@ -922,9 +969,8 @@ def _backward_fp8(
         num_warps=warps,
         num_stages=stages,
     )
-    scale_width = block_n
-    block_m, block_n, block_k, warps, stages = TILE_DX_FP8
-    if scale_width % block_k:
+    block_m, block_n, block_k, warps, stages = dx_tile
+    if DACT_SCALE_WIDTH % block_k:
         raise ValueError("the input-gradient reduction block must divide the scale tile")
     dx_assignments = torch.empty(
         (assignments.numel(), dim), dtype=torch.bfloat16, device=x.device
@@ -941,7 +987,7 @@ def _backward_fp8(
         width,
         dim,
         scale_tiles,
-        scale_width,
+        DACT_SCALE_WIDTH,
         block_m,
         block_n,
         block_k,

@@ -1,9 +1,8 @@
 """Small grouped-expert tile sweep at current model geometries, on an idle GPU.
 
     python scripts/moe_bench.py --rows 2 --routing balanced skewed
-    python scripts/moe_bench.py --scale bridge flagship --rows 2 --candidates dw128 k128
-    python scripts/moe_bench.py --scale screen bridge flagship --rows 4 --candidates ada_dw
-    python scripts/moe_bench.py --rows 4 16 --candidates baseline k128 dw128
+    python scripts/moe_bench.py --scale bridge flagship --rows 2 --candidates ada
+    python scripts/moe_bench.py --rows 4 16 --candidates baseline ada wide
     python scripts/moe_bench.py --check
 
 Times the complete routed expert forward/backward (all six GEMMs, SwiGLU,
@@ -14,9 +13,10 @@ Each candidate must match the current production tiles on output, input
 gradient, and both weight gradients before it receives a timing. This checks
 tile equivalence, not the FP8 recipe against a higher-precision oracle.
 
-Tile overrides exist only in this process. FP8 DACT.BN stays fixed because
-it defines the gradient quantization recipe; DX.BK must divide that width.
-Default sweep: four configurations, two routing distributions, one width.
+Tile overrides exist only in this process. The gate/up gradient scale width
+is the FP8 recipe and stays fixed: FP8 DACT.BN must be a multiple of it and
+DX.BK must divide it.
+Default sweep: three configurations, two routing distributions, one width.
 Results are incremental JSON under logs/moe-bench/; no training state changes.
 """
 
@@ -55,49 +55,48 @@ TILE_NAMES = (
 # Few hypotheses, not a Cartesian sweep. No change to scale granularity.
 CANDIDATES = {
     "baseline": {},
-    "ada_dw": {
-        "TILE_DW_GATE": (64, 64, 64, 4, 3),
-        "TILE_DW_DOWN": (64, 64, 64, 4, 3),
-    },
-    "k128": {
-        "TILE_GATE_UP": (64, 128, 64, 4, 3),
-        "TILE_DOWN": (64, 64, 64, 4, 3),
-        "TILE_DACT": (64, 64, 64, 4, 3),
-        "TILE_DX": (128, 64, 64, 4, 3),
-        "TILE_GATE_UP_FP8": (64, 128, 128, 4, 3),
-        "TILE_DOWN_FP8": (64, 64, 128, 4, 3),
-        "TILE_DACT_FP8": (64, 64, 128, 4, 3),
-        "TILE_DW_GATE": (64, 64, 128, 4, 3),
-        "TILE_DW_DOWN": (64, 64, 128, 4, 3),
-    },
-    "dw128": {
-        "TILE_DW_GATE": (64, 128, 128, 4, 3),
+    # The tiles this bank used before the H100 measurements, for the gain.
+    "ada": {
+        "TILE_DOWN_FP8": (64, 64, 64, 4, 3),
+        "TILE_DACT_FP8": (64, 64, 64, 4, 3),
         "TILE_DW_DOWN": (64, 128, 128, 4, 3),
     },
-    "dw_n128": {
-        "TILE_DW_GATE": (64, 128, 64, 4, 3),
-        "TILE_DW_DOWN": (64, 128, 64, 4, 3),
-    },
-    "wide128": {
-        "TILE_GATE_UP": (128, 128, 32, 8, 3),
-        "TILE_DOWN": (128, 128, 32, 8, 3),
-        "TILE_DACT": (128, 64, 32, 4, 3),
-        "TILE_DX": (128, 128, 32, 8, 3),
-        "TILE_GATE_UP_FP8": (128, 128, 64, 8, 3),
-        "TILE_DOWN_FP8": (128, 128, 64, 8, 3),
-        "TILE_DACT_FP8": (128, 64, 64, 4, 3),
+    # Wider output tiles: they cut operand re-reads but cost more in
+    # registers than the reuse returns on Hopper.
+    "wide": {
+        "TILE_GATE_UP_FP8": (64, 128, 128, 4, 3),
+        "TILE_DOWN_FP8": (64, 128, 128, 4, 3),
+        "TILE_DACT_FP8": (64, 128, 128, 8, 3),
         "TILE_DX_FP8": (128, 128, 64, 8, 3),
-        "TILE_DW_GATE": (64, 128, 64, 4, 3),
-        "TILE_DW_DOWN": (64, 128, 64, 4, 3),
+        "TILE_DW_GATE": (128, 128, 64, 4, 3),
+        "TILE_DW_DOWN": (128, 256, 64, 8, 3),
     },
 }
+
+
+def _git(*arguments: str) -> str:
+    """The repository's state, or an empty record when run from a plain copy.
+
+    Rented machines take an rsync of the checkout without its history.
+    """
+    try:
+        return subprocess.check_output(["git", *arguments], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return ""
 
 
 def tile_targets(capability):
     """Keep candidate names conceptual while patching the effective device tiles."""
     targets = {key: key for key in TILE_NAMES}
     if capability == (9, 0):
-        for key in ("TILE_DW_GATE", "TILE_DW_DOWN"):
+        for key in (
+            "TILE_DW_GATE",
+            "TILE_DW_DOWN",
+            "TILE_GATE_UP_FP8",
+            "TILE_DOWN_FP8",
+            "TILE_DACT_FP8",
+            "TILE_DX_FP8",
+        ):
             targets[key] = key + "_HOPPER"
     return targets
 
@@ -121,10 +120,11 @@ def routes(torch, tokens, kind, experts, selected):
 @contextmanager
 def tiles(module, baseline, candidate, targets):
     chosen = baseline | CANDIDATES[candidate]
-    if chosen["TILE_DACT_FP8"][1] != baseline["TILE_DACT_FP8"][1]:
-        raise ValueError("DACT.BN changes the FP8 recipe")
-    if chosen["TILE_DACT_FP8"][1] % chosen["TILE_DX_FP8"][2]:
-        raise ValueError("DX.BK must divide DACT.BN")
+    width = module.DACT_SCALE_WIDTH
+    if chosen["TILE_DACT_FP8"][1] % width:
+        raise ValueError("DACT.BN must cover whole gradient scale groups")
+    if width % chosen["TILE_DX_FP8"][2]:
+        raise ValueError("DX.BK must divide the gradient scale width")
     previous = {key: getattr(module, key) for key in targets.values()}
     try:
         for key, value in chosen.items():
@@ -420,7 +420,7 @@ def main():
         "--candidates",
         nargs="+",
         choices=tuple(CANDIDATES),
-        default=["baseline", "k128", "dw128", "wide128"],
+        default=["baseline", "ada", "wide"],
     )
     parser.add_argument("--precision", choices=("fp8", "bf16"), default="fp8")
     parser.add_argument("--warm", type=int, default=3)
@@ -467,10 +467,8 @@ def main():
         },
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "benchmark_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "git_status": subprocess.check_output(["git", "status", "--short"], text=True),
-        "git_revision": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
+        "git_status": _git("status", "--short"),
+        "git_revision": _git("rev-parse", "HEAD").strip(),
         "seed": args.seed,
         "cases": [],
         "timing_scope": "CUDA graph of six GEMMs plus SwiGLU/combine; excludes dispatch, external FP8 copies, sink zeroing",
