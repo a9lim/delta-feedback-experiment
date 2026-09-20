@@ -42,6 +42,7 @@ from transformer_experiments.schedule import Schedule
 
 from . import distributed
 from .data import DEFAULT_SOURCE, SOURCES, TokenData, read_meta
+from .head import dense_head_device
 from .model import (
     CONDITION_LETTERS,
     DEFAULT_LOOP_ITERATIONS,
@@ -1655,9 +1656,11 @@ def execution_fields(model, graph_runner, eval_graph_runner) -> dict[str, float]
     capture ends. Read before the peak statistics reset for the step field.
     """
     has_global_attention = any(not block.is_pkda for block in model.blocks)
+    device = next(model.parameters()).device
     return {
         "flash_sdpa": int(has_global_attention),
-        "cce": 1,
+        # The tied readout's cross-entropy: dense cuBLAS on Hopper, else CCE.
+        "head": "dense" if dense_head_device(device) and not model.fp8_classifier else "cce",
         "cuda_graphs": len(graph_runner.states) + len(eval_graph_runner.states),
         "eval_graphs": len(eval_graph_runner.states),
         "ranks": graph_runner.topology.world,
