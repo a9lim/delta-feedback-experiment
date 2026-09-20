@@ -77,20 +77,25 @@
   .log { margin-top: 22px; padding-top: 12px; border-top: 1px solid var(--grid); }
   .log pre { margin-top: 10px !important; }
   .results-scroll { overflow-x: auto; border: 1px solid var(--grid); border-radius: 8px; }
-  .results { min-width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 11px; line-height: 1.3; font-variant-numeric: tabular-nums; }
+  .results { --result-model-width: 220px; --result-mode-width: 82px; width: calc(var(--result-model-width) + var(--result-mode-width) + var(--metric-count) * 62px); min-width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 11px; line-height: 1.3; font-variant-numeric: tabular-nums; }
   .results th, .results td { padding: 4px 6px; border-bottom: 1px solid var(--grid); text-align: right; }
   .results th { font-weight: 500; }
-  .results .result-task { text-align: left; position: sticky; left: 0; background: var(--surface); z-index: 1; }
+  .results .result-model, .results .result-mode { text-align: left; position: sticky; background: var(--surface); z-index: 1; }
+  .results .result-model { left: 0; vertical-align: middle; }
+  .results .result-mode { left: var(--result-model-width); white-space: nowrap; }
   .results thead th { text-align: center; vertical-align: middle; }
-  .results thead .result-task { z-index: 2; }
-  .results thead tr:not(:last-child) th:not(.result-task) { border-bottom: 0; }
+  .results thead .result-model, .results thead .result-mode { z-index: 2; }
+  .results thead .result-benchmark { border-bottom: 0; }
   .results .result-start { border-left: 1px solid var(--grid); }
   .result-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .result-task-label { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; white-space: nowrap; }
   .results small { font-size: 10px; color: var(--muted); font-weight: 400; }
-  .result-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; text-align: right; }
-  .result-head { color: var(--muted); font-size: 10px; }
-  .results tbody tr:last-child > * { border-bottom: 0; }
+  .result-benchmark .result-name { font-size: 10px; }
+  .result-sort { display: flex; align-items: center; justify-content: flex-end; gap: 3px; width: 100%; height: auto; padding: 0; border: 0; border-radius: 2px; background: transparent; color: var(--muted); font: inherit; font-size: 10px; white-space: nowrap; cursor: pointer; }
+  .result-sort span { opacity: .5; }
+  .result-sort:hover, .results [aria-sort]:not([aria-sort="none"]) .result-sort { color: var(--ink); }
+  .results [aria-sort]:not([aria-sort="none"]) .result-sort span { opacity: 1; }
+  .result-sort:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+  .results tbody:last-child tr:last-child > *, .results tbody:last-child .result-model { border-bottom: 0; }
   #downstream-controls { margin: 8px 0; align-items: baseline; gap: 6px 14px; }
   #downstream-controls label { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; overflow-wrap: anywhere; }
   #downstream-controls select { font-size: 11px; padding: 2px 5px; }
@@ -98,6 +103,7 @@
   @media (min-width: 1180px) { .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 850px) { .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } .tile .v { font-size: 22px; } }
   @media (max-width: 640px) {
+    .results { --result-model-width: 140px; --result-mode-width: 72px; }
     .wrap { padding-top: 14px; } .grid.two, .grid.three { grid-template-columns: minmax(0, 1fr); }
     .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
     .tile:last-child { grid-column: 1 / -1; } .tile:last-child .v { display: inline-block; margin-right: 12px; }
@@ -153,7 +159,7 @@
   <div id="downstream-controls" class="controls"></div>
   <p id="downstream-status" class="section-note" role="status">No downstream results yet.</p>
   <div id="downstream-results"></div>
-  <p class="section-note">acc / norm: accuracy / normalized accuracy, % ↑. ppl: perplexity per word ↓. ×: feedback passes. n: documents; hover for differing counts or full identifiers. Step choices are independent of the layer slider.</p>
+  <p class="section-note">Click a metric: best first → worst first → default. acc / norm: accuracy / normalized accuracy, % ↑. ppl: perplexity per word ↓. ×: feedback passes. n: documents; hover for counts or full identifiers.</p>
 </section>
 <section id="anatomy">
   <div class="section-head"><h3>Layer anatomy</h3><p>Eval snapshots · up to two validation rows</p></div>
@@ -279,7 +285,7 @@ function onRecord(run, rec) {
 // ---------------------------------------------------------------- downstream
 // Saved JSON supplies downstream scores, independent of logs and fork ancestry.
 // Baselines belong to models and are shown alongside every selection of runs.
-const downstream = { selection: new Map(), markup: new Map() };
+const downstream = { selection: new Map(), markup: new Map(), sort: null };
 const METRICS = { acc: 'Accuracy ↑', acc_norm: 'Normalized accuracy ↑', ppl: 'Perplexity ↓' };
 const TASKS = ['hellaswag', 'arc_easy', 'arc_challenge', 'piqa', 'winogrande', 'boolq', 'openbookqa', 'sciq', 'lambada_openai'];
 const numeric = (value) => typeof value === 'number' ? finite(value) : null;
@@ -309,11 +315,11 @@ function resultsFor(tag) {
       return key ? taskRecords(file).map((record) => ({...key, ...record})) : [];
     });
 }
-function baselineColumns() {
+function baselineRows() {
   return state.results.files.filter((file) => file.file.startsWith('figures/baseline/') && typeof file.meta?.model === 'string')
     .map((file) => ({tag: file.meta.model, baseline: true, color: P.muted,
       tasks: new Map(taskRecords(file).map((record) => [record.task, record]))}))
-    .filter((column) => column.tasks.size).sort((a, b) => a.tag.localeCompare(b.tag));
+    .filter((row) => row.tasks.size).sort((a, b) => a.tag.localeCompare(b.tag));
 }
 function resultSelection(tag, records) {
   const steps = [...new Set(records.map((r) => r.step))].sort((a, b) => a - b);
@@ -325,7 +331,7 @@ function resultSelection(tag, records) {
   return { steps, selected, current: selected ?? steps.at(-1) ?? null };
 }
 const modeLabel = (r) => r.baseline ? 'Baseline' : r.mode === 'standard' ? 'Standard' : `${r.mode === 'fused' ? 'Fused' : 'Soft'} · ${r.passes} feedback pass${r.passes === 1 ? '' : 'es'}`;
-function resultColumns(groups) {
+function resultRows(groups) {
   return groups.flatMap((group) => {
     const modes = new Map();
     for (const record of group.records) if (record.step === group.current && record.task) {
@@ -344,39 +350,64 @@ function resultCell(result, metric) {
   const score = (value.mean * scale).toFixed(2);
   return `<div title="${METRICS[metric]} · n=${count(result.n)}">${score}</div>`;
 }
-function resultsHTML(columns) {
-  if (!columns.length) return '';
-  const tasks = [...new Set(columns.flatMap((column) => [...column.tasks.keys()]))];
+function resultMetrics(rows) {
+  const tasks = [...new Set(rows.flatMap((row) => [...row.tasks.keys()]))];
   tasks.sort((a, b) => (TASKS.includes(a) ? TASKS.indexOf(a) : TASKS.length) - (TASKS.includes(b) ? TASKS.indexOf(b) : TASKS.length) || a.localeCompare(b));
-  const groups = [];
-  columns.forEach((column, index) => {
-    const key = column.baseline ? 'baselines' : JSON.stringify([column.tag, column.current]);
-    if (groups.at(-1)?.key === key) groups.at(-1).size++;
-    else groups.push({key, column, start: index, size: 1});
+  return tasks.map((task) => ({task, metrics: Object.keys(METRICS)
+    .filter((metric) => rows.some((row) => row.tasks.get(task)?.metrics[metric]))}));
+}
+function cycleResultSort(task, metric) {
+  const sort = downstream.sort;
+  downstream.sort = sort?.task === task && sort.metric === metric
+    ? sort.order === 'best' ? {task, metric, order: 'worst'} : null
+    : {task, metric, order: 'best'};
+}
+function sortResultRows(rows) {
+  const sort = downstream.sort;
+  if (!sort) return rows;
+  const direction = (sort.order === 'best') === (sort.metric === 'ppl') ? 1 : -1;
+  // Stable ties retain the default order; missing values stay last either way.
+  return rows.slice().sort((a, b) => {
+    const av = numeric(a.tasks.get(sort.task)?.metrics[sort.metric]?.mean);
+    const bv = numeric(b.tasks.get(sort.task)?.metrics[sort.metric]?.mean);
+    if (av == null || bv == null) return av == null ? bv == null ? 0 : 1 : -1;
+    return direction * (av - bv);
   });
-  const starts = new Set(groups.map((group) => group.start));
-  const edge = (index) => starts.has(index) ? ' class="result-start"' : '';
-  const groupHeaders = groups.map(({column, size}) => {
-    const label = column.baseline ? 'Baselines' : column.tag;
-    const detail = column.baseline ? 'Pretrained reference models' : `${column.tag} · step ${count(column.current)}`;
-    return `<th scope="colgroup" colspan="${size}" class="result-start" style="color:${column.color}" title="${esc(detail)}"><span class="result-name">${esc(label)}</span></th>`;
+}
+function resultsHTML(rows) {
+  if (!rows.length) return '';
+  const tasks = resultMetrics(rows);
+  const columns = tasks.flatMap(({task, metrics}) => metrics.map((metric, index) => ({task, metric, start: index === 0})));
+  const groupHeaders = tasks.map(({task, metrics}) => {
+    const observations = rows.filter((row) => row.tasks.has(task));
+    const counts = [...new Set(observations.map((row) => row.tasks.get(task).n))];
+    const detail = observations.map((row) => `${row.tag} · ${modeLabel(row)}: n=${count(row.tasks.get(task).n)}`).join('; ');
+    return `<th scope="colgroup" colspan="${metrics.length}" class="result-start result-benchmark" title="${esc(task)}"><span class="result-name">${esc(task)}</span><small title="${esc(detail)}">${counts.length > 1 ? 'n varies' : `n=${count(counts[0])}`}</small></th>`;
   }).join('');
-  const modeHeaders = columns.map((column, index) => {
-    const label = column.baseline ? column.tag.split('/').at(-1) : column.mode === 'standard' ? 'Standard' : `${column.mode === 'fused' ? 'Fused' : 'Soft'} ×${column.passes}`;
-    const detail = column.baseline ? column.tag : `${modeLabel(column)} · step ${count(column.current)}`;
-    return `<th scope="col"${edge(index)} style="color:${column.color}" title="${esc(detail)}"><span class="result-name">${esc(label)}</span></th>`;
+  const metricHeaders = columns.map(({task, metric, start}) => {
+    const sort = downstream.sort;
+    const active = sort?.task === task && sort.metric === metric;
+    const ascending = active && ((sort.order === 'best') === (metric === 'ppl'));
+    const direction = active ? ascending ? 'ascending' : 'descending' : 'none';
+    const next = active ? sort.order === 'best' ? 'Sort worst to best' : 'Restore default order' : 'Sort best to worst';
+    const label = {acc: 'acc %', acc_norm: 'norm %', ppl: 'ppl'}[metric];
+    return `<th scope="col"${start ? ' class="result-start"' : ''} aria-sort="${direction}"><button class="result-sort" data-result-task="${esc(task)}" data-result-metric="${metric}" aria-label="${esc(`${task} · ${METRICS[metric]}. ${next}`)}" title="${esc(next)}">${label}<span aria-hidden="true">${active ? ascending ? '↑' : '↓' : '↕'}</span></button></th>`;
   }).join('');
-  const metricHeaders = columns.map((_, index) => `<th${edge(index)}><div class="result-metrics result-head"><span title="Accuracy, percent ↑">acc %</span><span title="Normalized accuracy, percent ↑">norm %</span></div></th>`).join('');
-  const rows = tasks.flatMap((task) => [['acc', 'acc_norm'], ['ppl']]
-    .filter((metrics) => metrics.some((metric) => columns.some((column) => column.tasks.get(task)?.metrics[metric])))
-    .map((metrics) => {
-      const observations = columns.filter((column) => metrics.some((metric) => column.tasks.get(task)?.metrics[metric]));
-      const counts = [...new Set(observations.map((column) => column.tasks.get(task).n))].sort((a, b) => a - b);
-      const countDetails = counts.length > 1 ? ` title="${esc(observations.map((column) => `${column.tag} · ${modeLabel(column)}: n=${count(column.tasks.get(task).n)}`).join('; '))}"` : '';
-      const cells = columns.map((column, index) => `<td${edge(index)}><div class="result-metrics">${metrics.map((metric) => resultCell(column.tasks.get(task), metric)).join('')}</div></td>`).join('');
-      return `<tr><th scope="row" class="result-task"><div class="result-task-label"><span>${esc(task)}${metrics[0] === 'ppl' ? ' · ppl ↓' : ''}</span><small${countDetails}>${counts.length > 1 ? 'n varies' : `n=${count(counts[0])}`}</small></div></th>${cells}</tr>`;
-  })).join('');
-  return `<div class="results-scroll"><table class="results" style="width:${180 + columns.length * 104}px" aria-label="Downstream scores across runs and baselines"><colgroup><col style="width:180px"></colgroup>${groups.map((group) => `<colgroup span="${group.size}"></colgroup>`).join('')}<thead><tr><th scope="col" rowspan="3" class="result-task"><div class="result-task-label"><span>Task / metric</span><small>documents</small></div></th>${groupHeaders}</tr><tr>${modeHeaders}</tr><tr>${metricHeaders}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  const groups = [];
+  for (const row of sortResultRows(rows)) {
+    const last = groups.at(-1);
+    if (!downstream.sort && !row.baseline && last && !last[0].baseline && last[0].tag === row.tag && last[0].current === row.current) last.push(row);
+    else groups.push([row]);
+  }
+  const bodies = groups.map((group) => `<tbody>${group.map((row, index) => {
+    const label = row.baseline ? row.tag.split('/').at(-1) : row.tag;
+    const detail = row.baseline ? row.tag : `${row.tag} · step ${count(row.current)}`;
+    const model = index ? '' : `<th scope="${group.length > 1 ? 'rowgroup' : 'row'}" rowspan="${group.length}" class="result-model" style="color:${row.color}" title="${esc(detail)}"><span class="result-name">${esc(label)}</span></th>`;
+    const mode = row.baseline ? 'Baseline' : row.mode === 'standard' ? 'Standard' : `${row.mode === 'fused' ? 'Fused' : 'Soft'} ×${row.passes}`;
+    const cells = columns.map(({task, metric, start}) => `<td${start ? ' class="result-start"' : ''}>${resultCell(row.tasks.get(task), metric)}</td>`).join('');
+    return `<tr>${model}<th scope="row" class="result-mode" style="color:${row.color}" title="${esc(modeLabel(row))}">${mode}</th>${cells}</tr>`;
+  }).join('')}</tbody>`).join('');
+  return `<div class="results-scroll"><table class="results" style="--metric-count:${columns.length}" aria-label="Downstream scores across models and benchmarks"><colgroup><col style="width:var(--result-model-width)"><col style="width:var(--result-mode-width)"></colgroup>${tasks.map(({metrics}) => `<colgroup span="${metrics.length}"></colgroup>`).join('')}<thead><tr><th scope="col" rowspan="2" class="result-model">Model / run</th><th scope="col" rowspan="2" class="result-mode">Mode</th>${groupHeaders}</tr><tr>${metricHeaders}</tr></thead>${bodies}</table></div>`;
 }
 function renderDownstream(views) {
   const groups = views.map((view, index) => {
@@ -384,18 +415,27 @@ function renderDownstream(views) {
     return { tag, records, index, color: index === 0 ? P.s1 : hue(index - 1), ...resultSelection(tag, records) };
   });
   const controls = groups.map((group) => `<label style="color:${group.color}">${esc(group.tag)} <select data-result-tag="${esc(group.tag)}" aria-label="Evaluation step for ${esc(group.tag)}" ${group.steps.length ? '' : 'disabled'}><option value="" ${group.selected == null ? 'selected' : ''}>Latest${group.steps.length ? ` · ${count(group.steps.at(-1))}` : ''}</option>${group.steps.map((step) => `<option value="${step}" ${group.selected === step ? 'selected' : ''}>Step ${count(step)}</option>`).join('')}</select></label>`).join('');
-  // Keep focused checkpoint controls in place during unchanged polls.
+  // Preserve focus and horizontal position through polling and sort changes.
   const replace = (id, html) => {
-    if (downstream.markup.get(id) !== html) { document.getElementById(id).innerHTML = html; downstream.markup.set(id, html); }
+    if (downstream.markup.get(id) === html) return;
+    const element = document.getElementById(id), focused = document.activeElement;
+    const scrollLeft = element.querySelector('.results-scroll')?.scrollLeft ?? 0;
+    const sortFocus = element.contains(focused) && focused?.matches('button[data-result-metric]') ? {...focused.dataset} : null;
+    element.innerHTML = html;
+    downstream.markup.set(id, html);
+    const scroll = element.querySelector('.results-scroll');
+    if (scroll) scroll.scrollLeft = scrollLeft;
+    if (sortFocus) [...element.querySelectorAll('button[data-result-metric]')]
+      .find((button) => button.dataset.resultTask === sortFocus.resultTask && button.dataset.resultMetric === sortFocus.resultMetric)?.focus({preventScroll: true});
   };
   replace('downstream-controls', controls);
-  const columns = [...resultColumns(groups), ...baselineColumns()];
-  replace('downstream-results', resultsHTML(columns));
+  const rows = [...resultRows(groups), ...baselineRows()];
+  replace('downstream-results', resultsHTML(rows));
   const status = [];
   for (const group of groups) if (!group.records.length) status.push(`${group.tag}: no saved evaluation results.`);
   if (state.resultsError) status.push(`Could not load saved evaluations: ${state.resultsError}`);
   for (const error of state.results.errors) status.push(`${error.file}: could not read result JSON; retrying on refresh.`);
-  if (columns.length) status.unshift(`${columns.length} result columns · updates when result JSON files are saved`);
+  if (rows.length) status.unshift(`${rows.length} evaluated configurations · updates when result JSON files are saved`);
   document.getElementById('downstream-status').textContent = status.join('\n');
 }
 
@@ -539,6 +579,12 @@ function setupSnapshotControls() {
   document.getElementById('downstream-controls').onchange = (event) => {
     const tag = event.target.dataset.resultTag;
     if (tag) { downstream.selection.set(tag, event.target.value === '' ? null : Number(event.target.value)); renderDownstream(shownViews()); }
+  };
+  document.getElementById('downstream-results').onclick = (event) => {
+    const button = event.target.closest('button[data-result-metric]');
+    if (!button) return;
+    cycleResultSort(button.dataset.resultTask, button.dataset.resultMetric);
+    renderDownstream(shownViews());
   };
   const select = (index) => {
     snapshot.step = snapshot.steps[index] ?? snapshot.step;

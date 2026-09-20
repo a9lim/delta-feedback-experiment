@@ -23,7 +23,7 @@ function monitor() {
   vm.runInContext(fs.readFileSync(path.join(shared, 'chassis.js'), 'utf8').replace('return { configure,', 'return { ingest, newRun, configure,'), context);
   vm.runInContext(inline.replace('\nsetupSnapshotControls();\nM.start();', ''), context);
   vm.runInContext("M.configure({onStep, onEval, onRecord, metaEvents: ['run', 'schedule']});", context);
-  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, downstream, taskRecords, baselineColumns, resultsFor, resultSelection, resultColumns, resultsHTML, resultCell, tightLogRange})', context);
+  const api = vm.runInContext('({M, onRecord, onEval, snapshot, reconcileSnapshot, orderedSites, SITES, profileOf, heatmapHTML, biasBound, nullRange, seriesOf, stepScale, stepDecorations, tokenTotals, downstream, taskRecords, baselineRows, resultsFor, resultSelection, resultRows, resultMetrics, cycleResultSort, sortResultRows, resultsHTML, resultCell, tightLogRange})', context);
   api.scaleSteps = scaleSteps;
   api.read = (tag, log) => {
     api.M.ingest(api.M.runFor(tag), log);
@@ -249,16 +249,16 @@ test('baselines appear alongside runs and remain when no selected run has saved 
   a.save(baseline());
   a.save(baseline('org/second', {piqa: task({acc: {mean: 0.8}}, 1838)}));
   const groups = [{tag: 'a', current: 9142, color: '#888', records: a.resultsFor('a')}];
-  const columns = [...a.resultColumns(groups), ...a.baselineColumns()], html = a.resultsHTML(columns);
-  assert.equal(columns.length, 3);
+  const rows = [...a.resultRows(groups), ...a.baselineRows()], html = a.resultsHTML(rows);
+  assert.equal(rows.length, 3);
   assert.match(html, /title="org\/reference"><span class="result-name">reference<\/span>/);
-  assert.match(html, /scope="colgroup" colspan="2"[^>]*><span class="result-name">Baselines<\/span>/);
+  assert.equal((html.match(/>Baseline<\/th>/g) || []).length, 2);
   assert.match(html, />80.00<\/div>/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
   assert.doesNotMatch(html, /Δ|Baseline · step|NaN|Infinity|undefined/);
   assert.equal(a.resultsFor('org/reference').length, 0);
-  assert.match(a.resultsHTML(a.baselineColumns()), /org\/reference/);
+  assert.match(a.resultsHTML(a.baselineRows()), /org\/reference/);
 });
 
 test('cross-run table aligns tasks and modes and keeps missing scores', () => {
@@ -268,13 +268,14 @@ test('cross-run table aligns tasks and modes and keeps missing scores', () => {
   a.save(result('b'));
   a.save(result('b', {mode: 'fused', passes: 1}, {piqa: task({acc: {mean: 0.7}}, 1838)}));
   const groups = ['a', 'b', 'no-json'].map((tag) => ({tag, current: 9142, color: '#888', records: a.resultsFor(tag)}));
-  const columns = a.resultColumns(groups), html = a.resultsHTML(columns);
-  assert.equal(columns.length, 4);
+  const rows = a.resultRows(groups), html = a.resultsHTML(rows);
+  assert.equal(rows.length, 4);
   assert.equal((html.match(/<span class="result-name">a<\/span>/g) || []).length, 1);
   assert.equal((html.match(/<span class="result-name">b<\/span>/g) || []).length, 1);
-  assert.equal((html.match(/scope="colgroup" colspan="2"/g) || []).length, 2);
-  assert.match(html, /Fused ×2<\/span>/);
-  assert.match(html, /Fused · 2 feedback passes · step 9,142/);
+  assert.equal((html.match(/scope="rowgroup" rowspan="2"/g) || []).length, 2);
+  assert.match(html, /Fused ×2<\/th>/);
+  assert.match(html, /title="Fused · 2 feedback passes"/);
+  assert.match(html, /title="a · step 9,142"/);
   assert.doesNotMatch(html, /Δ|no-json/);
   assert.match(html, /aria-label="No result"/);
   assert.match(html, /n=1,838/);
@@ -286,11 +287,119 @@ test('eval table escapes JSON-provided task, model and run labels', () => {
   const a = monitor();
   a.save(result('a', {}, {'<script>alert(1)</script>': task()}));
   a.save(baseline('<img src=x onerror=alert(1)>'));
-  const columns = [...a.resultColumns([{tag: '<img src=x>', current: 9142, records: a.resultsFor('a'), color: '#888'}]), ...a.baselineColumns()];
-  const html = a.resultsHTML(columns);
+  const rows = [...a.resultRows([{tag: '<img src=x>', current: 9142, records: a.resultsFor('a'), color: '#888'}]), ...a.baselineRows()];
+  const html = a.resultsHTML(rows);
   assert.doesNotMatch(html, /<script>|<img/);
   assert.match(html, /&lt;script&gt;/);
   assert.match(html, /&lt;img/);
+});
+
+test('benchmark headers contain only reported metrics, including LAMBADA accuracy and perplexity', () => {
+  const a = monitor();
+  a.save(baseline('org/reference', {
+    hellaswag: task(), boolq: task({acc: {mean: 0.6}}, 3270),
+    lambada_openai: task({acc: {mean: 0.5}, perplexity: {mean: 9.12}}, 5153),
+  }));
+  a.save(baseline('org/limited', {hellaswag: task(undefined, 32)}));
+  const rows = a.baselineRows(), html = a.resultsHTML(rows);
+  assert.deepEqual(plain(a.resultMetrics(rows)), [
+    {task: 'hellaswag', metrics: ['acc', 'acc_norm']},
+    {task: 'boolq', metrics: ['acc']},
+    {task: 'lambada_openai', metrics: ['acc', 'ppl']},
+  ]);
+  assert.match(html, /colspan="2" class="result-start result-benchmark" title="lambada_openai"/);
+  assert.match(html, /colspan="1" class="result-start result-benchmark" title="boolq"/);
+  assert.match(html, /n varies/);
+  assert.match(html, /org\/limited · Baseline: n=32/);
+  assert.match(html, />acc %<span/);
+  assert.match(html, />norm %<span/);
+  assert.match(html, />ppl<span/);
+  assert.doesNotMatch(html.slice(html.indexOf('<tbody>')), /%/);
+});
+
+test('metric clicks cycle best, worst, default; another column starts best first', () => {
+  const a = monitor();
+  assert.equal(a.downstream.sort, null);
+  for (const metric of ['acc', 'acc_norm', 'ppl']) {
+    a.cycleResultSort('task', metric);
+    assert.deepEqual(plain(a.downstream.sort), {task: 'task', metric, order: 'best'});
+    a.cycleResultSort('task', metric);
+    assert.equal(a.downstream.sort.order, 'worst');
+    a.cycleResultSort('task', metric);
+    assert.equal(a.downstream.sort, null);
+  }
+  a.cycleResultSort('boolq', 'acc');
+  a.cycleResultSort('boolq', 'acc');
+  a.cycleResultSort('hellaswag', 'acc');
+  assert.deepEqual(plain(a.downstream.sort), {task: 'hellaswag', metric: 'acc', order: 'best'});
+  a.cycleResultSort('hellaswag', 'acc_norm');
+  assert.deepEqual(plain(a.downstream.sort), {task: 'hellaswag', metric: 'acc_norm', order: 'best'});
+});
+
+test('accuracy sorting uses full precision, stable ties and missing last in both directions', () => {
+  const a = monitor();
+  for (const [tag, mean] of [['a', 0.60001], ['b', 0.60002], ['c', 0.60001], ['d', 0]]) {
+    a.save(baseline(tag, {boolq: task({acc: {mean}, acc_norm: {mean}})}));
+  }
+  a.save(baseline('e')); // Missing BoolQ task.
+  a.save(baseline('f', {boolq: task({perplexity: {mean: 8}})})); // Missing metric.
+  const rows = a.baselineRows(), tags = (sorted) => plain(sorted.map((row) => row.tag));
+  for (const metric of ['acc', 'acc_norm']) {
+    a.cycleResultSort('boolq', metric);
+    assert.deepEqual(tags(a.sortResultRows(rows)), ['b', 'a', 'c', 'd', 'e', 'f']);
+    a.cycleResultSort('boolq', metric);
+    assert.deepEqual(tags(a.sortResultRows(rows)), ['d', 'a', 'c', 'b', 'e', 'f']);
+    a.cycleResultSort('boolq', metric);
+    assert.deepEqual(tags(a.sortResultRows(rows)), ['a', 'b', 'c', 'd', 'e', 'f']);
+  }
+  assert.deepEqual(tags(rows), ['a', 'b', 'c', 'd', 'e', 'f']);
+});
+
+test('perplexity sorts lowest first and headers describe the actual order and next click', () => {
+  const a = monitor();
+  a.save(baseline('a', {lambada_openai: task({perplexity: {mean: 12}})}));
+  a.save(baseline('b', {lambada_openai: task({perplexity: {mean: 8}})}));
+  a.save(baseline('c'));
+  const rows = a.baselineRows(), tags = () => plain(a.sortResultRows(rows).map((row) => row.tag));
+  a.cycleResultSort('lambada_openai', 'ppl');
+  assert.deepEqual(tags(), ['b', 'a', 'c']);
+  assert.match(a.resultsHTML(rows), /aria-sort="ascending"><button[^>]*data-result-metric="ppl"[^>]*title="Sort worst to best"/);
+  a.cycleResultSort('lambada_openai', 'ppl');
+  assert.deepEqual(tags(), ['a', 'b', 'c']);
+  assert.match(a.resultsHTML(rows), /aria-sort="descending"><button[^>]*data-result-metric="ppl"[^>]*title="Restore default order"/);
+  a.cycleResultSort('lambada_openai', 'ppl');
+  assert.doesNotMatch(a.resultsHTML(rows), /aria-sort="ascending"|aria-sort="descending"/);
+});
+
+test('sorting ranks modes independently, restores grouping, and persists through JSON and checkpoint changes', () => {
+  const a = monitor();
+  const save = (step, mode, mean) => a.save(result('run', {step, mode, passes: mode === 'standard' ? 0 : 1}, {boolq: task({acc: {mean}})}));
+  save(10, 'standard', 0.5); save(10, 'fused', 0.6);
+  a.save(baseline('org/reference', {boolq: task({acc: {mean: 0.55}})}));
+  const rows = () => {
+    const records = a.resultsFor('run');
+    return [...a.resultRows([{tag: 'run', color: '#888', records, ...a.resultSelection('run', records)}]), ...a.baselineRows()];
+  };
+  const order = () => plain(a.sortResultRows(rows()).map((row) => row.mode ?? 'baseline'));
+  a.cycleResultSort('boolq', 'acc');
+  assert.deepEqual(order(), ['fused', 'baseline', 'standard']);
+  let html = a.resultsHTML(rows());
+  assert.equal((html.match(/<span class="result-name">run<\/span>/g) || []).length, 2);
+  assert.doesNotMatch(html, /scope="rowgroup"/);
+  assert.match(html, /aria-sort="descending"><button[^>]*data-result-task="boolq"/);
+  save(10, 'standard', 0.7);
+  assert.deepEqual(order(), ['standard', 'fused', 'baseline']);
+  save(20, 'standard', 0.4); save(20, 'fused', 0.45);
+  assert.deepEqual(order(), ['baseline', 'fused', 'standard']);
+  a.downstream.selection.set('run', 10);
+  assert.deepEqual(order(), ['standard', 'fused', 'baseline']);
+  assert.equal(a.downstream.sort.order, 'best');
+  a.cycleResultSort('boolq', 'acc');
+  a.cycleResultSort('boolq', 'acc');
+  assert.deepEqual(order(), ['standard', 'fused', 'baseline']);
+  html = a.resultsHTML(rows());
+  assert.match(html, /scope="rowgroup" rowspan="2"/);
+  assert.equal((html.match(/<span class="result-name">run<\/span>/g) || []).length, 1);
 });
 
 test('log axis has finite positive bounds for empty, singleton and normal ranges', () => {

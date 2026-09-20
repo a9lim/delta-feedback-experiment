@@ -332,19 +332,27 @@ recorded step addresses.
 `figures/baseline/**/*.json` reference scores through the monitor's
 `api/results` endpoint. It updates when each mode's JSON is saved; an eval log
 is unnecessary, smoke runs write no results, and a fork does not inherit its
-parent's scores. **Compare runs** places selected runs side by side, with a
-separate checkpoint choice for each run and columns for every saved mode and
-feedback pass count beneath one shared run header. Mode labels use × for
-feedback passes. Saved baselines share a **Baselines** header and show only the
-model name; hover reveals the full model ID. Run headers expose the full tag
-and checkpoint on hover, including when a narrow column truncates the label.
+parent's scores. Each row is one run's evaluation mode and feedback pass count,
+or one saved baseline. **Compare runs** adds selected runs with a separate
+checkpoint choice for each. By default, each run's modes sit together under
+one shared run name. Mode labels use × for feedback passes. Baselines show
+only the model name; hover reveals the full model ID. Run names expose the
+full tag and checkpoint on hover, including when a narrow column truncates
+the label. Model and mode columns stay pinned during horizontal scrolling.
 
-Accuracy and normalized accuracy appear side by side beneath compact
-**acc % / norm %** headers, with the percent unit only in the headers;
-unreported metrics show a dash.
-Document counts sit inline beside each task name. If counts differ across
-runs, modes, or baselines, the row shows **n varies** and a tooltip identifies
-each result's count. LAMBADA perplexity remains per word on its own **ppl** row.
+Benchmarks group their reported metrics into columns: **acc % / norm %** for
+HellaSwag, **acc %** for BoolQ, and **acc % / ppl** for LAMBADA. Percent units
+appear only in headers; perplexity remains per word. Unreported scores show a
+dash. Document counts sit beneath each benchmark name. If counts differ
+across runs, modes, or baselines, the header shows **n varies** and a tooltip
+identifies each result's count.
+
+Click a metric header to cycle through **best first → worst first → default**.
+Accuracy sorts highest first; perplexity sorts lowest first. Sorting ranks
+each mode independently and repeats run names so every row stays identifiable.
+It uses full precision, preserves default order for ties, and keeps missing
+scores last in either direction. The active sort survives result refreshes
+and checkpoint changes; choosing another metric starts with best first.
 The table shows saved scores without cross-run deltas; paired comparisons
 remain available through the evaluation CLI. Replacing or deleting a result
 file replaces or removes its scores on refresh. An unreadable file is reported
