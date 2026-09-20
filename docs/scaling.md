@@ -146,40 +146,72 @@ are excluded. This is decode-state arithmetic, not training-memory usage.
 
 ## Runtime estimates
 
-The following are **planning assumptions**, conditional on model construction,
-calibration, and graph capture fitting. They model the default recurrence
-schedule and global batch above under the FP8/BF16-head CUDA recipe. Mean
-update times are schedule averages, not measured full-run throughput.
+These durations come from replay benches on **one 80 GB H100 PCIe** (sm_90)
+with the current kernels. `scripts/replay_bench.py` captures every graph a
+schedule reaches at its planned replay width and times its replays. An update
+is one replay's time multiplied by the number of replays in a 128-row batch.
+Screen replays used trained `v` weights. Bridge and flagship used
+initialization, which ran about 3% slower than trained weights at screen. `fl`
+executes the same columns as `fv` and is budgeted with it. Update seconds,
+before the optimizer step:
 
-The eight-GPU scenario is an **8×80 GB H100 SXM node with NVSwitch**, using
-`--ranks 8` and optimizer ownership sharding. Assumed speedups relative to
-one GH200 are 6.5× for screen/bridge/flagship and 7× for extension. These
-are modeling inputs, not node benchmarks.
+| Scale | `(1,1)` | `f`: `(2,1)` / `(3,1)` | `fl`, `fv`: `(2,2)` / `(2,3)` / `(3,2)` | Rolled mean, `f` / `fv` |
+|---|---:|---:|---:|---:|
+| Screen | 5.98 | 11.85 / 18.11 | 24.10 / 38.42 / 38.49 | 12.60 / 27.55 |
+| Bridge | 10.66 | 20.21 / 31.85 | 42.38 / 69.31 / 69.39 | 21.60 / 48.86 |
+| Flagship | 15.18 | 30.69 / 49.99 | 66.56 / 103.00 / 103.12 | 33.00 / 75.32 |
 
-| Scale | GH200 mean update, `fl` / `f` | GH200 at 25x, `fl` / `f` | 8×H100 at 25x, `fl` / `f` |
-|---|---:|---:|---:|
-| Screen | 10.5 / 7.1 s | 1.2 d / 19.8 h | 4.5 / 3.1 h |
-| Bridge | 17.0 / 11.6 s | 4.4 / 3.0 d | 16.3 / 11.1 h |
-| Flagship | 27.0 / 18.3 s | 12.4 / 8.4 d | 1.9 / 1.3 d |
-| Extension | 55.0 / 37.0 s | 56.4 / 37.9 d | 8.1 / 5.4 d |
+Rolled means weight each shape by its roll probability: 0.88 / 0.12 for `f`'s
+two and three passes, and 0.76 / 0.12 / 0.12 for `fl` and `fv`. The planner
+narrows replays as scale grows: `(2,2)` runs four, two, then one row per
+replay. Flagship's six-column graphs keep lean intermediates and recompute
+five blocks. Extension does not fit one 80 GB card; see the memory boundary
+below.
 
 ```text
-GH200 seconds = steps * modeled_mean_update_seconds * 1.10
-H100 node seconds = GH200 seconds / assumed_node_speedup
+mean_update = s * t(1,1) + (1 - s) * t_rolled + t_optimizer
+H100 PCIe seconds = steps * mean_update * 1.10
+node seconds = H100 PCIe seconds / assumed_node_speedup
 ```
 
-The table includes 10% for evaluation/checkpointing. At 100x or 400x,
-durations are approximately 4× or 16× the 25x values; use the formula to
-avoid multiplying rounded table entries. Add 0.5–2 hours for cold setup and
-compilation, potentially more for extension. Data preparation, queueing,
-failures, and offline downstream evaluation are excluded.
+`s` is the recurrence start: 0.75 by default. The repository's current runs
+use 0.6, where screen `fv` averages 14.7 s. The eager optimizer step measured
+about 0.1 s at screen and is scaled by stored parameters at the other scales.
+At `s = 0.75`:
 
-Allow approximately ±20%, ±25%, and ±30% on GH200 for screen, bridge, and
-flagship; extension spans roughly 0.6–1.6× the point estimate, conditional on
-fit. H100 node estimates span roughly 0.7–1.5×, wider for extension. These
-are judgment ranges, not confidence intervals. Replace these inputs with
-complete schedule-weighted device measurements before using them for a rental
-budget; see the [node workflow](operations.md#hopper-and-node-workflow).
+| Scale | H100 PCIe mean update, `fv` / `f` | H100 PCIe at 25x, `fv` / `f` | 8×H100 SXM at 25x, `fv` / `f` |
+|---|---:|---:|---:|
+| Screen | 11.5 / 7.7 s | 1.3 d / 21.6 h | 3.6 / 2.4 h |
+| Bridge | 20.4 / 13.6 s | 5.3 / 3.5 d | 14.1 / 9.4 h |
+| Flagship | 30.6 / 20.0 s | 14.0 / 9.2 d | 1.6 / 1.0 d |
+| Extension | 58.4 / 38.3 s, extrapolated | does not fit | 6.0 / 3.9 d |
+
+The node is **8×80 GB H100 SXM with NVSwitch**, using `--ranks 8` and
+optimizer ownership sharding. Its assumed speedup over one H100 PCIe is 9× for
+screen, bridge and flagship, and 10× for extension. That chains two figures. A
+GH200, whose GPU is H100 SXM-class, ran the same screen `(2,2)` graph 1.4×
+faster than the PCIe card. The node is modeled at 6.5× one GH200, or 7× for
+extension, where sharding also relieves memory pressure. These are modeling
+inputs, not node benchmarks. Extension multiplies each flagship time by
+`(A_extension / A_flagship)^0.8 = 1.9`. That exponent is somewhat above the
+screen-to-flagship exponents of 0.62–0.76, because replays narrow further and
+extension needs recomputation.
+
+The table includes 10% for evaluation and checkpointing. At 100x or 400x,
+durations are approximately 4× or 16× the 25x values; use the formula to avoid
+multiplying rounded table entries. Add 0.5–2 hours for cold setup and
+compilation, potentially more for extension; one condition's graphs compiled
+in 20–30 minutes on the bench host. Data preparation, queueing, failures, and
+offline downstream evaluation are excluded.
+
+The single-card rows are measured graphs, not measured runs. Allow about ±10%
+for screen and bridge, and ±15% for flagship, whose weights were at
+initialization and whose plans are lean. The PCIe card's sustained clocks
+under its 350 W limit can also move them. Extension spans roughly 0.6–1.6× the
+point estimate, conditional on fit. Node estimates span roughly 0.7–1.5×,
+wider for extension. These are judgment ranges, not confidence intervals; see
+the [node workflow](operations.md#hopper-and-node-workflow) for measuring a
+new host.
 
 ### Training memory boundary
 
