@@ -130,3 +130,31 @@ def test_move_rolls_back_text_and_renames_after_an_io_failure(operator, monkeypa
         "report.json"
     ]
     assert not [p for p in root.rglob("*new*") if p.suffix != ".lock"]
+
+
+def test_clear_takes_the_tags_figures_with_its_snapshots_and_logs(operator):
+    root = operator.layout.root
+    owned = [
+        "runs/old.pt.2",
+        "logs/old.log",
+        "logs/old.eval.log",
+        "figures/downstream-old/standard.2.json",
+        "figures/route-old/report.json",
+        "figures/curves-old-vs-other/plot.png",
+    ]
+    kept = [
+        "runs/old-extra.pt.2",
+        "figures/downstream-other/standard.2.json",
+        "figures/baseline/org/model.json",
+    ]
+    for name in owned + kept:
+        write(root, name)
+
+    operator.clear("old")
+
+    (archive,) = operator.layout.recovery.iterdir()
+    for name in owned:
+        assert not (root / name).exists(), name
+        assert (archive / name).is_file(), name
+    for name in kept:
+        assert (root / name).is_file(), name

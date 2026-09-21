@@ -127,16 +127,6 @@ PIPELINE = spool.Pipeline(
     ),
 )
 
-LAYOUT = spool.Layout(
-    root=ROOT,
-    worker_module="delta_feedback_experiment.cli",
-    snapshot_dir=Path("runs"),
-)
-
-SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="delta")
-
-STOP_PHASE = "train run"
-
 RUN_ARTIFACTS = (
     *(
         f"figures/{kind}-{{tag}}"
@@ -146,6 +136,19 @@ RUN_ARTIFACTS = (
     "figures/curves-*-vs-{tag}",
     "figures/curves-*-vs-{tag}-vs-*",
 )
+"""A run's figure outputs beyond its snapshots and logs; ``delta clear`` and
+``delta move`` both carry them with the tag."""
+
+LAYOUT = spool.Layout(
+    root=ROOT,
+    worker_module="delta_feedback_experiment.cli",
+    snapshot_dir=Path("runs"),
+    artifact_globs=RUN_ARTIFACTS,
+)
+
+SPOOL = spool.Spool(LAYOUT, PIPELINE, prog="delta")
+
+STOP_PHASE = "train run"
 
 
 def move_command(argv: list[str]) -> None:
@@ -161,9 +164,7 @@ def move_command(argv: list[str]) -> None:
     )
     args = parser.parse_args(argv)
     layout = replace(
-        SPOOL.layout,
-        snapshot_dir=args.out_dir or SPOOL.layout.snapshot_dir,
-        artifact_globs=RUN_ARTIFACTS,
+        SPOOL.layout, snapshot_dir=args.out_dir or SPOOL.layout.snapshot_dir
     )
     try:
         spool.Spool(layout, SPOOL.pipeline, prog="delta").move(
