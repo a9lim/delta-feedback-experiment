@@ -1,9 +1,9 @@
 # Architecture
 
-The full `fl` or `fv` model combines two differentiable recurrences around one
-shared causal decoder: feedback (`f`) passes a predictive payload to the next
-token position, and looping re-enters the decoder at the same position, with a
-blank embedding (`l`) or with the position's own token again (`v`). A
+The full `fv` model combines two differentiable recurrences around one shared
+causal decoder: feedback (`f`) passes a predictive payload to the next token
+position, and looping (`v`) re-enters the decoder at the same position with
+the position's own token again. A
 **column** is one execution of the entire trunk; a **pass** runs the requested
 columns over a sequence. Columns share all parameters, but keep separate
 mixer-state tracks across token positions.
@@ -14,7 +14,7 @@ Block (MHDB) reads. A routed payload and one shared fusion connect the trunk,
 both recurrences, and auxiliary two-token prediction (MTP):
 
 ```text
-scaled token lookup or blank embedding + incoming or blank payload
+scaled token lookup + incoming or blank payload
                    │ shared concat-linear fusion
                    ▼
                 column seed
@@ -27,7 +27,7 @@ scaled token lookup or blank embedding + incoming or blank payload
                    ▼
              payload RMSNorm
                    │ + one training jitter draw
-                   ├─ fuse with blank embedding (l) or this token (v)
+                   ├─ fuse with this token (v)
                    │    → next column at this position
                    └─ fuse with next token ─┬→ next position's first column (f)
                                            └→ independent PKDA/expert block
@@ -287,10 +287,7 @@ activation, gate, or scaling: learned token magnitudes and payload gains
 reach its output directly. A learned width-`D` blank payload `p₀`, initialized
 to zero, supplies positions with no incoming payload. Their seed is
 `F(e_t,p₀)`; replacing the blank with a payload changes it by
-`W_p(p − p₀)`. Its counterpart on the token side is a learned width-`D`
-blank embedding `e₀`, in post-lookup token units and also initialized to
-zero, which stands in for the token wherever a column re-enters at its own
-position under `l`. Only `l` has it; `v` re-enters with `e_t` itself.
+`W_p(p − p₀)`.
 
 During training, each column adds one keyed perturbation `ξ_t` **after**
 payload normalization. Its amplitude is specified directly in payload units
@@ -304,21 +301,14 @@ use zero jitter.
 
 Let `p_t^(a,i)` denote the payload at position `t`, pass `a`, column `i`,
 and `R` the number of columns per pass. The first column of pass 1 uses
-`F(e_t,p₀)`. Later columns of any pass fill the token side according to the
-condition:
+`F(e_t,p₀)`. Later columns of any pass fuse the preceding column's payload
+with the same token again:
 
 ```text
-seed_t^(a,i+1) = F(e₀,  p_t^(a,i) + ξ_t^(a,i))        (l)
-seed_t^(a,i+1) = F(e_t, p_t^(a,i) + ξ_t^(a,i))        (v)
+seed_t^(a,i+1) = F(e_t, p_t^(a,i) + ξ_t^(a,i))
 ```
 
-Under `l` the first column consumes the token lookup `e_t` and every later
-column uses the learned baseline `e₀`. Those later columns receive
-token-dependent information through their payload and mixer caches, with no
-fresh token lookup, and their seed differs from a feedback seed even when the
-next token repeats.
-
-Under `v` every column consumes `e_t`. The re-entry is then the feedback
+Every column consumes `e_t`. The re-entry is then the feedback
 equation below applied to a chain in which every token is followed by a
 virtual repeat of itself: the seed operator and the payload chain of
 sequential decoding are those of feedback on `x_1, x_1, x_2, x_2, …`, while
@@ -343,10 +333,10 @@ through every payload and fusion.
 
 Every loop iteration is a complete column with a fresh seed and source bank;
 no cell delta is carried across its boundary as a separate source. Looping
-adds only `e₀`, and under `v` nothing. Its first column does not depend on
-later columns, and setting `R=1` makes `fl` and `fv` equal to `f` in values,
-routes, losses, and gradients for matched inputs and randomness, with `e₀`
-outside the graph. Every executed column is supervised.
+adds no parameter. Its first column does not depend on later columns, and
+setting `R=1` makes `fv` equal to `f` in values, routes, losses, and
+gradients for matched inputs and randomness. Every executed column is
+supervised.
 
 For sequential decoding, the first column at position `t` consumes the
 final payload from `t−1`; later columns loop at `t`. Each layer owns one
@@ -390,8 +380,8 @@ The next-token fusion `u` is computed once per column and exposed as
 `ColumnOutput.fused_input`. MTP reads it directly. After the pass's last
 column, feedback shifts that same tensor right and restores the plain
 prefix. A later looped column reuses the jittered payload but fuses it with
-the blank embedding or the position's own token instead. The auxiliary
-objective therefore trains the
+the position's own token instead. The auxiliary objective therefore trains
+the
 trunk, payload router and gain, fusion, embedding, and auxiliary block,
 including on a single-pass batch or the final pass.
 
@@ -410,7 +400,7 @@ scale to every matrix. Write `ρ = 1536/D`:
 | NAdam matrices with residual-width fan-in: GQA gates, expert routers, PKDA packed controls | `Normal(0, 0.02 sqrt(ρ))` |
 | Tied embedding/readout, PKDA decay and output-gate expansions | `Normal(0, 0.02)` |
 | RMSNorm gains, including payload and PKDA output norms | One |
-| MHDB queries/nulls, blank payload, blank embedding, linear biases, main PKDA decay bias | Zero |
+| MHDB queries/nulls, blank payload, linear biases, main PKDA decay bias | Zero |
 | PKDA depthwise convolutions | Kaiming-uniform |
 
 PKDA's main and preconditioner decay-rate parameters initialize independently
@@ -420,8 +410,8 @@ at `−0.2`.
 
 A payload-bearing fusion combines two approximately unit-RMS inputs with
 fan-in `2D`, giving an order-one seed. The zero-blank plain seed has only the
-token contribution, and the zero-blank `l` loop seed only the payload's; each
-has expected RMS near `1/sqrt(2)`, while a `v` loop seed is payload-bearing.
+token contribution, with expected RMS near `1/sqrt(2)`, while a loop seed is
+payload-bearing.
 These are initialization scales, not restrictions on learned magnitudes.
 Shared parameters initialize byte-identically across every condition for a
 given seed. Attention gates,

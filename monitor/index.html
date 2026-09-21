@@ -144,7 +144,7 @@
 <div class="tiles" id="tiles"></div>
 <details class="config"><summary>Run configuration <span class="hint">· geometry, optimizer &amp; schedule</span></summary><div class="config-grid" id="config"></div></details>
 <nav aria-label="Monitor sections">
-  <button data-section="learning">Learning</button><button data-section="downstream">Downstream</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letters="f">Feedback</button><button data-section="loop" data-letters="lv">Looped column</button>
+  <button data-section="learning">Learning</button><button data-section="downstream">Downstream</button><button data-section="anatomy">Layer anatomy</button><button data-section="optimization">Optimization</button><button data-section="feedback" data-letters="f">Feedback</button><button data-section="loop" data-letters="v">Looped column</button>
 </nav>
 <section id="learning">
   <div class="section-head"><h3>Learning</h3><p>Raw observations · nats · ▲ checkpoint snapshots</p></div>
@@ -201,7 +201,7 @@
     <div class="chart"><h2>Self-composition update</h2><p class="caption">‖h(8) − h(7)‖ · smaller means less movement</p><div class="plot" id="p-upd"></div></div>
   </div>
 </section>
-<section id="loop" data-letters="lv" hidden>
+<section id="loop" data-letters="v" hidden>
   <div class="section-head"><h3>Looped column</h3><p>Per-column readout on two validation rows</p></div>
   <div class="grid three">
     <div class="chart"><h2>Loss by column</h2><p class="caption">The same rows after 1, r eval, and r max columns</p><div class="plot" id="p-depth"></div></div>
@@ -226,14 +226,13 @@ const count = (v) => v == null || !Number.isFinite(v) ? '–' : Math.round(v).to
 const compact = (v) => v == null || !Number.isFinite(v) ? '–' : v >= 1e9 ? `${fmt(v / 1e9, 3)}B` : v >= 1e6 ? `${fmt(v / 1e6, 3)}M` : count(v);
 const conditionOf = (view) => view?.run.meta.run?.condition ?? '';
 const has = (view, letters) => [...letters].some((letter) => conditionOf(view).includes(letter));
-// l and v are the same looped columns with a different re-entry token side.
-const loops = (view) => has(view, 'lv');
+const loops = (view) => has(view, 'v');
 const shownViews = () => [viewOf(state.selected), ...overlayTags().map(viewOf)].filter(Boolean);
 function eventLines(view) {
   if (!view) return [];
   // n keeps the boundary only to pair with the rolling conditions; nothing rolls.
   const b = num(view.run.meta.schedule?.recurrence_boundary);
-  return has(view, 'flv') && b > 0 && b < view.total ? [{ label: 'roll →', step: b }] : [];
+  return has(view, 'fv') && b > 0 && b < view.total ? [{ label: 'roll →', step: b }] : [];
 }
 
 function onStep(run, rec) {
@@ -659,7 +658,7 @@ const CONFIG_GROUPS = [
   ['attention', null, ['pkda_heads', 'pkda_head_dim', 'pkda_conv_size']],
   ['experts', null, ['expert_shared', 'expert_routed', 'expert_top_k', 'expert_width', 'expert_balance_coef', 'expert_bias_rate']],
   ['recurrence roll', null, ['recurrence_start', 'three_rate', 'jitter']],
-  ['l, v · loop', 'lv', ['loop_iterations']],
+  ['v · loop', 'v', ['loop_iterations']],
   ['prediction', null, ['mtp_weight']],
   ['optimizer', null, ['lr_normuonh', 'lr_nadam', 'mup_ratio', 'expert_lr_scale', 'zloss']],
   ['batch', null, ['batch_rows', 'micro_rows', 'steps', 'warmup_frac', 'cooldown_frac']],
@@ -697,14 +696,14 @@ function tightLogRange(u, lo, hi) {
 function stepScale(view, enabled = document.getElementById('scalesteps').checked) {
   if (!enabled) return 1;
   const setup = view?.run.meta.run;
-  if (!setup || !['n', 'f', 'l', 'fl', 'v', 'fv'].includes(setup.condition)) return null;
+  if (!setup || !['n', 'f', 'v', 'fv'].includes(setup.condition)) return null;
   const fields = ['params', 'dim', 'vocab_size', 'layers', 'expert_width', 'expert_routed', 'expert_top_k', 'batch_rows', 'seq_len'];
   const [params, dim, vocab, layers, width, routed, topK, batch, seq] = fields.map((key) => num(setup[key]));
   if (![params, dim, vocab, layers, width, routed, topK, batch, seq].every((v) => Number.isSafeInteger(v) && v > 0) || topK > routed) return null;
-  // Match train.reference_active: remove the tied embedding, idle SwiGLU
-  // experts in every trunk bank plus MTP, and the loop-only blank embedding.
+  // Match train.reference_active: remove the tied embedding and idle SwiGLU
+  // experts in every trunk bank plus MTP.
   const inactive = (layers + 1) * (routed - topK) * 3 * dim * width;
-  const active = params - vocab * dim - inactive - (has(view, 'l') ? dim : 0);
+  const active = params - vocab * dim - inactive;
   return active > 0 ? batch * seq / active : null;
 }
 function stepDecorations(view) {

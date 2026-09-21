@@ -41,7 +41,7 @@ GEOMETRY = {
 }
 
 
-def tiny(condition="fl"):
+def tiny(condition="fv"):
     torch.manual_seed(5)
     return DeltaModel(condition_config(condition, **GEOMETRY))
 
@@ -135,7 +135,7 @@ def test_adopted_parameters_are_their_working_views_and_masters_follow():
 
 def _settings(tmp_path):
     return {
-        "condition": "fl",
+        "condition": "fv",
         "data-root": tmp_path / "data",
         "out-dir": tmp_path / "runs",
         "vocab-size": 31,

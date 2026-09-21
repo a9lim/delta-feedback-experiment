@@ -33,8 +33,7 @@ delta probe
 
 The default tests cover portable numerical, state, and lifecycle contracts.
 `delta probe` exercises small CUDA train/eval/decode graphs, recomputation,
-shared fusion, and replay under `fl`, or under `fv` with `--condition fv`;
-`--ranks N` adds the step's collectives on N devices.
+shared fusion, and replay under `fv`; `--ranks N` adds the step's collectives on N devices.
 Neither is a production memory or throughput measurement. The queue starts
 training directly. Kernel compilation and graph capture add startup time.
 
@@ -97,13 +96,13 @@ together with the metadata, validation files, and document sidecars.
 ## Runs
 
 ```bash
-delta train example-fl-s1 --condition fl --seed 1 --data-seed 0 \
+delta train example-fv-s1 --condition fv --seed 1 --data-seed 0 \
   --data-root /data/delta --source dclm-100b
-delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 \
+delta queue node-fv-s1 --condition fv --scale flagship --ranks 8 \
   --data-root /data/delta --source dclm-100b
-delta train example-fl-s1 --resume
-delta queue example-fl-s1-50x --continue example-fl-s1 --tokens-per-param 50
-delta queue example-l-s1 --fork example-fl-s1 --condition l
+delta train example-fv-s1 --resume
+delta queue example-fv-s1-50x --continue example-fv-s1 --tokens-per-param 50
+delta queue example-v-s1 --fork example-fv-s1 --condition v
 
 delta status
 delta watch
@@ -124,7 +123,7 @@ a queue file) go to that evaluation, and `--skip` alone opts out:
 
 ```bash
 delta queue example-f-s1 --condition f -- --mode standard fused
-delta queue node-fl-s1 --condition fl --scale flagship --ranks 8 -- --skip
+delta queue node-fv-s1 --condition fv --scale flagship --ranks 8 -- --skip
 ```
 
 The evaluation is one process on one device, at most twenty minutes for
@@ -214,9 +213,8 @@ A fork restores the source's protected boundary snapshot, or its latest one
 before that step, and trains on: it ends as the target condition trained
 from scratch, to the run's numerical floor, without repeating the shared
 steps. Every other state-defining setting is inherited, and typing a
-different one is refused, as is a fork that changes nothing. A parameter only one condition owns
-(`l`'s blank embedding) is still at its initialization with zero moments
-there, so the fork adds or drops it exactly; `v` and `n` have `f`'s parameter set.
+different one is refused, as is a fork that changes nothing. Every condition
+has the same parameter set, so the snapshot restores unchanged.
 `n` never rolls but still keeps its boundary snapshot, so it forks both ways. Recurrence can start no earlier
 than the source's retained snapshots allow. The `fork` record names the
 source snapshot and the changed settings, and the monitor draws the source's
@@ -380,7 +378,7 @@ Routing profiles show null/seed/previous-cell mass, maximum weight against
 rows from the final column of the fused pass when feedback is enabled. Expert
 profiles use the first column of pass 1 and the teacher-forced MTP block.
 Both disable jitter. These are sample diagnostics, not whole-corpus loads.
-The Looped column section appears for `l`, `v`, `fl`, and `fv`, including
+The Looped column section appears for `v` and `fv`, including
 when a looped run is an overlay. It shows per-column depth readouts and
 executed recurrence; training feedback gain
 appears only on single-column steps, where the combined CE isolates it.
@@ -410,7 +408,7 @@ For a single GPU, run the lifecycle script with a fresh tag:
 
 ```bash
 scripts/first_hour.sh --data-root /data/delta --tag first-hour \
-  --scale screen --condition fl --precision fp8 --steps 12
+  --scale screen --condition fv --precision fp8 --steps 12
 ```
 
 It inventories the host, runs the CUDA probe, trains with recurrence from

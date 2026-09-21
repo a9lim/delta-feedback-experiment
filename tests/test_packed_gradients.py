@@ -10,13 +10,13 @@ from delta_feedback_experiment.cuda_kernels import sink_linear
 from delta_feedback_experiment.model import DeltaModel, condition_config
 
 
-def tiny(condition):
+def tiny():
     return DeltaModel(
         condition_config(
-            condition,
+            "f",
             vocab_size=97,
             dim=32,
-            layers=16 if "l" in condition else 4,
+            layers=4,
             heads=2,
             kv_heads=2,
             head_dim=32,
@@ -38,7 +38,7 @@ def test_sites_cover_parameters_once_and_pack_shared_gemms():
     from delta_feedback_experiment.distributed import Topology
     from delta_feedback_experiment.sites import ParameterSites
 
-    model = tiny("f")
+    model = tiny()
     sites = ParameterSites(model, Topology())
     trainable = {p for p in model.parameters() if p.requires_grad}
     assert sites.sharded | sites.replicated == trainable

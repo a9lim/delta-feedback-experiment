@@ -95,11 +95,10 @@ def test_soft_feedback_starts_after_the_first_continuation_token():
 def test_modes_follow_the_condition():
     assert downstream.condition_modes(tiny("f")) == downstream.MODES
     assert downstream.condition_modes(tiny("fv")) == downstream.MODES
-    for condition in ("l", "v"):
-        looped = tiny(condition)
-        assert downstream.condition_modes(looped) == ("standard",)
-        with pytest.raises(ValueError, match="condition with f"):
-            downstream.DeltaScorer(looped, "fused")
+    looped = tiny("v")
+    assert downstream.condition_modes(looped) == ("standard",)
+    with pytest.raises(ValueError, match="condition with f"):
+        downstream.DeltaScorer(looped, "fused")
 
 
 @pytest.fixture

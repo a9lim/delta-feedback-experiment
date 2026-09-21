@@ -30,7 +30,7 @@ import sys
 import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
 from pathlib import Path
@@ -68,8 +68,6 @@ from .optim import (
     OptimizerPair,
     apply_schedule,
     build_optimizers,
-    optimizer_parameter_names,
-    rekey_optimizer_state,
 )
 from .sites import ParameterSites
 from .tokenizer import SYNTHETIC_TOKENIZER_ID, TOKENIZER_ID, VOCAB_SIZE
@@ -255,10 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--condition",
         type=condition,
         default="f",
-        metavar="{n,f,l,v,fl,fv}",
+        metavar="{n,f,v,fv}",
         help=(
-            "no recurrence (n), feedback (f), looped depth (l or v), or "
-            "feedback with either (fl, fv); default f: "
+            "no recurrence (n), feedback (f), looped depth (v), or both "
+            "(fv); default f: "
             + "; ".join(
                 [f"{NULL_CONDITION} = {NULL_CHANGE}"]
                 + [
@@ -368,7 +366,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "fraction of steps before the recurrence roll begins; every earlier "
             "step is one plain column and every later step rolls two or three "
-            "passes (f) and two or three columns per pass (l or v), while n "
+            "passes (f) and two or three columns per pass (v), while n "
             "stays one plain column and keeps the boundary only to pair with "
             "the conditions that roll; --resume may "
             "increase this fraction while the saved step is at or before the "
@@ -434,7 +432,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=range(1, LOOP_MAX_ITERATIONS + 1),
         default=DEFAULT_LOOP_ITERATIONS,
         help=(
-            "l or v: fixed evaluation/decode columns per position (default: 2); "
+            "v: fixed evaluation/decode columns per position (default: 2); "
             "training draws two or three from the recurrence roll"
         ),
     )
@@ -575,36 +573,6 @@ def shared_snapshot(source: str, found, last_shared: int, reason: str) -> Path:
     return eligible[-1]
 
 
-def graft_condition_state(payload: dict, source_condition: str, model: DeltaModel) -> None:
-    """Re-key a pre-recurrence snapshot for ``model``'s condition, in place.
-
-    Conditions share every parameter but those only a recurrent update
-    reaches (``l``'s blank embedding). Before the boundary such a parameter
-    still holds its initialization with zero moments, so a fork adds it in
-    that state or drops it without changing the trajectory: the result is the
-    snapshot the target condition would have written itself.
-    """
-    letters = parse_condition(source_condition)
-    flags = {flag: letter in letters for letter, (flag, _) in CONDITION_LETTERS.items()}
-    with torch.device("meta"):
-        source = DeltaModel(replace(model.cfg, **flags))
-    fresh = model.state_dict()
-    saved = payload[CONTRACT.state_key]
-    for name in saved.keys() - fresh.keys():
-        if saved[name].any():
-            raise ValueError(f"{name} has trained; its snapshot is not pre-recurrence")
-    payload[CONTRACT.state_key] = {
-        name: saved[name] if name in saved else value.detach().cpu().clone()
-        for name, value in fresh.items()
-    }
-    payload["optimizer"] = rekey_optimizer_state(
-        payload["optimizer"],
-        optimizer_parameter_names(source),
-        optimizer_parameter_names(model),
-        fresh,
-    )
-
-
 def draw_recurrence(args, step: int, total: int) -> tuple[int, int]:
     """The step's (passes, columns per pass) roll, before any condition
     projects it.
@@ -614,8 +582,8 @@ def draw_recurrence(args, step: int, total: int) -> tuple[int, int]:
     every update rather than eroded between them: one keyed uniform draw
     lands on three passes at two columns with probability ``three_rate``, on
     three columns at two passes with the same probability, and otherwise on
-    two and two. ``f`` reads the pass count, ``l`` or ``v`` the column count,
-    ``fl`` or ``fv`` both, and ``n`` neither, so the conditions align step by
+    two and two. ``f`` reads the pass count, ``v`` the column count, ``fv``
+    both, and ``n`` neither, so the conditions align step by
     step, and the pass projection is the feedback draw of a condition that
     does not loop.
     """
@@ -754,7 +722,7 @@ retained-forward activation budget leaves untouched. Backward workspaces,
 checkpoint recomputation, allocator rounding, CUDA context growth from
 kernels compiled after the budget is measured, and graph instantiation also
 need memory. On the 24 GiB card a 1 GiB margin OOMs in the eager warm-up
-backward of the deepest screen fl graph and 3.5 GiB runs; the ``execution``
+backward of the deepest screen fv graph and 3.5 GiB runs; the ``execution``
 record's peak allocated bytes show what a run actually needed above its
 static footprint and retained activations. The optimizer step and periodic
 monitors reuse the graphs' pool (``pool_scope``)."""
@@ -955,10 +923,7 @@ def mode_activity(
     parameter is active in every mode, whatever its warm-up gradient holds:
     autograd reaches all of them on every column, and a reached gradient can
     be exactly zero (a routing site's key-norm gain multiplies its
-    zero-initialized query), which must not read as absence. The one
-    exception is ``l``'s blank embedding, which only a re-entry reaches:
-    before the recurrence boundary its arena gradient and NAdam moments stay
-    zero, so its step is exactly zero. Warm-up rows
+    zero-initialized query), which must not read as absence. Warm-up rows
     can select only a few experts, and replay data changes those choices,
     so activity is structural for the entire bank.
     """
@@ -1695,8 +1660,7 @@ def evaluate(
     topology: distributed.Topology = distributed.Topology(),
 ) -> dict[str, float]:
     """Paired val losses at the evaluation depth: pass 1 always, one fused
-    pass on feedback conditions, and the single-column readout under ``l`` or
-    ``v``."""
+    pass on feedback conditions, and the single-column readout under ``v``."""
     if graph_runner is not None:
         return graph_runner.run(data_val)
     model.eval()
@@ -2355,8 +2319,6 @@ def _train(
     )
     pair = OptimizerPair(optimizers)
 
-    if args.fork_from:
-        graft_condition_state(payload, saved["condition"], model)
     if payload is not None:
         start_step = checkpoints.restore(
             payload, CONTRACT, model, pair, current_optimizer_groups=False

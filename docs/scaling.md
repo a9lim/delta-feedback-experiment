@@ -2,8 +2,7 @@
 
 `--scale screen|bridge|flagship|extension` selects geometry and batch settings;
 explicit flags override individual fields. The conditions share every
-parameter except `l`'s width-`D` blank embedding; `v` adds none. Loops and feedback reuse
-weights. Source definitions are
+parameter; loops and feedback reuse weights. Source definitions are
 [`SCALES` and `reference_active`](../delta_feedback_experiment/train.py).
 
 ## Geometry and parameters
@@ -33,8 +32,7 @@ experts, selects `k` routed experts per token, and uses intermediate width
 executes one quarter of its expert matrices per token.
 
 Totals and active counts cover the parameters every condition shares, so
-one denominator sets each scale's schedule; `l` and `fl` store `D` more for
-the blank embedding. Active counts include the selected experts and every
+one denominator sets each scale's schedule. Active counts include the selected experts and every
 router, mixer, payload, and fusion parameter, excluding only idle experts
 and the tied embedding matrix. They are a per-token accounting convention:
 a batch can touch all experts, and training must store all weights,
@@ -107,7 +105,7 @@ A step with `p` passes and `r` columns per pass executes `pr` columns,
 `4pr` cells, and `16pr` trunk layers per token position. The
 [recurrence roll](design.md#the-recurrence-roll) gives these expectations:
 
-| Quantity | `n` | `f` | `l`, `v` | `fl`, `fv` |
+| Quantity | `n` | `f` | `v` | `fv` |
 |---|---:|---:|---:|---:|
 | Mean columns per position on rolled steps | 1 | 2.12 | 2.12 | 4.48 |
 | Maximum columns per position on rolled steps | 1 | 3 | 3 | 6 |
@@ -122,7 +120,7 @@ sequentially between positions and does not replay full-prefix Jacobi passes.
 
 Predicted-token counters count data once, pass-tokens multiply by `p`, and
 cell-tokens multiply by `4pr`. Report all three plus device time: MTP and
-vocabulary loss add work beyond these trunk counters. The full `fl` mean
+vocabulary loss add work beyond these trunk counters. The full `fv` mean
 uses the joint roll, not a product of independent pass/column means.
 
 Each column has separate mixer caches at every layer. For one sequence and
@@ -151,18 +149,17 @@ with the current kernels. `scripts/replay_bench.py` captures every graph a
 schedule reaches at its planned replay width and times its replays. An update
 is one replay's time multiplied by the number of replays in a 128-row batch.
 Screen replays used trained `v` weights. Bridge and flagship used
-initialization, which ran about 3% slower than trained weights at screen. `fl`
-executes the same columns as `fv` and is budgeted with it. Update seconds,
-before the optimizer step:
+initialization, which ran about 3% slower than trained weights at screen.
+Update seconds, before the optimizer step:
 
-| Scale | `(1,1)` | `f`: `(2,1)` / `(3,1)` | `fl`, `fv`: `(2,2)` / `(2,3)` / `(3,2)` | Rolled mean, `f` / `fv` |
+| Scale | `(1,1)` | `f`: `(2,1)` / `(3,1)` | `fv`: `(2,2)` / `(2,3)` / `(3,2)` | Rolled mean, `f` / `fv` |
 |---|---:|---:|---:|---:|
 | Screen | 5.98 | 11.85 / 18.11 | 24.10 / 38.42 / 38.49 | 12.60 / 27.55 |
 | Bridge | 10.66 | 20.21 / 31.85 | 42.38 / 69.31 / 69.39 | 21.60 / 48.86 |
 | Flagship | 15.18 | 30.69 / 49.99 | 66.56 / 103.00 / 103.12 | 33.00 / 75.32 |
 
 Rolled means weight each shape by its roll probability: 0.88 / 0.12 for `f`'s
-two and three passes, and 0.76 / 0.12 / 0.12 for `fl` and `fv`; `n` runs
+two and three passes, and 0.76 / 0.12 / 0.12 for `fv`; `n` runs
 `(1,1)` on every step. The planner
 narrows replays as scale grows: `(2,2)` runs four, two, then one row per
 replay. Flagship's six-column graphs keep lean intermediates and recompute

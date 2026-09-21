@@ -1,16 +1,15 @@
 # delta-feedback-experiment
 
-A recurrent language model for interpretability experiments. The full `fl`
+A recurrent language model for interpretability experiments. The full `fv`
 model combines cross-token latent feedback with repeated execution of a
 shared column. Each column contains four `[PKDA, PKDA, PKDA, NoPE-GGQA]`
 cells, shared and routed SwiGLU experts, and Multi-Head Delta Block routing
 over the seed and cell deltas. A shared fusion projection connects token
 embeddings, payloads, and an auxiliary second-token predictor.
 
-The conditions select feedback (`f`), looped depth re-entering with a blank
-embedding (`l`) or with the token again (`v`), feedback with either (`fl`,
-`fv`), or neither (`n`, the no-recurrence baseline). They share parameters,
-paired initialization, and keyed training draws.
+The conditions select feedback (`f`), looped depth re-entering with the token
+again (`v`), both (`fv`), or neither (`n`, the no-recurrence baseline). They
+share one parameter set, paired initialization, and keyed training draws.
 Four presets span 621M–5.32B stored parameters; the CLI defaults to screen
 scale and `f`. Ordinary generation uses the main next-token head.
 
@@ -20,7 +19,7 @@ general capture/readout tooling lives in `interpretability-experiments`.
 
 | Document | Owns |
 |---|---|
-| [Architecture](docs/architecture.md) | The full `fl` computation, component equations, state, initialization, and optimizer mechanics |
+| [Architecture](docs/architecture.md) | The full `fv` computation, component equations, state, initialization, and optimizer mechanics |
 | [Training recipe](docs/design.md) | Conditions, data identity, objectives, randomness, schedules, and evaluation |
 | [Scaling](docs/scaling.md) | Presets, parameter/token/compute accounting, decode memory, and runtime estimates |
 | [Operations](docs/operations.md) | Installation, tokenization, run/checkpoint control, telemetry, CUDA, and Hopper/node workflows |

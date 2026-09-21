@@ -96,7 +96,7 @@
 \node[font=\bfseries\fontsize{25}{29}\selectfont] at (21,69.05)
   {Delta: feedback + looped depth};
 \node[note,font=\fontsize{10}{13}\selectfont,align=center] at (21,68.25)
-  {Full \texttt{fl} model\quad $\cdot$\quad one shared 16-layer trunk\quad $\cdot$\quad four cells};
+  {Full \texttt{fv} model\quad $\cdot$\quad one shared 16-layer trunk\quad $\cdot$\quad four cells};
 % One operation-family palette, maintained at every magnification.
 \foreach \x/\kind/\word in {2.5/tokenop/Embedding,7.2/norm/Normalization,12.5/bankop/Depth bank,
  17.7/pkdaop/PKDA,21.5/gqaop/GGQA,25.5/moeop/Expert FFN,30.5/fusionop/Fusion,35.5/readoutop/Readout}{
@@ -107,7 +107,7 @@
 % A. Main model and its two recurrence coordinates.
 \node[anchor=west,font=\bfseries\fontsize{14}{17}\selectfont] at (.8,65.7) {A\quad Model and recurrence};
 \node[anchor=west,note] at (.8,64.95)
- {Shared fusion $F(e,p)=W_F[e;p]$,\quad $W_F:[D,2D]$; learned blanks $e_0,p_0$};
+ {Shared fusion $F(e,p)=W_F[e;p]$,\quad $W_F:[D,2D]$; learned blank payload $p_0$};
 \node[port] (tokens) at (9.5,35.8) {$x_t$};
 \op{embedding}{9.5}{37.05}{6.0}{tokenop}{\textbf{Token embedding}\\$e_t=50E[x_t],\quad E:[V,D]$}
 \op{entry}{9.5}{39.05}{6.0}{fusionop,minimum height=1.12cm}{\textbf{Plain fusion}\\$F(e_t,p_0)$}
@@ -120,9 +120,10 @@
 \node[edgeword,anchor=west] at (9.7,41.0) {Column seed $s_t^{(a,i)}$};
 \op{blank}{5.8}{35.6}{2.8}{fusionop}{\textbf{Blank payload}\\$p_0\in\mathbb R^D$}
 \draw[flow] (blank.north) -- (5.8,38.0) -| ($(entry.south)+(-1.6,0)$);
-\op{blankembed}{3.1}{37.05}{4.0}{tokenop}{\textbf{Blank embedding}\\$e_0\in\mathbb R^D$}
-\op{loopfusion}{3.1}{39.05}{4.0}{fusionop,minimum height=1.12cm}{\textbf{Loop fusion}\\$F(e_0,\widetilde p_t^{(a,i)})$}
-\draw[loopflow] (blankembed) -- (loopfusion);
+\op{loopembed}{3.1}{37.05}{4.0}{tokenop}{\textbf{Same token}\\$e_t$ again}
+\op{loopfusion}{3.1}{39.05}{4.0}{fusionop,minimum height=1.12cm}{\textbf{Loop fusion}\\$F(e_t,\widetilde p_t^{(a,i)})$}
+\draw[loopflow,preaction={draw=white,line width=3.5pt}] (embedding.west) -- (loopembed.east);
+\draw[loopflow] (loopembed) -- (loopfusion);
 \cell{c1}{43.4}{1}
 \cell{c2}{47.2}{2}
 \cell{c3}{51.0}{3}
@@ -159,13 +160,13 @@
 \draw[flow] (payload) -- (jitter);
 \node[note,align=center,text width=4.8cm] at (3.1,64.0)
  {$\xi\sim U(-.02,.02)$ in training;\\$\xi=0$ for evaluation / decode.};
-% l returns the jittered payload to fusion with the learned blank embedding:
-% only a position's first column sees its token.
+% v returns the jittered payload to fusion with the position's own token:
+% the feedback entry of a virtual repeat of that token.
 \draw[loopflow] (jitter.west) -- (.2,62.35) -- (.2,38.0)
  -| ($(loopfusion.south)+(-1.4,0)$);
 \draw[loopflow] (loopfusion.north) -- (3.1,40.6) -- (9.5,40.6);
 \node[recurrencelabel,rotate=90,text=loopink] at (.2,50.5)
- {\textbf{\texttt{l}: same token}\quad $i<R,\ i\to i+1$};
+ {\textbf{\texttt{v}: same token}\quad $i<R,\ i\to i+1$};
 \node[edgeword,text=loopink] at (6.55,40.6) {$s_t^{(a,i+1)}$};
 % Every column also builds next-token fusion for MTP; final-column feedback
 % reuses this exact tensor, shifted to the next position and Jacobi pass.

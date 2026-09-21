@@ -25,7 +25,7 @@ Use model entry points to preserve the trained fusion and readout conventions:
 |---|---|
 | `embed_tokens(tokens)`, `plain_seed(e)` | Token features and their blank-payload fusion, respectively; the embedding's `.weight` is the tied classifier parameter. |
 | `forward_column(x, want_weights=True)` | One `ColumnOutput` with top residual, payload, source bank, routing data, expert balance, and assignment counts. |
-| `forward_iterations(x, e, iterations=...)` | Every looped column for one position range, returned in order; `e` is the raw lookup of the same positions. Later columns re-enter through `loop_seed(payload, e)`, the payload's fusion with `blank_embedding` under `l` or with `e` under `v`. |
+| `forward_iterations(x, e, iterations=...)` | Every looped column for one position range, returned in order; `e` is the raw lookup of the same positions. Later columns re-enter through `loop_seed(payload, e)`, the payload's fusion with `e`. |
 | `multipass(model, tokens, n_passes, ...)` | Outputs indexed `[pass][column]`; `tokens` has shape `[B,T+1]` and the trunk executes `T` positions. |
 | `forward_mtp_fused(fused_input)` | The auxiliary block on an already projected fusion tensor. `forward_mtp(payload, next_tokens)` computes that fusion first. |
 
@@ -45,17 +45,12 @@ post-writer value from the projected fusion tensor: those interventions
 affect different interfaces. Replacing an incoming payload with
 `blank_payload` restores the plain seed at that position; top-only payload
 ablation instead removes routed enrichment and retains the normalized top
-residual. They test different hypotheses. An `l` re-entry differs: its seed
-is `fuse(payload, blank_embedding)` with no token term, so the payload is the
-later column's only view of its position. Patching it sets that column's
-whole input, and the blank payload there leaves a constant, token-free seed
-rather than a plain one. The informative `l` question is what the payload
-holds beyond the current token and the draft readout, not whether it is read.
-A `v` re-entry is `fuse(payload, e)`, a feedback seed at the same position:
-the blank payload there restores the plain seed, and with every looped
-payload blanked a later column repeats the first exactly, so the gap between
-a later column and the first is what its payload is worth. Under `v` whether
-the payload is read is again a measurement.
+residual. They test different hypotheses. A loop re-entry is
+`fuse(payload, e)`, a feedback seed at the same position: the blank payload
+there restores the plain seed, and with every looped payload blanked a later
+column repeats the first exactly, so the gap between a later column and the
+first is what its payload is worth. Whether and how the payload is read is a
+measurement.
 
 ## Diagnostics and tools
 
@@ -72,7 +67,7 @@ tools use the loader and evaluation numerics above. JSON and figures under
 `figures/` are generated outputs and remain untracked.
 
 The payload sweep overrides the writer wherever it runs, including loop
-seeds under `fl`; its loss measures that combined intervention rather than
+seeds under `fv`; its loss measures that combined intervention rather than
 one isolated feedback edge.
 
 Two model-level diagnostics also appear in trainer telemetry:
@@ -98,7 +93,7 @@ loop count.
 
 Training curves need the objective's [recurrence weighting](design.md#objective).
 The plotted `ntp - pass1` remainder includes loop-only and joint terms under
-`fl`, even though the plot labels it feedback. Combined training CE has a
+`fv`, even though the plot labels it feedback. Combined training CE has a
 different total weight across recurrence shapes; compare matching `(k,r)`
 or use per-head held-out CE. The plotted gradient norm is the full norm;
 training does not clip it.

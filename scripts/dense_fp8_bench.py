@@ -50,7 +50,7 @@ def shapes(scales: list[str], sites: list[str]) -> list[dict]:
         with torch.device("meta"):
             model = DeltaModel(
                 condition_config(
-                    "fl", **{k: v for k, v in SCALES[scale].items() if k in keys}
+                    "fv", **{k: v for k, v in SCALES[scale].items() if k in keys}
                 )
             )
         specs = {spec.name: spec for spec in model.slab_specs() if spec.kind == "rows"}

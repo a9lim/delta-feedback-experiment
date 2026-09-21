@@ -44,8 +44,8 @@ def site_names(cfg) -> list[str]:
 
 @torch.no_grad()
 def collect(model, data_val, device, rows: int, micro: int):
-    """Routing statistics per (pass, site) over `rows` val rows; under ``l``
-    or ``v`` each pass is read at its last column, the evaluation depth.
+    """Routing statistics per (pass, site) over `rows` val rows; under ``v``
+    each pass is read at its last column, the evaluation depth.
 
     Returns (mean weights [N,H], per-head token stats {max, H_tok},
     normalized cross-head JS) keyed by (pass, site).  Mean weights say

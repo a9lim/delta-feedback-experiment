@@ -10,7 +10,7 @@ import warnings
 from dataclasses import replace
 
 
-def cuda_probe(condition: str) -> None:
+def cuda_probe() -> None:
     import torch
 
     from . import distributed
@@ -36,7 +36,7 @@ def cuda_probe(condition: str) -> None:
         [
             "probe",
             "--condition",
-            condition,
+            "fv",
             "--steps",
             "2",
             "--recurrence-start",
@@ -224,13 +224,6 @@ def main(argv: list[str] | None = None) -> None:
         "one rank per device, with the same collectives a training step "
         "makes (default: 1)",
     )
-    parser.add_argument(
-        "--condition",
-        choices=("fl", "fv"),
-        default="fl",
-        help="feedback with either loop re-entry: the blank embedding (fl) or "
-        "the position's own token (fv) (default: fl)",
-    )
     argv = list(sys.argv[1:] if argv is None else argv)
     parsed = parser.parse_args(argv)
     ranks = parsed.ranks
@@ -249,7 +242,7 @@ def main(argv: list[str] | None = None) -> None:
         warnings.filterwarnings(
             "ignore", message=r"flex_attention called without torch\.compile\(\)"
         )
-        cuda_probe(parsed.condition)
+        cuda_probe()
 
 
 if __name__ == "__main__":

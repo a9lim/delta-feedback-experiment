@@ -246,7 +246,7 @@ def test_preset_accounting_counts_shared_and_selected_experts(
     )
 
     args = parse_run_args(["geometry", "--scale", scale])
-    cfg = condition_config("fl", **model_fields(args))
+    cfg = condition_config("fv", **model_fields(args))
     assert cfg.loop_iterations == ModelConfig().loop_iterations == 2
     assert cfg.layers == 16 and cfg.pkda_layers == 12
     assert cfg.routing_blocks == 4
@@ -263,9 +263,8 @@ def test_preset_accounting_counts_shared_and_selected_experts(
     assert routed + 1 == 4 * (selected + 1)
     with torch.device("meta"):
         model = DeltaModel(cfg)
-    # The table counts what every condition shares; ``l`` stores its
-    # width-D blank embedding on top.
-    assert sum(p.numel() for p in model.parameters()) == total + dim
+    # Every condition shares the table's parameter set.
+    assert sum(p.numel() for p in model.parameters()) == total
     assert len(model.expert_banks) == 17
     assert all(
         bank.intermediate == 832
@@ -302,7 +301,7 @@ def test_keyed_schedule_draws_are_reproducible():
         assert roll == draw_recurrence(args, step, args.steps)
         assert roll in {(1, 1), (2, 2), (3, 2), (2, 3)}
         # Every condition projects the same roll onto the letters it has.
-        for condition in ("n", "f", "l", "fl", "v", "fv"):
+        for condition in ("n", "f", "v", "fv"):
             cfg = condition_config(condition)
             passes, iterations = step_shape(args, step, args.steps, cfg)
             assert passes == (roll[0] if cfg.feedback else 1)
@@ -351,7 +350,7 @@ def test_recurrence_rolls_are_shared_across_scales_and_independent_of_eval_depth
         assert args.loop_iterations == 2
         for eval_depth in (1, 2, 3):
             args.loop_iterations = eval_depth
-            cfg = condition_config("fl", **model_fields(args))
+            cfg = condition_config("fv", **model_fields(args))
             assert cfg.loop_iterations == eval_depth
             rolls = [draw_recurrence(args, step, 128) for step in steps]
             if expected is None:
@@ -381,33 +380,32 @@ def test_roll_rng_is_addressed_by_step_and_preserves_other_streams():
 
 def test_reachable_graphs_cover_every_rolled_shape_without_cuda():
     args = parse_run_args([
-        "graphs", "--condition", "fl", "--steps", "400",
+        "graphs", "--condition", "fv", "--steps", "400",
         "--recurrence-start", "0.25", "--three-rate", "0.3",
     ])
     runner = object.__new__(CudaGraphTrainer)
     runner.args = args
-    runner.model = SimpleNamespace(cfg=condition_config("fl", **model_fields(args)))
+    runner.model = SimpleNamespace(cfg=condition_config("fv", **model_fields(args)))
     schedule = build_schedule(args)
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(2, 2), GraphSpec(2, 3), GraphSpec(3, 2),
     ]
-    runner.model.cfg = replace(runner.model.cfg, loop_blank=False)
+    runner.model.cfg = replace(runner.model.cfg, loop=False)
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(2, 1), GraphSpec(3, 1),
     ]
-    runner.model.cfg = replace(runner.model.cfg, feedback=False, loop_token=True)
+    runner.model.cfg = replace(runner.model.cfg, feedback=False, loop=True)
     assert runner._reachable_specs(schedule) == [
         GraphSpec(1, 1), GraphSpec(1, 2), GraphSpec(1, 3),
     ]
-    runner.model.cfg = replace(runner.model.cfg, loop_token=False)
+    runner.model.cfg = replace(runner.model.cfg, loop=False)
     assert runner._reachable_specs(schedule) == [GraphSpec(1, 1)]
 
 
 @pytest.mark.parametrize("depth", [0, 4])
 def test_eval_depth_stays_within_the_trained_range(depth):
-    for flag in ("loop_blank", "loop_token"):
-        with pytest.raises(ValueError, match="loop.*iterations"):
-            ModelConfig(**{flag: True}, loop_iterations=depth)
+    with pytest.raises(ValueError, match="loop.*iterations"):
+        ModelConfig(loop=True, loop_iterations=depth)
     with pytest.raises(SystemExit):
         parse_run_args(["draws", "--steps", "1", "--loop-iterations", str(depth)])
 
@@ -500,7 +498,7 @@ def test_training_resume_preserves_the_exact_next_update(
         tmp_path / "data" / DEFAULT_SOURCE, train_tokens=80, val_tokens=20, vocab=31
     )
     settings = {
-        "condition": "fl",
+        "condition": "fv",
         "data-root": tmp_path / "data",
         "out-dir": tmp_path / "runs",
         "vocab-size": 31,
@@ -595,8 +593,8 @@ def test_replay_plan_fits_rows_then_recomputes_blocks():
         plan_replay,
     )
 
-    args = parse_run_args(["plan", "--condition", "fl", "--steps", "5"])
-    cfg = condition_config("fl", **model_fields(args))
+    args = parse_run_args(["plan", "--condition", "fv", "--steps", "5"])
+    cfg = condition_config("fv", **model_fields(args))
     assert block_invocations(cfg, GraphSpec(1, 1)) == (17, 13)
     assert block_invocations(cfg, GraphSpec(2, 1)) == (34, 26)
     assert block_invocations(cfg, GraphSpec(1, 3)) == (51, 39)
@@ -793,8 +791,8 @@ def test_null_condition_trains_as_f_whose_roll_never_begins(tmp_path):
 
 @pytest.mark.parametrize(
     "source,target",
-    [("f", "fl"), ("f", "l"), ("fl", "f"), ("f", "v"), ("fl", "fv"), ("f", "n"), ("n", "fl")],
-    ids=["f-fl", "f-l", "fl-f", "f-v", "fl-fv", "f-n", "n-fl"],
+    [("f", "fv"), ("fv", "f"), ("f", "v"), ("v", "fv"), ("f", "n"), ("n", "fv")],
+    ids=["f-fv", "fv-f", "f-v", "v-fv", "f-n", "n-fv"],
 )
 def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source, target):
     """Before the recurrence boundary every condition is one trajectory, so a
@@ -821,7 +819,6 @@ def test_fork_is_the_target_condition_from_the_shared_boundary(tmp_path, source,
     complete = trainer.read_checkpoint(tmp_path / "runs/scratch.pt.4")
     branched = trainer.read_checkpoint(tmp_path / "runs/forked.pt.4")
     assert branched["args"]["condition"] == target
-    assert ("blank_embedding" in branched["state"]) == ("l" in target)
     assert_identical(complete["state"], branched["state"])
     assert_identical(complete["optimizer"], branched["optimizer"])
     # The fork begins at the boundary, not at the source's end.

@@ -7,32 +7,27 @@ checkpoints.
 
 ## Conditions
 
-| Condition | Feedback between positions | Looped columns per position | Token side of a re-entry |
-|---|---|---|---|
-| `n` | Disabled | One | — |
-| `f` (default) | Enabled | One | — |
-| `l` | Disabled | Sampled during training | Blank embedding |
-| `v` | Disabled | Sampled during training | The position's own token |
-| `fl` | Enabled | Sampled during training | Blank embedding |
-| `fv` | Enabled | Sampled during training | The position's own token |
+| Condition | Feedback between positions | Looped columns per position |
+|---|---|---|
+| `n` | Disabled | One |
+| `f` (default) | Enabled | One |
+| `v` | Disabled | Sampled during training |
+| `fv` | Enabled | Sampled during training |
 
 All conditions retain the same PKDA/GQA stack, MHDB readers, shared and routed
 experts, payload writer, fusion, and auxiliary second-token predictor (MTP).
-The letters select recurrence axes, not component ablations. `l` and `v` are
-the same looped columns and differ only in what a later column fuses with its
-payload, so a condition has at most one of them. `l` adds one learned blank
-embedding, which replaces the token at every re-entry: the payload alone
-carries the position, and a re-entry seed is marked apart from a feedback
-seed. `v` fuses the position's own token again and adds no parameter: its
-re-entry is the feedback entry of a chain that repeats every token once, the
-payload carries only what the token does not, and the blank payload is an
-in-distribution null under which a later column repeats the first. Shared
-parameters initialize identically at a given `--seed`; at one column, `fl`
-and `fv` have the values and gradients of `f`. `n` selects neither axis and
+The letters select recurrence axes, not component ablations, and every
+condition has the same parameter set. A later `v` column fuses its
+preceding column's payload with the position's own token again: its re-entry
+is the feedback entry of a chain that repeats every token once, the payload
+carries only what the token does not, and the blank payload is an
+in-distribution null under which a later column repeats the first.
+Parameters initialize identically at a given `--seed`; at one column, `fv`
+has the values and gradients of `f`. `n` selects neither axis and
 is the no-recurrence control: every update and evaluation is the plain column
 that each condition trains through its recurrence boundary, seeded by fusing
-the token with the blank payload. It has `f`'s parameters and trains as `f`
-with `--recurrence-start 1`.
+the token with the blank payload. It trains as `f` with
+`--recurrence-start 1`.
 
 ## Data
 
@@ -89,7 +84,7 @@ Let `k` be feedback passes and `r` columns per pass. Through step
 `round(recurrence_start * steps)`, every condition executes `(k,r) = (1,1)`.
 Every subsequent step draws one shared shape, which `n` projects to `(1,1)`:
 
-| Draw | Probability | `f`: `(k,r)` | `l`, `v`: `(k,r)` | `fl`, `fv`: `(k,r)` |
+| Draw | Probability | `f`: `(k,r)` | `v`: `(k,r)` | `fv`: `(k,r)` |
 |---|---:|---|---|---|
 | Three passes, two columns | `three_rate` = 0.12 | `(3,1)` | `(1,2)` | `(3,2)` |
 | Two passes, three columns | `three_rate` = 0.12 | `(2,1)` | `(1,3)` | `(2,3)` |
@@ -113,16 +108,15 @@ Every supervised column adds uniform payload jitter in
 `[-jitter, jitter]`, with `--jitter 0.02` by default. One draw serves that
 column's MTP, feedback, and loop consumers, including on single-pass batches
 and final columns. Prefix draws and last-column jitter precede earlier-column
-jitter in each row's keyed stream, so adding `l` or `v` preserves the draws
-shared with `f`, and `l` and `v` read the same loop jitter. Evaluation and
-diagnostics disable jitter.
+jitter in each row's keyed stream, so adding `v` preserves the draws shared
+with `f`. Evaluation and diagnostics disable jitter.
 
 ### Objective
 
 Every executed column trains next-token prediction and MTP. Define
 `F(x) = x[0]` for one element, otherwise
 `F(x) = x[0] + mean(x[1:])`. `combine` applies `F` over passes for each
-column, then over columns. On rolled `fl` or `fv` steps this assigns one unit of
+column, then over columns. On rolled `fv` steps this assigns one unit of
 weight to each of four groups: the plain first column, later columns of
 pass 1, column 1 of later passes, and later columns of later passes. It
 does not average the four groups into one unit. With a single recurrence

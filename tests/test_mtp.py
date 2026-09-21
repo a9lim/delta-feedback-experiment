@@ -225,7 +225,7 @@ def test_the_padded_auxiliary_row_leaves_the_supervised_rows_unchanged():
     torch.testing.assert_close(full[:, :-1], cropped, atol=2e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("condition, count", [("f", 1), ("l", 1), ("fl", 2)])
+@pytest.mark.parametrize("condition, count", [("f", 1), ("v", 1), ("fv", 2)])
 def test_mtp_trains_shared_fusion_and_payload_on_every_column(condition, count):
     model = tiny(condition)
     toks = tokens(length=5)
@@ -266,7 +266,7 @@ def test_mtp_trains_shared_fusion_and_payload_on_every_column(condition, count):
 
 @torch.no_grad()
 def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
-    model = tiny("fl")
+    model = tiny("fv")
     supplied = tokens(length=5)
     payload = torch.randn(2, 5, model.cfg.dim)
     before = model.forward_mtp(payload, supplied)
@@ -283,21 +283,16 @@ def test_auxiliary_recurrent_state_is_independent_between_rows_and_calls():
         )
 
 
-@pytest.mark.parametrize("condition", ["fl", "fv"])
-def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses(condition):
+def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses():
     """Independent consumers recompute the jittered concat equation; sharing that
     input and raw token lookup must preserve both objectives' derivatives."""
     count, z_coef, coefficient = 3, 0.017, 0.23
-    model, reference = tiny(condition), tiny(condition)
+    model, reference = tiny("fv"), tiny("fv")
     for candidate in (model, reference):
         for bank in candidate.expert_banks:
             bank.expert_bias[-bank.experts_per_token :] = 2
         with torch.no_grad():
             candidate.blank_payload.copy_(torch.linspace(-1, 1, candidate.cfg.dim))
-            if candidate.cfg.loop_blank:
-                candidate.blank_embedding.copy_(
-                    torch.linspace(1, -1, candidate.cfg.dim)
-                )
     toks = tokens(length=6)
     iterations = 2
     jitter, loop_jitter = jitter_for(model, toks, count, iterations)
@@ -331,14 +326,10 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses(condi
             pass_outs.append(reference.forward_column(x))
             payload = pass_outs[-1].payload + draw(index, column)
             if column + 1 < iterations:
-                # ``l`` re-enters with the blank embedding, never the token;
-                # ``v`` with its own lookup of the position's token.
-                token_side = (
-                    reference.blank_embedding.expand_as(payload)
-                    if reference.cfg.loop_blank
-                    else explicit_embedding(reference, toks[:, :-1])
+                # The loop re-enters with its own lookup of the position's token.
+                x = explicit_fusion(
+                    reference, payload, explicit_embedding(reference, toks[:, :-1])
                 )
-                x = explicit_fusion(reference, payload, token_side)
         reference_outs.append(pass_outs)
         if index + 1 < count:
             # Keep the production order (fuse, then shift): changing the rows
@@ -433,7 +424,7 @@ def test_reused_fusion_matches_duplicated_values_gradients_and_head_losses(condi
             assert error.abs().max() < 2e-6 + 2e-4 * scale, name
 
 
-@pytest.mark.parametrize("condition, iterations", [("f", 1), ("fl", 2)])
+@pytest.mark.parametrize("condition, iterations", [("f", 1), ("fv", 2)])
 def test_training_reuses_one_lookup_and_one_scaled_payload_per_column(
     monkeypatch, condition, iterations
 ):

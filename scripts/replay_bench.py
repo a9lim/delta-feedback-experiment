@@ -2,7 +2,7 @@
 by kernel class: the baseline the Hopper levers are scored against.
 
     python scripts/replay_bench.py --data-root /data/delta [--tag gh200-base]
-        [--condition fl] [--scale screen] [--specs 1:1,2:2,3:2] [--trace]
+        [--condition fv] [--scale screen] [--specs 1:1,2:2,3:2] [--trace]
         [--replay-rows 2] [--attention-backend cudnn|flash]
         [--cce-config bf16-base] [--expert-tiles default|ada]
         [--train-steps 4]  # optional optimizer check; requires one captured spec
@@ -86,7 +86,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--tag", default="replay-bench")
-    parser.add_argument("--condition", default="fl")
+    parser.add_argument("--condition", default="fv")
     parser.add_argument("--scale", default="screen")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--source", default="dclm-100b")

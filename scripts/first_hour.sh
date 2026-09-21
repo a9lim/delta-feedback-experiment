@@ -6,7 +6,7 @@
 # the benchmarks in docs/operations.md follow this lifecycle check.
 #
 #   scripts/first_hour.sh --data-root /data/delta [--tag first-hour] [--steps 12]
-#       [--source dclm-100b] [--scale screen] [--condition fl] [--precision fp8]
+#       [--source dclm-100b] [--scale screen] [--condition fv] [--precision fp8]
 #       [--seed 1] [--data-seed 0]
 #
 # Run from the experiment directory. Logs and summary.json land in
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 DATA_ROOT="" SOURCE=dclm-100b TAG=first-hour STEPS=12
-SCALE=screen CONDITION=fl PRECISION=fp8 SEED=1 DATA_SEED=0
+SCALE=screen CONDITION=fv PRECISION=fp8 SEED=1 DATA_SEED=0
 
 usage() {
   sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'

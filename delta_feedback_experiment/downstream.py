@@ -71,7 +71,7 @@ class DeltaScorer:
         ids = ids.to(self.device)
         with analysis.autocast(self.device):
             e = model.embed_tokens(ids)
-            # Under l or v every pass runs the evaluation column count and
+            # Under v every pass runs the evaluation column count and
             # scores its last column.
             out = model.forward_iterations(
                 model.plain_seed(e), e, need_payload=self.passes > 0
