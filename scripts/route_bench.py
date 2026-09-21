@@ -45,19 +45,19 @@ def make_case(rows: int, n_bank: int, dtype=torch.bfloat16):
     weights /= weights.sum(0, keepdim=True)
     inv_rms = torch.rand(n_bank, bt, device=dev, dtype=torch.float32) + 0.5
     routed = torch.empty_like(sources[0])
-    return dict(
-        rows=rows,
-        bt=bt,
-        n_bank=n_bank,
-        projected=projected,
-        null=null,
-        sources=sources,
-        accumulators=accumulators,
-        grad_routed=grad_routed,
-        weights=weights,
-        inv_rms=inv_rms,
-        routed=routed,
-    )
+    return {
+        "rows": rows,
+        "bt": bt,
+        "n_bank": n_bank,
+        "projected": projected,
+        "null": null,
+        "sources": sources,
+        "accumulators": accumulators,
+        "grad_routed": grad_routed,
+        "weights": weights,
+        "inv_rms": inv_rms,
+        "routed": routed,
+    }
 
 
 def launch_geometry(block_k: int | None, warps: int | None, backward=False):
@@ -203,7 +203,9 @@ def main() -> None:
                 for n in args.banks:
                     case = cases[n]
                     fwd[n] = time_ms(
-                        lambda c=case, f=ftpp: forward_call(c, bk, wp, stages, f),
+                        lambda c=case, f=ftpp, bk=bk, wp=wp, stages=stages: forward_call(
+                            c, bk, wp, stages, f
+                        ),
                         iters=args.iters,
                     )
                 total = sum(fwd[n] * counts[n] for n in args.banks if n in counts)
@@ -211,12 +213,12 @@ def main() -> None:
                     n: bytes_forward(n, cases[n]["bt"]) / (fwd[n] * 1e-3) / 1e12
                     for n in args.banks
                 }
-                rec = dict(
-                    kind="forward", rows=rows, geom=geom, stages=stages, tpp=ftpp,
-                    per_bank={n: round(fwd[n], 4) for n in args.banks},
-                    tbps={n: round(eff[n], 2) for n in args.banks},
-                    column_ms=round(total, 3),
-                )
+                rec = {
+                    "kind": "forward", "rows": rows, "geom": geom, "stages": stages, "tpp": ftpp,
+                    "per_bank": {n: round(fwd[n], 4) for n in args.banks},
+                    "tbps": {n: round(eff[n], 2) for n in args.banks},
+                    "column_ms": round(total, 3),
+                }
                 records.append(rec)
                 print(json.dumps(rec))
             for tpp in args.tpp:
@@ -224,7 +226,9 @@ def main() -> None:
                 for n in args.banks:
                     case = cases[n]
                     bwd[n] = time_ms(
-                        lambda c=case, t=tpp: backward_call(c, bk, wp, stages, t),
+                        lambda c=case, t=tpp, bk=bk, wp=wp, stages=stages: backward_call(
+                            c, bk, wp, stages, t
+                        ),
                         iters=args.iters,
                     )
                 total = sum(bwd[n] * counts[n] for n in args.banks if n in counts)
@@ -234,12 +238,12 @@ def main() -> None:
                     / 1e12
                     for n in args.banks
                 }
-                rec = dict(
-                    kind="backward", rows=rows, geom=geom, stages=stages, tpp=tpp,
-                    per_bank={n: round(bwd[n], 4) for n in args.banks},
-                    tbps={n: round(eff[n], 2) for n in args.banks},
-                    column_ms=round(total, 3),
-                )
+                rec = {
+                    "kind": "backward", "rows": rows, "geom": geom, "stages": stages, "tpp": tpp,
+                    "per_bank": {n: round(bwd[n], 4) for n in args.banks},
+                    "tbps": {n: round(eff[n], 2) for n in args.banks},
+                    "column_ms": round(total, 3),
+                }
                 records.append(rec)
                 print(json.dumps(rec))
         del cases

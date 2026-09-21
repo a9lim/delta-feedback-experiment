@@ -31,8 +31,8 @@ from the working copy after every gather, on every rank alike.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable
 
 import torch
 from torch import Tensor, nn

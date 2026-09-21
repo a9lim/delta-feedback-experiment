@@ -82,7 +82,8 @@ def git_rev(path: str) -> str:
 
 
 def main() -> None:
-    from cce_bench import CANDIDATES as CCE_CANDIDATES, select as select_cce
+    from cce_bench import CANDIDATES as CCE_CANDIDATES
+    from cce_bench import select as select_cce
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--tag", default="replay-bench")
@@ -114,10 +115,10 @@ def main() -> None:
         parser.error("--train-steps must be nonnegative")
 
     import torch
+    from torch.nn.attention import SDPBackend
     from torch.profiler import ProfilerActivity, profile
 
     from delta_feedback_experiment import attention, distributed, moe_kernels
-    from torch.nn.attention import SDPBackend
 
     if opts.attention_backend != "default":
         attention.FUSED_BACKENDS = [{"cudnn": SDPBackend.CUDNN_ATTENTION,

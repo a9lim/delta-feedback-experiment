@@ -19,6 +19,7 @@ import os
 import signal
 import sys
 from dataclasses import dataclass
+from typing import Self
 
 import torch
 import torch.distributed as dist
@@ -57,6 +58,11 @@ class Topology:
 
     def padded(self, count: int) -> int:
         return self.chunk(count) * self.world
+
+
+ONE_RANK = Topology()
+"""The lone rank of a single-process invocation, the default wherever a
+topology is optional."""
 
 
 LAUNCHER = "torch.distributed.run"
@@ -226,7 +232,7 @@ class Interrupt:
             raise KeyboardInterrupt
         self.requested = True
 
-    def __enter__(self) -> Interrupt:
+    def __enter__(self) -> Self:
         self._previous = signal.signal(signal.SIGINT, self._handle)
         return self
 

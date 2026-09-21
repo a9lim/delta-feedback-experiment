@@ -1,10 +1,9 @@
 """The split-scan tuner floor is recorded under the key the tuner reads."""
 
 import pytest
-
 from torch._inductor import config as inductor_config
-from torch._inductor.codegen.triton_split_scan import TritonSplitScanKernel
 from torch._inductor.codegen.triton import TritonKernel
+from torch._inductor.codegen.triton_split_scan import TritonSplitScanKernel
 
 import delta_feedback_experiment.inductor  # noqa: F401  (applies the fix)
 

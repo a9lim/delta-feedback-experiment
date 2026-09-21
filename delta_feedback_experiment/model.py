@@ -44,7 +44,6 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import Tensor, nn
 
-from .inductor import INDUCTOR_MODE
 from .attention import causal_attention, prefix_attention
 from .cuda_kernels import (
     Fp8Weights,
@@ -53,6 +52,7 @@ from .cuda_kernels import (
     sink_linear,
 )
 from .head import dense_head, dense_head_device, weighted_dense_head
+from .inductor import INDUCTOR_MODE
 from .moe import EXPERT_BIAS_RATE, MixtureOfExperts, validate_expert_geometry
 from .parameter_groups import is_normuonh_parameter, is_width_scaled_parameter
 from .pkda import PreconditionedKDA
@@ -2262,7 +2262,7 @@ def multipass_loss(
                 raise ValueError("MTP loss needs the column's shared fused input")
             mtp = model.forward_mtp_fused(out.fused_input)
             weight_nll = row_weights * (pass_coefficient * column_coefficient)
-            head_total, nll, lse = weighted_head_loss(
+            head_total, nll, _ = weighted_head_loss(
                 model, (out.h_top, mtp.hidden), (targets, mtp_targets),
                 weight_nll, weight_nll * z_coef, grad_scale=grad_scale,
             )

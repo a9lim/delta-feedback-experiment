@@ -329,7 +329,7 @@ def test_recurrence_roll_assigns_exact_probability_intervals(monkeypatch):
         monkeypatch.setattr(
             torch,
             "rand",
-            lambda *args, **kwargs: torch.tensor(draw, dtype=torch.float64),
+            lambda *args, draw=draw, **kwargs: torch.tensor(draw, dtype=torch.float64),
         )
         assert draw_recurrence(args, 1, 100) == expected
     # Before the boundary no step is rolled; after it none is single-column.

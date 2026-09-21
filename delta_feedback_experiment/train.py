@@ -893,7 +893,7 @@ class StepSums:
 
     @classmethod
     def zeros(cls, model: DeltaModel, device: torch.device) -> StepSums:
-        scalar = lambda: torch.zeros((), dtype=torch.float32, device=device)  # noqa: E731
+        scalar = lambda: torch.zeros((), dtype=torch.float32, device=device)
         return cls(
             scalar(), scalar(), scalar(), scalar(), scalar(),
             torch.zeros(
@@ -1657,7 +1657,7 @@ def evaluate(
     args,
     device,
     graph_runner: CudaEvalRunner | None = None,
-    topology: distributed.Topology = distributed.Topology(),
+    topology: distributed.Topology = distributed.ONE_RANK,
 ) -> dict[str, float]:
     """Paired val losses at the evaluation depth: pass 1 always, one fused
     pass on feedback conditions, and the single-column readout under ``v``."""
@@ -2121,7 +2121,7 @@ def inherit_fork_settings(args, saved: dict, source: str, pinned: frozenset[str]
 
 
 def pick_device(
-    name: str | None, topology: distributed.Topology = distributed.Topology()
+    name: str | None, topology: distributed.Topology = distributed.ONE_RANK
 ) -> torch.device:
     """The device of this rank: a named one, else CUDA by local rank, MPS, CPU."""
     if name:
