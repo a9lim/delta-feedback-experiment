@@ -39,3 +39,9 @@ references:
   - arxiv: "2310.17813"
     slug: yang2023-spectral-condition
     note: Spectral scaling of matrix updates.
+  - arxiv: "2408.11029"
+    slug: tissue2024-lr-annealing-scaling-law
+    note: Loss as a power law in the forward learning-rate area minus a momentum-smoothed annealing area; the scaling script's schedule-aware fit.
+  - arxiv: "2203.15556"
+    slug: hoffmann2022-chinchilla
+    note: Separable parameter/token loss form the annealed finals are anchored to.

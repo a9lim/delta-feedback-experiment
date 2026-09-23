@@ -465,6 +465,8 @@ python scripts/route_report.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 python scripts/payload_swap.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 python scripts/depth_trace.py runs/TAG.pt.STEP --data-dir /data/delta/dclm-100b
 python scripts/training_curves.py logs/A.log logs/B.log --out-dir figures/curves-A-vs-B
+python scripts/scaling_curves.py logs/A.log logs/B.log logs/C.log
+python scripts/optimizer_state.py runs/TAG.pt.A runs/TAG.pt.B --log logs/TAG.log
 ```
 
 Checkpoint tools use `delta_feedback_experiment.analysis` and trainer

@@ -99,6 +99,43 @@ changing the source changes the stream and validation slice, so it breaks
 per-token pairing. The [recipe](design.md#data) defines stream identity, and
 [operations](operations.md#tokenize) covers build storage and commands.
 
+## Measured loss scaling
+
+[`scaling_curves.py`](../scripts/scaling_curves.py) fits run logs and writes
+`figures/scaling/`; the current read uses `screen-f-25x-feedback0p6-s1`,
+`screen-n-50x-s2`, and `bridge-f-25x-feedback0p6-s1`. Runs with one
+`--data-seed` read identical batches at each step, so step-matched differences
+cancel the data-order bumps (detrended residuals correlate 0.998 across scales
+and seeds). Two screen seeds differ by 0.002 nats of validation loss, and
+enabling feedback moves the plain pass by under 0.003.
+
+The stable phase flattens toward a floor set by the peak learning rate while
+annealed finals keep falling. Cooldown lowers validation loss by 0.150 at 4.8B
+tokens (0.155 measured directly against a run still at peak rate on the same
+batches) and by 0.18–0.19 at 9.6–10.7B tokens, so within-run stable curves do
+not extrapolate; annealed finals do.
+
+Annealed finals on seed 1 anchor `E + A·N^-α + B·D^-β`, with `N` the
+training-active count and `D` predicted tokens. Three anchors leave the
+exponents free: the table holds α = 0.3, β = 0.4 and brackets β over 0.3–0.7
+and α over 0.25–0.35. The anchors imply a screen–bridge capacity gap of
+0.096–0.098 for any β in that range, matching the step-matched stable-phase
+gap, and a fall of 0.093 per doubling of tokens at screen. The learning-rate
+annealing law of Tissue et al., fitted to the 25x screen run alone, predicted
+the 50x final within 0.002; its own extrapolations sit at the high-β edge of
+the brackets.
+
+| Scale | 25x | 50x | 100x | 400x |
+|---|---:|---:|---:|---:|
+| Screen | 2.931 (measured) | 2.838 (measured) | 2.767 [2.762–2.780] | 2.673 [2.650–2.723] |
+| Bridge | 2.729 (measured) | 2.661 [2.656–2.676] | 2.610 [2.596–2.643] | 2.541 [2.508–2.610] |
+| Flagship | 2.616 [2.610–2.629] | 2.562 [2.548–2.593] | 2.521 [2.498–2.571] | 2.467 [2.424–2.549] |
+| Extension | 2.490 [2.471–2.528] | 2.451 [2.422–2.507] | 2.422 [2.383–2.495] | 2.382 [2.325–2.482] |
+
+Downstream, paired per document, the 50x screen run scores 3.4 ± 0.2 accuracy
+points above the 25x run pooled over the suite, and the 25x bridge run a
+further 4 above that.
+
 ## Loop compute and decode state
 
 A step with `p` passes and `r` columns per pass executes `pr` columns,

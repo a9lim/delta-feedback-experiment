@@ -61,6 +61,8 @@ measurement.
 | [`depth_trace.py`](../scripts/depth_trace.py) | Held-out loss and top-state update at every column, default `1..3`, in plain and eligible fused modes. Route mass is sampled from the first microbatch in plain mode. |
 | [`delta eval`](operations.md#downstream-evaluation) | Workspace zero-shot tasks with Standard, Soft, or Fused teacher-forced continuation scoring; the queue runs it after a finished schedule. `--baseline` adds a paired comparison against a published model. |
 | [`training_curves.py`](../scripts/training_curves.py) | Main/auxiliary CE, gradient norm, and throughput from logs; repeated steps retain their final record. |
+| [`scaling_curves.py`](../scripts/scaling_curves.py) | Stable-phase power-law fit and cooldown bonus per run; step-matched seed offset and direct cooldown bonus between runs on one data seed; the annealing-law cross-check; the predicted-final-loss table for every preset from annealed anchors; paired downstream differences against the first run. Current numbers are in [scaling](scaling.md#measured-loss-scaling). |
+| [`optimizer_state.py`](../scripts/optimizer_state.py) | Optimizer state across a run's snapshots: matrix rotation and momentum overlap between snapshots, EMA energy against the iid floor per tensor role, update size and displacement against the learning-rate path, the gradient-energy split between the optimizers given the log, and logit-temperature drift. |
 
 [Operations](operations.md#inspect-a-checkpoint) gives commands. Checkpoint
 tools use the loader and evaluation numerics above. JSON and figures under
