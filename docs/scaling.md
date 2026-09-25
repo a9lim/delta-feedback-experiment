@@ -145,6 +145,10 @@ step for step after onset. Its plain pass equals the trunk's (2.839 vs
 +0.6 at bridge), and every gold-log-probability shift under fusion is smaller
 than at 25x. A 1.5× token budget at 50x is worth 0.044 nats and about 2
 points, so at this width feedback earns about a tenth of the compute it costs.
+Prompt length does not change this: with five worked examples
+(`delta eval --shots 5`) the fused gain is +0.3 to +0.6 points pooled at
+every scale, the same as zero-shot, while the examples themselves add about
+one point on ARC and SciQ, as they do for published models of this size.
 
 ## Loop compute and decode state
 
