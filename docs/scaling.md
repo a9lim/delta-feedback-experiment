@@ -136,6 +136,16 @@ Downstream, paired per document, the 50x screen run scores 3.4 ± 0.2 accuracy
 points above the 25x run pooled over the suite, and the 25x bridge run a
 further 4 above that.
 
+The feedback channel's value at fixed width does not grow with tokens.
+`screen-f-50x-feedback0p75-s2`, forked from the 50x `n` trunk at its
+boundary snapshot, ends at val 2.839 / val_fused 2.834: a fused gain of 0.005
+against 0.007 at 25x and 0.011 at bridge, with the two screen runs matching
+step for step after onset. Its plain pass equals the trunk's (2.839 vs
+2.840). Downstream the fused gain is +0.1 ± 0.1 points pooled (+0.4 at 25x,
++0.6 at bridge), and every gold-log-probability shift under fusion is smaller
+than at 25x. A 1.5× token budget at 50x is worth 0.044 nats and about 2
+points, so at this width feedback earns about a tenth of the compute it costs.
+
 ## Loop compute and decode state
 
 A step with `p` passes and `r` columns per pass executes `pr` columns,
