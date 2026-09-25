@@ -481,6 +481,7 @@ delta eval TAG                          # latest snapshot, every eligible mode
 delta eval TAG --step 5485 --mode standard
 delta eval TAG --mode fused --passes 2
 delta eval TAG --tasks piqa --limit 32  # smoke; writes nothing
+delta eval TAG --shots 5                # five worked examples per document
 delta eval TAG --baseline EleutherAI/pythia-410m HuggingFaceTB/SmolLM2-360M
 python -m transformer_experiments.downstream --compare \
   figures/downstream-TAG/standard.STEP.json figures/downstream-TAG/fused.STEP.json
@@ -492,12 +493,20 @@ model: Standard for every condition, plus Fused and Soft for conditions with
 each mode writes `figures/downstream-TAG/MODE.STEP.json`, or
 `MODEk.STEP.json` for `--passes k`; a `--tasks` subset updates its tasks
 there and keeps the rest. `--out-dir` names a custom snapshot root.
+
+`--shots k` prepends `k` worked examples to every document, as the harness
+does: each document draws its own with a fixed seed from the task's training
+split, or from the evaluation split minus the document where there is none
+(LAMBADA), joined by blank lines. Results go to `MODE-kshot.STEP.json` and
+baselines to `figures/baseline/ORG/NAME-kshot.json`; the default buckets
+extend to 2048 tokens so five examples fit, and longer prompts truncate from
+the left.
 The first use downloads the task datasets from the Hub. The queue runs the
 same command [after a finished schedule](#runs).
 
 `--baseline MODEL` compares each mode against a published Hub model on the
 same documents. The model is scored once in FP32, a few minutes below 1B
-parameters, into `figures/baseline/ORG/NAME.json`, which belongs to no run
+parameters, into `figures/baseline/ORG/NAME.json` (`NAME-kshot.json` under `--shots k`), which belongs to no run
 and survives `clear`. Later evaluations reuse it without loading the model
 or reaching the Hub, and score only tasks it lacks; a model whose Hub commit
 has moved is rescored. The snapshot's own results are written first. Each

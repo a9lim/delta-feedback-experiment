@@ -107,7 +107,7 @@ def suite(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     request = tasks.Request(("ab", "ab"), ("c", "d"), 0, ("c", "d"))
     monkeypatch.setattr(
-        tasks, "load_requests", lambda task, limit=None: [request, request][:limit]
+        tasks, "load_requests", lambda task, limit=None, shots=0: [request, request][:limit]
     )
     encode = lambda text, add_special_tokens: SimpleNamespace(
         input_ids=[1 + ord(c) % 96 for c in text]
@@ -144,6 +144,21 @@ def test_eval_limit_is_a_smoke_and_passes_name_their_file(suite):
     # A task subset updates its tasks and keeps the rest, in suite order.
     downstream.main([*common[:2], "arc_easy", *common[3:], "--passes", "2"])
     assert list(json.loads(written.read_text())["tasks"]) == ["arc_easy", "piqa"]
+
+
+def test_eval_shots_name_their_file_and_widen_the_buckets(suite):
+    snapshot(suite)
+    common = ["tiny", "--tasks", "piqa", "--device", "cpu", "--mode", "standard"]
+    downstream.main([*common, "--shots", "2"])
+    written = suite / "figures/downstream-tiny/standard-2shot.5.json"
+    payload = json.loads(written.read_text())
+    assert payload["meta"]["shots"] == 2 and payload["meta"]["buckets"] == [128, 256, 512, 1024, 2048]
+    assert payload["tasks"]["piqa"]["meta"]["shots"] == 2
+    downstream.main(common)
+    assert sorted(p.name for p in written.parent.iterdir()) == ["standard-2shot.5.json", "standard.5.json"]
+    # A stored task is current only under its own shot count; baselines keep shot counts apart too.
+    assert set(downstream.stored_results(written, 8, 2)[0]) == {"piqa"} and not downstream.stored_results(written, 8)[0]
+    assert downstream.baseline_path("org/name", 5) == downstream.FIGURES / "baseline/org/name-5shot.json"
 
 
 def test_eval_refuses_missing_steps_and_synthetic_vocabularies(suite):

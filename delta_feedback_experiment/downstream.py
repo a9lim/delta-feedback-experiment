@@ -1,4 +1,4 @@
-"""Downstream zero-shot tasks on a run's snapshot: ``delta eval TAG``.
+"""Downstream tasks on a run's snapshot: ``delta eval TAG``.
 
 Uses the workspace's ``transformer_experiments.downstream`` tasks (pinned Hub
 revisions, harness-identical prompts) with this model's own scorer: one plain
@@ -15,11 +15,14 @@ shapes.
 Every mode the snapshot's condition supports runs by default, against one
 loaded model.  Each task emits a ``downstream`` record as it finishes, and each
 mode writes ``figures/downstream-TAG/MODE.STEP.json`` (``MODEk.STEP.json`` for
-``k > 1`` passes); compare two files with
-``python -m transformer_experiments.downstream --compare``.  A ``--tasks``
-subset updates those tasks in the file and keeps the rest; a ``--limit`` run
-is a smoke and writes nothing.  The queue runs this module as the phase after
-a finished training schedule.
+``k > 1`` passes, ``MODE-kshot.STEP.json`` for ``--shots k``); compare two
+files with ``python -m transformer_experiments.downstream --compare``.  A
+``--tasks`` subset updates those tasks in the file and keeps the rest; a
+``--limit`` run is a smoke and writes nothing.  ``--shots k`` prepends ``k``
+worked examples to every document, drawn per document from the task's
+training split (or the evaluation split minus the document), and widens the
+default buckets to 2048 tokens so they fit.  The queue runs this module as the
+phase after a finished training schedule.
 
 ``--baseline MODEL`` adds a yardstick: a published Hub causal LM scored on the
 same documents by the workspace's reference scorer in FP32, the numerics its
@@ -97,18 +100,21 @@ def condition_modes(model) -> tuple[str, ...]:
     return MODES if model.cfg.feedback else MODES[:1]
 
 
-def result_path(tag: str, step: int, mode: str, passes: int = 1) -> Path:
+def result_path(tag: str, step: int, mode: str, passes: int = 1, shots: int = 0) -> Path:
     """Where one mode's results for one snapshot live under ``figures/``."""
     suffix = f"{mode}{passes}" if mode != "standard" and passes > 1 else mode
+    if shots:
+        suffix += f"-{shots}shot"
     return FIGURES / f"downstream-{tag}" / f"{suffix}.{step}.json"
 
 
-def stored_results(path: Path, max_len: int) -> tuple[dict[str, downstream.TaskResult], dict]:
+def stored_results(path: Path, max_len: int, shots: int = 0) -> tuple[dict[str, downstream.TaskResult], dict]:
     """A result file's still-current tasks, in suite order, and its meta.
 
-    A task is current while the pinned dataset revision and ``max_len`` it was
-    scored under are the ones in force; scores depend on nothing else a rerun
-    could change, so a partial rerun updates its tasks and keeps the rest.
+    A task is current while the pinned dataset revision, ``max_len``, and shot
+    count it was scored under are the ones in force; scores depend on nothing
+    else a rerun could change, so a partial rerun updates its tasks and keeps
+    the rest.
     """
     if not path.is_file():
         return {}, {}
@@ -120,6 +126,7 @@ def stored_results(path: Path, max_len: int) -> tuple[dict[str, downstream.TaskR
         if name in found
         and found[name].meta.get("revision") == task.revision
         and found[name].meta.get("max_len") == max_len
+        and found[name].meta.get("shots", 0) == shots
     }, payload["meta"]
 
 
@@ -130,11 +137,12 @@ def write_results(path: Path, results: dict[str, downstream.TaskResult], meta: d
     print(f"wrote {path}", flush=True)
 
 
-def baseline_path(model_id: str) -> Path:
-    """Where a published model's results live: ``figures/baseline/ORG/NAME.json``."""
+def baseline_path(model_id: str, shots: int = 0) -> Path:
+    """Where a published model's results live: ``figures/baseline/ORG/NAME.json``,
+    or ``NAME-kshot.json`` for ``k`` shots."""
     if not HUB_ID.fullmatch(model_id):
         raise ValueError(f"--baseline takes Hub model ids such as ORG/NAME, got {model_id!r}")
-    return FIGURES / "baseline" / f"{model_id}.json"
+    return FIGURES / "baseline" / (f"{model_id}-{shots}shot.json" if shots else f"{model_id}.json")
 
 
 def hub_id(text: str) -> str:
@@ -170,6 +178,7 @@ def baseline_results(
     *,
     limit: int | None,
     max_len: int,
+    shots: int = 0,
     **run_kwargs,
 ) -> dict[str, downstream.TaskResult]:
     """A published model's results on ``tasks``, scored once and then reused.
@@ -179,8 +188,8 @@ def baseline_results(
     only missing tasks load the model, and a model whose Hub commit has moved
     is rescored whole. A ``--limit`` smoke neither reads nor writes the store.
     """
-    path = baseline_path(model_id)
-    stored, meta = stored_results(path, max_len) if limit is None else ({}, {})
+    path = baseline_path(model_id, shots)
+    stored, meta = stored_results(path, max_len, shots) if limit is None else ({}, {})
     commit = meta.get("commit")
     missing = [name for name in tasks if name not in stored]
     if missing:
@@ -195,10 +204,11 @@ def baseline_results(
                 scorer,
                 max_len=max_len,
                 pad_id=pad_id,
+                shots=shots,
                 **run_kwargs,
             )
         if limit is None:
-            meta = {"model": model_id, "commit": commit, "dtype": "float32"}
+            meta = {"model": model_id, "commit": commit, "dtype": "float32", **({"shots": shots} if shots else {})}
             write_results(path, stored, meta)
     return {name: stored[name] for name in tasks}
 
@@ -215,7 +225,7 @@ def task_fields(result: downstream.TaskResult) -> dict[str, str]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         "delta eval",
-        description="Score a run's snapshot on the downstream zero-shot tasks.",
+        description="Score a run's snapshot on the downstream tasks, zero- or few-shot.",
     )
     parser.add_argument("tag")
     parser.add_argument(
@@ -249,6 +259,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="documents per task; a smoke that writes no results",
     )
     parser.add_argument(
+        "--shots",
+        type=int,
+        default=0,
+        help="worked examples prepended to every document, drawn per document "
+        "from the task's training split or the evaluation split minus the "
+        "document (default: 0)",
+    )
+    parser.add_argument(
         "--baseline",
         dest="baselines",
         nargs="+",
@@ -259,7 +277,13 @@ def build_parser() -> argparse.ArgumentParser:
         "is scored once in FP32 and kept under figures/baseline/",
     )
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--buckets", type=int, nargs="+", default=(128, 256, 512, 1024))
+    parser.add_argument(
+        "--buckets",
+        type=int,
+        nargs="+",
+        default=None,
+        help="padded sequence lengths (default: 128 256 512 1024, extended to 2048 with --shots)",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--out-dir", default="runs", help="snapshot directory")
     return parser
@@ -283,8 +307,9 @@ def main(argv: list[str] | None = None) -> None:
         for mode in args.modes or condition_modes(model)
     ]
     tokenize = downstream.hf_tokenize(load_tokenizer())
-    max_len = min(saved["seq_len"], max(args.buckets))
-    buckets = [b for b in args.buckets if b <= max_len]
+    chosen_buckets = tuple(args.buckets) if args.buckets else (128, 256, 512, 1024, *((2048,) if args.shots else ()))
+    max_len = min(saved["seq_len"], max(chosen_buckets))
+    buckets = [b for b in chosen_buckets if b <= max_len]
     address = telemetry.step_address(saved["step"], saved["steps"])
     requests: dict[str, list[downstream.Request]] = {}
     started = time.time()
@@ -299,7 +324,7 @@ def main(argv: list[str] | None = None) -> None:
         for name in args.tasks:
             task = downstream.TASKS[name]
             if name not in requests:
-                requests[name] = downstream.load_requests(task, args.limit)
+                requests[name] = downstream.load_requests(task, args.limit, args.shots)
             results[name] = downstream.run_task(
                 task,
                 requests[name],
@@ -309,12 +334,14 @@ def main(argv: list[str] | None = None) -> None:
                 max_len=max_len,
                 buckets=buckets,
                 progress=progress,
+                shots=args.shots,
             )
             telemetry.log(
                 "downstream",
                 step=address,
                 mode=scorer.mode,
                 passes=scorer.passes,
+                **({"shots": args.shots} if args.shots else {}),
                 task=name,
                 **task_fields(results[name]),
             )
@@ -322,7 +349,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.limit is not None:
             print(f"--limit {args.limit} is a smoke; nothing written", flush=True)
             continue
-        out_path = result_path(saved["tag"], saved["step"], scorer.mode, args.passes)
+        out_path = result_path(saved["tag"], saved["step"], scorer.mode, args.passes, args.shots)
         meta = {
             "snapshot": str(path),
             "tag": saved["tag"],
@@ -330,13 +357,14 @@ def main(argv: list[str] | None = None) -> None:
             "step": saved["step"],
             "mode": scorer.mode,
             "passes": scorer.passes,
+            "shots": args.shots,
             **tokenizer_metadata(),
             "tokenizer_id": TOKENIZER_ID,
             "device": str(scorer.device),
             "batch_size": args.batch_size,
-            "buckets": list(args.buckets),
+            "buckets": list(chosen_buckets),
         }
-        write_results(out_path, stored_results(out_path, max_len)[0] | results, meta)
+        write_results(out_path, stored_results(out_path, max_len, args.shots)[0] | results, meta)
 
     if not args.baselines:
         return
@@ -354,6 +382,7 @@ def main(argv: list[str] | None = None) -> None:
             device,
             limit=args.limit,
             max_len=max_len,
+            shots=args.shots,
             batch_size=args.batch_size,
             buckets=buckets,
             progress=progress,
@@ -369,6 +398,7 @@ def main(argv: list[str] | None = None) -> None:
                 step=address,
                 mode=mode,
                 passes=passes[mode],
+                **({"shots": args.shots} if args.shots else {}),
                 against=model_id,
                 diff=telemetry.format_metric(pool["diff"]),
                 se=telemetry.format_metric(pool["se"]),
